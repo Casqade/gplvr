@@ -1,0 +1,133 @@
+#pragma once
+
+// The presenter's half of the VR channel: open the game's shared texture and draw one
+// eye's half of it into an OpenXR swapchain image.
+//
+// The drawing is a single full-screen pass with no vertex buffer, because everything it
+// has to do is a texture lookup with the coordinates bent three ways:
+//
+//   * pick out the eye's sub-rect, since one texture carries both eyes;
+//   * invert v, because a GL back buffer copied through NV_DX_interop arrives bottom-up
+//     (measured -- STATUS.md -- not assumed);
+//   * fit rather than stretch, because the game's half is 1280x1440 and the swapchain is
+//     square, and stretching a 1.13:1 image into 1:1 would make the whole world lean.
+
+#include "presenter/SharedPresentation.h"
+
+#include <d3d11.h>
+
+namespace gplvr {
+
+class Consumer {
+public:
+    ~Consumer();
+
+    Consumer(const Consumer&) = delete;
+    Consumer& operator=(const Consumer&) = delete;
+    Consumer() = default;
+
+    // Opens the control block the game created. Fails if the game is not running, which
+    // is the ordinary case when gplvr-xr is started by hand.
+    bool open(const wchar_t* instance);
+
+    // Tells the game which adapter the runtime wants and what size it recommends, then
+    // moves to RequirementsReady. The game cannot create its shared textures until this
+    // has happened -- a texture shared from a device on the wrong adapter cannot be
+    // opened here at all.
+    void publishRequirements(LUID adapter, uint32_t eyeWidth, uint32_t eyeHeight);
+
+    // Compiles the blit pipeline. Call once the D3D11 device exists.
+    bool initialise(ID3D11Device* device, ID3D11DeviceContext* context);
+
+    // Picks up texture recreation -- the game does that on every menu-to-sim transition
+    // -- and latches the newest published frame. False means there is nothing to draw
+    // yet, which is normal for the first second or two.
+    bool update();
+
+    // Draws eye 0 or 1 into the given render target. Safe to call only after update()
+    // has returned true.
+    bool drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                 int eye);
+
+    // The poses the current frame was rendered from. False means the game is not
+    // tracking yet, in which case the caller should fall back to the located views --
+    // the picture will be head-locked, but there is nothing better to submit.
+    bool renderedViews(SharedView out[2]) const;
+
+    void publishViews(const SharedView views[2], const SharedPose& head, bool valid);
+
+    void setError(int32_t code);
+    bool shutdownRequested() const;
+    bool producerAlive() const;
+
+    void close();
+
+private:
+    struct Slot {
+        ID3D11Texture2D*          texture = nullptr;
+        ID3D11ShaderResourceView* view = nullptr;
+    };
+
+    bool openTextures();
+    void releaseTextures();
+
+    HANDLE        mapping_ = nullptr;
+    ControlBlock* block_ = nullptr;
+    HANDLE        producerProcess_ = nullptr;
+
+    ID3D11Device*        device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+
+    ID3D11VertexShader*  vertexShader_ = nullptr;
+    ID3D11PixelShader*   pixelShader_ = nullptr;
+    ID3D11SamplerState*  sampler_ = nullptr;
+    ID3D11Buffer*        constants_ = nullptr;
+    ID3D11BlendState*    blend_ = nullptr;
+    ID3D11RasterizerState* rasterizer_ = nullptr;
+
+    // One consistent snapshot of everything the producer publishes with a frame, taken
+    // once per presenter frame.
+    //
+    // Reading these live, per eye, was a real bug: the producer publishes at 36 Hz and
+    // we draw at 90, so a new frame could land between eye 0 and eye 1 and the two eyes
+    // would be submitted with poses from different game frames. The runtime then
+    // reprojects them differently, which is a binocular disparity error that only shows
+    // up while the head is moving -- exactly "one eye lags behind".
+    struct Frame {
+        int32_t    sequence = 0;
+        bool       sideBySide = false;
+        uint32_t   eyeHalfWidth = 0;
+        bool       stretchToFill = false;
+        float      monoScale = 0.5f;
+        bool       renderedValid = false;
+        SharedView rendered[2] = {};
+    };
+
+    Slot     slots_[kFrameSlots] = {};
+    Frame    current_;
+    int32_t  openedGeneration_ = 0;
+    uint32_t sourceWidth_ = 0;
+    uint32_t sourceHeight_ = 0;
+    bool     bottomUp_ = true;
+    bool     loggedFirstFrame_ = false;
+
+    // What the last logged layer description said, so it can be repeated when it
+    // changes rather than only once at startup.
+    bool     loggedSideBySide_ = false;
+    bool     loggedStretch_ = false;
+    bool     loggedRenderedValid_ = false;
+    float    loggedFov_ = -1.0f;
+    int32_t  viewSequence_ = 0;
+
+    // Once-a-second arithmetic on how frames are actually arriving, because "the game is
+    // not keeping up" and "the poses are wrong" look identical in a headset and only one
+    // of them is fixed by rendering faster.
+    DWORD    statsStart_ = 0;
+    int32_t  statsFirstSequence_ = 0;
+    unsigned statsPresenterFrames_ = 0;
+    unsigned statsRepeats_ = 0;
+    unsigned statsWorstRepeat_ = 0;
+    unsigned statsSinceNewFrame_ = 0;
+};
+
+}  // namespace gplvr
