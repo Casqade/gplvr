@@ -1,6 +1,6 @@
 #include "Hooks.h"
 
-#include "GlCapture.h"
+#include "MouseLook.h"
 #include "Log.h"
 #include "Stereo.h"
 #include "VrCamera.h"
@@ -35,11 +35,8 @@ long long g_sceneTicksWorst = 0;
 bool      g_stereoKeyLast = false;
 bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
-bool      g_vrDumpKeyLast = false;
-bool      g_vrFovProbeKeyLast = false;
-bool      g_vrRotateResetKeyLast = false;
-bool      g_vrRotateSweeping = false;
-DWORD     g_vrRotateLastTick = 0;
+bool      g_vrMouseLookKeyLast = false;
+bool      g_loggedMouseLook = false;
 
 // Set by the scene hook when stereoRender actually split the frame into two eyes.
 // Read and cleared by the frame hook.
@@ -49,6 +46,17 @@ DWORD     g_vrRotateLastTick = 0;
 // presenter side-by-side anyway made it cut the menu in half and blow one half up to
 // fill the headset. What matters is whether THIS frame has two eyes in it.
 bool      g_stereoRenderedFrame = false;
+
+// The parameter block the last scene render used. Stable across frames -- it is
+// simFrame+81 -- but taken from the hook rather than assumed, so an extra render can
+// never run against a block the game has not handed us.
+void*     g_lastSceneParams = nullptr;
+LONGLONG  g_lastPresentTick = 0;
+LONGLONG  g_frameInterval = 0;
+bool      g_loggedExtraRenders = false;
+bool      g_lastFrameWasStereo = false;
+bool      g_warnedSlowTick = false;
+LONGLONG  g_extraRenderCost = 0;
 
 std::vector<uintptr_t> g_pendingCallSites;
 volatile bool          g_sceneHookPending = false;
@@ -111,71 +119,177 @@ void pollToggle() {
         g_vrRecentreKeyLast = down;
     }
 
-    // Dump the head matrix and the eye offsets once. Press it while LOOKING at whatever
-    // looks wrong: a matrix that has stopped being a rotation shears the world in
-    // proportion to how far the head is turned, so facing forward would tell you nothing.
-    if (g_options.vr && g_options.vrDumpKey) {
-        const bool down = (GetAsyncKeyState(g_options.vrDumpKey) & 0x8000) != 0;
-        if (down && !g_vrDumpKeyLast) vrRequestDump();
-        g_vrDumpKeyLast = down;
-    }
-
-    // Sweep the fixed debug rotation while a key is held.
+    // The mouse look toggle, and the mouse itself.
     //
-    // Rate-based rather than per-frame, so the sweep is the same speed whether the game
-    // is managing 36 fps or stalling, and so it stays comparable between runs.
-    if (g_options.vr && vrDebugRotationActive()) {
-        const DWORD now = GetTickCount();
-        DWORD       elapsed = now - g_vrRotateLastTick;
-        g_vrRotateLastTick = now;
-        // A first call, or a long stall, must not teleport the angle.
-        if (elapsed > 250) elapsed = 0;
-
-        const float seconds = static_cast<float>(elapsed) / 1000.0f;
-        const float step = g_options.vrDebugRotateRate * seconds;
-
-        const auto held = [](int key) {
-            return key && (GetAsyncKeyState(key) & 0x8000) != 0;
-        };
-
-        float yaw = 0.0f;
-        float pitch = 0.0f;
-        if (held(g_options.vrDebugYawLeftKey)) yaw += step;
-        if (held(g_options.vrDebugYawRightKey)) yaw -= step;
-        if (held(g_options.vrDebugPitchUpKey)) pitch += step;
-        if (held(g_options.vrDebugPitchDownKey)) pitch -= step;
-
-        if (yaw != 0.0f || pitch != 0.0f) {
-            vrDebugRotateBy(yaw, pitch);
-            g_vrRotateSweeping = true;
-        } else if (g_vrRotateSweeping) {
-            // Report where the sweep stopped, so a screenshot has an angle against it.
-            g_vrRotateSweeping = false;
-            float atYaw = 0.0f, atPitch = 0.0f;
-            vrDebugRotationAngles(atYaw, atPitch);
-            logf("vr: debug rotation now yaw %.1f deg, pitch %.1f deg", atYaw, atPitch);
+    // Deliberately NOT gated on g_options.vr: the whole reason this exists is to drive
+    // the camera with vr = 0, on a flat monitor, where a straight line is straight and
+    // the headset cannot be blamed for anything.
+    if (g_options.vrMouseLookKey) {
+        const bool down = (GetAsyncKeyState(g_options.vrMouseLookKey) & 0x8000) != 0;
+        if (down && !g_vrMouseLookKeyLast) {
+            g_options.vrMouseLook = !g_options.vrMouseLook;
+            logf("mouselook toggled %s%s", g_options.vrMouseLook ? "ON" : "off",
+                 (g_options.vrMouseLook && g_options.vr)
+                     ? " -- head tracking is now inhibited"
+                     : "");
         }
-
-        const bool reset = held(g_options.vrDebugRotateResetKey);
-        if (reset && !g_vrRotateResetKeyLast) {
-            vrDebugRotateReset();
-            logf("vr: debug rotation reset to the starting angles");
-        }
-        g_vrRotateResetKeyLast = reset;
+        g_vrMouseLookKeyLast = down;
     }
 
-    // Render one frame twice over, same viewpoint, two frusta an octave apart, and dump
-    // both halves. Whether the fov we write reaches the picture stops being a matter of
-    // opinion at that point.
-    if (g_options.vr && g_options.vrFovProbeKey) {
-        const bool down = (GetAsyncKeyState(g_options.vrFovProbeKey) & 0x8000) != 0;
-        if (down && !g_vrFovProbeKeyLast) stereoRequestFovProbe();
-        g_vrFovProbeKeyLast = down;
+    if (g_options.vrMouseLook && mouseLookEnsureStarted()) {
+        int deltaX = 0;
+        int deltaY = 0;
+        if (mouseLookTake(deltaX, deltaY)) {
+            // Right turns the view right, and yaw is positive to the LEFT, so that sign
+            // flips. Mouse forward is negative Y and should look UP, and pitch is
+            // positive up, so that one flips as well.
+            const float pitchSign = g_options.vrMouseLookInvertPitch ? 1.0f : -1.0f;
+            vrLookOverrideBy(
+                -static_cast<float>(deltaX) * g_options.vrMouseLookSensitivity,
+                pitchSign * static_cast<float>(deltaY) *
+                    g_options.vrMouseLookSensitivity);
+
+            if (!g_loggedMouseLook) {
+                g_loggedMouseLook = true;
+                float atYaw = 0.0f, atPitch = 0.0f;
+                vrLookOverrideAngles(atYaw, atPitch);
+                logf("mouselook: first movement -- the camera is being driven from the "
+                     "mouse (now yaw %.1f deg, pitch %.1f deg). %s",
+                     atYaw, atPitch,
+                     g_options.vr
+                         ? "Head tracking is inhibited."
+                         : "vr is off, so this is GPL's own renderer on a flat monitor "
+                           "with nothing else in the chain.");
+            }
+        }
     }
+
 }
 
 void applyPendingSceneRenderHook();  // defined below
 void enforceNotTopmost();            // defined below
+void __cdecl callOriginalSceneRender(void* params);  // defined below
+
+// Re-render the whole scene from a fresher head pose, spread across the idle tail of
+// the 36 Hz tick.
+//
+// Calling sceneRender more than once per frame is not a new risk: stereo has been
+// calling it twice, once per eye, for the whole project. This calls it twice more.
+//
+// The spacing is the point. Publishing three frames back to back would give the
+// presenter three images at the same instant and nothing for the next 28 ms, which is
+// no smoother than one. Each extra render therefore waits until its slice of the
+// measured frame interval before drawing, so the poses it picks up from the presenter
+// are genuinely newer.
+void renderExtraFrames() {
+    if (!g_options.vr || g_options.vrExtraRenders <= 0 || !g_options.stereo) return;
+    if (!g_lastSceneParams || !stereoAvailable()) return;
+    if (!g_lastFrameWasStereo || !vrFrustumInjected()) return;
+
+    LARGE_INTEGER frequency, now;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+
+    // Measure the tick from present to present rather than assuming 36 Hz -- the rate
+    // changes with the replay/menu/sim state and a wrong guess would either overrun the
+    // next frame or bunch the extra renders at the start of it.
+    const LONGLONG previous = g_lastPresentTick;
+    g_lastPresentTick = now.QuadPart;
+    if (!previous) return;
+
+    const LONGLONG measured = now.QuadPart - previous;
+    if (measured <= 0) return;
+    // Smooth it, and ignore an outlier from a load hitch.
+    g_frameInterval = g_frameInterval ? (g_frameInterval * 3 + measured) / 4 : measured;
+    const LONGLONG interval = g_frameInterval;
+    if (interval <= 0 || measured > interval * 3) return;
+
+    // Never stretch a frame that is already slow.
+    //
+    // The spacing waits a FRACTION of the measured interval, so during a load stall --
+    // observed at 1.1 fps for seven seconds -- it waited a quarter of a second twice
+    // per frame and made the stall several times worse. The smoothed interval adapts to
+    // a sustained slow patch, so the spike guard above never fires for one. Anything
+    // slower than 25 fps is not a tick with idle time to spend, so spend none.
+    const LONGLONG slowest = frequency.QuadPart / 25;
+    if (interval > slowest) {
+        if (!g_warnedSlowTick) {
+            g_warnedSlowTick = true;
+            logf("vr: extra renders paused -- the game frame is %.1f ms, which leaves no "
+                 "idle time to render into. They resume on their own once it recovers.",
+                 1000.0 * static_cast<double>(interval) /
+                     static_cast<double>(frequency.QuadPart));
+        }
+        return;
+    }
+    g_warnedSlowTick = false;
+
+    int extra = g_options.vrExtraRenders;
+    if (extra > 3) extra = 3;
+
+    if (!g_loggedExtraRenders) {
+        g_loggedExtraRenders = true;
+        // The wording said "spread over a tick" long after the spreading was replaced
+        // by locking to the presenter's cadence. A stale log line is a lie told once a
+        // session.
+        logf("vr: extra renders ON -- up to %d per game frame, each waiting for the "
+             "presenter to publish a new pose rather than for a slice of the %.1f ms "
+             "tick. The world still animates at the sim rate; only head tracking gets "
+             "faster. Watch that 'fps' below does not fall.",
+             extra, 1000.0 * static_cast<double>(interval) /
+                        static_cast<double>(frequency.QuadPart));
+    }
+
+    // Lock each extra render to the presenter's own cadence instead of slicing the
+    // tick into equal parts.
+    //
+    // Slicing gave 3 renders per 27.8 ms tick -- 108 Hz into a 90 Hz display, which
+    // does not divide. About every fifth frame is discarded and what is left beats at
+    // 18 Hz, which is visible as precisely the stepping these renders exist to remove.
+    // Waiting for the view counter to move means one rendered frame per display frame,
+    // whatever the two rates happen to be.
+    //
+    // The deadline is the point where the game's own next frame is due. Stop before it
+    // rather than counting renders: if the presenter is slow we do fewer, if it is fast
+    // we do more, and neither case runs into the game.
+    const LONGLONG deadline = now.QuadPart + interval - interval / 8;
+
+    for (int done = 0; done < extra; ++done) {
+        const int32_t before = presenterViewSequence();
+        if (!before) return;
+
+        // Wait for the presenter to publish a NEW view set. Without this the extra
+        // render would draw from the same pose as the frame before it and cost time for
+        // an identical image.
+        for (;;) {
+            LARGE_INTEGER current;
+            QueryPerformanceCounter(&current);
+            if (current.QuadPart >= deadline) return;
+            if (presenterViewSequence() != before) break;
+            SwitchToThread();
+        }
+
+        // Do not START a render that cannot finish before the game's next frame.
+        //
+        // The deadline was only checked while waiting, so a render begun just under it
+        // ran straight into the game's own frame -- which is a hitch, and hitches are
+        // what these renders exist to remove. Budget on what the last one actually
+        // cost, doubled for headroom.
+        LARGE_INTEGER before2;
+        QueryPerformanceCounter(&before2);
+        if (before2.QuadPart + g_extraRenderCost * 2 > deadline) return;
+
+        if (stereoRender(static_cast<SceneParams*>(g_lastSceneParams),
+                         &callOriginalSceneRender)) {
+            presenterFrame(true, vrFrustumInjected());
+        }
+
+        LARGE_INTEGER after;
+        QueryPerformanceCounter(&after);
+        const LONGLONG cost = after.QuadPart - before2.QuadPart;
+        g_extraRenderCost = g_extraRenderCost ? (g_extraRenderCost * 3 + cost) / 4 : cost;
+    }
+}
 
 int __cdecl screenDisplayHook(void* surface) {
     // We are on the game's render thread, between frames: sceneRender has already
@@ -189,7 +303,6 @@ int __cdecl screenDisplayHook(void* surface) {
 
     // Before the original, not after: the back buffer still holds the finished frame
     // at this point, which is the whole reason the transport probe lives here.
-    if (g_options.glProbe) glProbeFrame();
 
     // Same reason, same moment: the shared texture is filled from the back buffer
     // before the game presents it. presenterStart needs a current GL context, which is
@@ -207,10 +320,23 @@ int __cdecl screenDisplayHook(void* surface) {
         if (!g_stereoRenderedFrame) vrClearRendered();
 
         presenterFrame(g_stereoRenderedFrame, vrFrustumInjected());
+        // Remembered before it is cleared: an extra render must only ever repeat a
+        // frame the game actually rendered a tracked stereo world into. On a menu the
+        // saved parameter block is stale, and re-running it would paint the sim over
+        // the menu.
+        g_lastFrameWasStereo = g_stereoRenderedFrame;
         g_stereoRenderedFrame = false;
     }
 
-    return g_originalScreenDisplay ? g_originalScreenDisplay(surface) : 0;
+    const int presented = g_originalScreenDisplay ? g_originalScreenDisplay(surface) : 0;
+
+    // Extra renders go AFTER the present, in the idle tail of the tick.
+    //
+    // Before it, they would delay the game's own frame by however long they take and
+    // cost exactly the frame rate they are meant to improve. After it, they spend time
+    // the game thread was going to spend waiting for the next 36 Hz task anyway.
+    renderExtraFrames();
+    return presented;
 }
 
 // One timed invocation of the engine's sceneRender.
@@ -264,12 +390,28 @@ void __cdecl sceneRenderHook(void* params) {
     // If stereo is on and its targets are up it owns the whole frame: two renders, one
     // per half of the buffer. It returns false if it could not build the eye targets,
     // and then we render normally -- a failed stereo setup must never cost you the game.
-    if (g_options.stereo && stereoRender(scene, &callOriginalSceneRender)) {
-        g_stereoRenderedFrame = true;
-        return;
-    }
+    g_lastSceneParams = params;
 
-    callOriginalSceneRender(params);
+    // The look override, on the flat path.
+    //
+    // With vr = 1 it is applied inside vrAcquireEyes, which writes it over the head
+    // rotation; doing it here as well would apply it twice. With vr = 0 there is no
+    // presenter and vrAcquireEyes never runs, so here is the only place it can go -- and
+    // that is the case this exists for.
+    //
+    // params is the game's own block and it is reused every frame, so the original has
+    // to go back before we return, exactly as stereoRender does with what it borrows.
+    float savedOrientation[9];
+    std::memcpy(savedOrientation, scene->orientation, sizeof(savedOrientation));
+    const bool overridden = !g_options.vr && vrApplyLookOverride(scene->orientation);
+
+    if (g_options.stereo && stereoRender(scene, &callOriginalSceneRender))
+        g_stereoRenderedFrame = true;
+    else
+        callOriginalSceneRender(params);
+
+    if (overridden)
+        std::memcpy(scene->orientation, savedOrientation, sizeof(savedOrientation));
 }
 
 // -- ChangeDisplaySettings -------------------------------------------------
@@ -541,74 +683,49 @@ void loadOptions(const char* fileName) {
     char text[64] = {};
 
     g_options.stereo = GetPrivateProfileIntA("gplvr", "stereo", 0, path) != 0;
-    g_options.stereoSwapEyes =
-        GetPrivateProfileIntA("gplvr", "stereoSwapEyes", 0, path) != 0;
     g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 1, path);
     g_options.stereoKey = GetPrivateProfileIntA("gplvr", "stereoKey", '1', path);
     g_options.blockDisplayChange =
         GetPrivateProfileIntA("gplvr", "blockDisplayChange", 0, path) != 0;
     g_options.blockClipCursor =
         GetPrivateProfileIntA("gplvr", "blockClipCursor", 0, path) != 0;
-    g_options.installHooks = GetPrivateProfileIntA("gplvr", "installHooks", 1, path) != 0;
-    g_options.glProbe = GetPrivateProfileIntA("gplvr", "glProbe", 0, path) != 0;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
-    g_options.vrDumpKey = GetPrivateProfileIntA("gplvr", "vrDumpKey", '4', path);
-    g_options.vrFovProbeKey =
-        GetPrivateProfileIntA("gplvr", "vrFovProbeKey", '5', path);
-    GetPrivateProfileStringA("gplvr", "vrDebugYawDegrees", "0", text, sizeof(text), path);
-    g_options.vrDebugYawDegrees = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrDebugPitchDegrees", "0", text, sizeof(text),
-                             path);
-    g_options.vrDebugPitchDegrees = static_cast<float>(atof(text));
-    g_options.vrDebugRotate =
-        GetPrivateProfileIntA("gplvr", "vrDebugRotate", 0, path) != 0;
-    g_options.vrSubmitRenderedPose =
-        GetPrivateProfileIntA("gplvr", "vrSubmitRenderedPose", 1, path) != 0;
-    g_options.vrOverlayMarkers =
-        GetPrivateProfileIntA("gplvr", "vrOverlayMarkers", 0, path) != 0;
-    g_options.vrLevelSeat = GetPrivateProfileIntA("gplvr", "vrLevelSeat", 0, path) != 0;
-    g_options.vrLevelRecentre =
-        GetPrivateProfileIntA("gplvr", "vrLevelRecentre", 1, path) != 0;
+    g_options.vrMouseLook =
+        GetPrivateProfileIntA("gplvr", "vrMouseLook", 0, path) != 0;
+    GetPrivateProfileStringA("gplvr", "vrMouseLookSensitivity", "0.08", text,
+                             sizeof(text), path);
+    g_options.vrMouseLookSensitivity = static_cast<float>(atof(text));
+    g_options.vrMouseLookInvertPitch =
+        GetPrivateProfileIntA("gplvr", "vrMouseLookInvertPitch", 0, path) != 0;
+    g_options.vrMouseLookKey =
+        GetPrivateProfileIntA("gplvr", "vrMouseLookKey", '6', path);
+    GetPrivateProfileStringA("gplvr", "vrHorizonLock", "0.0", text, sizeof(text), path);
+    g_options.vrHorizonLock = static_cast<float>(atof(text));
+    g_options.vrExtraRenders = GetPrivateProfileIntA("gplvr", "vrExtraRenders", 0, path);
     GetPrivateProfileStringA("gplvr", "vrWorldScale", "1.0", text, sizeof(text), path);
     g_options.vrWorldScale = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrDebugRotateRate", "45", text, sizeof(text), path);
-    g_options.vrDebugRotateRate = static_cast<float>(atof(text));
-    g_options.vrDebugYawLeftKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugYawLeftKey", 0x25, path);
-    g_options.vrDebugYawRightKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugYawRightKey", 0x27, path);
-    g_options.vrDebugPitchUpKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugPitchUpKey", 0x26, path);
-    g_options.vrDebugPitchDownKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugPitchDownKey", 0x28, path);
-    g_options.vrDebugRotateResetKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugRotateResetKey", 0x24, path);
     g_options.allowWindowTopmost =
         GetPrivateProfileIntA("gplvr", "allowWindowTopmost", 0, path) != 0;
     g_options.shrinkWindowByOnePixel =
         GetPrivateProfileIntA("gplvr", "shrinkWindowByOnePixel", 1, path) != 0;
-    GetPrivateProfileStringA("gplvr", "stereoIpd", "0.064", text, sizeof(text), path);
-    g_options.stereoIpd = static_cast<float>(atof(text));
     GetPrivateProfileStringA("gplvr", "vrMenuScale", "0.5", text, sizeof(text), path);
     g_options.vrMenuScale = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrFovScale", "1.0", text, sizeof(text), path);
-    g_options.vrFovScale = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrFovScaleRight", "0", text, sizeof(text), path);
-    g_options.vrFovScaleRight = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrEyeScale", "1.0", text, sizeof(text), path);
-    g_options.vrEyeScale = static_cast<float>(atof(text));
+    GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
+    g_options.vrRenderScale = static_cast<float>(atof(text));
 
-    logf("options: stereo=%d ipd=%.4f m swapEyes=%d mirror=%d stereoKey=0x%02X",
-         g_options.stereo, g_options.stereoIpd, g_options.stereoSwapEyes,
-         g_options.stereoMirror, g_options.stereoKey);
-    logf("options: vrMenuScale=%.2f vrFovScale=%.2f vrFovScaleRight=%.2f "
-         "vrEyeScale=%.2f vrRecentreKey=0x%02X vrFovProbeKey=0x%02X",
-         g_options.vrMenuScale, g_options.vrFovScale, g_options.vrFovScaleRight,
-         g_options.vrEyeScale, g_options.vrRecentreKey, g_options.vrFovProbeKey);
-    logf("options: installHooks=%d vr=%d glProbe=%d blockDisplayChange=%d blockClipCursor=%d "
+    logf("options: stereo=%d mirror=%d stereoKey=0x%02X",
+         g_options.stereo, g_options.stereoMirror, g_options.stereoKey);
+    logf("options: vrMenuScale=%.2f vrRenderScale=%.2f vrRecentreKey=0x%02X",
+         g_options.vrMenuScale, g_options.vrRenderScale, g_options.vrRecentreKey);
+    logf("options: vrExtraRenders=%d vrHorizonLock=%.2f vrWorldScale=%.2f",
+         g_options.vrExtraRenders, g_options.vrHorizonLock, g_options.vrWorldScale);
+    logf("options: vrMouseLook=%d sensitivity=%.3f invertPitch=%d key=0x%02X",
+         g_options.vrMouseLook ? 1 : 0, g_options.vrMouseLookSensitivity,
+         g_options.vrMouseLookInvertPitch ? 1 : 0, g_options.vrMouseLookKey);
+    logf("options: vr=%d blockDisplayChange=%d blockClipCursor=%d "
          "allowWindowTopmost=%d shrinkWindowByOnePixel=%d (from %s)",
-         g_options.installHooks, g_options.vr, g_options.glProbe, g_options.blockDisplayChange,
+         g_options.vr, g_options.blockDisplayChange,
          g_options.blockClipCursor, g_options.allowWindowTopmost,
          g_options.shrinkWindowByOnePixel, path);
 }

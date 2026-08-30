@@ -40,6 +40,7 @@ struct Entries {
     void** bitmapHeightSlot = nullptr;
     void** instanceAllocSlot = nullptr;
     void** instanceFreeSlot = nullptr;
+    void** backBufferSlot = nullptr;
 
     // Both are code in the exe, so their addresses are fixed once discovered.
     CameraCreateFn cameraCreate = nullptr;
@@ -60,17 +61,17 @@ struct State {
     int   sourceWidth = 0;
     int   sourceHeight = 0;
     Half  half[2];  // [0] = left half of the buffer, [1] = right half
+    // Where each eye actually landed: x, y, w, h in source pixels. Not derivable from
+    // sourceWidth/2 -- an odd-width buffer leaves a column belonging to neither eye.
+    int   eyeRect[2][4] = {};
     bool  reported = false;
     bool  gaveUp = false;
     bool  verifiedFrustum = false;
     bool  verifiedRebuild[2] = {false, false};
-
-    // One-shot fov probe. `requested` is set from the key hook, `armed` by the render
-    // once the probe frame is sitting in the back buffer.
-    bool  fovProbeRequested = false;
-    bool  fovProbeArmed = false;
-    float fovProbeFov[2] = {0.0f, 0.0f};
-    float fovProbeAspect[2] = {0.0f, 0.0f};
+    // The fov the camera actually held after the last render, per pass, so a SWEEP can
+    // be traced rather than a single startup frame.
+    float lastRenderedFov[2] = {0.0f, 0.0f};
+    int   rebuildReports = 0;
 
     // The frustum each eye camera should be rendering with, kept so the cameraBind hook
     // can put it back after sceneRender overwrites it.
@@ -78,6 +79,13 @@ struct State {
     float pendingAspect[2] = {0.0f, 0.0f};
     bool  pendingValid[2] = {false, false};
     bool  loggedReapply = false;
+    bool  loggedFlatFrustum = false;
+    float loggedMainCx = 999.0f;
+    float loggedMainCy = 999.0f;
+    int   loggedSurfaceW = -1;
+    int   loggedSurfaceH = -1;
+    int   loggedBackW = -1;
+    int   loggedBackH = -1;
 
     // Watchdog counters. The fov was silently overridden once already; "it is fixed"
     // is worth exactly as much as the instrument that keeps saying so.
@@ -120,6 +128,19 @@ void* cameraPointer(void* camera, unsigned offset) {
 // unless the byte at +0x3C is set -- and cameraBind calls it on the way into every
 // render, so writing the two floats and raising the flag is the whole job. Rebuilding
 // the camera object would also work and would cost a bitmapInstanceAlloc per frame.
+// Put the principal point back in the middle.
+//
+// cameraCreate stores cx and cy PRE-MULTIPLIED by the half extents, so centring them is
+// simply writing zero to both -- no need to know the extents. The dirty byte is raised
+// the same way cameraSetFrustum does it, so cameraBind rebuilds the projection from the
+// centred values on its way into the render.
+void cameraCentrePrincipalPoint(void* camera) {
+    auto bytes = static_cast<unsigned char*>(camera);
+    *reinterpret_cast<float*>(bytes + kCameraCx) = 0.0f;
+    *reinterpret_cast<float*>(bytes + kCameraCy) = 0.0f;
+    bytes[kCameraDirty] = 1;
+}
+
 void cameraSetFrustum(void* camera, float fov, float aspect) {
     auto bytes = static_cast<unsigned char*>(camera);
     *reinterpret_cast<float*>(bytes + kCameraFov) = fov;
@@ -197,6 +218,48 @@ bool ensureEyes(void* mainCamera) {
     const int height = bitmapHeight(source);
     if (width < 2 || height < 1) return false;
 
+    // A world render fills the back buffer. A menu's 3D viewport does not.
+    //
+    // The racing lobby draws a TV feed into a 373x280 surface inside a 640x480 window,
+    // and we were splitting that into two 186x280 eyes -- so the headset went stereo
+    // while the driver was still in the menu, and vrMenuScale stopped applying because
+    // the presenter was told the frame was a side-by-side world. Quitting to the menu
+    // from a race does the same thing.
+    //
+    // The surface's size against the back buffer's is what separates them, and it costs
+    // one call.
+    if (g_entries.backBufferSlot && *g_entries.backBufferSlot) {
+        auto getBackBuffer =
+            reinterpret_cast<void*(__cdecl*)()>(*g_entries.backBufferSlot);
+        if (void* back = getBackBuffer()) {
+            const int fullWidth = bitmapWidth(back);
+            const int fullHeight = bitmapHeight(back);
+            // Allow a small margin: shrinkWindowByOnePixel and odd sizes mean the world
+            // surface is not always exactly the back buffer.
+            // Report on CHANGE, both ways. The first version logged once and only
+            // when it decided "menu", so a case where it wrongly decided "world" said
+            // nothing at all -- which is exactly the case still misbehaving after a
+            // race. An instrument that only speaks when it agrees with itself is no
+            // instrument.
+            const bool viewport = fullWidth > 0 && fullHeight > 0 &&
+                                  (width * 8 < fullWidth * 7 ||
+                                   height * 8 < fullHeight * 7);
+            if (width != g_state.loggedSurfaceW || height != g_state.loggedSurfaceH ||
+                fullWidth != g_state.loggedBackW ||
+                fullHeight != g_state.loggedBackH) {
+                g_state.loggedSurfaceW = width;
+                g_state.loggedSurfaceH = height;
+                g_state.loggedBackW = fullWidth;
+                g_state.loggedBackH = fullHeight;
+                logf("stereo: %dx%d render into a %dx%d back buffer -> treated as %s",
+                     width, height, fullWidth, fullHeight,
+                     viewport ? "a MENU viewport (mono, vrMenuScale applies)"
+                              : "a WORLD view (split into two eyes)");
+            }
+            if (viewport) return false;
+        }
+    }
+
     if (g_state.half[0].camera && source == g_state.sourceSurface &&
         width == g_state.sourceWidth && height == g_state.sourceHeight)
         return true;
@@ -218,8 +281,19 @@ bool ensureEyes(void* mainCamera) {
          fov, cameraFloat(mainCamera, kCameraAspect),
          cameraFloat(mainCamera, 0x0C), cameraFloat(mainCamera, 0x10));
 
-    if (!buildHalf(g_state.half[0], g_state.storage[0], source, 0, 0, halfWidth, height,
-                   fov, nearZ) ||
+    // Where each eye lands, published to the presenter so it samples exactly what
+    // was rendered rather than assuming a clean half -- an odd-width buffer leaves a
+    // column belonging to neither eye.
+    g_state.eyeRect[0][0] = 0;
+    g_state.eyeRect[1][0] = halfWidth;
+    for (int eye = 0; eye < 2; ++eye) {
+        g_state.eyeRect[eye][1] = 0;
+        g_state.eyeRect[eye][2] = halfWidth;
+        g_state.eyeRect[eye][3] = height;
+    }
+
+    if (!buildHalf(g_state.half[0], g_state.storage[0], source, 0, 0, halfWidth,
+                   height, fov, nearZ) ||
         !buildHalf(g_state.half[1], g_state.storage[1], source, halfWidth, 0, halfWidth,
                    height, fov, nearZ)) {
         stereoRelease();
@@ -251,6 +325,7 @@ void stereoBind(const Binding& binding) {
     g_entries.bitmapHeightSlot = binding.raster.bitmapHeight;
     g_entries.instanceAllocSlot = binding.raster.bitmapInstanceAlloc;
     g_entries.instanceFreeSlot = binding.raster.bitmapInstanceFree;
+    g_entries.backBufferSlot = binding.raster.screenGetBackBuffer;
     g_entries.cameraCreate = reinterpret_cast<CameraCreateFn>(binding.cameraCreate);
     g_entries.cameraBind = reinterpret_cast<CameraBindFn>(binding.cameraBind);
 
@@ -277,6 +352,17 @@ void stereoOnCameraBind(void* camera) {
 
         cameraSetFrustum(camera, g_state.pendingFov[pass], g_state.pendingAspect[pass]);
 
+        // And the principal point, on the same grounds and for the same reason.
+        //
+        // sceneRender sets the fov and the principal point on consecutive lines before
+        // cameraBind. The fov half was put back from Phase 2 onward and the principal
+        // point was left as the game set it -- which, for the cockpit view, is offset
+        // vertically by about an eighth of half-height, and pitched the whole VR image
+        // down by nine degrees for nine sessions. A headset frustum is symmetric about
+        // the eye; anything but centre is simply wrong here, so there is nothing to
+        // choose between.
+        cameraCentrePrincipalPoint(camera);
+
         if (!g_state.loggedReapply) {
             g_state.loggedReapply = true;
             logf("stereo: eye frustum re-applied at bind -- fov %.4f aspect %.4f. Before "
@@ -288,29 +374,21 @@ void stereoOnCameraBind(void* camera) {
     }
 }
 
-void stereoRequestFovProbe() {
-    g_state.fovProbeRequested = true;
-    logf("stereo: fov probe armed -- the next tracked frame renders both halves from "
-         "one viewpoint, left at the normal frustum and right at twice its tangent");
-}
-
-bool stereoTakeFovProbe(float fov[2], float aspect[2]) {
-    if (!g_state.fovProbeArmed) return false;
-    g_state.fovProbeArmed = false;
-    fov[0] = g_state.fovProbeFov[0];
-    fov[1] = g_state.fovProbeFov[1];
-    aspect[0] = g_state.fovProbeAspect[0];
-    aspect[1] = g_state.fovProbeAspect[1];
-    return true;
-}
-
 int stereoEyeWidth() {
-    return g_state.half[0].camera ? g_state.sourceWidth / 2 : 0;
+    return g_state.half[0].camera ? g_state.eyeRect[0][2] : 0;
+}
+
+bool stereoEyeRect(int eye, int out[4]) {
+    if (eye < 0 || eye > 1 || !g_state.half[eye].camera) return false;
+    for (int i = 0; i < 4; ++i) out[i] = g_state.eyeRect[eye][i];
+    return out[2] > 0 && out[3] > 0;
 }
 
 void stereoRelease() {
     releaseHalf(g_state.half[0]);
     releaseHalf(g_state.half[1]);
+    for (int eye = 0; eye < 2; ++eye)
+        for (int i = 0; i < 4; ++i) g_state.eyeRect[eye][i] = 0;
     g_state.sourceSurface = nullptr;
     g_state.sourceWidth = 0;
     g_state.sourceHeight = 0;
@@ -374,203 +452,218 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     std::memcpy(savedOrientation, params->orientation, sizeof(savedOrientation));
 
 
-    const float halfIpd = g_options.stereoIpd * 0.5f;
-
-    // Head tracking, when the presenter has poses to give. It supplies the eye
-    // separation as well, so stereoIpd is not consulted at all in this path -- the
-    // runtime knows the user's real IPD and we do not.
+    // Head poses, or nothing. The runtime supplies the eye separation as well as the
+    // orientation, so there is no eye-separation constant anywhere in here: the runtime
+    // knows the user's real IPD and we do not.
     VrEye      vr[2];
     const bool tracked =
         vrAcquireEyes(vr, g_state.sourceWidth / 2, g_state.sourceHeight);
 
-    // The probe needs head poses to render from, so it waits for a tracked frame rather
-    // than firing into the menu and reporting on a mono image.
     // Without this a frustum from the last tracked frame would keep being re-applied at
     // bind time after tracking drops, quietly overriding the game's own fov in a mode
     // that is supposed to be stock.
     if (!tracked) g_state.pendingValid[0] = g_state.pendingValid[1] = false;
 
-    // A frame with no head poses renders from the car's own pose and the game's own
-    // frustum, which lands in the headset as a one-frame jump to a different viewpoint.
-    // That is almost certainly the "blink": it was always here, but it only became
-    // visible once the tracked frames started using a genuinely different field of
-    // view from the untracked ones.
+    // No poses, no split. Returning false sends the caller to the game's own single
+    // render, and the presenter shows that one image to both eyes.
+    //
+    // The alternative -- splitting anyway and separating the halves by a fixed IPD from
+    // the car's own pose -- is what this used to do, and it landed in the headset as a
+    // one-frame jump to a different viewpoint whenever tracking dropped. That was the
+    // "blink". A mono frame shown to both eyes is a still picture for a frame; a stereo
+    // pair from the wrong viewpoint is a lurch.
     if (tracked != g_state.wasTracked) {
         g_state.wasTracked = tracked;
         if (!tracked && g_state.untrackedReports < 8) {
             ++g_state.untrackedReports;
-            logf("stereo: head poses UNAVAILABLE this frame -- rendering from the car "
-                 "pose and the game's fov. One of these is one blink.");
+            logf("stereo: head poses UNAVAILABLE this frame -- falling back to the "
+                 "game's own single render, shown to both eyes.");
         }
     }
+    if (!tracked) return false;
 
-    const bool probe = g_state.fovProbeRequested && tracked;
+    // What the game is asking for, reported on change. This is the number the overlay
+    // alignment was measuring the whole time, and it costs one line to read directly
+    // instead of inferring it from a horizon a human had to line up by hand.
+    if (std::fabs(params->mainCy - g_state.loggedMainCy) > 0.001f ||
+        std::fabs(params->mainCx - g_state.loggedMainCx) > 0.001f) {
+        g_state.loggedMainCx = params->mainCx;
+        g_state.loggedMainCy = params->mainCy;
+        logf("stereo: the game's PRINCIPAL POINT is cx %.4f cy %.4f (normalised, screen "
+             "edges at +/-1), applied to whatever camera is in p[2] -- ours -- on the "
+             "line before cameraBind. cy shifts the image by that fraction of half-"
+             "height with NO dependence on the field of view; the bind hook puts it back "
+             "to centre.",
+             params->mainCx, params->mainCy);
+    }
 
-    // -- level the seat ------------------------------------------------------------
+    // -- horizon lock ---------------------------------------------------------------
     //
     // params->orientation maps camera-local to world, so its columns are the camera's
-    // axes: column 0 is forward, column 2 is up, in GPL's frame (X forward, Y left,
-    // Z up). The elevation of that forward vector is the camera's pitch.
+    // axes: column 0 is forward, column 1 is left, column 2 is up, in GPL's frame
+    // (X forward, Y left, Z up). So the world-Z component of each column is that axis's
+    // elevation, and both angles fall straight out:
     //
-    // GPL's cockpit camera is pitched down -- recentring aims at the wheel. Composing
-    // the head rotation onto a pitched frame makes a head yaw rotate about a tilted
-    // axis, which injects roll that grows with yaw and equals the pitch offset at 90
-    // degrees. Removing the pitch first makes the head yaw about true vertical.
+    //   pitch = asin(forward.z)                 how far the nose is up or down
+    //   roll  = atan2(left.z, up.z)             how far the car leans
     //
-    // The correction is a rotation about the camera's own left axis (local Y), applied
-    // on the right so it acts in camera space and leaves the car's heading alone.
-    float seatPitch = 0.0f;
-    if (tracked) {
-        // MEASURE unconditionally. The first version only computed this inside the
-        // `vrLevelSeat` branch, so running with the fix off -- the obvious thing to do
-        // when comparing -- produced no number at all. An instrument that only works
-        // when the fix is enabled cannot tell you whether the fix is needed.
-        const float forwardZ = savedOrientation[2 * 3 + 0];  // column 0, world Z
-        seatPitch = std::asin(forwardZ < -1.0f ? -1.0f
-                                               : (forwardZ > 1.0f ? 1.0f : forwardZ));
+    // ROLL IS THE HALF THAT MATTERS MOST, and that is not a preference. A viewer can
+    // counteract a pitched or yawed camera by moving their own head; nobody can
+    // counteract roll, and it is the axis that conflicts most directly with the inner
+    // ear's sense of down. Meta's own VR guidance is blunt about never rotating the
+    // camera in roll, and every racing sim that ships a horizon lock -- ACC, AMS2,
+    // rFactor 2, the Dirt/WRC games -- aims it at roll from banking, kerbs and body
+    // lean first, with pitch along for the ride.
+    //
+    // Both corrections are applied on the RIGHT, so they act in camera space and leave
+    // the car's heading alone. Roll goes first, and the order is not arbitrary: a
+    // rotation about the forward axis leaves the forward direction untouched, so the
+    // pitch measured above is unaffected by it -- and once the roll is out, the left
+    // axis is horizontal, which is exactly the axis a pitch correction wants to turn
+    // about.
+    // MEASURED unconditionally, whatever the horizon lock is set to. An earlier
+    // version computed these only when the levelling was switched on, so running with
+    // it off -- the obvious thing to do when comparing -- produced no number at all. An
+    // instrument that only works when the option is enabled cannot tell you whether the
+    // option is needed.
+    const float forwardZ = savedOrientation[2 * 3 + 0];  // column 0, world Z
+    const float leftZ = savedOrientation[2 * 3 + 1];     // column 1, world Z
+    const float upZ = savedOrientation[2 * 3 + 2];       // column 2, world Z
+    const float seatPitch = std::asin(
+        forwardZ < -1.0f ? -1.0f : (forwardZ > 1.0f ? 1.0f : forwardZ));
+    const float seatRoll = std::atan2(leftZ, upZ);
 
-        // Rotation about +Y by b takes local X to (cos b, 0, -sin b), i.e. positive b
-        // pitches the forward axis DOWN. To cancel a downward pitch (negative
-        // elevation) we therefore rotate by b = +seatPitch.
-        const float cb = std::cos(g_options.vrLevelSeat ? seatPitch : 0.0f);
-        const float sb = std::sin(g_options.vrLevelSeat ? seatPitch : 0.0f);
-        const float aboutY[9] = {cb, 0.0f, sb,
-                                 0.0f, 1.0f, 0.0f,
-                                 -sb, 0.0f, cb};
+    // Blended, not switched. See Options::vrHorizonLock.
+    const float lock = (g_options.vrHorizonLock < 0.0f)
+                           ? 0.0f
+                           : (g_options.vrHorizonLock > 1.0f ? 1.0f
+                                                             : g_options.vrHorizonLock);
 
-        float levelled[9];
-        for (int row = 0; row < 3; ++row)
-            for (int column = 0; column < 3; ++column)
-                levelled[row * 3 + column] =
-                    savedOrientation[row * 3 + 0] * aboutY[0 * 3 + column] +
-                    savedOrientation[row * 3 + 1] * aboutY[1 * 3 + column] +
-                    savedOrientation[row * 3 + 2] * aboutY[2 * 3 + column];
+    // Rotation about +X by a maps local Y to (0, cos a, sin a) and local Z to
+    // (0, -sin a, cos a). Taking a = -seatRoll drives the left axis's world-Z
+    // component to cos(roll)*left.z - sin(roll)*up.z, which is zero by construction.
+    const float ra = -seatRoll * lock;
+    const float cr = std::cos(ra);
+    const float sr = std::sin(ra);
+    const float aboutX[9] = {1.0f, 0.0f, 0.0f,
+                             0.0f, cr,   -sr,
+                             0.0f, sr,   cr};
 
-        // Say what it was and prove the correction landed, rather than asserting the
-        // sign was right. If "after" is not ~0 the rotation went the wrong way.
-        // Report on CHANGE, not the first few frames. The first version capped at four
-        // reports and spent all four on the 373x280 lobby camera before the sim camera
-        // existed, so it measured the menu and said nothing about driving.
-        const float degrees = seatPitch * 57.29578f;
-        if (std::fabs(degrees - g_state.lastSeatPitch) > 1.0f &&
-            g_state.seatReports < 40) {
-            ++g_state.seatReports;
-            g_state.lastSeatPitch = degrees;
-            constexpr float kDegrees = 57.29578f;
-            logf("stereo: game camera pitch %.2f deg (negative is nose-down); after "
-                 "levelling %.2f deg. vrLevelSeat=%d. This angle becomes ROLL at 90 "
-                 "degrees of head yaw, because the head then yaws about a tilted axis.",
-                 seatPitch * kDegrees, std::asin(levelled[2 * 3 + 0]) * kDegrees,
-                 g_options.vrLevelSeat ? 1 : 0);
-        }
+    // Rotation about +Y by b takes local X to (cos b, 0, -sin b), i.e. positive b
+    // pitches the forward axis DOWN. To cancel a downward pitch (negative
+    // elevation) we therefore rotate by b = +seatPitch.
+    const float cb = std::cos(seatPitch * lock);
+    const float sb = std::sin(seatPitch * lock);
+    const float aboutY[9] = {cb, 0.0f, sb,
+                             0.0f, 1.0f, 0.0f,
+                             -sb, 0.0f, cb};
 
-        std::memcpy(savedOrientation, levelled, sizeof(levelled));
+    float unrolled[9];
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            unrolled[row * 3 + column] =
+                savedOrientation[row * 3 + 0] * aboutX[0 * 3 + column] +
+                savedOrientation[row * 3 + 1] * aboutX[1 * 3 + column] +
+                savedOrientation[row * 3 + 2] * aboutX[2 * 3 + column];
+
+    float levelled[9];
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            levelled[row * 3 + column] =
+                unrolled[row * 3 + 0] * aboutY[0 * 3 + column] +
+                unrolled[row * 3 + 1] * aboutY[1 * 3 + column] +
+                unrolled[row * 3 + 2] * aboutY[2 * 3 + column];
+
+    // Say what it was and prove the correction landed, rather than asserting the
+    // signs were right. If either "after" figure is not ~0 at a lock of 1.0, that
+    // rotation went the wrong way.
+    // Report on CHANGE, not the first few frames. The first version capped at four
+    // reports and spent all four on the 373x280 lobby camera before the sim camera
+    // existed, so it measured the menu and said nothing about driving.
+    const float degrees = seatPitch * 57.29578f;
+    if (std::fabs(degrees - g_state.lastSeatPitch) > 1.0f &&
+        g_state.seatReports < 40) {
+        ++g_state.seatReports;
+        g_state.lastSeatPitch = degrees;
+        constexpr float kDegrees = 57.29578f;
+        logf("stereo: car pitch %.2f roll %.2f deg (pitch negative is nose-down); "
+             "after a horizon lock of %.2f, %.2f and %.2f deg reach the view. This "
+             "is the CAR'S attitude, not a fixed view offset -- it drifts through "
+             "zero.",
+             degrees, seatRoll * kDegrees, lock,
+             std::asin(levelled[2 * 3 + 0]) * kDegrees,
+             std::atan2(levelled[2 * 3 + 1], levelled[2 * 3 + 2]) * kDegrees);
     }
-    if (probe) g_state.fovProbeRequested = false;
+
+    std::memcpy(savedOrientation, levelled, sizeof(levelled));
 
     for (int pass = 0; pass < 2; ++pass) {
-        // pass 0 draws the left half of the buffer. Which eye that half belongs to is
-        // the one thing a display can get wrong in a way that is invisible on a flat
-        // screen and instantly nauseating in a headset, hence the switch.
-        const int index = g_options.stereoSwapEyes ? 1 - pass : pass;
+        // pass 0 draws the left half of the buffer and is the left eye. Proven in
+        // game, not assumed: the left viewpoint lands in the left half with no swap
+        // needed, and no headset has wanted otherwise.
+        const int poseIndex = pass;
 
-        // During the probe both halves render from eye 0's viewpoint. Leaving the IPD
-        // in would put 65 mm of parallax between the halves and make a bitwise
-        // comparison meaningless -- every pixel would differ whether or not the fov
-        // did.
-        const int poseIndex = probe ? 0 : index;
+        // Compose rather than replace: p+24 already carries the car's attitude and
+        // its g-force lean, and the head turns relative to that.
+        float composed[9];
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                composed[row * 3 + column] =
+                    savedOrientation[row * 3 + 0] * vr[poseIndex].rotation[0 * 3 + column] +
+                    savedOrientation[row * 3 + 1] * vr[poseIndex].rotation[1 * 3 + column] +
+                    savedOrientation[row * 3 + 2] * vr[poseIndex].rotation[2 * 3 + column];
+        std::memcpy(params->orientation, composed, sizeof(composed));
 
-        if (tracked) {
-            // Compose rather than replace: p+24 already carries the car's attitude and
-            // its g-force lean, and the head turns relative to that.
-            float composed[9];
-            for (int row = 0; row < 3; ++row)
-                for (int column = 0; column < 3; ++column)
-                    composed[row * 3 + column] =
-                        savedOrientation[row * 3 + 0] * vr[poseIndex].rotation[0 * 3 + column] +
-                        savedOrientation[row * 3 + 1] * vr[poseIndex].rotation[1 * 3 + column] +
-                        savedOrientation[row * 3 + 2] * vr[poseIndex].rotation[2 * 3 + column];
-            std::memcpy(params->orientation, composed, sizeof(composed));
+        // The eye offset is in car-local axes, so it rotates with the car -- the
+        // same reason a raw world offset was wrong in Phase 0.
+        float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+        localToWorld(savedOrientation, vr[poseIndex].offset[0],
+                     vr[poseIndex].offset[1], vr[poseIndex].offset[2], dx, dy, dz);
 
-            // The eye offset is in car-local axes, so it rotates with the car -- the
-            // same reason a raw world offset was wrong in Phase 0.
-            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-            localToWorld(savedOrientation, vr[poseIndex].offset[0],
-                         vr[poseIndex].offset[1], vr[poseIndex].offset[2], dx, dy, dz);
+        params->camera = g_state.half[pass].camera;
+        params->eyeX = savedX + dx;
+        params->eyeY = savedY + dy;
+        params->eyeZ = savedZ + dz;
 
-            params->camera = g_state.half[pass].camera;
-            params->eyeX = savedX + dx;
-            params->eyeY = savedY + dy;
-            params->eyeZ = savedZ + dz;
+        // Re-aim at the runtime's frustum. Writing fov and aspect and setting the
+        // dirty byte is enough -- cameraBind rebuilds the projection from them on
+        // its way into the render, so there is no need to rebuild the camera.
+        const float useFov = vr[poseIndex].fov;
+        const float useAspect = vr[poseIndex].aspect;
 
-            // Re-aim at the runtime's frustum. Writing fov and aspect and setting the
-            // dirty byte is enough -- cameraBind rebuilds the projection from them on
-            // its way into the render, so there is no need to rebuild the camera.
-            // The probe doubles the right half's frustum in TANGENT space, because
-            // that is what `fov` means to gpl_cameraRebuildProjection -- doubling the
-            // angle instead would be a different and less extreme change, and past 90
-            // degrees not even well defined.
-            float useFov = vr[poseIndex].fov;
-            const float useAspect = vr[poseIndex].aspect;
-            if (probe && pass == 1)
-                useFov = 2.0f * std::atan(std::tan(useFov * 0.5f) * 2.0f);
-            if (probe) {
-                g_state.fovProbeFov[pass] = useFov;
-                g_state.fovProbeAspect[pass] = useAspect;
-            }
+        g_state.pendingFov[pass] = useFov;
+        g_state.pendingAspect[pass] = useAspect;
+        g_state.pendingValid[pass] = true;
 
-            g_state.pendingFov[pass] = useFov;
-            g_state.pendingAspect[pass] = useAspect;
-            g_state.pendingValid[pass] = true;
+        cameraSetFrustum(g_state.half[pass].camera, useFov, useAspect);
 
-            cameraSetFrustum(g_state.half[pass].camera, useFov, useAspect);
-
-            // Read it straight back. vrFovScale demonstrably reaches vrAcquireEyes --
-            // the frustum log line moves with it -- but the picture reportedly does not
-            // change at all, which cannot be true if the camera really rendered a
-            // different field of view. Either the write is not sticking, or something
-            // overwrites it before the render. This says which, once, rather than
-            // letting the contradiction stand.
-            if (!g_state.verifiedFrustum) {
-                g_state.verifiedFrustum = true;
-                const float readFov = cameraFloat(g_state.half[pass].camera, kCameraFov);
-                const float readAspect =
-                    cameraFloat(g_state.half[pass].camera, kCameraAspect);
-                logf("stereo: frustum write check -- wrote fov %.4f aspect %.4f, reads "
-                     "back fov %.4f aspect %.4f, dirty=%u%s",
-                     useFov, useAspect, readFov, readAspect,
-                     static_cast<unsigned>(
-                         static_cast<unsigned char*>(g_state.half[pass].camera)
-                             [kCameraDirty]),
-                     (readFov == useFov) ? "" : "  <-- THE WRITE DID NOT STICK");
-            }
-        } else {
-            // Local +Y is LEFT, so the left eye sits at +halfIpd and the right at
-            // -halfIpd.
-            const float lateral = (index == 0) ? halfIpd : -halfIpd;
-
-            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-            localToWorld(savedOrientation, 0.0f, lateral, 0.0f, dx, dy, dz);
-
-            params->camera = g_state.half[pass].camera;
-            params->eyeX = savedX + dx;
-            params->eyeY = savedY + dy;
-            params->eyeZ = savedZ + dz;
+        // Read it straight back. A frustum that reaches vrAcquireEyes and does not
+        // reach the picture means either the write is not sticking or something
+        // overwrites it before the render -- and something does, twice: sceneRender
+        // sets the fov and then the principal point on its way to cameraBind. This
+        // says which, once, rather than
+        // letting the contradiction stand.
+        if (!g_state.verifiedFrustum) {
+            g_state.verifiedFrustum = true;
+            const float readFov = cameraFloat(g_state.half[pass].camera, kCameraFov);
+            const float readAspect =
+                cameraFloat(g_state.half[pass].camera, kCameraAspect);
+            logf("stereo: frustum write check -- wrote fov %.4f aspect %.4f, reads "
+                 "back fov %.4f aspect %.4f, dirty=%u%s",
+                 useFov, useAspect, readFov, readAspect,
+                 static_cast<unsigned>(
+                     static_cast<unsigned char*>(g_state.half[pass].camera)
+                         [kCameraDirty]),
+                 (readFov == useFov) ? "" : "  <-- THE WRITE DID NOT STICK");
         }
 
         // The mirror camera targets the full render surface at its own fixed rect, so it
         // does not follow the eye into its half of the buffer. Drawing it once keeps the
         // picture closest to stock; drawing it twice doubles its cost for no gain.
-        // The mirror lands in one half only by default, which would show up as a
-        // difference the fov had nothing to do with. Suppress it for the probe frame.
-        if (probe) {
-            params->mirrorCamera = nullptr;
-        } else {
-            switch (g_options.stereoMirror) {
-                case 0: params->mirrorCamera = nullptr; break;
-                case 1: params->mirrorCamera = (pass == 0) ? savedMirror : nullptr; break;
-                default: params->mirrorCamera = savedMirror; break;
-            }
+        switch (g_options.stereoMirror) {
+            case 0: params->mirrorCamera = nullptr; break;
+            case 1: params->mirrorCamera = (pass == 0) ? savedMirror : nullptr; break;
+            default: params->mirrorCamera = savedMirror; break;
         }
 
         // Does GPL's euler round trip preserve what we composed?
@@ -580,25 +673,23 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         // suspect. If it grows with head angle, it is the transform that has been
         // distorting the world -- and it would be invisible facing forward, which is
         // the signature we have been chasing.
-        if (tracked) {
-            float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
-            gplMatrixToEuler(params->orientation, yaw, pitch, roll);
-            float rebuilt[9];
-            gplEulerToMatrix(yaw, pitch, roll, rebuilt);
+        float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+        gplMatrixToEuler(params->orientation, yaw, pitch, roll);
+        float rebuilt[9];
+        gplEulerToMatrix(yaw, pitch, roll, rebuilt);
 
-            float worst = 0.0f;
-            for (int i = 0; i < 9; ++i) {
-                const float d = std::fabs(rebuilt[i] - params->orientation[i]);
-                if (d > worst) worst = d;
-            }
-            if (worst > g_state.worstEuler + 0.002f && g_state.eulerReports < 12) {
-                ++g_state.eulerReports;
-                g_state.worstEuler = worst;
-                logf("stereo: euler round trip worst element error %.5f (yaw %.1f pitch "
-                     "%.1f roll %.1f deg). GPL renders from these three angles, not from "
-                     "the matrix; a growing error here IS the distortion.",
-                     worst, yaw * 57.29578f, pitch * 57.29578f, roll * 57.29578f);
-            }
+        float worst = 0.0f;
+        for (int i = 0; i < 9; ++i) {
+            const float d = std::fabs(rebuilt[i] - params->orientation[i]);
+            if (d > worst) worst = d;
+        }
+        if (worst > g_state.worstEuler + 0.002f && g_state.eulerReports < 12) {
+            ++g_state.eulerReports;
+            g_state.worstEuler = worst;
+            logf("stereo: euler round trip worst element error %.5f (yaw %.1f pitch "
+                 "%.1f roll %.1f deg). GPL renders from these three angles, not from "
+                 "the matrix; a growing error here IS the distortion.",
+                 worst, yaw * 57.29578f, pitch * 57.29578f, roll * 57.29578f);
         }
 
         original(params);
@@ -615,41 +706,53 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         //        cameraCreate built, whatever we wrote into the object
         //
         // The write check above only proved the float survives in memory. It never
-        // proved the renderer consumed it, and that gap is exactly what vrFovScale
-        // having no visible effect at 0.35 points at.
-        if (tracked) {
-            const unsigned char dirty = static_cast<unsigned char*>(
-                g_state.half[pass].camera)[kCameraDirty];
-            const float renderedFov = cameraFloat(g_state.half[pass].camera, kCameraFov);
-            const float renderedAspect =
-                cameraFloat(g_state.half[pass].camera, kCameraAspect);
+        // proved the renderer consumed it, and that gap is where a frustum written at
+        // the wrong moment disappears without trace.
+        const unsigned char dirty = static_cast<unsigned char*>(
+            g_state.half[pass].camera)[kCameraDirty];
+        const float renderedFov = cameraFloat(g_state.half[pass].camera, kCameraFov);
+        const float renderedAspect =
+            cameraFloat(g_state.half[pass].camera, kCameraAspect);
 
-            if (!g_state.verifiedRebuild[pass]) {
-                g_state.verifiedRebuild[pass] = true;
-                logf("stereo: pass %d after render -- dirty=%u, camera fov %.4f aspect "
-                     "%.4f%s",
-                     pass, static_cast<unsigned>(dirty), renderedFov, renderedAspect,
-                     dirty ? "  <-- NOT REBUILT: nothing bound this camera, so the fov "
-                             "we wrote never reached the projection"
-                           : "  (rebuilt, so the projection used our fov)");
-            }
+        // Report the first frame AND every change of half a degree after it.
+        //
+        // One-shot is how six separate instruments in this project spent their
+        // single report on a startup frame and said nothing about the thing under
+        // investigation. This one has to be able to trace a change over time.
+        const float renderedDegrees = renderedFov * 57.29578f;
+        const bool  changed =
+            std::fabs(renderedDegrees - g_state.lastRenderedFov[pass] * 57.29578f) >
+            0.5f;
+        if ((!g_state.verifiedRebuild[pass] || changed) &&
+            g_state.rebuildReports < 60) {
+            if (changed) ++g_state.rebuildReports;
+            g_state.verifiedRebuild[pass] = true;
+            g_state.lastRenderedFov[pass] = renderedFov;
+            logf("stereo: pass %d after render -- dirty=%u, camera fov %.4f rad "
+                 "(%.1f deg) aspect %.4f, we asked for %.1f deg%s",
+                 pass, static_cast<unsigned>(dirty), renderedFov, renderedDegrees,
+                 renderedAspect,
+                 g_state.pendingValid[pass]
+                     ? g_state.pendingFov[pass] * 57.29578f
+                     : 0.0f,
+                 dirty ? "  <-- NOT REBUILT: nothing bound this camera, so the fov "
+                         "we wrote never reached the projection"
+                       : "  (rebuilt, so the projection used our fov)");
+        }
 
-            // Every frame, not once: the whole point is to catch a path that overrides
-            // the fov only sometimes. Capped so a persistent fault cannot flood the log.
-            if (g_state.pendingValid[pass] &&
-                renderedFov != g_state.pendingFov[pass] &&
-                g_state.fovOverrideReports < 8) {
-                ++g_state.fovOverrideReports;
-                logf("stereo: FOV OVERRIDDEN on pass %d -- we set %.4f, the camera "
-                     "rendered %.4f (aspect %.4f vs %.4f). Something outside the two "
-                     "hooked cameraBind sites is writing this camera.",
-                     pass, g_state.pendingFov[pass], renderedFov,
-                     g_state.pendingAspect[pass], renderedAspect);
-            }
+        // Every frame, not once: the whole point is to catch a path that overrides
+        // the fov only sometimes. Capped so a persistent fault cannot flood the log.
+        if (g_state.pendingValid[pass] &&
+            renderedFov != g_state.pendingFov[pass] &&
+            g_state.fovOverrideReports < 8) {
+            ++g_state.fovOverrideReports;
+            logf("stereo: FOV OVERRIDDEN on pass %d -- we set %.4f, the camera "
+                 "rendered %.4f (aspect %.4f vs %.4f). Something outside the two "
+                 "hooked cameraBind sites is writing this camera.",
+                 pass, g_state.pendingFov[pass], renderedFov,
+                 g_state.pendingAspect[pass], renderedAspect);
         }
     }
-
-    if (probe) g_state.fovProbeArmed = true;
 
     params->camera = savedCamera;
     params->mirrorCamera = savedMirror;
@@ -680,8 +783,14 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
 
     if (!g_state.reported) {
         g_state.reported = true;
-        logf("stereo: first stereo frame rendered, IPD %.4f world units (half %.4f)",
-             g_options.stereoIpd, halfIpd);
+        logf("stereo: first stereo frame rendered -- eye separation %.4f world units, "
+             "straight from the runtime",
+             std::sqrt((vr[1].offset[0] - vr[0].offset[0]) *
+                           (vr[1].offset[0] - vr[0].offset[0]) +
+                       (vr[1].offset[1] - vr[0].offset[1]) *
+                           (vr[1].offset[1] - vr[0].offset[1]) +
+                       (vr[1].offset[2] - vr[0].offset[2]) *
+                           (vr[1].offset[2] - vr[0].offset[2])));
     }
     return true;
 }

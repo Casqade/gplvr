@@ -21,7 +21,7 @@
 //
 // Usage:
 //   gplvr-xr [--runtime <path-to-runtime.json>] [--seconds N] [--no-session]
-//   gplvr-xr --present <instance> [--eye-scale N]      (launched by the game)
+//   gplvr-xr --present <instance> [--render-scale N]   (launched by the game)
 //
 // --runtime sets XR_RUNTIME_JSON for this process only, which is how you point the
 // loader straight at one vendor's runtime without changing any machine-wide setting.
@@ -64,31 +64,43 @@ struct Options {
     // The game's instance name, handed to us by the producer when it launches us. Its
     // presence is what turns this from a diagnostic into the presenter.
     const wchar_t* presentInstance = nullptr;
-    // Scales the swapchain away from the runtime's recommendation. Passed by the
-    // producer from gplvr.ini so both halves agree without the presenter reading the
-    // game's config file.
-    float          eyeScale = 1.0f;
+    // Multiplies the runtime's recommended per-eye size. Passed by the producer from
+    // gplvr.ini so both halves agree without the presenter reading the game's config
+    // file. Clamped at use against the runtime's reported maximum, not against 1.0.
+    float          renderScale = 1.0f;
     int            seconds = 20;
     bool           session = true;
 
-    // Submit the pose the frame was DRAWN from (the default), or the pose located at
-    // submission time.
-    //
-    // The rendered pose is what lets the runtime reproject a 36 Hz image into a 90 Hz
-    // compositor, so turning it off costs judder. It is here because reprojection is a
-    // projective warp of a flat image -- shear under yaw, vertical scale under pitch --
-    // and that is exactly the distortion left to explain now that the game has been
-    // shown to render correctly. Submitting the located pose head-locks the layer and
-    // leaves the runtime nothing to warp. If the distortion goes with it, the warp is
-    // the mechanism.
-    bool           submitRenderedPose = true;
-
-    // Draw the world-locked reference ring over the game's picture.
-    bool           overlayMarkers = false;
 };
 
-// The frame loop reads this rather than threading Options through every helper.
-bool g_submitRenderedPose = true;
+// Ctrl+C, and why it needs handling rather than the default.
+//
+// The default handler calls ExitProcess from a second thread. With a frame in flight
+// that tears the runtime down underneath itself, and PicoStreamingXR hangs -- which is
+// what "hangs on Ctrl+C, had to force it" was. Setting a flag and letting the frame
+// loop exit through the same path as Esc means the session is ended properly. A second
+// Ctrl+C returns FALSE and lets the default handler kill us, so an unresponsive runtime
+// cannot trap the process forever.
+volatile bool g_stopRequested = false;
+
+BOOL WINAPI consoleControlHandler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_stopRequested) return FALSE;  // second press: let Windows kill us
+            g_stopRequested = true;
+            logf("xr: stop requested (Ctrl+C) -- ending the session cleanly. Press it "
+                 "again to force.");
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+bool g_fovMutable = true;
 
 Options parseCommandLine(int argc, wchar_t** argv) {
     Options options;
@@ -99,16 +111,12 @@ Options parseCommandLine(int argc, wchar_t** argv) {
             options.presentInstance = argv[++i];
             // Presenting runs until the game says stop, not for a fixed spell.
             options.seconds = 0;
-        } else if (!wcscmp(argv[i], L"--eye-scale") && i + 1 < argc) {
-            options.eyeScale = static_cast<float>(_wtof(argv[++i]));
+        } else if (!wcscmp(argv[i], L"--render-scale") && i + 1 < argc) {
+            options.renderScale = static_cast<float>(_wtof(argv[++i]));
         } else if (!wcscmp(argv[i], L"--seconds") && i + 1 < argc) {
             options.seconds = _wtoi(argv[++i]);
         } else if (!wcscmp(argv[i], L"--no-session")) {
             options.session = false;
-        } else if (!wcscmp(argv[i], L"--no-rendered-pose")) {
-            options.submitRenderedPose = false;
-        } else if (!wcscmp(argv[i], L"--markers")) {
-            options.overlayMarkers = true;
         } else {
             wprintf(L"unrecognised argument: %s\n", argv[i]);
         }
@@ -192,6 +200,17 @@ const char* dxgiFormatName(int64_t format) {
 // outright or silently costs a cross-adapter copy every frame, so match it exactly and
 // say which card it turned out to be.
 IDXGIAdapter1* findAdapter(LUID luid) {
+    // A zero LUID means the runtime does not care which adapter we use.
+    //
+    // PicoStreamingXR reports 00000000:00000000, which is legal -- the OpenXR spec only
+    // requires the runtime to name an adapter when it actually needs a specific one. The
+    // first version treated "no adapter matched" as fatal and stopped, so a runtime that
+    // was being permissive looked like a runtime that was broken.
+    const bool anyAdapterWillDo = luid.LowPart == 0 && luid.HighPart == 0;
+    if (anyAdapterWillDo)
+        logf("xr: the runtime named no adapter (LUID is zero) -- it accepts any, so "
+             "taking the first one DXGI reports");
+
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
         logf("xr: CreateDXGIFactory1 failed");
@@ -205,12 +224,16 @@ IDXGIAdapter1* findAdapter(LUID luid) {
 
         DXGI_ADAPTER_DESC1 desc = {};
         adapter->GetDesc1(&desc);
-        const bool isMatch = desc.AdapterLuid.LowPart == luid.LowPart &&
-                             desc.AdapterLuid.HighPart == luid.HighPart;
+        const bool isMatch = anyAdapterWillDo
+                                 ? (match == nullptr)
+                                 : (desc.AdapterLuid.LowPart == luid.LowPart &&
+                                    desc.AdapterLuid.HighPart == luid.HighPart);
         logf("xr: adapter %u %S luid=%08lX:%08lX%s", index, desc.Description,
              (unsigned long)desc.AdapterLuid.HighPart,
              (unsigned long)desc.AdapterLuid.LowPart,
-             isMatch ? "  <-- the one OpenXR asked for" : "");
+             isMatch ? (anyAdapterWillDo ? "  <-- using this one"
+                                         : "  <-- the one OpenXR asked for")
+                     : "");
 
         if (isMatch && !match)
             match = adapter;
@@ -264,9 +287,6 @@ constexpr int kMarkerCount = 24;
 Marker g_markers[kMarkerCount] = {};
 bool   g_markersPlaced = false;
 
-// Overlay the ring on top of the game's image. A diagnostic: it draws over the picture.
-bool g_overlayMarkers = false;
-
 void placeMarkers(const XrView& view) {
     // A ring three metres out, level with the head, index 0 straight ahead. OpenXR is
     // +Y up and -Z forward, so "ahead" is negative Z.
@@ -302,39 +322,6 @@ void rotateByInverse(const XrQuaternionf& q, const float v[3], float out[3]) {
 // exactly like the distortion being hunted. At infinity there is no parallax, so the
 // eye's POSITION drops out of the maths entirely and the result depends on nothing but
 // orientation and fov -- which is the only thing worth comparing against the game.
-bool projectDirectionToEye(const XrView& view, const float direction[3], uint32_t width,
-                           uint32_t height, LONG halfSize, D3D11_RECT& rect) {
-    float local[3];
-    rotateByInverse(view.pose.orientation, direction, local);
-
-    if (local[2] > -1e-4f) return false;  // behind the eye
-    const float invDepth = -1.0f / local[2];
-    const float tanX = local[0] * invDepth;
-    const float tanY = local[1] * invDepth;
-
-    const float left = std::tan(view.fov.angleLeft);
-    const float right = std::tan(view.fov.angleRight);
-    const float down = std::tan(view.fov.angleDown);
-    const float up = std::tan(view.fov.angleUp);
-
-    const float u = (tanX - left) / (right - left);
-    const float v = (tanY - down) / (up - down);
-    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return false;
-
-    const LONG centreX = static_cast<LONG>(u * static_cast<float>(width));
-    const LONG centreY = static_cast<LONG>((1.0f - v) * static_cast<float>(height));
-    rect.left = centreX - halfSize;
-    rect.top = centreY - halfSize;
-    rect.right = centreX + halfSize;
-    rect.bottom = centreY + halfSize;
-    if (rect.left < 0) rect.left = 0;
-    if (rect.top < 0) rect.top = 0;
-    if (rect.right > static_cast<LONG>(width)) rect.right = static_cast<LONG>(width);
-    if (rect.bottom > static_cast<LONG>(height))
-        rect.bottom = static_cast<LONG>(height);
-    return rect.left < rect.right && rect.top < rect.bottom;
-}
-
 // Project a point in the reference space into one eye's image. Uses the four fov
 // tangents rather than a symmetric half-angle, so it stays correct on a runtime whose
 // frustum is not centred.
@@ -394,9 +381,6 @@ const char* sessionStateName(XrSessionState state) {
 
 int wmain(int argc, wchar_t** argv) {
     const Options options = parseCommandLine(argc, argv);
-    g_submitRenderedPose = options.submitRenderedPose;
-    g_overlayMarkers = options.overlayMarkers;
-
     logOpen("gplvr-xr.log");
     logEcho(options.presentInstance == nullptr);
     logf("gplvr-xr -- %u-bit, %s", (unsigned)(sizeof(void*) * 8),
@@ -413,9 +397,29 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (options.runtimeJson) {
+        // Set it BOTH ways, and this is not belt and braces.
+        //
+        // SetEnvironmentVariable writes the Win32 block; _wputenv_s writes the CRT's
+        // own copy, which is snapshotted at startup and does NOT track Win32 changes.
+        // The OpenXR loader reads this variable through the CRT in some builds and
+        // through Win32 in others, so setting only one can leave the override silently
+        // ignored -- which looks exactly like passing no --runtime at all.
         SetEnvironmentVariableW(L"XR_RUNTIME_JSON", options.runtimeJson);
-        logf("xr: forcing XR_RUNTIME_JSON = %S for this process only",
-             options.runtimeJson);
+        _wputenv_s(L"XR_RUNTIME_JSON", options.runtimeJson);
+
+        wchar_t readback[1024] = {};
+        const DWORD got =
+            GetEnvironmentVariableW(L"XR_RUNTIME_JSON", readback, 1024);
+        logf("xr: forcing XR_RUNTIME_JSON = %S for this process only%s",
+             options.runtimeJson,
+             (got && !wcscmp(readback, options.runtimeJson))
+                 ? ""
+                 : "  <-- READ BACK DIFFERENT, the override did not take");
+
+        DWORD attrs = GetFileAttributesW(options.runtimeJson);
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+            logf("xr: WARNING -- that runtime manifest does not exist; the loader will "
+                 "fall back to the registry's ActiveRuntime and you will get SteamVR");
     }
 
     xrLogRuntimeSelection();
@@ -501,8 +505,13 @@ int wmain(int argc, wchar_t** argv) {
         XR_TYPE_VIEW_CONFIGURATION_PROPERTIES};
     if (XR_CHECK(g_api.xrGetViewConfigurationProperties(g_instance, system, viewType,
                                                         &viewProperties)))
-        logf("xr: primary stereo view configuration, fovMutable=%s",
-             viewProperties.fovMutable ? "yes" : "no");
+        logf("xr: primary stereo view configuration, fovMutable=%s%s",
+             viewProperties.fovMutable ? "yes" : "no",
+             viewProperties.fovMutable
+                 ? ""
+                 : "  <-- the runtime does NOT allow the application to change the "
+                   "fov, so a submitted fov is ignored rather than honoured");
+        g_fovMutable = viewProperties.fovMutable != 0;
 
     if (!XR_CHECK(g_api.xrEnumerateViewConfigurationViews(g_instance, system, viewType,
                                                           2, &viewCount, viewConfigs)) ||
@@ -560,14 +569,6 @@ int wmain(int argc, wchar_t** argv) {
          (unsigned long)requirements.adapterLuid.LowPart,
          (unsigned)requirements.minFeatureLevel);
 
-    // The game cannot create its shared textures until it knows this LUID -- a texture
-    // shared from a device on another adapter cannot be opened here at all -- so tell it
-    // now, before we spend time on our own device and session.
-    if (presenting)
-        consumer.publishRequirements(requirements.adapterLuid,
-                                     viewConfigs[0].recommendedImageRectWidth,
-                                     viewConfigs[0].recommendedImageRectHeight);
-
     IDXGIAdapter1* adapter = findAdapter(requirements.adapterLuid);
     if (!adapter) {
         logf("xr: no DXGI adapter matches the runtime's LUID -- stopping");
@@ -576,6 +577,27 @@ int wmain(int argc, wchar_t** argv) {
         xrUnloadLoader(g_api);
         logClose();
         return 1;
+    }
+
+    // Publish the adapter we ACTUALLY chose, not what the runtime asked for.
+    //
+    // Those differ whenever the runtime names no adapter: it reports a zero LUID, we
+    // pick the first one, and the game has to create its shared textures on that same
+    // card. Publishing the zero would send it looking for an adapter that does not
+    // exist and it would fail exactly where we just stopped failing.
+    DXGI_ADAPTER_DESC1 chosen = {};
+    adapter->GetDesc1(&chosen);
+
+    // The game cannot create its shared textures until it knows this LUID -- a texture
+    // shared from a device on another adapter cannot be opened here at all -- so tell it
+    // now, before we spend time on our own device and session.
+    if (presenting) {
+        // Before the requirements, so the game knows the fov rule from its very first
+        // tracked frame rather than scaling once and being corrected afterwards.
+        consumer.publishFovMutable(g_fovMutable);
+        consumer.publishRequirements(chosen.AdapterLuid,
+                                     viewConfigs[0].recommendedImageRectWidth,
+                                     viewConfigs[0].recommendedImageRectHeight);
     }
 
     ID3D11Device*        device = nullptr;
@@ -694,16 +716,43 @@ int wmain(int argc, wchar_t** argv) {
                                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         swapchainInfo.format = chosenFormat;
         swapchainInfo.sampleCount = 1;
-        // The recommendation is what a natively rendered app should use. Ours upscales a
-        // 1280x1440 game half, so every pixel above that carries no detail and still
-        // costs encode time and link bandwidth on a streamed headset.
-        const float scale =
-            (options.eyeScale >= 0.25f && options.eyeScale <= 1.0f) ? options.eyeScale
-                                                                    : 1.0f;
-        swapchainInfo.width = static_cast<uint32_t>(
+        // Scale the runtime's RECOMMENDED size, and clamp against the one number that
+        // is a real limit: the MAX it also reports.
+        //
+        // The old ceiling was a hard-coded 1.0, which was wrong twice. It was arbitrary
+        // -- xrEnumerateViewConfigurationViews returns recommended AND max side by side,
+        // and this runtime reports 3172 recommended against 8192 max, so there is 2.6x of
+        // advertised headroom the option refused to reach. And it protected nothing: a
+        // swapchain larger than the max is refused by xrCreateSwapchain, which the clamp
+        // below now prevents properly.
+        //
+        // Above 1.0 buys little while the source is a 1280x1440 game half -- there is no
+        // detail up there to resolve, only encode time and link bandwidth on a streamed
+        // headset. It is worth having anyway: the compositor's own distortion warp
+        // resamples what we hand it, and once the source resolution rises the ceiling
+        // should not be the thing in the way.
+        const uint32_t maxW = viewConfigs[i].maxImageRectWidth;
+        const uint32_t maxH = viewConfigs[i].maxImageRectHeight;
+        float scale = options.renderScale > 0.05f ? options.renderScale : 1.0f;
+
+        uint32_t width = static_cast<uint32_t>(
             viewConfigs[i].recommendedImageRectWidth * scale);
-        swapchainInfo.height = static_cast<uint32_t>(
+        uint32_t height = static_cast<uint32_t>(
             viewConfigs[i].recommendedImageRectHeight * scale);
+        if (maxW && width > maxW) width = maxW;
+        if (maxH && height > maxH) height = maxH;
+        if (width < 64) width = 64;
+        if (height < 64) height = 64;
+        if (i == 0 && (width != static_cast<uint32_t>(
+                                    viewConfigs[i].recommendedImageRectWidth * scale) ||
+                       height != static_cast<uint32_t>(
+                                     viewConfigs[i].recommendedImageRectHeight * scale)))
+            logf("xr: vrRenderScale %.2f asked for more than the runtime allows -- "
+                 "clamped to its maximum of %ux%u",
+                 scale, maxW, maxH);
+
+        swapchainInfo.width = width;
+        swapchainInfo.height = height;
         swapchainInfo.faceCount = 1;
         swapchainInfo.arraySize = 1;
         swapchainInfo.mipCount = 1;
@@ -760,8 +809,9 @@ int wmain(int argc, wchar_t** argv) {
     DWORD       lastReport = startTick;
     unsigned    framesThisSecond = 0;
 
-    logf("xr: entering the frame loop for %d s -- press Esc to stop early",
-         options.seconds);
+    SetConsoleCtrlHandler(consoleControlHandler, TRUE);
+    logf("xr: entering the frame loop for %d s -- press Esc%s to stop early",
+         options.seconds, presenting ? "" : " or Ctrl+C");
 
     while (!exitLoop) {
         XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
@@ -847,13 +897,78 @@ int wmain(int argc, wchar_t** argv) {
                                  ? "symmetric, so cameraCreate(fov, cx=0, cy=0) is exact"
                                  : "asymmetric; cameraCreate's cx/cy carry the offset");
                     }
-                    // Both eye offsets in one line, because the IPD the runtime reports
-                    // is what stereoIpd will eventually have to agree with.
+                    // Both eye offsets in one line. This IS the eye separation the game
+                    // renders with -- it is published straight through, so a wrong
+                    // number here is a wrong world scale in the headset.
                     const float dx = views[1].pose.position.x - views[0].pose.position.x;
                     const float dy = views[1].pose.position.y - views[0].pose.position.y;
                     const float dz = views[1].pose.position.z - views[0].pose.position.z;
                     logf("xr: runtime IPD %.4f m (eye separation %.4f, %.4f, %.4f)",
                          std::sqrt(dx * dx + dy * dy + dz * dz), dx, dy, dz);
+                }
+
+                // The fov can change per frame too, so watch it for the same reason.
+                //
+                // xrLocateViews may return a different frustum at any time -- dynamic
+                // foveation, an IPD motor moving, or simply the first reading being
+                // taken before the session settled. The RENDER path already follows it
+                // (vrAcquireEyes uses whatever the presenter last published); it was
+                // only the log that fired once and could therefore describe a frustum
+                // we had long stopped using.
+                if (valid) {
+                    static float lastFov[2][4] = {};
+                    static bool  haveLastFov = false;
+                    const float now[2][4] = {
+                        {views[0].fov.angleLeft, views[0].fov.angleRight,
+                         views[0].fov.angleUp, views[0].fov.angleDown},
+                        {views[1].fov.angleLeft, views[1].fov.angleRight,
+                         views[1].fov.angleUp, views[1].fov.angleDown}};
+                    bool moved = false;
+                    if (haveLastFov)
+                        for (int e = 0; e < 2 && !moved; ++e)
+                            for (int k = 0; k < 4 && !moved; ++k)
+                                moved = std::fabs(now[e][k] - lastFov[e][k]) > 0.0005f;
+                    if (moved) {
+                        constexpr float kDeg = 57.29578f;
+                        for (int e = 0; e < 2; ++e)
+                            logf("xr: eye %d fov CHANGED to L%.4f R%.4f U%.4f D%.4f rad "
+                                 "= %.1f x %.1f deg",
+                                 e, now[e][0], now[e][1], now[e][2], now[e][3],
+                                 (now[e][1] - now[e][0]) * kDeg,
+                                 (now[e][2] - now[e][3]) * kDeg);
+                    }
+                    if (moved || !haveLastFov) {
+                        std::memcpy(lastFov, now, sizeof(lastFov));
+                        haveLastFov = true;
+                    }
+                }
+
+                // Keep watching it, because the first reading is taken before the
+                // session is SYNCHRONIZED and may be a placeholder rather than the
+                // headset's real optics.
+                //
+                // PicoStreamingXR's first report was 0.0710 exactly, with y and z both
+                // 0.0000, while the headset itself is set to 65 mm. Numbers that clean
+                // are what a default looks like. If this line never fires, 71 mm is
+                // what the runtime genuinely wants us to render and the disagreement
+                // with the headset setting is real; if it fires and settles elsewhere,
+                // the first reading was simply too early to trust.
+                if (valid) {
+                    // Recomputed here: the originals are scoped to the one-shot block
+                    // above and are not in scope on later frames.
+                    const float sx = views[1].pose.position.x - views[0].pose.position.x;
+                    const float sy = views[1].pose.position.y - views[0].pose.position.y;
+                    const float sz = views[1].pose.position.z - views[0].pose.position.z;
+                    const float ipd = std::sqrt(sx * sx + sy * sy + sz * sz);
+                    static float reportedIpd = 0.0f;
+                    if (reportedIpd == 0.0f) reportedIpd = ipd;
+                    else if (std::fabs(ipd - reportedIpd) > 0.0005f) {
+                        logf("xr: runtime IPD CHANGED %.4f -> %.4f m (separation %.4f, "
+                             "%.4f, %.4f) -- the earlier value was taken before the "
+                             "session settled",
+                             reportedIpd, ipd, sx, sy, sz);
+                        reportedIpd = ipd;
+                    }
                 }
 
                 if (valid && !g_markersPlaced) {
@@ -862,14 +977,6 @@ int wmain(int argc, wchar_t** argv) {
                          "height -- turn your head and they should sweep past the grey "
                          "box in the centre, which is head-locked and never moves",
                          kMarkerCount);
-                    if (g_overlayMarkers)
-                        logf("xr: the HORIZON overlay is on. It is drawn from level "
-                             "directions at infinity through the frustum we declare, so "
-                             "it depends on orientation and fov and on nothing else -- "
-                             "no parallax, no eye position. On flat ground GPL's horizon "
-                             "must lie on it at every head angle; any gap is the "
-                             "difference between what the game rendered and what we "
-                             "declare.");
                 }
 
                 if (valid && presenting) {
@@ -954,98 +1061,6 @@ int wmain(int argc, wchar_t** argv) {
                                                      static_cast<int>(i));
                         if (!drawn) context->ClearRenderTargetView(target, base[i]);
 
-                        // The reference ring, over the game's picture.
-                        //
-                        // Projected through the frustum this eye is ABOUT TO DECLARE --
-                        // the rendered pose and rendered fov, the same values that go
-                        // into projectionViews below -- so the ring is correct by
-                        // construction relative to the layer. The compositor then warps
-                        // ring and game content together, which is what makes this a
-                        // measurement of the game's frustum rather than of reprojection.
-                        //
-                        // Both the ring and GPL's horizon lie in the horizontal plane
-                        // through the eye. If they slide apart as the head pitches or
-                        // yaws, the frustum the game rendered is not the one we declare,
-                        // and the size of the gap is the size of the error.
-                        if (presenting && drawn && context1 && g_overlayMarkers &&
-                            g_markersPlaced) {
-                            XrView   declared = views[i];
-                            SharedView shown[2] = {};
-                            if (g_submitRenderedPose && consumer.renderedViews(shown)) {
-                                const SharedView& source = shown[i];
-                                declared.pose.orientation = {
-                                    source.pose.orientationX, source.pose.orientationY,
-                                    source.pose.orientationZ, source.pose.orientationW};
-                                declared.pose.position = {source.pose.positionX,
-                                                          source.pose.positionY,
-                                                          source.pose.positionZ};
-                                declared.fov = {
-                                    source.fov.angleLeft, source.fov.angleRight,
-                                    source.fov.angleUp, source.fov.angleDown};
-                            }
-
-                            // The true horizon for the declared frustum: level
-                            // directions at infinity, every 2 degrees of azimuth. GPL's
-                            // own horizon is also level and also at infinity, so on flat
-                            // ground the two must coincide at EVERY head angle. Any gap
-                            // is the difference between the frustum the game rendered
-                            // and the one we declare, measured where it is largest.
-                            const float ring[4] = {0.0f, 1.0f, 0.25f, 1.0f};
-                            const LONG  size =
-                                static_cast<LONG>(eyes[i].width / 200) + 1;
-
-                            // Measure the slope of the line we are about to draw.
-                            //
-                            // A horizon at infinity is a straight line in a rectilinear
-                            // projection, always, and its tilt equals the camera's roll
-                            // exactly. So this number must match the roll in the pose.
-                            // If it does not, this overlay is drawn wrong and is not
-                            // evidence about anything. If it does match and the picture
-                            // still looks tilted, what is tilted is the game's content,
-                            // not this line.
-                            LONG  firstX = 0, firstY = 0, lastX = 0, lastY = 0;
-                            bool  haveFirst = false;
-                            for (int step = -90; step <= 90; step += 2) {
-                                const float azimuth =
-                                    static_cast<float>(step) * 0.017453292f;
-                                const float direction[3] = {std::sin(azimuth), 0.0f,
-                                                            -std::cos(azimuth)};
-                                D3D11_RECT rect;
-                                if (!projectDirectionToEye(declared, direction,
-                                                           eyes[i].width, eyes[i].height,
-                                                           size, rect))
-                                    continue;
-                                context1->ClearView(target, ring, &rect, 1);
-
-                                const LONG midX = (rect.left + rect.right) / 2;
-                                const LONG midY = (rect.top + rect.bottom) / 2;
-                                if (!haveFirst) {
-                                    haveFirst = true;
-                                    firstX = midX;
-                                    firstY = midY;
-                                }
-                                lastX = midX;
-                                lastY = midY;
-                            }
-
-                            if (i == 0 && haveFirst && lastX != firstX) {
-                                const float slope =
-                                    std::atan2(static_cast<float>(lastY - firstY),
-                                               static_cast<float>(lastX - firstX)) *
-                                    57.29578f;
-                                static float reported = 999.0f;
-                                if (std::fabs(slope - reported) > 1.0f) {
-                                    reported = slope;
-                                    logf("xr: horizon overlay slope %.1f deg in the "
-                                         "image (positive tilts down to the right). It "
-                                         "must equal the roll of the pose it is drawn "
-                                         "with; anything else means this overlay is "
-                                         "wrong, not the game.",
-                                         slope);
-                                }
-                            }
-                        }
-
                         if (!presenting && context1) {
                             const LONG marker =
                                 static_cast<LONG>(eyes[i].width / 24);
@@ -1120,8 +1135,7 @@ int wmain(int argc, wchar_t** argv) {
                         // rendered pose is what lets it reproject, which is the whole
                         // reason 36 Hz into a 90 Hz compositor is survivable.
                         SharedView rendered[2] = {};
-                        if (presenting && g_submitRenderedPose &&
-                            consumer.renderedViews(rendered)) {
+                        if (presenting && consumer.renderedViews(rendered)) {
                             const SharedView& source = rendered[i];
                             projectionViews[i].pose.orientation = {
                                 source.pose.orientationX, source.pose.orientationY,
@@ -1129,6 +1143,7 @@ int wmain(int argc, wchar_t** argv) {
                             projectionViews[i].pose.position = {source.pose.positionX,
                                                                 source.pose.positionY,
                                                                 source.pose.positionZ};
+
                             projectionViews[i].fov = {
                                 source.fov.angleLeft, source.fov.angleRight,
                                 source.fov.angleUp, source.fov.angleDown};
@@ -1183,16 +1198,21 @@ int wmain(int argc, wchar_t** argv) {
         // reading it here would end the session the moment the driver braked.
         const bool escape =
             !presenting && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+
         const bool gameGone = presenting && !consumer.producerAlive();
         const bool gameAsked = presenting && consumer.shutdownRequested();
+        // Works in presenting mode too, unlike Esc: the console is ours even when the
+        // keyboard belongs to the game.
+        const bool stopped = g_stopRequested;
 
-        if ((timeUp || escape || gameGone || gameAsked) && !exitRequested) {
+        if ((timeUp || escape || gameGone || gameAsked || stopped) && !exitRequested) {
             exitRequested = true;
             exitDeadline = GetTickCount() + 5000;
             logf("xr: %s -- requesting exit",
                  gameGone    ? "the game exited"
                  : gameAsked ? "the game asked us to stop"
                  : timeUp    ? "time is up"
+                 : stopped   ? "Ctrl+C"
                              : "Esc pressed");
             if (!XR_CHECK(g_api.xrRequestExitSession(session))) exitLoop = true;
             // Do not break: the runtime still has to walk the session down through

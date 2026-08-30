@@ -280,6 +280,9 @@ bool Consumer::update() {
         latched.sequence = before;
         latched.sideBySide = block_->sideBySide != 0;
         latched.eyeHalfWidth = block_->eyeHalfWidth;
+        for (int eye = 0; eye < 2; ++eye)
+            for (int i = 0; i < 4; ++i)
+                latched.eyeRect[eye][i] = block_->eyeRect[eye][i];
         latched.stretchToFill = block_->stretchToFill != 0;
         latched.monoScale = block_->monoScale;
         // From the slot the latched sequence names, not from a shared copy the
@@ -341,10 +344,20 @@ bool Consumer::update() {
     // Say what is actually going into the projection layer, and say it again whenever it
     // changes. The one-shot line above fires during the startup menu, where "MISSING" is
     // correct and uninformative -- it cannot show whether the layer is carrying the
-    // game's own frustum while driving, which is the thing vrFovScale depends on.
+    // game's own frustum while driving, which is what reprojection depends on.
     const bool  layoutChanged = latched.sideBySide != loggedSideBySide_ ||
                                 latched.stretchToFill != loggedStretch_ ||
-                                latched.renderedValid != loggedRenderedValid_;
+                                latched.renderedValid != loggedRenderedValid_ ||
+                                latched.eyeRect[0][2] != loggedEyeW_ ||
+                                latched.eyeRect[0][3] != loggedEyeH_ ||
+                                // The SOURCE size too. It was left out, and that is
+                                // exactly why two runs went by without anyone noticing
+                                // the drawable shrinking to 2559x1439 under an eye rect
+                                // still computed for 2560x1440 -- the line that would
+                                // have said so only re-fired on the eye size, which did
+                                // not change.
+                                sourceWidth_ != loggedSourceW_ ||
+                                sourceHeight_ != loggedSourceH_;
     const float submittedFov = latched.renderedValid
                                    ? latched.rendered[0].fov.angleRight -
                                          latched.rendered[0].fov.angleLeft
@@ -353,12 +366,25 @@ bool Consumer::update() {
         loggedSideBySide_ = latched.sideBySide;
         loggedStretch_ = latched.stretchToFill;
         loggedRenderedValid_ = latched.renderedValid;
+        loggedEyeW_ = latched.eyeRect[0][2];
+        loggedEyeH_ = latched.eyeRect[0][3];
+        loggedSourceW_ = sourceWidth_;
+        loggedSourceH_ = sourceHeight_;
         loggedFov_ = submittedFov;
-        logf("present: layer now %s, %s, poses %s, submitted fov %.4f rad (%.1f deg)",
+        // The eye rect goes in this line too. "stretched to fill" alone cannot tell
+        // you WHAT is being stretched, and a rect that is not the shape you think is
+        // exactly the failure this whole line of work is chasing.
+        logf("present: layer now %s, %s, poses %s, submitted fov %.4f rad (%.1f deg), "
+             "eye 0 rect %u,%u %ux%u of a %ux%u texture%s",
              latched.sideBySide ? "side by side" : "one image for both eyes",
              latched.stretchToFill ? "stretched to fill" : "aspect fitted",
              latched.renderedValid ? "from the game" : "from the runtime (head-locked)",
-             submittedFov, submittedFov * 57.29578f);
+             submittedFov, submittedFov * 57.29578f, latched.eyeRect[0][0],
+             latched.eyeRect[0][1], latched.eyeRect[0][2], latched.eyeRect[0][3],
+             sourceWidth_, sourceHeight_,
+             (latched.eyeRect[0][2] && latched.eyeRect[0][2] == latched.eyeRect[0][3])
+                 ? "  <-- SQUARE, so aspect is 1.0 and this scale is uniform"
+                 : "");
     }
     return true;
 }
@@ -379,9 +405,22 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     // split would sample the right eye from 1279.5 onwards -- half a pixel off, and
     // reading that dead column at the edge. Roughly 0.04 degrees of horizontal disparity
     // on one eye only, which is several times the stereo acuity threshold.
+    //
+    // The published rect is authoritative when it is there: it says exactly what the
+    // game rendered into, which a left/right split can only approximate. The
+    // eyeHalfWidth path stays as the fallback for a producer that has not filled it in.
     float rectWidth = 1.0f;
     float rectLeft = 0.0f;
-    if (current_.sideBySide) {
+    float rectHeight = 1.0f;
+    float rectTop = 0.0f;
+    const uint32_t* published =
+        (eye >= 0 && eye < 2) ? current_.eyeRect[eye] : nullptr;
+    if (current_.sideBySide && published && published[2] && published[3]) {
+        rectLeft = static_cast<float>(published[0]) / static_cast<float>(sourceWidth_);
+        rectTop = static_cast<float>(published[1]) / static_cast<float>(sourceHeight_);
+        rectWidth = static_cast<float>(published[2]) / static_cast<float>(sourceWidth_);
+        rectHeight = static_cast<float>(published[3]) / static_cast<float>(sourceHeight_);
+    } else if (current_.sideBySide) {
         rectWidth = current_.eyeHalfWidth
                         ? static_cast<float>(current_.eyeHalfWidth) /
                               static_cast<float>(sourceWidth_)
@@ -395,7 +434,7 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
         // Aspect fit. Right when the game rendered its own frustum and the image's
         // shape is meaningful.
         const float sourcePixelsX = static_cast<float>(sourceWidth_) * rectWidth;
-        const float sourcePixelsY = static_cast<float>(sourceHeight_);
+        const float sourcePixelsY = static_cast<float>(sourceHeight_) * rectHeight;
         const float scale = (sourcePixelsX / static_cast<float>(width) >
                              sourcePixelsY / static_cast<float>(height))
                                 ? static_cast<float>(width) / sourcePixelsX
@@ -424,10 +463,15 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     constants.fit[1] = 1.0f / coverY;
     constants.fit[2] = bottomUp_ ? 1.0f : 0.0f;
     constants.fit[3] = 0.0f;
+    // Image-space coordinates, origin top-left. The shader's bottom-up flip is applied
+    // to the FINAL coordinate, after this rect maps into it, so a band at image rows
+    // [t, t+h) comes back as texture rows [1-t-h, 1-t) -- the same band, correctly
+    // ordered. That is why the rect is expressed the way the game sees the surface
+    // rather than the way the texture stores it.
     constants.rect[0] = rectLeft;
-    constants.rect[1] = 0.0f;
+    constants.rect[1] = rectTop;
     constants.rect[2] = rectWidth;
-    constants.rect[3] = 1.0f;
+    constants.rect[3] = rectHeight;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context_->Map(constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -474,6 +518,12 @@ bool Consumer::renderedViews(SharedView out[2]) const {
     out[0] = current_.rendered[0];
     out[1] = current_.rendered[1];
     return true;
+}
+
+void Consumer::publishFovMutable(bool mutableFov) {
+    if (!block_) return;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->fovMutable),
+                        mutableFov ? 1 : 0);
 }
 
 void Consumer::publishViews(const SharedView views[2], const SharedPose& head,

@@ -71,10 +71,10 @@ else()
     add_library(gplvr SHARED
         src/dllmain.cpp
         src/Discovery.cpp
-        src/GlCapture.cpp
         src/GlInterop.cpp
         src/Hooks.cpp
         src/Log.cpp
+        src/MouseLook.cpp
         src/Pe.cpp
         src/Stereo.cpp
         src/VrCamera.cpp
@@ -82,10 +82,10 @@ else()
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
     target_include_directories(gplvr PRIVATE src)
-    # No d3d11 or opengl32 import here on purpose. GlCapture.cpp resolves both by name,
-    # so neither is loaded into the game unless glProbe is switched on -- and with the
-    # D3D7 rasterizer selected there is no GL at all, which has to stay a logged note
-    # rather than a load failure.
+    # No d3d11 or opengl32 import here on purpose. GlInterop.cpp resolves both by name,
+    # so neither is loaded into the game until VR is switched on -- and with the D3D7
+    # rasterizer selected there is no GL at all, which has to stay a logged note rather
+    # than a load failure.
     target_link_libraries(gplvr PRIVATE user32)
 
     # -- the loader --------------------------------------------------------------

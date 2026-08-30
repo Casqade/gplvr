@@ -68,9 +68,11 @@ struct Binding {
     // sceneRender calls cameraSetFov on the camera it is about to draw with, 27 bytes
     // before each of these -- so anything we write into the camera object before
     // sceneRender runs is overwritten before the projection is ever rebuilt. That is
-    // why vrFovScale had no effect at any value, proven by the fov probe: two frusta an
+    // why a frustum written before sceneRender has no effect at any value: two frusta an
     // octave apart produced pixel-identical halves. Redirecting these sites puts us
     // after the game's write and before cameraBind rebuilds the matrix.
+    //
+    // It writes the PRINCIPAL POINT on the very next line too -- see stereoOnCameraBind.
     //
     // Empty means the fix is not installed and the eyes render the game's own fov; that
     // is a degraded picture, not a crash, so it is a warning rather than a failure.

@@ -43,7 +43,6 @@ void gplToXr(const float gpl[3], float xr[3]) {
 struct State {
     bool  haveOrigin = false;
     bool  recentreRequested = false;
-    bool  dumpRequested = false;
     Quat  originOrientation = {0, 0, 0, 1};
     float originPosition[3] = {0, 0, 0};
 
@@ -53,10 +52,11 @@ struct State {
     int  loggedFrustumWidth = 0;
     int  loggedFrustumHeight = 0;
     bool loggedAsymmetric = false;
-    bool  loggedDebugRotation = false;
-    bool  debugSeeded = false;
-    float debugYaw = 0.0f;
-    float debugPitch = 0.0f;
+    bool  loggedLookOverride = false;
+
+    bool  lookSeeded = false;
+    float lookYaw = 0.0f;
+    float lookPitch = 0.0f;
 };
 
 State g_state;
@@ -65,43 +65,86 @@ State g_state;
 
 void vrRequestRecentre() { g_state.recentreRequested = true; }
 
-bool vrDebugRotationActive() {
-    return g_options.vrDebugRotate || g_options.vrDebugYawDegrees != 0.0f ||
-           g_options.vrDebugPitchDegrees != 0.0f;
+bool vrLookOverrideActive() { return g_options.vrMouseLook; }
+
+// yaw   about +Z (up),   positive turns left
+// pitch about +Y (left); a positive rotation about +Y tilts forward toward -Z, which is
+//       looking DOWN, so looking up is the negative angle
+void vrLookOverrideMatrix(float out[9]) {
+    if (!g_state.lookSeeded) vrLookOverrideReset();
+
+    constexpr float kRadians = 0.017453292f;
+    const float     a = g_state.lookYaw * kRadians;
+    const float     b = -g_state.lookPitch * kRadians;
+    const float     ca = std::cos(a), sa = std::sin(a);
+    const float     cb = std::cos(b), sb = std::sin(b);
+
+    // Rz(a) * Ry(b), row-major, matching how the callers multiply it.
+    const float fixed[9] = {ca * cb, -sa,  ca * sb,
+                            sa * cb, ca,   sa * sb,
+                            -sb,     0.0f, cb};
+    std::memcpy(out, fixed, sizeof(fixed));
 }
 
-void vrDebugRotateBy(float yawDegrees, float pitchDegrees) {
-    if (!g_state.debugSeeded) {
-        g_state.debugSeeded = true;
-        g_state.debugYaw = g_options.vrDebugYawDegrees;
-        g_state.debugPitch = g_options.vrDebugPitchDegrees;
-    }
-    g_state.debugYaw += yawDegrees;
-    g_state.debugPitch += pitchDegrees;
+bool vrApplyLookOverride(float orientation[9]) {
+    if (!vrLookOverrideActive()) return false;
+
+    float rotation[9];
+    vrLookOverrideMatrix(rotation);
+
+    // Right-multiplied, the same way the tracked path composes the head onto the car:
+    // the override then acts in the camera's own axes, so yaw turns the view relative to
+    // wherever the car is pointing rather than relative to the world.
+    float composed[9];
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            composed[row * 3 + column] =
+                orientation[row * 3 + 0] * rotation[0 * 3 + column] +
+                orientation[row * 3 + 1] * rotation[1 * 3 + column] +
+                orientation[row * 3 + 2] * rotation[2 * 3 + column];
+
+    std::memcpy(orientation, composed, sizeof(composed));
+    return true;
+}
+
+void vrLookOverrideBy(float yawDegrees, float pitchDegrees) {
+    g_state.lookSeeded = true;
+    g_state.lookYaw += yawDegrees;
+    g_state.lookPitch += pitchDegrees;
 
     // Pitch past straight up or down stops being a pitch and starts being a roll, which
     // would confuse the very thing this is measuring.
-    if (g_state.debugPitch > 89.0f) g_state.debugPitch = 89.0f;
-    if (g_state.debugPitch < -89.0f) g_state.debugPitch = -89.0f;
+    if (g_state.lookPitch > 89.0f) g_state.lookPitch = 89.0f;
+    if (g_state.lookPitch < -89.0f) g_state.lookPitch = -89.0f;
 
-    while (g_state.debugYaw > 180.0f) g_state.debugYaw -= 360.0f;
-    while (g_state.debugYaw < -180.0f) g_state.debugYaw += 360.0f;
+    while (g_state.lookYaw > 180.0f) g_state.lookYaw -= 360.0f;
+    while (g_state.lookYaw < -180.0f) g_state.lookYaw += 360.0f;
 }
 
-void vrDebugRotateReset() {
-    g_state.debugSeeded = true;
-    g_state.debugYaw = g_options.vrDebugYawDegrees;
-    g_state.debugPitch = g_options.vrDebugPitchDegrees;
+void vrLookOverrideReset() {
+    g_state.lookSeeded = true;
+    g_state.lookYaw = 0.0f;
+    g_state.lookPitch = 0.0f;
 }
 
-void vrDebugRotationAngles(float& yawDegrees, float& pitchDegrees) {
-    yawDegrees = g_state.debugYaw;
-    pitchDegrees = g_state.debugPitch;
+void vrLookOverrideAngles(float& yawDegrees, float& pitchDegrees) {
+    yawDegrees = g_state.lookYaw;
+    pitchDegrees = g_state.lookPitch;
 }
 
-void vrRequestDump() { g_state.dumpRequested = true; }
+void vrClearRendered() {
+    g_state.haveRendered = false;
 
-void vrClearRendered() { g_state.haveRendered = false; }
+    // Clear `injected` too, and this is the whole menu-scale bug.
+    //
+    // It is normally cleared at the top of vrAcquireEyes -- but a menu frame never
+    // reaches vrAcquireEyes, because the viewport guard in ensureEyes returns first.
+    // So after the first stereo frame it stayed true for the rest of the session, the
+    // presenter was told stretchToFill, and vrMenuScale was skipped from then on.
+    // Exactly "works the first time you enter the lobby, never again once you have
+    // raced": before racing it had never been set.
+    g_state.injected = false;
+}
 
 bool vrFrustumInjected() { return g_state.injected; }
 
@@ -141,22 +184,33 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
         // rolling never straightened it: the roll was manufactured, not observed.
         //
         // A seat is a heading. Its up axis is the world's up axis, always.
-        if (g_options.vrLevelRecentre) {
-            const float forwardIn[3] = {0.0f, 0.0f, -1.0f};
-            float       forward[3];
-            rotate(headQuat, forwardIn, forward);
+        // Position and HEADING only -- never pitch, never roll. Not a preference:
+        // OpenXR's LOCAL space is gravity-aligned by definition, every runtime's own
+        // recentre (Meta, SteamVR, WMR) resets translation and yaw alone, and every sim
+        // that ships a centre-view key does the same. The reason is vestibular: your
+        // inner ear knows which way down is, and a virtual horizon that disagrees with
+        // it is the strongest single trigger for simulator sickness. Yaw carries no such
+        // conflict, because rotating about the gravity vector does not move "down".
+        //
+        // Measured here before this was unconditional: a head carrying just -1.0 degrees
+        // of roll at recentre produced 5.2 degrees of roll at 89 degrees of head yaw. A
+        // tilted origin does not merely offset the view, it poisons every later rotation
+        // by giving the yaw a tilted axis to turn about.
+        //
+        // Someone wanting a head-down neutral posture needs a deliberate pitch offset
+        // applied after this, which is how sims expose it -- not a tilted origin.
+        const float forwardIn[3] = {0.0f, 0.0f, -1.0f};
+        float       forward[3];
+        rotate(headQuat, forwardIn, forward);
 
-            // Looking straight up or down leaves no heading to recover; keep the one
-            // already in force rather than snapping to an arbitrary one.
-            const float planar =
-                std::sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
-            if (planar > 0.01f) {
-                const float yaw = std::atan2(-forward[0], -forward[2]);
-                g_state.originOrientation = {0.0f, std::sin(yaw * 0.5f), 0.0f,
-                                             std::cos(yaw * 0.5f)};
-            }
-        } else {
-            g_state.originOrientation = headQuat;
+        // Looking straight up or down leaves no heading to recover; keep the one already
+        // in force rather than snapping to an arbitrary one.
+        const float planar =
+            std::sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
+        if (planar > 0.01f) {
+            const float yaw = std::atan2(-forward[0], -forward[2]);
+            g_state.originOrientation = {0.0f, std::sin(yaw * 0.5f), 0.0f,
+                                         std::cos(yaw * 0.5f)};
         }
         g_state.originPosition[0] = head.positionX;
         g_state.originPosition[1] = head.positionY;
@@ -176,9 +230,7 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
              head.positionX, head.positionY, head.positionZ,
              std::asin(sinPitch) * 57.29578f,
              std::atan2(right[1], up[1]) * 57.29578f,
-             g_options.vrLevelRecentre
-                 ? "-- discarded, the seat keeps only the heading"
-                 : "-- KEPT (vrLevelRecentre=0), so head yaw will turn this into roll");
+             "-- discarded, the seat keeps position and heading only");
     }
 
     const Quat inverseOrigin = conjugate(g_state.originOrientation);
@@ -211,37 +263,17 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
             out[eye].rotation[2 * 3 + axis] = asGpl[2];
         }
 
-        // A fixed rotation instead of the head's, when asked for. Written straight
-        // over the composed result rather than folded into the quaternion maths above,
-        // so what the game receives is unambiguous: exactly this rotation, in GPL axes,
-        // and nothing derived from tracking.
-        //
-        //   yaw   about +Z (up),   positive turns left
-        //   pitch about +Y (left); a positive rotation about +Y tilts forward toward
-        //         -Z, which is looking DOWN, so looking up is the negative angle
-        if (vrDebugRotationActive()) {
-            if (!g_state.debugSeeded) vrDebugRotateReset();
+        // The look override instead of the head's rotation, when one is active. Written
+        // straight over the composed result rather than folded into the quaternion maths
+        // above, so what the game receives is unambiguous: exactly this rotation, in GPL
+        // axes, and nothing derived from tracking.
+        if (vrLookOverrideActive()) {
+            vrLookOverrideMatrix(out[eye].rotation);
 
-            constexpr float kRadians = 0.017453292f;
-            const float     a = g_state.debugYaw * kRadians;
-            const float     b = -g_state.debugPitch * kRadians;
-            const float     ca = std::cos(a), sa = std::sin(a);
-            const float     cb = std::cos(b), sb = std::sin(b);
-
-            // Rz(a) * Ry(b), row-major, matching how the caller multiplies it.
-            const float fixed[9] = {ca * cb, -sa, ca * sb,
-                                    sa * cb, ca,  sa * sb,
-                                    -sb,     0.0f, cb};
-            std::memcpy(out[eye].rotation, fixed, sizeof(fixed));
-
-            if (!g_state.loggedDebugRotation) {
-                g_state.loggedDebugRotation = true;
-                logf("vr: head rotation REPLACED by a fixed rotation, starting at yaw "
-                     "%.1f deg pitch %.1f deg. Tracking no longer turns the view -- "
-                     "hold the arrow keys to sweep it and judge the picture on the flat "
-                     "monitor. If straight lines shear as it sweeps, GPL's own view "
-                     "transform does it and the headset is not involved.",
-                     g_state.debugYaw, g_state.debugPitch);
+            if (!g_state.loggedLookOverride) {
+                g_state.loggedLookOverride = true;
+                logf("vr: head rotation REPLACED by the look override -- head tracking "
+                     "no longer turns the view, the mouse does. See vrMouseLook.");
             }
         }
 
@@ -285,29 +317,16 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
         const float tanUp = std::tan(view.fov.angleUp);
         const float tanDown = std::tan(view.fov.angleDown);
 
-        // Per-eye, so the two halves can be made to disagree on purpose. Rendering
-        // the left eye at 1.0 and the right at 0.5 puts the answer to "does fov reach
-        // the picture at all" on the flat monitor, side by side, with no headset and no
-        // theory: different world extents means it does, identical halves means it
-        // does not. vrFovScaleRight <= 0 means "same as vrFovScale".
-        float configured = g_options.vrFovScale;
-        if (eye == 1 && g_options.vrFovScaleRight > 0.1f &&
-            g_options.vrFovScaleRight < 4.0f)
-            configured = g_options.vrFovScaleRight;
-        const float scale =
-            (configured > 0.1f && configured < 4.0f) ? configured : 1.0f;
         const float centreH = (tanRight + tanLeft) * 0.5f;
         const float centreV = (tanUp + tanDown) * 0.5f;
-        const float halfH = (tanRight - tanLeft) * 0.5f * scale;
-        const float halfV = (tanUp - tanDown) * 0.5f * scale;
+        const float halfH = (tanRight - tanLeft) * 0.5f;
+        const float halfV = (tanUp - tanDown) * 0.5f;
         if (halfH <= 0.0f || halfV <= 0.0f) return false;
 
         // Record the frustum we are ACTUALLY about to render, not the one the runtime
         // asked for. The producer echoes this back with the frame and the presenter puts
         // it in the projection layer, so the compositor knows what the image really
-        // covers. Skipping this would tell it a 115%-wide image is 100% wide and have it
-        // warp accordingly -- reintroducing, through the fix, exactly the distortion
-        // vrFovScale exists to reduce.
+        // covers.
         renderedLocal[eye] = views[eye];
         renderedLocal[eye].fov.angleLeft = std::atan(centreH - halfH);
         renderedLocal[eye].fov.angleRight = std::atan(centreH + halfH);
@@ -342,8 +361,6 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
         logf("vr: eye frustum from the runtime -- fov %.4f rad (%.1f deg) full "
              "horizontal, aspect %.4f for a %dx%d eye",
              out[0].fov, out[0].fov * 57.29578f, out[0].aspect, eyeWidth, eyeHeight);
-        // Both eyes, because vrFovScaleRight makes them differ on purpose and a line
-        // that only ever prints eye 0 cannot show that the split took effect.
         logf("vr: eye 1 frustum -- fov %.4f rad (%.1f deg), aspect %.4f", out[1].fov,
              out[1].fov * 57.29578f, out[1].aspect);
         logf("vr: eye offsets left (%.4f, %.4f, %.4f) right (%.4f, %.4f, %.4f) metres "
@@ -362,100 +379,6 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
     // the raw views would undo that.
     g_state.rendered[0] = renderedLocal[0];
     g_state.rendered[1] = renderedLocal[1];
-
-    if (g_state.dumpRequested) {
-        g_state.dumpRequested = false;
-        const float* r = out[0].rotation;
-
-        // Column norms and the dot products between columns. A proper rotation has all
-        // three norms at 1.000 and all three dots at 0.000. Anything else shears the
-        // world in proportion to how far the head is turned -- which is invisible facing
-        // forward and obvious at 45 degrees, exactly the reported symptom.
-        const float n0 = std::sqrt(r[0]*r[0] + r[3]*r[3] + r[6]*r[6]);
-        const float n1 = std::sqrt(r[1]*r[1] + r[4]*r[4] + r[7]*r[7]);
-        const float n2 = std::sqrt(r[2]*r[2] + r[5]*r[5] + r[8]*r[8]);
-        const float d01 = r[0]*r[1] + r[3]*r[4] + r[6]*r[7];
-        const float d02 = r[0]*r[2] + r[3]*r[5] + r[6]*r[8];
-        const float d12 = r[1]*r[2] + r[4]*r[5] + r[7]*r[8];
-
-        // r[0] is the forward axis' forward component, so acos of it is how far the head
-        // has turned away from the seat.
-        const float turn = std::acos(r[0] < -1.0f ? -1.0f : (r[0] > 1.0f ? 1.0f : r[0]));
-
-        logf("vrdump: head turned %.1f deg from the seat", turn * 57.29578f);
-        logf("vrdump: head matrix [%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f]",
-             r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
-        logf("vrdump: column norms %.5f %.5f %.5f (want 1) dots %.5f %.5f %.5f (want 0)",
-             n0, n1, n2, d01, d02, d12);
-        logf("vrdump: eye offsets L(%.4f %.4f %.4f) R(%.4f %.4f %.4f) m, fwd/left/up",
-             out[0].offset[0], out[0].offset[1], out[0].offset[2],
-             out[1].offset[0], out[1].offset[1], out[1].offset[2]);
-        logf("vrdump: written to the cameras -- fov %.4f rad (%.1f deg), aspect %.4f, "
-             "eye %dx%d",
-             out[0].fov, out[0].fov * 57.29578f, out[0].aspect, eyeWidth, eyeHeight);
-
-        // Where the ROLL is.
-        //
-        // A horizon overlay drawn from directions at infinity through the XR pose can
-        // only tilt if that pose carries roll. So take the roll apart at every stage
-        // and print it, instead of arguing about which stage it must be in:
-        //
-        //   raw     -- the eye pose the runtime reports, in LOCAL space
-        //   seat    -- the recentre origin
-        //   head    -- raw relative to seat, i.e. what a head is actually doing
-        //   in GPL  -- the same rotation after the frame conversion, ready to compose
-        //
-        // If "raw" carries roll and "head" does not, the seat is tilted. If both do,
-        // the head really is rolled and the overlay is telling the truth. If neither
-        // does but the picture tilts, the roll is being introduced after this point.
-        constexpr float kDeg = 57.29578f;
-
-        // Report the euler angles from a rotation's own axes, so the same routine can
-        // describe an XR quaternion and a GPL matrix without a conversion in between.
-        auto reportXr = [](const char* label, const Quat& q) {
-            const float fwdIn[3] = {0.0f, 0.0f, -1.0f};
-            const float upIn[3] = {0.0f, 1.0f, 0.0f};
-            const float rightIn[3] = {1.0f, 0.0f, 0.0f};
-            float fwd[3], up[3], right[3];
-            rotate(q, fwdIn, fwd);
-            rotate(q, upIn, up);
-            rotate(q, rightIn, right);
-            const float sinPitch = fwd[1] < -1.0f ? -1.0f : (fwd[1] > 1.0f ? 1.0f : fwd[1]);
-            logf("vrdump: %-34s yaw %7.1f  pitch %6.1f  roll %6.1f deg", label,
-                 std::atan2(-fwd[0], -fwd[2]) * 57.29578f,
-                 std::asin(sinPitch) * 57.29578f,
-                 std::atan2(right[1], up[1]) * 57.29578f);
-        };
-
-        const Quat rawQuat{views[0].pose.orientationX, views[0].pose.orientationY,
-                           views[0].pose.orientationZ, views[0].pose.orientationW};
-
-        // conj(origin) * raw -- the head relative to the seat, which is the only part
-        // that should reach the game.
-        const Quat inv = conjugate(g_state.originOrientation);
-        const Quat relative{
-            inv.w * rawQuat.x + inv.x * rawQuat.w + inv.y * rawQuat.z - inv.z * rawQuat.y,
-            inv.w * rawQuat.y - inv.x * rawQuat.z + inv.y * rawQuat.w + inv.z * rawQuat.x,
-            inv.w * rawQuat.z + inv.x * rawQuat.y - inv.y * rawQuat.x + inv.z * rawQuat.w,
-            inv.w * rawQuat.w - inv.x * rawQuat.x - inv.y * rawQuat.y - inv.z * rawQuat.z};
-
-        reportXr("eye pose in LOCAL (raw)", rawQuat);
-        reportXr("seat / recentre origin", g_state.originOrientation);
-        reportXr("head relative to the seat", relative);
-
-        // And the same rotation once it is in GPL's frame: columns are the camera axes,
-        // X forward, Y left, Z up, so column 1's up-component is the roll.
-        const float sinPitchGpl = r[6] < -1.0f ? -1.0f : (r[6] > 1.0f ? 1.0f : r[6]);
-        // Negated: GPL's roll is measured from the LEFT axis and XR's from the RIGHT,
-        // so the raw figures differ in sign by construction. The first version of this
-        // dump printed both and made a clean conversion look like a sign bug.
-        logf("vrdump: %-34s yaw %7.1f  pitch %6.1f  roll %6.1f deg",
-             "handed to GPL (same rotation)", std::atan2(r[3], r[0]) * kDeg,
-             std::asin(sinPitchGpl) * kDeg, -std::atan2(r[7], r[8]) * kDeg);
-        logf("vrdump: a horizon drawn from infinity can only tilt if a pose carries "
-             "roll. If every roll above is ~0 while the picture ladders, the tilt is "
-             "added after this point -- not by the head, and not by us here.");
-    }
 
     g_state.haveRendered = true;
     g_state.injected = true;

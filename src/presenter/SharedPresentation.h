@@ -42,7 +42,7 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 2;  // 2: renderedViews became per-slot
+inline constexpr uint32_t kControlVersion = 4;  // 4: added eyeRect
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -149,6 +149,23 @@ struct ControlBlock {
     // disparity error on one eye only, which is far easier to feel than to see.
     uint32_t eyeHalfWidth = 0;
 
+    // The exact sub-rect each eye was rendered into, in SOURCE pixels, image-space:
+    // origin top-left, the way the game sees the surface. [eye][x, y, w, h].
+    //
+    // eyeHalfWidth could only ever describe a full-height left/right split. It cannot
+    // describe a SQUARE eye -- a 1280x1280 sub-rect inside a 1280x1440 half -- and a
+    // square eye is the point: GPL's `aspect` is a vertical stretch factor, and the rest
+    // of the engine assumes it is 1 (gpl_cameraBind hands the rasterizer the fov and
+    // never the aspect; gpl_lodScreenScale is computed from the horizontal axis alone).
+    // Matching the target's SHAPE to the frustum keeps aspect at 1.0 and takes the
+    // engine out of a regime it was never built for. It is also what BFVR does, by
+    // sizing the game's render target from the runtime instead of compensating
+    // afterwards, and it is why BFVR does not have this problem.
+    //
+    // All zero means "fall back to the eyeHalfWidth split", so a producer that has not
+    // filled this in still works.
+    uint32_t eyeRect[2][4] = {};
+
     // Non-zero when the two eyes are the left and right halves of the texture, which is
     // what Phase 1's stereo produces. Zero means one image for both eyes -- the menus,
     // or stereo switched off -- and the presenter shows it to both eyes rather than
@@ -170,6 +187,16 @@ struct ControlBlock {
     // Published AFTER views/headPose are written.
     volatile int32_t viewSequence = 0;
     volatile int32_t viewsValid = 0;
+
+    // Whether the runtime permits the application to submit a different field of view
+    // (XrViewConfigurationProperties::fovMutable).
+    //
+    // PicoStreamingXR reports NO. Submitting a scaled fov to such a runtime is not an
+    // override it will fight -- it is simply unsupported, and the image gets displayed
+    // across the runtime's own fixed fov, i.e. stretched. We logged this field from the
+    // first survey and never read it, and vrFovScale silently did nothing for days as a
+    // result. 0 until the presenter has said.
+    volatile int32_t fovMutable = 0;
     SharedPose       headPose;
     SharedView       views[2];
 

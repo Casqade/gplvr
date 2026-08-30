@@ -32,7 +32,16 @@ struct SceneParams {
     float eyeX, eyeY, eyeZ;      // p[3..5] world position. Z is up.
     float pad1[18];              // p[6..23]
     float orientation[9];        // p[24..32] 3x3 row-major; columns are the local axes
-    float pad2[10];              // p[33..42]
+    float pad2[7];               // p[33..39]
+    // The main camera's frustum, applied by sceneRender to whatever camera sits in
+    // p[2] -- ours included -- on the two lines immediately before cameraBind:
+    //     cameraSetFov(camera, p[40])
+    //     cameraSetPrincipalPoint(camera, p[41], p[42])
+    // The fov half of that is the bug that cost weeks in Phase 2. The principal point
+    // is the same bug on the very next line, and it went unnoticed for as long again.
+    float mainFov;               // p[40]
+    float mainCx;                // p[41]
+    float mainCy;                // p[42]   the cockpit view's vertical offset
     void* mirrorCamera;          // p[43]   0 = skip the mirror pass
     float mirrorEye[3];          // p[44..46]
     float pad3[18];              // p[47..64]
@@ -43,6 +52,8 @@ static_assert(sizeof(float) == 4, "32-bit floats assumed");
 static_assert(offsetof(SceneParams, camera) == 2 * 4, "p[2] is the main camera");
 static_assert(offsetof(SceneParams, eyeX) == 3 * 4, "p[3..5] is the eye position");
 static_assert(offsetof(SceneParams, orientation) == 24 * 4, "p+24 is the orientation");
+static_assert(offsetof(SceneParams, mainFov) == 40 * 4, "p[40] is the main fov");
+static_assert(offsetof(SceneParams, mainCy) == 42 * 4, "p[42] is the main cy");
 static_assert(offsetof(SceneParams, mirrorCamera) == 43 * 4, "p[43] is the mirror camera");
 
 // Camera object layout, from gpl_cameraCreate and gpl_cameraRebuildProjection.
@@ -50,6 +61,13 @@ static_assert(offsetof(SceneParams, mirrorCamera) == 43 * 4, "p[43] is the mirro
 enum : unsigned {
     kCameraSurface = 0x00,  // void*  destination bitmap
     kCameraNear = 0x04,     // float
+    // Half extents, and the principal point PRE-MULTIPLIED by them -- gpl_cameraCreate
+    // stores cx*halfW and cy*halfH, which is why cameraRebuildProjection can divide by
+    // the centre and get a plain normalised cx back.
+    kCameraHalfWExtent = 0x24,
+    kCameraHalfHExtent = 0x28,
+    kCameraCx = 0x34,       // float, = cx * halfWExtent
+    kCameraCy = 0x38,       // float, = cy * halfHExtent
     // Decoded from gpl_cameraRebuildProjection:
     //   screen_x = cx - cot(fov/2) * (y/x)
     //   screen_y = cy - (width / (aspect*height)) * cot(fov/2) * (z/x)
@@ -97,26 +115,22 @@ void stereoRelease();
 // eye by half a pixel relative to what was actually rendered into it.
 int stereoEyeWidth();
 
-// Arm the one-shot field-of-view probe.
-//
-// On the next tracked frame both halves are rendered from an IDENTICAL viewpoint --
-// same orientation, same eye position, no IPD -- and with the mirror suppressed, so the
-// only thing differing between them is the field of view: the left half gets the
-// frustum we normally use, the right half twice its tangent. The halves can then be
-// compared bitwise. Identical halves mean the fov we write never reaches the renderer.
-// That is the question the probe exists to settle without anyone judging a picture.
+// The sub-rect one eye is rendered into, in source pixels: x, y, w, h. False when there
+// are no eye targets. The presenter samples exactly this, which is what lets an eye be a
+// square inside its half rather than the whole half.
+bool stereoEyeRect(int eye, int out[4]);
+
+
 // Re-apply the eye frustum to `camera`, if it is one of ours.
 //
 // Called from the cameraBind hook, which sits inside sceneRender AFTER sceneRender has
 // overwritten the camera's fov with the game's own and BEFORE cameraBind rebuilds the
 // projection from it. Writing the frustum any earlier -- as stereoRender does -- is
-// simply undone, which the fov probe demonstrated bitwise.
+// simply undone.
+//
+// It puts the PRINCIPAL POINT back as well. sceneRender sets the fov and the principal
+// point on consecutive lines, and only the fov half of that was ever noticed; the other
+// half shifted every VR frame by an eighth of half-height for as long again.
 void stereoOnCameraBind(void* camera);
-
-void stereoRequestFovProbe();
-
-// True exactly once, on the frame the probe rendered, reporting the two frusta actually
-// written. The caller reads the buffer back and does the comparison.
-bool stereoTakeFovProbe(float fov[2], float aspect[2]);
 
 }  // namespace gplvr

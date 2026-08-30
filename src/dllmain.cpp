@@ -115,11 +115,6 @@ DWORD WINAPI installThread(LPVOID) {
     logf("--- compare against the static analysis of gplc67.exe ---");
     logf("    expected cameraBind 004C7AB0, sceneRender 00487620, simFrameRender 0048B240");
 
-    if (!g_options.installHooks) {
-        logf("installHooks=0 -- discovery only, the game is left unmodified");
-        return 0;
-    }
-
     logf("patching import tables...");
     patchDisplaySettingsImportsEverywhere();
     logf("installing frame counter...");
@@ -147,7 +142,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
 
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        logf("gplvr attached to %s", exe);
+        // Stamp the build. Two runs have now been discussed without knowing whether
+        // the binary contained a given fix, which wastes the test.
+        logf("gplvr attached to %s -- built %s %s", exe, __DATE__, __TIME__);
 
         loadOptions("gplvr.ini");
 

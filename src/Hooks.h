@@ -11,14 +11,6 @@ struct Options {
     // bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the head.
     bool stereo = false;
 
-    // Interpupillary distance. A world unit is a metre -- measured, see STATUS.md -- so
-    // this is a real human IPD and needs no scaling.
-    float stereoIpd = 0.064f;
-
-    // Swap which half of the buffer gets which eye. Invisible on a flat screen and
-    // immediately sickening in a headset, so it needs to be adjustable without a build.
-    bool stereoSwapEyes = false;
-
     // The mirror pass, p[43]. Its camera targets a fixed rect of the full render
     // surface, so it does not follow an eye into its half of the buffer.
     //   0 = off in both eyes   1 = left eye only (default)   2 = both eyes
@@ -71,77 +63,61 @@ struct Options {
     // the view sits a standing height above the driver.
     int vrRecentreKey = '3';
 
-    // Dump the head matrix, whether it is still a proper rotation, the eye offsets and
-    // the frustum written to the cameras. '4' by default; 0 disables.
-    int vrDumpKey = '4';
-
-    // Fire the one-shot fov probe: one frame with both halves drawn from the same
-    // viewpoint and only the field of view differing, dumped to disk and compared
-    // bitwise. See stereoRequestFovProbe.
-    int vrFovProbeKey = '5';
-
-    // Diagnostic: replace the head rotation with a FIXED one, in degrees.
+    // Drive the camera with the MOUSE, and stop head tracking driving it.
     //
-    // Rotation is rotation -- if GPL's view transform shears the world at a fixed 45
-    // degrees of yaw, it does so whether that yaw came from a head or from here, and
-    // the whole VR pipeline is off the hook. Both stay 0 for normal play; either being
-    // non-zero freezes head tracking so the picture is judged on the flat monitor,
-    // deterministically, with nothing moving.
+    // The point is to be able to judge the distortion on a flat monitor. In the headset
+    // every candidate explanation has now been ruled out by measurement and the picture
+    // is still wrong, and the desktop mirror cannot settle it -- the preview is
+    // letterboxed and horizontally shrunk, so it is already distorted before you start
+    // and there is no reasoning about what is left on top of that.
     //
-    // Yaw is about GPL's up axis, positive turns left. Pitch is positive looking up.
-    // These are the STARTING angles; the keys below sweep from here.
-    float vrDebugYawDegrees = 0.0f;
-    float vrDebugPitchDegrees = 0.0f;
-
-    // Turn the mode on with no starting offset. A still image cannot show a distortion
-    // that only reads as motion -- you would be comparing two unfamiliar pictures from
-    // memory -- so the angles sweep while a key is held and the shear appears the same
-    // way it does when a head turns.
-    bool  vrDebugRotate = false;
-    float vrDebugRotateRate = 45.0f;  // degrees per second while held
-
-    // Arrows by default, as asked. The game sees them too -- GetAsyncKeyState does not
-    // consume anything -- so sweep while stationary, or rebind these, if the car
-    // steering away would confuse the picture.
-    int vrDebugYawLeftKey = 0x25;   // VK_LEFT
-    int vrDebugYawRightKey = 0x27;  // VK_RIGHT
-    int vrDebugPitchUpKey = 0x26;   // VK_UP
-    int vrDebugPitchDownKey = 0x28; // VK_DOWN
-    int vrDebugRotateResetKey = 0x24;  // VK_HOME, back to the starting angles
-
-    // Hand the runtime the pose each frame was drawn from, so it can reproject 36 Hz
-    // into a 90 Hz compositor. Setting this to 0 submits the pose located at submission
-    // time instead, which head-locks the layer and disables reprojection entirely.
-    // Costs judder; isolates whether the reprojection warp is the distortion.
-    bool vrSubmitRenderedPose = true;
-
-    // Draw a world-locked reference ring over the picture, at eye height, projected
-    // with the frustum we declare to the runtime. GPL's horizon should stay locked to
-    // it at every head angle. Diagnostic: it draws over the game.
-    bool vrOverlayMarkers = false;
-
-    // Level the seat before composing the head rotation onto it.
+    // With vr = 0 this is the whole mechanism: no presenter, no runtime, no streaming
+    // layer, no optics. Just GPL's own renderer being asked to look in a direction, on a
+    // monitor, where a straight line is straight. If the shear and the vertical stretch
+    // appear here too they are GPL's or ours and the headset was never involved; if the
+    // picture stays clean however far you turn, everything above the runtime is
+    // exonerated and the fault is below it.
     //
-    // GPL's cockpit camera carries a built-in downward pitch -- recentring aims at the
-    // wheel, not the horizon. Composing the head rotation onto that pitched frame makes
-    // a head YAW rotate about a tilted axis, which injects roll: none looking forward,
-    // rising with yaw, peaking at 90 degrees where it equals the pitch offset. That is
-    // the "ladder", and the "distortion that grows as you turn away from forward".
-    //
-    // With this on, the pitch is removed from the seat first, so the head yaws about
-    // true vertical and supplies all the looking -- which is what a headset is for.
-    // Measured and rejected: GPL's camera pitch runs -5 to +3 degrees and drifts
-    // continuously through zero, which is the CAR's attitude over terrain, not a fixed
-    // view offset. Levelling it deletes the car's real pitch and buys nothing, so this
-    // stays off. Kept because it is one line and re-measuring beats re-deriving.
-    bool vrLevelSeat = false;
+    // With vr = 1 it INHIBITS head tracking and steers the same override instead, so the
+    // two can be compared at identical angles rather than from memory.
+    bool vrMouseLook = false;
 
-    // Keep only the heading when recentring: discard the head's pitch and roll.
+    // Degrees of view per raw mouse count. Device counts, not pixels -- no acceleration
+    // and no Windows pointer speed in the way, which is what makes a sweep repeatable.
+    // A 1600 DPI mouse moving 10 cm is about 6300 counts, so the default sweeps a little
+    // over half a turn across a mousepad.
+    float vrMouseLookSensitivity = 0.08f;
+
+    // Mouse forward looks up by default, as a head does.
+    bool vrMouseLookInvertPitch = false;
+
+    // Toggle it in game. '6' by default, since 1-5 are taken above and the in-game
+    // cameras have the function keys; 0 disables the toggle.
+    int vrMouseLookKey = '6';
+
+    // HORIZON LOCK, 0 to 1. How much of the car's pitch is taken out of the view.
     //
-    // A seat captured with pitch in it turns head YAW into roll -- measured at 5.2
-    // degrees of roll from a level head at 89 degrees of yaw. This is the fix for that;
-    // 0 restores the old behaviour for comparison.
-    bool vrLevelRecentre = true;
+    // 0 -- the view pitches with the car, which is what a driver's head actually does
+    //      and the physically correct answer.
+    // 1 -- the view stays level with the world horizon while the car pitches under it.
+    // between -- blended, which is what most people who want this actually want.
+    //
+    // This is the setting iRacing, ACC and AMS2 all ship, and they expose it as a
+    // percentage for the same reason: enough of it to take the edge off kerbs and
+    // braking, not so much that the car slides around underneath you.
+    //
+    // It blends the car's ROLL and its PITCH, roll first. Roll is the half that
+    // matters: a viewer can counteract a pitched camera by tilting their own head and
+    // nobody can counteract roll, which is why Meta's VR guidance is blunt about never
+    // rotating the camera in roll, and why every sim horizon lock aims at banking,
+    // kerbs and body lean before it worries about braking dive.
+    //
+    // The pitch it removes is the CAR'S ATTITUDE over terrain -- measured at -5 to +3
+    // degrees, drifting continuously through zero. GPL's cockpit FRAMING, the thing that
+    // used to make the view aim at the wheel, was the principal point, and that is fixed
+    // unconditionally at bind time now. These are different quantities; do not confuse
+    // this setting with that fix.
+    float vrHorizonLock = 0.0f;
 
     // GPL world units per metre.
     //
@@ -158,51 +134,39 @@ struct Options {
     // assumption nothing has yet verified.
     float vrWorldScale = 1.0f;
 
+    // Extra whole-scene renders per game frame, 0 to 3.
+    //
+    // The 36 Hz is the sim TASK RATE, not a rendering limit: sceneRender costs about a
+    // millisecond an eye out of an 11 ms budget at 90 Hz, and the game thread spends
+    // the rest of each tick idle. Rendering the scene again from a fresh head pose
+    // produces a real head-tracked frame rather than a reprojected one -- the world
+    // still animates at 36 Hz, but head motion, which is what causes discomfort, gets
+    // smooth.
+    //
+    // 1 gives 72 Hz of head tracking, 2 gives 108. Off by default because it spends
+    // idle time that the game may want back on a slower machine, and because it is new.
+    int vrExtraRenders = 0;
+
     // How much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
     // world render behind them, so at 1.0 they fill the whole 104-degree view a few
     // centimetres from your face. The layer sits at infinity either way -- angular size
     // is the only "distance" a projection layer has.
     float vrMenuScale = 0.5f;
 
-    // Multiply the runtime's field of view before handing it to the eye cameras.
+    // Multiply the runtime's RECOMMENDED per-eye render size.
     //
-    // 1.0 renders exactly what the runtime asks for, which is the geometrically correct
-    // answer and should be left alone unless the picture says otherwise. Above 1.0
-    // renders wider than the headset shows, which wastes pixels but gives the runtime
-    // margin to reproject into on fast turns.
-    float vrFovScale = 1.0f;
-
-    // Diagnostic: the same multiplier for the right eye only, so the two halves render
-    // visibly different fields of view. 0 (the default) means "use vrFovScale for both".
-    // Set it to 0.5 and look at the flat monitor -- if both halves still show the same
-    // extent of world, the fov we write is not reaching the renderer.
-    float vrFovScaleRight = 0.0f;
-
-    // Scale the swapchain away from the runtime's recommendation, 0.25 to 1.0.
+    // 1.0 keeps the recommendation, which for a Pico 4 is around 3172x3172. Below 1.0
+    // trades resolution the source does not have for encode time and link bandwidth it
+    // does -- GPL hands us a 1280x1440 half, so at 1.0 we are already upscaling six
+    // times into pixels that carry no extra detail.
     //
-    // SteamVR recommends 3172x3172 per eye for a Pico 4. That is what a natively
-    // rendered app should use -- but GPL gives us 1280x1440 per eye, so we upscale by
-    // six times and then make the runtime encode and stream ten megapixels an eye of
-    // pixels that carry no extra detail. On a streamed headset those pixels are real
-    // bandwidth and real encoder time.
-    //
-    // 1.0 keeps the recommendation. Lower trades headroom the source does not have for
-    // encode and transmit load it does.
-    float vrEyeScale = 1.0f;
-
-    // Run the Phase 2 transport probe: time both candidate routes out of roglv2's
-    // OpenGL back buffer -- WGL_NV_DX_interop2 into a shared D3D11 texture, and plain
-    // glReadPixels -- and check that the interop route really delivers the pixels.
-    //
-    // One shot. It measures 60 frames, writes a summary, releases everything and goes
-    // quiet, so leaving it on costs one burst at startup. Off by default because it
-    // pulls d3d11 into the game process.
-    bool glProbe = false;
-
-    // Install nothing -- run discovery, log what it found, and leave the game alone.
-    // The first thing to try if a run misbehaves: it separates "discovery is wrong"
-    // from "a hook is wrong".
-    bool installHooks = true;
+    // There is no ceiling of 1.0. xrEnumerateViewConfigurationViews reports the
+    // recommended size and the MAXIMUM side by side -- 3172 against 8192 here -- and the
+    // presenter clamps to that maximum, which is the only figure that is a real limit.
+    // Above 1.0 buys little while the source is a game half, but the ceiling should not
+    // be an invented number, and it should not be the thing in the way once the source
+    // resolution rises.
+    float vrRenderScale = 1.0f;
 
 };
 

@@ -15,6 +15,7 @@
 #include <cstdlib>
 
 #include <cstring>
+#include <cwchar>
 
 namespace gplvr {
 namespace {
@@ -113,16 +114,14 @@ bool launchPresenter(State& state, const wchar_t* instance) {
         return false;
     }
 
-    wchar_t commandLine[MAX_PATH + 64] = {};
-    _snwprintf_s(commandLine, _TRUNCATE, L"\"%s\" --present %s --eye-scale %.3f%s%s",
-                 exePath, instance, g_options.vrEyeScale,
-                 g_options.vrSubmitRenderedPose ? L"" : L" --no-rendered-pose",
-                 g_options.vrOverlayMarkers ? L" --markers" : L"");
-    if (!g_options.vrSubmitRenderedPose)
-        logf("vr: submitting the LOCATED pose, not the rendered one -- the layer is "
-             "head-locked and the runtime has nothing to reproject. Expect judder; this "
-             "is a diagnostic, not a setting to drive with.");
-
+    // MAX_PATH + 192, not + 64. A full-length exe path plus --present, --eye-scale and
+    // all three optional flags overruns the old size, and _TRUNCATE would have cut the
+    // LAST flag off silently -- so an option would simply not arrive, with nothing in
+    // either log to say why. Widened once rather than counted every time a flag is added.
+    wchar_t commandLine[MAX_PATH + 192] = {};
+    _snwprintf_s(commandLine, _TRUNCATE,
+                 L"\"%s\" --present %s --render-scale %.3f",
+                 exePath, instance, g_options.vrRenderScale);
     STARTUPINFOW startup = {};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process = {};
@@ -134,8 +133,12 @@ bool launchPresenter(State& state, const wchar_t* instance) {
 
     CloseHandle(process.hThread);
     state.presenterProcess = process.hProcess;
-    logf("vr: presenter started, pid %lu -- it writes its own gplvr-xr.log",
-         process.dwProcessId);
+    // The arguments, not just the pid. Options reach the presenter ONLY through this
+    // line, so "I turned it on and nothing happened" is answered here or nowhere.
+    logf("vr: presenter started, pid %lu, args%S -- it writes its own gplvr-xr.log",
+         process.dwProcessId,
+         wcsstr(commandLine, L" --present") ? wcsstr(commandLine, L" --present")
+                                            : L" (command line truncated)");
     return true;
 }
 
@@ -313,96 +316,6 @@ bool writeBmp32(const char* path, const unsigned char* pixels, int sourceWidth,
     return ok;
 }
 
-void dumpFovProbe(const GlFunctions& gl, int width, int height, const float fov[2],
-                  const float aspect[2]) {
-    int half = stereoEyeWidth();
-    if (half <= 0 || half * 2 > width) {
-        logf("vr: fov probe -- eye width %d does not fit a %d-wide buffer; falling back "
-             "to a clean split",
-             half, width);
-        half = width / 2;
-    }
-    if (half <= 0 || height <= 0) return;
-
-    const size_t bytes = static_cast<size_t>(width) * height * 4;
-    unsigned char* pixels = static_cast<unsigned char*>(malloc(bytes));
-    if (!pixels) {
-        logf("vr: fov probe -- could not allocate %u bytes for the readback",
-             static_cast<unsigned>(bytes));
-        return;
-    }
-
-    if (!glReadBackBufferBgra(gl, width, height, pixels)) {
-        logf("vr: fov probe -- glReadPixels failed; nothing dumped");
-        free(pixels);
-        return;
-    }
-
-    // Compare the halves. Colour only: the alpha channel of a back buffer is not
-    // meaningful and would not survive a format change anyway.
-    unsigned long long differing = 0;
-    int                worst = 0;
-    for (int y = 0; y < height; ++y) {
-        const unsigned char* row = pixels + static_cast<size_t>(y) * width * 4;
-        const unsigned char* left = row;
-        const unsigned char* right = row + static_cast<size_t>(half) * 4;
-        for (int x = 0; x < half; ++x) {
-            int delta = 0;
-            for (int c = 0; c < 3; ++c) {
-                const int d = abs(static_cast<int>(left[x * 4 + c]) -
-                                  static_cast<int>(right[x * 4 + c]));
-                if (d > delta) delta = d;
-            }
-            if (delta) {
-                ++differing;
-                if (delta > worst) worst = delta;
-            }
-        }
-    }
-
-    const double total = static_cast<double>(half) * height;
-    const double percent = total > 0.0 ? 100.0 * static_cast<double>(differing) / total
-                                       : 0.0;
-
-    char directory[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, directory, MAX_PATH);
-    // Trim back to the last separator. Written with the character code rather than a
-    // backslash literal: this file is produced by a generator, and an escape layer has
-    // already been lost here once.
-    const char kSeparator = 92;
-    for (int i = static_cast<int>(strlen(directory)) - 1; i >= 0; --i) {
-        if (directory[i] == kSeparator || directory[i] == 47) {
-            directory[i + 1] = 0;
-            break;
-        }
-    }
-
-    static int sequence = 0;
-    ++sequence;
-
-    char pathLeft[MAX_PATH];
-    char pathRight[MAX_PATH];
-    sprintf(pathLeft, "%sgplvr-fov-%d-a-normal.bmp", directory, sequence);
-    sprintf(pathRight, "%sgplvr-fov-%d-b-doubled.bmp", directory, sequence);
-
-    const bool wroteLeft = writeBmp32(pathLeft, pixels, width, half, height, 0);
-    const bool wroteRight = writeBmp32(pathRight, pixels, width, half, height, half);
-
-    logf("vr: fov probe -- half A fov %.4f rad (%.1f deg) aspect %.4f, half B fov %.4f "
-         "rad (%.1f deg) aspect %.4f",
-         fov[0], fov[0] * 57.29578f, aspect[0], fov[1], fov[1] * 57.29578f, aspect[1]);
-    logf("vr: fov probe -- %llu of %.0f pixels differ (%.3f%%), worst channel delta %d",
-         differing, total, percent, worst);
-    logf("vr: fov probe -- %s", percent < 0.5
-             ? "THE HALVES ARE THE SAME PICTURE. Two frusta an octave apart produced "
-               "identical pixels, so the fov we write never reaches the renderer."
-             : "the halves differ, so the fov we write DOES reach the renderer and the "
-               "fault is downstream of it.");
-    logf("vr: fov probe -- wrote %s (%s) and %s (%s)", pathLeft,
-         wroteLeft ? "ok" : "FAILED", pathRight, wroteRight ? "ok" : "FAILED");
-
-    free(pixels);
-}
 
 }  // namespace
 
@@ -533,6 +446,16 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     block->sideBySide = sideBySide ? 1 : 0;
     block->monoScale = g_options.vrMenuScale;
     block->eyeHalfWidth = static_cast<uint32_t>(stereoEyeWidth());
+
+    // Where each eye actually landed. Published every frame rather than at setup,
+    // because the eye targets rebuild themselves whenever the game changes render size
+    // and a stale rect would sample the wrong pixels rather than fail visibly.
+    for (int eye = 0; eye < 2; ++eye) {
+        int rect[4] = {};
+        const bool have = sideBySide && stereoEyeRect(eye, rect);
+        for (int i = 0; i < 4; ++i)
+            block->eyeRect[eye][i] = have ? static_cast<uint32_t>(rect[i]) : 0u;
+    }
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->stretchToFill),
                         stretchToFill ? 1 : 0);
 
@@ -542,14 +465,6 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     // The slot must be the one the published sequence names, not the one before it:
     // the presenter reads slot (frameSequence % kFrameSlots), so the frame we are about
     // to write is numbered frameSequence + 1 and belongs in that slot.
-    // The fov probe, when this is its frame. Ahead of the interop copy so that a copy
-    // failure cannot swallow it, and only ever on a keypress -- it is a full GPU sync
-    // and a 15 MB readback, which is precisely what the interop path exists to avoid.
-    float probeFov[2] = {};
-    float probeAspect[2] = {};
-    if (stereoTakeFovProbe(probeFov, probeAspect))
-        dumpFovProbe(state.gl, width, height, probeFov, probeAspect);
-
     const uint32_t slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
 
     // The poses go in the SAME slot as the pixels they belong to. Version 1 kept one
@@ -595,6 +510,18 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
              block->views[0].fov.angleRight, block->views[0].fov.angleUp,
              block->views[0].fov.angleDown);
     }
+}
+
+bool presenterFovMutable() {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return true;
+    return state.block->fovMutable != 0;
+}
+
+int32_t presenterViewSequence() {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return 0;
+    return state.block->viewsValid ? state.block->viewSequence : 0;
 }
 
 bool presenterLatestViews(SharedView views[2], SharedPose& head) {

@@ -62,24 +62,33 @@ void vrRequestRecentre();
 // so the presenter can submit the pose the image was actually drawn from.
 bool vrLastRenderedViews(SharedView out[2]);
 
-// Dump one block of diagnostics on the next frame: the composed orientation matrix and
-// whether it is still a proper rotation, the eye offsets, and the frustum written into
-// the cameras. Meant to be triggered while LOOKING at whatever looks wrong -- a matrix
-// that has stopped being orthonormal shears the world in proportion to how far the head
-// is turned, which hides completely when you are facing forward.
-void vrRequestDump();
+// True when the head rotation is being replaced by a look override -- the fixed debug
+// rotation, or the mouse.
+bool vrLookOverrideActive();
 
-// True when the head rotation is being replaced by the fixed debug rotation.
-bool vrDebugRotationActive();
+// That override as a 3x3 in GPL axes, row-major. ONE definition, used both by the VR
+// path (which writes it over the head rotation) and by the flat path (which composes it
+// onto the game's own camera), so the two cannot drift apart.
+void vrLookOverrideMatrix(float out[9]);
+
+// Compose the override onto a camera orientation, in place, right-multiplied so it acts
+// in camera-local axes exactly as a head rotation does. Returns false and leaves the
+// matrix untouched when no override is active.
+//
+// This is the flat-monitor path. With vr = 0 there is no presenter and vrAcquireEyes
+// never runs, so the override has to be applied where the scene parameters pass by --
+// which is what makes the distortion judgeable on a monitor, where the headset's mirror
+// preview is letterboxed and shrunk and cannot settle anything.
+bool vrApplyLookOverride(float orientation[9]);
 
 // Sweep that rotation, in degrees. Called once a frame from the key poll.
-void vrDebugRotateBy(float yawDegrees, float pitchDegrees);
+void vrLookOverrideBy(float yawDegrees, float pitchDegrees);
 
 // Back to the starting angles from the ini.
-void vrDebugRotateReset();
+void vrLookOverrideReset();
 
 // The angles currently in force, for logging.
-void vrDebugRotationAngles(float& yawDegrees, float& pitchDegrees);
+void vrLookOverrideAngles(float& yawDegrees, float& pitchDegrees);
 
 // Forget the last rendered views. Must be called on any frame the eyes were NOT rendered
 // from a head pose -- stereo switched off, a menu, a failed acquire. Otherwise the

@@ -31,4 +31,17 @@ void presenterStop();
 // log line that proves the return path works.
 bool presenterLatestViews(SharedView views[2], SharedPose& head);
 
+// The presenter's view-publication counter, or 0 if it is not publishing.
+//
+// Extra renders pace themselves off this rather than off a slice of the game's tick.
+// Slicing produced 108 Hz into a 90 Hz display, which does not divide: about every
+// fifth frame is discarded and the leftovers beat at 18 Hz, which is visible as exactly
+// the stepping the extra renders were meant to remove. Locking to this counter makes
+// each rendered frame correspond to one display frame.
+int32_t presenterViewSequence();
+
+// False when the runtime forbids the application changing the field of view. Defaults
+// to true until the presenter has reported, so nothing is disabled on a guess.
+bool presenterFovMutable();
+
 }  // namespace gplvr

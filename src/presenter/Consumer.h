@@ -56,6 +56,11 @@ public:
 
     void publishViews(const SharedView views[2], const SharedPose& head, bool valid);
 
+    // Tell the game whether the runtime allows a modified fov. False means a submitted
+    // fov is ignored rather than honoured, so the eye cameras must render exactly what
+    // the runtime asks for.
+    void publishFovMutable(bool mutableFov);
+
     void setError(int32_t code);
     bool shutdownRequested() const;
     bool producerAlive() const;
@@ -97,6 +102,7 @@ private:
         int32_t    sequence = 0;
         bool       sideBySide = false;
         uint32_t   eyeHalfWidth = 0;
+        uint32_t   eyeRect[2][4] = {};
         bool       stretchToFill = false;
         float      monoScale = 0.5f;
         bool       renderedValid = false;
@@ -116,6 +122,10 @@ private:
     bool     loggedSideBySide_ = false;
     bool     loggedStretch_ = false;
     bool     loggedRenderedValid_ = false;
+    uint32_t loggedSourceW_ = 0;
+    uint32_t loggedSourceH_ = 0;
+    uint32_t loggedEyeW_ = 0;
+    uint32_t loggedEyeH_ = 0;
     float    loggedFov_ = -1.0f;
     int32_t  viewSequence_ = 0;
 
