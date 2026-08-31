@@ -23,9 +23,10 @@ struct Options {
     // code for '1' is simply 0x31.
     int stereoKey = '1';
 
-    // Stop the rasterizer forcing its window above everything else. With
-    // blockDisplayChange on, roglv2 still believes it is exclusive fullscreen and makes
-    // its window topmost, which hides even the alt-tab switcher.
+    // Stop the rasterizer forcing its window above everything else.
+    //
+    // roglv2's WindowManager::SetSize calls SetWindowPos(hwnd, HWND_TOPMOST, ...) on
+    // every mode change; that is the only source, and demoting it there is enough.
     bool allowWindowTopmost = false;
 
     // Make the render window one pixel short of the desktop.
@@ -167,6 +168,28 @@ struct Options {
     // be an invented number, and it should not be the thing in the way once the source
     // resolution rises.
     float vrRenderScale = 1.0f;
+
+    // Render the whole frame into an off-screen buffer sized by vrRenderScale instead of
+    // by the game window.
+    //
+    // This is what makes vrRenderScale mean anything above 1.0. With it off the eyes are
+    // halves of roglv2's back buffer, so their size is a Windows display mode and every
+    // pixel above 1280x1440 is invented by the presenter's upscale. With it on the game
+    // rasterizes at the headset's own resolution and the flat window becomes a scaled
+    // monitor of the result.
+    //
+    // OFF by default for its first release, and it should not stay an option: the two
+    // things to look at first are whether the menus, which are laid out in surface
+    // pixels, still place their cursor correctly, and whether GPL's own HUD follows the
+    // larger surface. Both are visible in one session. Once they are answered this
+    // becomes the behaviour and the switch goes -- see AGENTS.md on options.
+    bool vrOffscreen = false;
+
+    // What the flat window shows while VR is on: 0 both eyes, 1 the left eye, 2 the
+    // right. Only meaningful with vrOffscreen on, because without an off-screen frame
+    // the window IS the render and there is nothing to choose.
+    int vrMonitorEye = 0;
+
 
 };
 

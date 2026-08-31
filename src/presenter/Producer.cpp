@@ -1,5 +1,7 @@
 #include "presenter/Producer.h"
 
+#include "RenderTarget.h"
+
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -337,6 +339,9 @@ bool presenterStart() {
         fail("WGL_NV_DX_interop is unavailable, and it is the only transport built");
         return false;
     }
+    // Not a failure if it does not resolve: the frame then goes into the window's own
+    // back buffer, exactly as it did before there was an off-screen path at all.
+    renderTargetResolve(state.gl);
 
     wchar_t instance[32] = {};
     if (!createControlBlock(state, instance)) {
@@ -382,9 +387,9 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         }
         if (presenter < ProcessState::RequirementsReady) return;
 
-        logf("vr: presenter is ready -- adapter %08lX:%08lX, recommends %ux%u per eye",
+        logf("vr: presenter is ready -- adapter %08lX:%08lX, wants %ux%u per eye",
              (unsigned long)block->adapterLuidHigh, (unsigned long)block->adapterLuidLow,
-             block->recommendedEyeWidth, block->recommendedEyeHeight);
+             block->targetEyeWidth, block->targetEyeHeight);
         if (!createDevice(state)) {
             fail("could not create a D3D11 device on the runtime's adapter");
             return;
@@ -429,9 +434,24 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         state.height = 0;
     }
 
+    // What the game should render into, in pixels, both eyes side by side. The
+    // presenter publishes the size it actually created its swapchains at -- scaled by
+    // vrRenderScale and clamped to the runtime's maximum -- so there is one number and
+    // not two that have to agree.
+    if (g_options.vrOffscreen && block->targetEyeWidth && block->targetEyeHeight) {
+        renderTargetRequestSize(static_cast<int>(block->targetEyeWidth) * 2,
+                                static_cast<int>(block->targetEyeHeight));
+    } else {
+        renderTargetRequestSize(0, 0);
+    }
+
     int width = 0;
     int height = 0;
-    if (!glDrawableSize(state.gl, width, height)) return;
+    // The render target when there is one, the window when there is not. Asked in that
+    // order rather than switched on the option, so a target that failed to build is
+    // indistinguishable from the option being off.
+    if (!renderTargetSize(width, height) && !glDrawableSize(state.gl, width, height))
+        return;
 
     if (width != state.width || height != state.height) {
         if (state.width)
@@ -481,9 +501,18 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     }
     block->renderedViewsValid[slot] = haveRendered ? 1 : 0;
 
-    if (!glInteropCopyBackBuffer(state.gl, state.interopDevice, state.shared[slot],
-                                 width, height))
-        return;
+    // Timed, because it is the one per-frame cost with no instrument on it and it runs
+    // once per PUBLISHED frame -- so three to six times a tick, each ending in a glFinish
+    // that stalls until the GPU drains. At 76.8 MB that is not obviously cheap, and the
+    // frame budget cannot be reasoned about while one of its terms is unknown.
+    LARGE_INTEGER transferBegin, transferEnd;
+    QueryPerformanceCounter(&transferBegin);
+    const bool transferred =
+        glInteropCopyBackBuffer(state.gl, state.interopDevice, state.shared[slot], width,
+                                height, renderTargetFramebuffer());
+    QueryPerformanceCounter(&transferEnd);
+    presenterNoteTransfer(transferEnd.QuadPart - transferBegin.QuadPart);
+    if (!transferred) return;
 
     // The copy above ends in glFinish, so the pixels are complete before the sequence
     // that advertises them is published. That ordering is the whole reason no lock is
@@ -510,6 +539,53 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
              block->views[0].fov.angleRight, block->views[0].fov.angleUp,
              block->views[0].fov.angleDown);
     }
+}
+
+void presenterEndFrame() {
+    State& state = g_state;
+    if (state.stage == Stage::Off) return;
+    renderTargetEndFrame(state.gl);
+}
+
+void presenterBlitToWindow(int eye) {
+    State& state = g_state;
+    if (state.stage == Stage::Off) return;
+    renderTargetBlitToWindow(state.gl, eye);
+}
+
+void presenterBeginFrame() {
+    State& state = g_state;
+    if (state.stage == Stage::Off) return;
+    if (!g_options.vr || !g_options.vrOffscreen) {
+        // Not merely "do not bind": the engine's back buffer size has to go back to what
+        // roglv2 believes, or the next frame is laid out for a surface that is no longer
+        // the render target.
+        renderTargetRelease(state.gl);
+        return;
+    }
+    renderTargetBeginFrame(state.gl);
+}
+
+namespace {
+long long g_transferTicks = 0;
+int       g_transferCount = 0;
+}  // namespace
+
+void presenterNoteTransfer(long long ticks) {
+    g_transferTicks += ticks;
+    ++g_transferCount;
+}
+
+bool presenterTakeTransferCost(double& totalMs, int& count) {
+    if (!g_transferCount) return false;
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    totalMs = 1000.0 * static_cast<double>(g_transferTicks) /
+              static_cast<double>(frequency.QuadPart);
+    count = g_transferCount;
+    g_transferTicks = 0;
+    g_transferCount = 0;
+    return true;
 }
 
 bool presenterFovMutable() {

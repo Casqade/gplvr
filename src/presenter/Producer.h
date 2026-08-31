@@ -20,9 +20,29 @@ namespace gplvr {
 // launched; the game carries on as a flat stereo mod.
 bool presenterStart();
 
-// Called from the frame hook, before the game presents, so the back buffer still holds
-// the finished frame. Drives the handshake, then copies and publishes.
+// Called from the frame hook, before the game presents, so the render target still
+// holds the finished frame. Drives the handshake, then copies and publishes.
 void presenterFrame(bool sideBySide, bool stretchToFill);
+
+// The off-screen render target, which is what decouples the eye resolution from the
+// game window. These own the GL entry points, which is why they live here rather than
+// being called on RenderTarget directly from the frame hook.
+//
+//   presenterEndFrame     stop drawing off-screen, before the copy and the present
+//   presenterBlitToWindow show the off-screen frame in the game window
+//   presenterBeginFrame   start drawing off-screen again, after the present
+//
+// All three are inert unless vr and vrOffscreen are on and the target actually built.
+void presenterEndFrame();
+
+// The frame transfer's cost. Noted per transfer, taken and reset by the reporter, so the
+// once-a-second line can say how much of the tick the transport is using -- the only
+// per-frame term that has never been measured.
+void presenterNoteTransfer(long long ticks);
+bool presenterTakeTransferCost(double& totalMs, int& count);
+
+void presenterBlitToWindow(int eye);
+void presenterBeginFrame();
 
 void presenterStop();
 

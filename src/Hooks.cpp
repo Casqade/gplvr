@@ -2,6 +2,7 @@
 
 #include "MouseLook.h"
 #include "Log.h"
+#include "RenderTarget.h"
 #include "Stereo.h"
 #include "VrCamera.h"
 #include "presenter/Producer.h"
@@ -46,6 +47,7 @@ bool      g_loggedMouseLook = false;
 // presenter side-by-side anyway made it cut the menu in half and blow one half up to
 // fill the headset. What matters is whether THIS frame has two eyes in it.
 bool      g_stereoRenderedFrame = false;
+bool      g_warnedLateTick = false;
 
 // The parameter block the last scene render used. Stable across frames -- it is
 // simFrame+81 -- but taken from the hook rather than assumed, so an extra render can
@@ -80,11 +82,18 @@ void reportOncePerSecond() {
             : 0.0;
     const double worstMs = 1000.0 * g_sceneTicksWorst / g_frequency.QuadPart;
 
+    double transferMs = 0.0;
+    int    transfers = 0;
+    const bool haveTransfer = presenterTakeTransferCost(transferMs, transfers);
+
     logf("fps %.1f | worldFrames %.1f/s, renders %.1f/s (x%.2f), %.2f ms each, "
-         "%.2f ms worst | mode %s",
+         "%.2f ms worst | transfer %.2f ms x%.1f/frame | mode %s",
          g_frames / seconds, g_sceneHookCalls / seconds, g_sceneOrigCalls / seconds,
          g_sceneHookCalls ? static_cast<double>(g_sceneOrigCalls) / g_sceneHookCalls : 0.0,
-         msPerRender, worstMs, g_options.stereo ? "stereo" : "single");
+         msPerRender, worstMs,
+         haveTransfer && transfers ? transferMs / transfers : 0.0,
+         haveTransfer && g_frames ? static_cast<double>(transfers) / g_frames : 0.0,
+         g_options.stereo ? "stereo" : "single");
 
     g_windowStart = now;
     g_frames = 0;
@@ -224,6 +233,51 @@ void renderExtraFrames() {
     }
     g_warnedSlowTick = false;
 
+    // PACE AGAINST THE SIM'S OWN TICK, NOT THE RATE THE GAME HAPPENS TO BE RUNNING AT.
+    //
+    // Everything above measures the achieved frame interval, which is right for spacing
+    // but wrong for deciding how much time there is to spend -- because the extra renders
+    // are part of what determines that interval. At 30 Hz the measured interval is 33 ms,
+    // comfortably inside the 25 fps guard, so the deadline is generous, every extra render
+    // fits, and the game stays at 30. The loop is self-consistent at ANY rate, including
+    // one it caused itself. Measured: three extra renders held a heavy map at exactly
+    // 30.0 for minutes; dropping to two returned it to 36.0 with the same scene.
+    //
+    // The 36 is the sim TASK RATE, the same constant the mod is forbidden to change --
+    // and a frame slower than that is not merely less smooth. The user reports tyre grip
+    // behaving differently on maps that ran under 36, which is what you would expect if
+    // the physics is stepped by this rate. NOT yet verified in simFrameRender, and worth
+    // verifying before anything depends on it, but it turns "hold 36" from a comfort
+    // preference into a correctness one.
+    const LONGLONG budget = frequency.QuadPart / 36;
+
+    // Already late: give the time back rather than spending it. Reported on the
+    // transition only -- once per frame would be a flood at exactly the moment the log
+    // is least readable.
+    if (measured > budget + budget / 10) {
+        // On CHANGE, and CAPPED. A latch alone is not enough when the condition itself
+        // alternates: holding back on a late frame makes the next one early, so the
+        // transition fires again, and the first version of this line appeared 2650 times
+        // in one session. Reporting on change is necessary and not sufficient.
+        static int lateReportsLeft = 12;
+        if (!g_warnedLateTick && lateReportsLeft > 0) {
+            --lateReportsLeft;
+            g_warnedLateTick = true;
+            logf("vr: extra renders held back -- the game frame is %.1f ms against a "
+                 "27.8 ms tick, so the time belongs to the sim. They resume by "
+                 "themselves.%s",
+                 1000.0 * static_cast<double>(measured) /
+                     static_cast<double>(frequency.QuadPart),
+                 lateReportsLeft ? "" : " (further holdbacks will not be reported)");
+        }
+        return;
+    }
+    g_warnedLateTick = false;
+
+    // The earlier of the two: never plan past the next 36 Hz tick, and never past the
+    // next frame if the game is legitimately slower (a replay, a menu).
+    const LONGLONG pace = interval < budget ? interval : budget;
+
     int extra = g_options.vrExtraRenders;
     if (extra > 3) extra = 3;
 
@@ -252,7 +306,7 @@ void renderExtraFrames() {
     // The deadline is the point where the game's own next frame is due. Stop before it
     // rather than counting renders: if the presenter is slow we do fewer, if it is fast
     // we do more, and neither case runs into the game.
-    const LONGLONG deadline = now.QuadPart + interval - interval / 8;
+    const LONGLONG deadline = now.QuadPart + pace - pace / 8;
 
     for (int done = 0; done < extra; ++done) {
         const int32_t before = presenterViewSequence();
@@ -307,6 +361,11 @@ int __cdecl screenDisplayHook(void* surface) {
     // Same reason, same moment: the shared texture is filled from the back buffer
     // before the game presents it. presenterStart needs a current GL context, which is
     // why it starts here rather than at discovery time.
+    // The off-screen frame has to stop being the draw target before the presenter
+    // reads it and before the game presents: glCopyTexSubImage2D reads the READ
+    // framebuffer, and SwapBuffers only ever shows the window's own.
+    presenterEndFrame();
+
     if (g_options.vr) {
         if (!g_vrStarted) {
             g_vrStarted = true;
@@ -328,7 +387,20 @@ int __cdecl screenDisplayHook(void* surface) {
         g_stereoRenderedFrame = false;
     }
 
+    // The window is a monitor of the off-screen frame, not the frame itself. Between
+    // the presenter's copy and the present, so what the player sees on the desktop is
+    // the same image that went to the headset.
+    presenterBlitToWindow(g_options.vrMonitorEye);
+
     const int presented = g_originalScreenDisplay ? g_originalScreenDisplay(surface) : 0;
+
+    // Bind the off-screen target for the NEXT frame here, before the extra renders,
+    // because an extra render is a whole frame too and must land in the same place the
+    // game's own does. It also has to be before the game draws anything at all: GPL
+    // lays out the HUD and the 2D overlays into the same surface after sceneRender
+    // returns, so catching only the world would put the world in one buffer and the
+    // instruments in another.
+    presenterBeginFrame();
 
     // Extra renders go AFTER the present, in the idle tail of the tick.
     //
@@ -556,8 +628,12 @@ BOOL WINAPI clipCursorHook(const RECT* rect) {
     return realUser32<decltype(&ClipCursor)>("ClipCursor")(rect);
 }
 
-// roglv2 believes it is exclusive fullscreen and pushes its window above everything,
-// which hides the alt-tab switcher. Demote TOPMOST to NOTOPMOST on the way through.
+// roglv2's WindowManager::SetSize is the one that asks:
+//     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, cx, cy, 0)
+// on every mode change. Demote TOPMOST to NOTOPMOST on the way through. Note the flags
+// are 0, so that call also moves the window to (0,0) and resizes it -- and it then polls
+// GetWindowRect up to 500 times at 10 ms until the rect is exactly (0,0,cx,cy). Do not
+// change the window rect while a resize is in flight or the game stalls five seconds.
 BOOL WINAPI setWindowPosHook(HWND window, HWND insertAfter, int x, int y, int cx, int cy,
                              UINT flags) {
     ApiGuard guard;
@@ -571,10 +647,14 @@ BOOL WINAPI setWindowPosHook(HWND window, HWND insertAfter, int x, int y, int cx
                                                               cy, flags);
 }
 
-// Demoting SetWindowPos is not enough on its own: the sim window comes back topmost by
-// some other route (it is created by gplc67, not roglv2, so a WS_EX_TOPMOST at creation
-// is the likely culprit). Rather than chase every path, re-assert it from the frame
-// hook -- once a second is plenty and costs nothing.
+// Re-assert from the frame hook -- once a second is plenty and costs nothing.
+//
+// The guess this once carried, that gplc67 created the window WS_EX_TOPMOST, is WRONG:
+// WinMain calls CreateWindowExA with dwExStyle 0 and style WS_POPUP, and the IAT patch
+// covers roglv2 as well as the exe. The demote branch below should therefore never fire;
+// if it does, something outside these two modules is setting it, and that is worth
+// knowing. The branch that DOES earn its place is the one-pixel shrink: WS_POPUP exactly
+// covering the desktop is what Windows hands fullscreen exclusivity to.
 //
 // The game exports its own window handle, which is exact; fall back to enumerating our
 // thread's windows if that export is missing.
@@ -716,8 +796,15 @@ void loadOptions(const char* fileName) {
 
     logf("options: stereo=%d mirror=%d stereoKey=0x%02X",
          g_options.stereo, g_options.stereoMirror, g_options.stereoKey);
-    logf("options: vrMenuScale=%.2f vrRenderScale=%.2f vrRecentreKey=0x%02X",
-         g_options.vrMenuScale, g_options.vrRenderScale, g_options.vrRecentreKey);
+    g_options.vrOffscreen = GetPrivateProfileIntA("gplvr", "vrOffscreen", 0, path) != 0;
+    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 0, path);
+    if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 2)
+        g_options.vrMonitorEye = 0;
+
+    logf("options: vrMenuScale=%.2f vrRenderScale=%.2f vrRecentreKey=0x%02X "
+         "vrOffscreen=%d vrMonitorEye=%d",
+         g_options.vrMenuScale, g_options.vrRenderScale, g_options.vrRecentreKey,
+         g_options.vrOffscreen, g_options.vrMonitorEye);
     logf("options: vrExtraRenders=%d vrHorizonLock=%.2f vrWorldScale=%.2f",
          g_options.vrExtraRenders, g_options.vrHorizonLock, g_options.vrWorldScale);
     logf("options: vrMouseLook=%d sensitivity=%.3f invertPitch=%d key=0x%02X",
@@ -745,11 +832,15 @@ bool installFrameCounter(Binding& binding) {
         return false;
     }
     logf("installFrameCounter: screenDisplay %p -> %p", g_originalScreenDisplay, hook);
+
+    // Hand over the ORIGINAL, before anyone can read the global and find our hook there.
+    renderTargetSetScreenDisplay(reinterpret_cast<const void*>(g_originalScreenDisplay));
     return true;
 }
 
 void requestSceneRenderHook(const Binding& binding) {
     stereoBind(binding);
+    renderTargetBind(binding);
 
     if (binding.sceneRenderCallSites.empty()) {
         logf("requestSceneRenderHook: nothing to patch");

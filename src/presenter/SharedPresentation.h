@@ -20,7 +20,7 @@
 //   --------------                        ---------------
 //   create block, launch presenter   -->
 //   Starting
-//                                    <--  adapter LUID + recommended eye size
+//                                    <--  adapter LUID + target eye size
 //                                         RequirementsReady
 //   create device on THAT adapter,
 //   create shared textures, publish
@@ -42,7 +42,7 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 4;  // 4: added eyeRect
+inline constexpr uint32_t kControlVersion = 5;  // 5: targetEye* replaces recommendedEye*
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -118,8 +118,17 @@ struct ControlBlock {
     // -- presenter to producer, valid once presenterState >= RequirementsReady --------
     uint32_t adapterLuidLow = 0;
     int32_t  adapterLuidHigh = 0;
-    uint32_t recommendedEyeWidth = 0;
-    uint32_t recommendedEyeHeight = 0;
+    // The size the game should render EACH EYE at: the runtime's recommendation
+    // multiplied by vrRenderScale and clamped to the runtime's own maximum.
+    //
+    // Already scaled and clamped, on purpose. This used to carry the raw recommendation
+    // and the presenter applied the scale again when it created its swapchains, which
+    // was fine while nothing else read it -- but the moment the game renders off-screen
+    // there are two places computing the same number from the same inputs, and two such
+    // places eventually disagree. One number, computed once, by the side that knows the
+    // runtime's maximum.
+    uint32_t targetEyeWidth = 0;
+    uint32_t targetEyeHeight = 0;
 
     // -- producer to presenter, valid once producerState >= TexturesReady ------------
     //

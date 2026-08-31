@@ -76,6 +76,7 @@ else()
         src/Log.cpp
         src/MouseLook.cpp
         src/Pe.cpp
+        src/RenderTarget.cpp
         src/Stereo.cpp
         src/VrCamera.cpp
         src/presenter/Producer.cpp

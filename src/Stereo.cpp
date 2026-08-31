@@ -2,6 +2,7 @@
 
 #include "Hooks.h"
 #include "Log.h"
+#include "RenderTarget.h"
 #include "VrCamera.h"
 
 #include <windows.h>
@@ -213,6 +214,11 @@ bool ensureEyes(void* mainCamera) {
 
     void* source = cameraPointer(mainCamera, kCameraSurface);
     if (!source) return false;
+
+    // Before measuring it. When the frame is going to an off-screen target, the surface
+    // GPL built for its own display mode has to be told the new size, or the eyes are
+    // carved out of the old one and nothing about the resolution actually changes.
+    renderTargetOverrideSurface(source);
 
     const int width = bitmapWidth(source);
     const int height = bitmapHeight(source);

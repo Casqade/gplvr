@@ -132,13 +132,13 @@ void Consumer::publishRequirements(LUID adapter, uint32_t eyeWidth,
 
     block_->adapterLuidLow = adapter.LowPart;
     block_->adapterLuidHigh = adapter.HighPart;
-    block_->recommendedEyeWidth = eyeWidth;
-    block_->recommendedEyeHeight = eyeHeight;
+    block_->targetEyeWidth = eyeWidth;
+    block_->targetEyeHeight = eyeHeight;
 
     // Payload first, then the state that advertises it.
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->presenterState),
                         static_cast<LONG>(ProcessState::RequirementsReady));
-    logf("present: published adapter %08lX:%08lX and %ux%u per eye",
+    logf("present: published adapter %08lX:%08lX and a %ux%u per-eye render target",
          (unsigned long)adapter.HighPart, (unsigned long)adapter.LowPart, eyeWidth,
          eyeHeight);
 }

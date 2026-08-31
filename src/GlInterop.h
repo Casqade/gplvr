@@ -36,6 +36,36 @@ typedef void(WINAPI* GlBindTextureFn)(GLenum, GLuint);
 typedef void(WINAPI* GlCopyTexSubImage2DFn)(GLenum, GLint, GLint, GLint, GLint, GLint,
                                             GLsizei, GLsizei);
 typedef void(WINAPI* GlPixelStoreiFn)(GLenum, GLint);
+typedef void(WINAPI* GlTexImage2DFn)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint,
+                                     GLenum, GLenum, const void*);
+typedef void(WINAPI* GlTexParameteriFn)(GLenum, GLenum, GLint);
+typedef void(WINAPI* GlViewportFn)(GLint, GLint, GLsizei, GLsizei);
+typedef void(WINAPI* GlMatrixModeFn)(GLenum);
+typedef void(WINAPI* GlLoadIdentityFn)();
+typedef void(WINAPI* GlOrthoFn)(double, double, double, double, double, double);
+typedef void(WINAPI* GlTranslatefFn)(GLfloat, GLfloat, GLfloat);
+typedef void(WINAPI* GlClearFn)(GLbitfield);
+typedef void(WINAPI* GlClearColorFn)(GLfloat, GLfloat, GLfloat, GLfloat);
+
+typedef void(WINAPI* GlEnableFn)(GLenum);
+typedef GLboolean(WINAPI* GlIsEnabledFn)(GLenum);
+typedef void(WINAPI* GlGetIntegervFn)(GLenum, GLint*);
+
+// EXT_framebuffer_object / GL 3.0. Resolved through wglGetProcAddress, ARB names first
+// and the EXT spelling as a fallback: roglv2 links a GLEW that only ever loads the EXT
+// entry points, so the EXT names are certain to exist on any driver that runs the game.
+typedef void(WINAPI* GlGenFramebuffersFn)(GLsizei, GLuint*);
+typedef void(WINAPI* GlDeleteFramebuffersFn)(GLsizei, const GLuint*);
+typedef void(WINAPI* GlBindFramebufferFn)(GLenum, GLuint);
+typedef void(WINAPI* GlFramebufferTexture2DFn)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef void(WINAPI* GlGenRenderbuffersFn)(GLsizei, GLuint*);
+typedef void(WINAPI* GlDeleteRenderbuffersFn)(GLsizei, const GLuint*);
+typedef void(WINAPI* GlBindRenderbufferFn)(GLenum, GLuint);
+typedef void(WINAPI* GlRenderbufferStorageFn)(GLenum, GLenum, GLsizei, GLsizei);
+typedef void(WINAPI* GlFramebufferRenderbufferFn)(GLenum, GLenum, GLenum, GLuint);
+typedef GLenum(WINAPI* GlCheckFramebufferStatusFn)(GLenum);
+typedef void(WINAPI* GlBlitFramebufferFn)(GLint, GLint, GLint, GLint, GLint, GLint,
+                                          GLint, GLint, GLbitfield, GLenum);
 
 typedef HANDLE(WINAPI* WglDXOpenDeviceFn)(void*);
 typedef BOOL(WINAPI* WglDXCloseDeviceFn)(HANDLE);
@@ -46,6 +76,18 @@ typedef BOOL(WINAPI* WglDXObjectAccessFn)(HANDLE, GLint, HANDLE*);
 // Not in the GL 1.1 headers the Windows SDK ships.
 inline constexpr GLenum kGlBgraExt = 0x80E1;
 inline constexpr GLenum kWglAccessWriteDiscardNv = 0x00000002;
+
+inline constexpr GLenum kGlFramebuffer = 0x8D40;
+inline constexpr GLenum kGlReadFramebuffer = 0x8CA8;
+inline constexpr GLenum kGlDrawFramebuffer = 0x8CA9;
+inline constexpr GLenum kGlRenderbuffer = 0x8D41;
+inline constexpr GLenum kGlColorAttachment0 = 0x8CE0;
+inline constexpr GLenum kGlDepthAttachment = 0x8D00;
+inline constexpr GLenum kGlDepthComponent24 = 0x81A6;
+inline constexpr GLenum kGlFramebufferComplete = 0x8CD5;
+inline constexpr GLenum kGlClampToEdge = 0x812F;
+inline constexpr GLenum kGlFramebufferBinding = 0x8CA6;
+inline constexpr GLenum kGlReadFramebufferBinding = 0x8CAA;
 
 struct GlFunctions {
     HMODULE                module = nullptr;
@@ -63,6 +105,39 @@ struct GlFunctions {
     GlBindTextureFn       bindTexture = nullptr;
     GlCopyTexSubImage2DFn copyTexSubImage2D = nullptr;
     GlPixelStoreiFn       pixelStorei = nullptr;
+    GlTexImage2DFn        texImage2D = nullptr;
+    GlTexParameteriFn     texParameteri = nullptr;
+    GlViewportFn          viewport = nullptr;
+    GlMatrixModeFn        matrixMode = nullptr;
+    GlLoadIdentityFn      loadIdentity = nullptr;
+    GlOrthoFn             ortho = nullptr;
+    GlTranslatefFn        translatef = nullptr;
+    GlClearFn             clear = nullptr;
+    GlClearColorFn        clearColor = nullptr;
+
+    GlEnableFn            enable = nullptr;
+    GlEnableFn            disable = nullptr;
+    GlIsEnabledFn         isEnabled = nullptr;
+    GlGetIntegervFn       getIntegerv = nullptr;
+
+    // Which spelling each framebuffer entry point resolved to. Not cosmetic: the EXT
+    // entry points predate GL 3.0's split of the framebuffer binding into a READ and a
+    // DRAW target, and a call that passes GL_READ_FRAMEBUFFER to an entry point that
+    // does not know it fails with INVALID_ENUM, leaves the binding alone, and makes
+    // every later call read from the wrong place.
+    bool framebufferIsExt = false;
+
+    GlGenFramebuffersFn         genFramebuffers = nullptr;
+    GlDeleteFramebuffersFn      deleteFramebuffers = nullptr;
+    GlBindFramebufferFn         bindFramebuffer = nullptr;
+    GlFramebufferTexture2DFn    framebufferTexture2D = nullptr;
+    GlGenRenderbuffersFn        genRenderbuffers = nullptr;
+    GlDeleteRenderbuffersFn     deleteRenderbuffers = nullptr;
+    GlBindRenderbufferFn        bindRenderbuffer = nullptr;
+    GlRenderbufferStorageFn     renderbufferStorage = nullptr;
+    GlFramebufferRenderbufferFn framebufferRenderbuffer = nullptr;
+    GlCheckFramebufferStatusFn  checkFramebufferStatus = nullptr;
+    GlBlitFramebufferFn         blitFramebuffer = nullptr;
 
     WglDXOpenDeviceFn       dxOpenDevice = nullptr;
     WglDXCloseDeviceFn      dxCloseDevice = nullptr;
@@ -80,6 +155,11 @@ bool glResolve(GlFunctions& gl);
 // points and reports whether WGL_NV_DX_interop is advertised.
 bool glResolveInterop(GlFunctions& gl, HDC dc);
 
+// Framebuffer objects, for rendering off-screen at a size the window does not dictate.
+// Must be called with a context current. False means the off-screen path is unavailable
+// and everything falls back to rendering into the window's own back buffer.
+bool glResolveFramebuffer(GlFunctions& gl);
+
 // The client area of the window the current context draws to.
 bool glDrawableSize(const GlFunctions& gl, int& width, int& height);
 
@@ -89,6 +169,9 @@ struct GlSharedTexture {
     HANDLE           shareHandle = nullptr;  // legacy, openable by the x64 presenter
     HANDLE           interopObject = nullptr;
     GLuint           name = 0;
+    // A framebuffer with `name` as colour attachment 0, so the frame can be moved with
+    // glBlitFramebuffer instead of glCopyTexSubImage2D. See the copy function.
+    GLuint framebuffer = 0;
 };
 
 // The D3D11 device must live on the adapter the OpenXR runtime named, or the share
@@ -101,12 +184,26 @@ bool glInteropRegister(const GlFunctions& gl, HANDLE interopDevice,
 void glInteropUnregister(const GlFunctions& gl, HANDLE interopDevice,
                          GlSharedTexture& shared);
 
-// Copy the current back buffer into the registered texture. Synchronous: it ends with
+// Copy the current render result into the registered texture. Synchronous: it ends with
 // glFinish, so when it returns the pixels really are there and the frame can be
 // published. That costs the 0.21 ms measured above and removes any question about what
 // the presenter might read half-written.
+//
+// `sourceFramebuffer` is 0 for the window's own back buffer, or the name of an
+// off-screen framebuffer whose colour attachment 0 holds the frame. The cost does not
+// change with the source -- it is the same glCopyTexSubImage2D either way, which is why
+// rendering off-screen adds no copy.
+//
+// From the window's back buffer it uses glCopyTexSubImage2D, which is proven. From an
+// off-screen framebuffer it uses glBlitFramebuffer into a framebuffer wrapping the shared
+// texture instead, because glCopyTexSubImage2D with an FBO as the read source returns
+// INVALID_OPERATION here -- measured, twice, with errors drained beforehand so it could
+// only have been its own. Which call in the sequence failed is reported for the first few
+// frames after every texture recreation, so a failure names itself instead of arriving as
+// a black headset.
 bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
-                             const GlSharedTexture& shared, int width, int height);
+                             const GlSharedTexture& shared, int width, int height,
+                             GLuint sourceFramebuffer);
 
 // Pull the back buffer into system memory as BGRA, bottom-up, for the one-shot fov
 // probe. This is the slow path the interop transport exists to avoid -- 1.36 ms and a

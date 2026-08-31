@@ -377,6 +377,37 @@ const char* sessionStateName(XrSessionState state) {
     }
 }
 
+// The size one eye is rendered at, submitted at, and now also RASTERIZED at.
+//
+// One function, because there are three consumers of this number and they have to agree
+// exactly: the swapchain, the requirements published to the game, and -- once the game
+// renders off-screen -- the game's own render target. Computing it twice from the same
+// inputs works right up until one copy is edited.
+//
+// The ceiling is the runtime's own maximum, reported beside the recommendation by
+// xrEnumerateViewConfigurationViews. The old hard-coded 1.0 was wrong twice: arbitrary,
+// against 3172 recommended and 8192 max here; and protecting nothing, because a
+// swapchain above the maximum is refused by xrCreateSwapchain anyway.
+void targetEyeSize(const XrViewConfigurationView& view, float renderScale,
+                   uint32_t& width, uint32_t& height, bool& clamped) {
+    const float scale = renderScale > 0.05f ? renderScale : 1.0f;
+
+    const uint32_t askedW = static_cast<uint32_t>(view.recommendedImageRectWidth * scale);
+    const uint32_t askedH =
+        static_cast<uint32_t>(view.recommendedImageRectHeight * scale);
+
+    width = askedW;
+    height = askedH;
+    if (view.maxImageRectWidth && width > view.maxImageRectWidth)
+        width = view.maxImageRectWidth;
+    if (view.maxImageRectHeight && height > view.maxImageRectHeight)
+        height = view.maxImageRectHeight;
+    if (width < 64) width = 64;
+    if (height < 64) height = 64;
+
+    clamped = width != askedW || height != askedH;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -595,9 +626,17 @@ int wmain(int argc, wchar_t** argv) {
         // Before the requirements, so the game knows the fov rule from its very first
         // tracked frame rather than scaling once and being corrected afterwards.
         consumer.publishFovMutable(g_fovMutable);
-        consumer.publishRequirements(chosen.AdapterLuid,
-                                     viewConfigs[0].recommendedImageRectWidth,
-                                     viewConfigs[0].recommendedImageRectHeight);
+        uint32_t targetW = 0;
+        uint32_t targetH = 0;
+        bool     targetClamped = false;
+        targetEyeSize(viewConfigs[0], options.renderScale, targetW, targetH,
+                      targetClamped);
+        if (targetClamped)
+            logf("xr: vrRenderScale %.2f asked for more than the runtime allows -- "
+                 "clamped to its maximum of %ux%u",
+                 options.renderScale, (unsigned)viewConfigs[0].maxImageRectWidth,
+                 (unsigned)viewConfigs[0].maxImageRectHeight);
+        consumer.publishRequirements(chosen.AdapterLuid, targetW, targetH);
     }
 
     ID3D11Device*        device = nullptr;
@@ -731,25 +770,10 @@ int wmain(int argc, wchar_t** argv) {
         // headset. It is worth having anyway: the compositor's own distortion warp
         // resamples what we hand it, and once the source resolution rises the ceiling
         // should not be the thing in the way.
-        const uint32_t maxW = viewConfigs[i].maxImageRectWidth;
-        const uint32_t maxH = viewConfigs[i].maxImageRectHeight;
-        float scale = options.renderScale > 0.05f ? options.renderScale : 1.0f;
-
-        uint32_t width = static_cast<uint32_t>(
-            viewConfigs[i].recommendedImageRectWidth * scale);
-        uint32_t height = static_cast<uint32_t>(
-            viewConfigs[i].recommendedImageRectHeight * scale);
-        if (maxW && width > maxW) width = maxW;
-        if (maxH && height > maxH) height = maxH;
-        if (width < 64) width = 64;
-        if (height < 64) height = 64;
-        if (i == 0 && (width != static_cast<uint32_t>(
-                                    viewConfigs[i].recommendedImageRectWidth * scale) ||
-                       height != static_cast<uint32_t>(
-                                     viewConfigs[i].recommendedImageRectHeight * scale)))
-            logf("xr: vrRenderScale %.2f asked for more than the runtime allows -- "
-                 "clamped to its maximum of %ux%u",
-                 scale, maxW, maxH);
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool     clamped = false;
+        targetEyeSize(viewConfigs[i], options.renderScale, width, height, clamped);
 
         swapchainInfo.width = width;
         swapchainInfo.height = height;
