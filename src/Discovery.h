@@ -27,6 +27,10 @@
 
 namespace gplvr {
 
+// Resolve one rasterizer entry point's global by its export name, the way the table
+// below is filled. For the entry points the table does not carry a field for.
+void** rasterGlobal(const ModuleImage& image, const char* name);
+
 struct RasterTable {
     void** screenDisplay = nullptr;
     void** screenGetBackBuffer = nullptr;

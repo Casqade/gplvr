@@ -1,0 +1,170 @@
+<?xml version="1.0"?>
+<GPLPatch>
+
+<!-- FFB: deepen the force curve's notch from -1.20 to -1.33.
+
+This is what GEM's ffb3test1.xml was trying to do. That file writes 315 dwords
+starting at the HEADER's address: 157 of them are the stock table misaligned by
+four entries, 155 are byte-identical no-ops, and only three are real edits. The
+misalignment overwrites the 5.0 domain max and the integer count 313, and moves
+the curve's ascending limb while leaving the descending limb in place, breaking a
+symmetry the whole table is built on.
+
+This emits the stock curve with every NEGATIVE sample scaled by 1.108333 so the notch
+reaches -1.33. Symmetry is preserved exactly, the header is untouched, the positive
+lobe is unchanged, and there is no step at the zero crossing because the samples
+there are ~0. 25 of 313 entries are written.
+NOT A RATE FIX.
+-->
+
+   <BinaryPatch>
+      <!-- y[145] -0.00806 -> -0.00893 -->
+      <VirtualAddress>0x0055BCD0</VirtualAddress>
+      <Data>6A5C12BC</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[146] -0.05621 -> -0.06230 -->
+      <VirtualAddress>0x0055BCD4</VirtualAddress>
+      <Data>AC2D7FBD</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[147] -0.11365 -> -0.12596 -->
+      <VirtualAddress>0x0055BCD8</VirtualAddress>
+      <Data>34FC00BE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[148] -0.18201 -> -0.20173 -->
+      <VirtualAddress>0x0055BCDC</VirtualAddress>
+      <Data>B7914EBE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[149] -0.26301 -> -0.29150 -->
+      <VirtualAddress>0x0055BCE0</VirtualAddress>
+      <Data>D93F95BE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[150] -0.35821 -> -0.39702 -->
+      <VirtualAddress>0x0055BCE4</VirtualAddress>
+      <Data>B145CBBE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[151] -0.46865 -> -0.51942 -->
+      <VirtualAddress>0x0055BCE8</VirtualAddress>
+      <Data>BCF804BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[152] -0.59413 -> -0.65849 -->
+      <VirtualAddress>0x0055BCEC</VirtualAddress>
+      <Data>119328BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[153] -0.73214 -> -0.81146 -->
+      <VirtualAddress>0x0055BCF0</VirtualAddress>
+      <Data>86BB4FBF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[154] -0.87642 -> -0.97137 -->
+      <VirtualAddress>0x0055BCF4</VirtualAddress>
+      <Data>69AB78BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[155] -1.01536 -> -1.12536 -->
+      <VirtualAddress>0x0055BCF8</VirtualAddress>
+      <Data>B50B90BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[156] -1.13103 -> -1.25356 -->
+      <VirtualAddress>0x0055BCFC</VirtualAddress>
+      <Data>9874A0BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[157] -1.20000 -> -1.33000 -->
+      <VirtualAddress>0x0055BD00</VirtualAddress>
+      <Data>713DAABF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[158] -1.13103 -> -1.25356 -->
+      <VirtualAddress>0x0055BD04</VirtualAddress>
+      <Data>9874A0BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[159] -1.01536 -> -1.12536 -->
+      <VirtualAddress>0x0055BD08</VirtualAddress>
+      <Data>B50B90BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[160] -0.87642 -> -0.97137 -->
+      <VirtualAddress>0x0055BD0C</VirtualAddress>
+      <Data>69AB78BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[161] -0.73214 -> -0.81146 -->
+      <VirtualAddress>0x0055BD10</VirtualAddress>
+      <Data>86BB4FBF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[162] -0.59413 -> -0.65849 -->
+      <VirtualAddress>0x0055BD14</VirtualAddress>
+      <Data>119328BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[163] -0.46865 -> -0.51942 -->
+      <VirtualAddress>0x0055BD18</VirtualAddress>
+      <Data>BCF804BF</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[164] -0.35821 -> -0.39702 -->
+      <VirtualAddress>0x0055BD1C</VirtualAddress>
+      <Data>B145CBBE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[165] -0.26301 -> -0.29150 -->
+      <VirtualAddress>0x0055BD20</VirtualAddress>
+      <Data>D93F95BE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[166] -0.18201 -> -0.20173 -->
+      <VirtualAddress>0x0055BD24</VirtualAddress>
+      <Data>B7914EBE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[167] -0.11365 -> -0.12596 -->
+      <VirtualAddress>0x0055BD28</VirtualAddress>
+      <Data>34FC00BE</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[168] -0.05621 -> -0.06230 -->
+      <VirtualAddress>0x0055BD2C</VirtualAddress>
+      <Data>AC2D7FBD</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- y[169] -0.00806 -> -0.00893 -->
+      <VirtualAddress>0x0055BD30</VirtualAddress>
+      <Data>6A5C12BC</Data>
+   </BinaryPatch>
+
+</GPLPatch>

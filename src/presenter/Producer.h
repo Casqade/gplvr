@@ -44,6 +44,27 @@ bool presenterTakeTransferCost(double& totalMs, int& count);
 void presenterBlitToWindow(int eye);
 void presenterBeginFrame();
 
+// Draw the mouse pointer into the frame that is about to be copied and presented.
+//
+// Here rather than called on CursorOverlay directly from the frame hook, for the same
+// reason the three above are: this side owns the resolved GL entry points and the frame
+// hook has no GlFunctions of its own. `sideBySide` says whether this frame holds two
+// eyes, which is what decides between one cursor and one per eye.
+//
+// It also saves the pixels it covers; presenterRestoreUnderCursor puts them back.
+void presenterDrawCursor(bool sideBySide);
+
+// Put back the pixels the cursor was drawn over, before the game presents.
+//
+// Exactly one of these per presenterDrawCursor, in the same frame, AFTER the frame has
+// gone to the headset. GPL's menu does not redraw the whole back buffer and roglv2
+// preserves it across the swap, so a cursor left in there stays for the rest of the
+// session and the pointer paints a trail instead of moving.
+//
+// Gated only on the GL entry points and deliberately NOT on the presenter's stage, so a
+// save can never be left unmatched by a stage change landing between the two calls.
+void presenterRestoreUnderCursor();
+
 void presenterStop();
 
 // The most recent eye views the presenter published, or false if none yet. This is what

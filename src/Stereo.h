@@ -46,6 +46,18 @@ struct SceneParams {
     float mirrorEye[3];          // p[44..46]
     float pad3[18];              // p[47..64]
     float mirrorOrientation[9];  // p[65..73]
+    float mirrorQuat[4];         // p[74..77] the same rotation, as a quaternion
+    float pad4[3];               // p[78..80]
+    // gpl_mirrorViewCompute writes 0x3F32B8C2 here = 0.6981317 rad = EXACTLY 40 degrees.
+    // Full horizontal angle, same convention as mainFov.
+    float mirrorFov;             // p[81]
+    float mirrorCx;              // p[82]  already the asymmetric-frustum terms, so a
+    float mirrorCy;              // p[83]  per-eye mirror needs no game change
+    void* mirrorMip;             // p[84]  the texture the rear view is copied into
+    // Bit 0 tells gpl_sceneRender to bitmapDraw the rendered corner of the framebuffer
+    // into mirrorMip. gpl_simFrameRender SETS IT AND NEVER CLEARS IT, so it is a
+    // reliable "this frame really did refresh the mirror" signal.
+    unsigned mirrorFlags;        // p[85]
 };
 
 static_assert(sizeof(float) == 4, "32-bit floats assumed");
@@ -55,6 +67,10 @@ static_assert(offsetof(SceneParams, orientation) == 24 * 4, "p+24 is the orienta
 static_assert(offsetof(SceneParams, mainFov) == 40 * 4, "p[40] is the main fov");
 static_assert(offsetof(SceneParams, mainCy) == 42 * 4, "p[42] is the main cy");
 static_assert(offsetof(SceneParams, mirrorCamera) == 43 * 4, "p[43] is the mirror camera");
+static_assert(offsetof(SceneParams, mirrorOrientation) == 65 * 4, "p+65 is the mirror basis");
+static_assert(offsetof(SceneParams, mirrorFov) == 81 * 4, "p[81] is the mirror fov");
+static_assert(offsetof(SceneParams, mirrorMip) == 84 * 4, "p[84] is the mirror mip");
+static_assert(offsetof(SceneParams, mirrorFlags) == 85 * 4, "p[85] is the mirror flag word");
 
 // Camera object layout, from gpl_cameraCreate and gpl_cameraRebuildProjection.
 // Only the fields we read are named; everything else the engine derives itself.

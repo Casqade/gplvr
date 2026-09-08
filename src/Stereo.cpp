@@ -445,12 +445,72 @@ void gplEulerToMatrix(float yaw, float pitch, float roll, float out[9]) {
     out[8] = cy * cx;
 }
 
+// Re-aim the mirror before the game renders it.
+//
+// gpl_mirrorViewCompute builds the mirror view every sim tick as
+//     position    = car origin + M_car * (0, 0, 0.35)
+//     orientation = Rz(carYaw + pi) . Ry(-pitch) . Rx(-roll)
+//     fov         = 0.6981317 rad, exactly 40 degrees
+// and hands all of it over in the params block. Nothing about it is baked into the car
+// model -- the mirror GLASS is two texture-mapped quads per car and the engine never even
+// looks at their names -- so aiming it is entirely a matter of editing these fields.
+//
+// Rotations go through the game's own euler decomposition rather than a hand-rolled
+// matrix multiply, because gpl_viewRecordSetEuler builds this basis FROM eulers in the
+// first place: decomposing and recomposing is exactly the round trip the engine already
+// performs, and the existing per-frame check in stereoRender measures its error at zero.
+void aimMirror(SceneParams* params) {
+    const Options& o = g_options;
+    if (o.vrMirrorYaw == 0.0f && o.vrMirrorPitch == 0.0f && o.vrMirrorFov == 0.0f &&
+        o.vrMirrorBack == 0.0f && o.vrMirrorUp == 0.0f)
+        return;
+    if (!params->mirrorCamera) return;  // no mirror pass this frame; nothing to aim
+
+    if (o.vrMirrorYaw != 0.0f || o.vrMirrorPitch != 0.0f) {
+        float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+        gplMatrixToEuler(params->mirrorOrientation, yaw, pitch, roll);
+        const float toRad = 3.14159265358979f / 180.0f;
+        gplEulerToMatrix(yaw + o.vrMirrorYaw * toRad, pitch + o.vrMirrorPitch * toRad, roll,
+                         params->mirrorOrientation);
+    }
+
+    // Along the mirror's OWN axes, after any rotation above, so "back" means back from
+    // where the mirror is now looking rather than from where it started. The basis is
+    // row-major with the columns as the local axes, matching the main orientation.
+    if (o.vrMirrorBack != 0.0f || o.vrMirrorUp != 0.0f) {
+        const float* m = params->mirrorOrientation;
+        for (int i = 0; i < 3; ++i)
+            params->mirrorEye[i] += m[i * 3 + 0] * o.vrMirrorBack + m[i * 3 + 2] * o.vrMirrorUp;
+    }
+
+    if (o.vrMirrorFov > 0.0f)
+        params->mirrorFov = o.vrMirrorFov * (3.14159265358979f / 180.0f);
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        logf("mirror: re-aimed -- yaw %+.1f deg, pitch %+.1f deg, back %+.2f m, up %+.2f m, "
+             "fov %s. The stock view is 40.0 deg from the car origin plus 0.35 m forward.",
+             o.vrMirrorYaw, o.vrMirrorPitch, o.vrMirrorBack, o.vrMirrorUp,
+             o.vrMirrorFov > 0.0f ? "overridden" : "stock 40.0 deg");
+    }
+}
+
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     if (!stereoAvailable() || !params || !params->camera) return false;
     if (!ensureEyes(params->camera)) return false;
 
     void* const savedCamera = params->camera;
     void* const savedMirror = params->mirrorCamera;
+    // The params block is the GAME'S live memory, not a copy of it -- gpl_simFrameRender
+    // reuses it and zeroes p[43] the moment sceneRender returns. So anything we adjust in
+    // it has to be put back before we hand control away, mirror fields included.
+    float       savedMirrorEye[3];
+    float       savedMirrorBasis[9];
+    const float savedMirrorFov = params->mirrorFov;
+    std::memcpy(savedMirrorEye, params->mirrorEye, sizeof(savedMirrorEye));
+    std::memcpy(savedMirrorBasis, params->mirrorOrientation, sizeof(savedMirrorBasis));
+    aimMirror(params);
     const float savedX = params->eyeX;
     const float savedY = params->eyeY;
     const float savedZ = params->eyeZ;
@@ -762,6 +822,9 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
 
     params->camera = savedCamera;
     params->mirrorCamera = savedMirror;
+    params->mirrorFov = savedMirrorFov;
+    std::memcpy(params->mirrorEye, savedMirrorEye, sizeof(savedMirrorEye));
+    std::memcpy(params->mirrorOrientation, savedMirrorBasis, sizeof(savedMirrorBasis));
     params->eyeX = savedX;
     params->eyeY = savedY;
     params->eyeZ = savedZ;

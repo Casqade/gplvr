@@ -51,6 +51,27 @@ typedef void(WINAPI* GlEnableFn)(GLenum);
 typedef GLboolean(WINAPI* GlIsEnabledFn)(GLenum);
 typedef void(WINAPI* GlGetIntegervFn)(GLenum, GLint*);
 
+// Immediate mode, for the cursor overlay. GL 1.1 core, so all of these are plain
+// opengl32 exports rather than extensions -- but they are still checked before use and
+// still named if one is missing, because "the pointer did not appear" has to have a
+// cause attached. glPushAttrib/glPopAttrib and the two matrix stacks are what make
+// drawing inside the game's own context safe: every piece of state the overlay touches
+// is saved and put back, the matrix MODE included, which rogl_displaySetDestination
+// silently depends on.
+typedef void(WINAPI* GlPushAttribFn)(GLbitfield);
+typedef void(WINAPI* GlPopAttribFn)();
+typedef void(WINAPI* GlPushMatrixFn)();
+typedef void(WINAPI* GlPopMatrixFn)();
+typedef void(WINAPI* GlBeginFn)(GLenum);
+typedef void(WINAPI* GlEndFn)();
+typedef void(WINAPI* GlVertex2fFn)(GLfloat, GLfloat);
+typedef void(WINAPI* GlTexCoord2fFn)(GLfloat, GLfloat);
+typedef void(WINAPI* GlColor4fFn)(GLfloat, GLfloat, GLfloat, GLfloat);
+typedef void(WINAPI* GlPolygonModeFn)(GLenum, GLenum);
+typedef void(WINAPI* GlColorMaskFn)(GLboolean, GLboolean, GLboolean, GLboolean);
+typedef void(WINAPI* GlBlendFuncFn)(GLenum, GLenum);
+typedef void(WINAPI* GlTexEnviFn)(GLenum, GLenum, GLint);
+
 // EXT_framebuffer_object / GL 3.0. Resolved through wglGetProcAddress, ARB names first
 // and the EXT spelling as a fallback: roglv2 links a GLEW that only ever loads the EXT
 // entry points, so the EXT names are certain to exist on any driver that runs the game.
@@ -119,6 +140,20 @@ struct GlFunctions {
     GlEnableFn            disable = nullptr;
     GlIsEnabledFn         isEnabled = nullptr;
     GlGetIntegervFn       getIntegerv = nullptr;
+
+    GlPushAttribFn  pushAttrib = nullptr;
+    GlPopAttribFn   popAttrib = nullptr;
+    GlPushMatrixFn  pushMatrix = nullptr;
+    GlPopMatrixFn   popMatrix = nullptr;
+    GlBeginFn       begin = nullptr;
+    GlEndFn         end = nullptr;
+    GlVertex2fFn    vertex2f = nullptr;
+    GlTexCoord2fFn  texCoord2f = nullptr;
+    GlColor4fFn     color4f = nullptr;
+    GlPolygonModeFn polygonMode = nullptr;
+    GlColorMaskFn   colorMask = nullptr;
+    GlBlendFuncFn   blendFunc = nullptr;
+    GlTexEnviFn     texEnvi = nullptr;
 
     // Which spelling each framebuffer entry point resolved to. Not cosmetic: the EXT
     // entry points predate GL 3.0's split of the framebuffer binding into a READ and a

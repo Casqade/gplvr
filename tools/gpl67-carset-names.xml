@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GEM+ carset team/car names for the stock 1967 mod.
+
+  Why this file exists.
+  The 22 XMLs in Mods\GEM+\gpl67\ are not the whole of what GEM+ writes into gplc67.exe.
+  95.xml sets the team and chassis resource strings to one naming scheme, and GEM+ then
+  overwrites ten of them with the carset's own names before saving. Those names are not in
+  any XML: the chassis short names come from Mods\gplmods.ini (bra_short, brm_short,
+  cov_short, eag_short, lot_short, mur_short) and the team names come from GEM+'s own
+  built-in 1967 team list.
+
+  Applying this file LAST, after 95.xml, reproduces that step exactly. Verified: it is the
+  difference between a rebuild that matches the shipped gplc67.exe in every byte of .rsrc
+  and one that differs in 9811.
+
+  Ids confirmed by diffing the resource string tables of a GEM+-built gplc67.exe against a
+  gplexegen build of the same 22 XMLs.
+-->
+<GPLPatch>
+
+  <!-- teams -->
+  <ResourceString>
+    <Id>591</Id>
+    <Value>British Racing Motors</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>593</Id>
+    <Value>Scuderia Ferrari</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>1124</Id>
+    <Value>Honda Motor Co</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>1167</Id>
+    <Value>Brabham Racing Organisation</Value>
+  </ResourceString>
+
+  <!-- chassis: the *_short values in Mods\gplmods.ini -->
+  <ResourceString>
+    <Id>596</Id>
+    <Value>Repco-Brabham BT24</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>597</Id>
+    <Value>BRM P115</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>598</Id>
+    <Value>Eagle-Weslake T1G</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>601</Id>
+    <Value>Lotus-Ford 49</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>1122</Id>
+    <Value>Cooper T81b</Value>
+  </ResourceString>
+  <ResourceString>
+    <Id>1125</Id>
+    <Value>Honda RA300</Value>
+  </ResourceString>
+
+</GPLPatch>

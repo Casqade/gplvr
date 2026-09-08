@@ -59,6 +59,23 @@ bool glResolve(GlFunctions& gl) {
     resolveExport(gl.module, "glIsEnabled", gl.isEnabled);
     resolveExport(gl.module, "glGetIntegerv", gl.getIntegerv);
 
+    // The cursor overlay's. Deliberately NOT in the return expression below: a driver
+    // that somehow lacks one of these should cost the pointer overlay and nothing else.
+    // CursorOverlay.cpp checks them itself and names them if they are missing.
+    resolveExport(gl.module, "glPushAttrib", gl.pushAttrib);
+    resolveExport(gl.module, "glPopAttrib", gl.popAttrib);
+    resolveExport(gl.module, "glPushMatrix", gl.pushMatrix);
+    resolveExport(gl.module, "glPopMatrix", gl.popMatrix);
+    resolveExport(gl.module, "glBegin", gl.begin);
+    resolveExport(gl.module, "glEnd", gl.end);
+    resolveExport(gl.module, "glVertex2f", gl.vertex2f);
+    resolveExport(gl.module, "glTexCoord2f", gl.texCoord2f);
+    resolveExport(gl.module, "glColor4f", gl.color4f);
+    resolveExport(gl.module, "glPolygonMode", gl.polygonMode);
+    resolveExport(gl.module, "glColorMask", gl.colorMask);
+    resolveExport(gl.module, "glBlendFunc", gl.blendFunc);
+    resolveExport(gl.module, "glTexEnvi", gl.texEnvi);
+
     return gl.wglGetCurrentContext && gl.wglGetCurrentDC && gl.wglGetProcAddress &&
            gl.getString && gl.getError && gl.finish && gl.readPixels &&
            gl.copyTexSubImage2D && gl.genTextures && gl.deleteTextures &&

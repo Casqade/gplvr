@@ -90,6 +90,10 @@ std::vector<uintptr_t> findIndirectCallSites(const ModuleImage& img, void** glob
 
 }  // namespace
 
+void** rasterGlobal(const ModuleImage& image, const char* name) {
+    return findRasterGlobal(image, name);
+}
+
 bool discoverRasterTable(const ModuleImage& image, RasterTable& out) {
     out.screenDisplay = findRasterGlobal(image, "screenDisplay");
     out.screenGetBackBuffer = findRasterGlobal(image, "screenGetBackBuffer");

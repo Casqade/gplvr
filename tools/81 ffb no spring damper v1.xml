@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<GPLPatch>
+
+<!-- FFB: disable GPL's two canned DirectInput condition effects.
+
+GPL installs a centring spring and a damper as DirectInput CONDITION
+effects at FFB init. Conditions are computed in the wheel's firmware from
+wheel position and velocity, so they never see the car and never pass
+through the tick loop - they are rate-independent, and this patch is
+equally valid at 36 Hz. Zeroing their coefficients leaves only the
+constant force GPL computes from the physics. On a direct-drive or belt
+wheel that usually removes a dead, rubbery overlay; the wheel's own
+software can supply the same effects, tuned, if they are wanted.
+NOT A RATE FIX. Reversible: remove this XML and rebuild.
+-->
+
+   <BinaryPatch>
+      <!-- gpl_ffbEffectSetTriple's condition coefficient, 0.75 -> 0.0 -->
+      <VirtualAddress>0x004A1116</VirtualAddress>
+      <Data>00000000</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- gpl_ffbEffectSetSingle's condition coefficient, 0.2 -> 0.0 -->
+      <VirtualAddress>0x004A113F</VirtualAddress>
+      <Data>00000000</Data>
+   </BinaryPatch>
+
+</GPLPatch>

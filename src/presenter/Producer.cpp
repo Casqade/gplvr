@@ -2,6 +2,7 @@
 
 #include "RenderTarget.h"
 
+#include "CursorOverlay.h"
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -411,6 +412,9 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         if (state.glContext) {
             logf("vr: the GL context has gone away; releasing until one comes back");
             releaseTextures(state);
+            // The cursor texture belongs to that context too, and it is not in
+            // releaseTextures because it is not one of the shared frame textures.
+            cursorOverlayReleaseGl();
             state.glContext = nullptr;
             state.width = 0;
             state.height = 0;
@@ -424,6 +428,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
                  (void*)state.glContext, (void*)currentContext);
         state.glContext = currentContext;
         releaseTextures(state);
+        cursorOverlayReleaseGl();
         glInteropCloseDevice(state.gl, state.interopDevice);
         state.interopDevice = glInteropOpenDevice(state.gl, state.device);
         if (!state.interopDevice) {
@@ -551,6 +556,28 @@ void presenterBlitToWindow(int eye) {
     State& state = g_state;
     if (state.stage == Stage::Off) return;
     renderTargetBlitToWindow(state.gl, eye);
+}
+
+void presenterDrawCursor(bool sideBySide) {
+    State& state = g_state;
+    // Off or Failed means there is no headset to be blind in, and the flat window
+    // already has the real Windows pointer over it. Failed is included deliberately: the
+    // GL entry points may well have resolved before whatever failed, and a second cursor
+    // on the monitor would be a puzzle rather than a feature.
+    if (state.stage == Stage::Off || state.stage == Stage::Failed) return;
+    if (!state.gl.module) return;
+    cursorOverlayDraw(state.gl, sideBySide);
+}
+
+void presenterRestoreUnderCursor() {
+    State& state = g_state;
+    // NOT gated on the stage, unlike the draw above. presenterFrame stops the channel on
+    // the spot if the presenter process has exited, and that can land between the two
+    // calls -- after which the saved rect would sit in the game's back buffer for the
+    // rest of the session, which is the trail this exists to prevent.
+    // cursorOverlayRestore is inert when nothing is saved, so this costs a branch.
+    if (!state.gl.module) return;
+    cursorOverlayRestore(state.gl);
 }
 
 void presenterBeginFrame() {

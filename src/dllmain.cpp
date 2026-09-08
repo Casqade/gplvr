@@ -9,8 +9,10 @@
 // us, and the GPU driver roglv2 loads needed exports we had not provided. Injection
 // has no such shared namespace.
 
+#include "Billboard.h"
 #include "Discovery.h"
 #include "Hooks.h"
+#include "RenderShim.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -124,6 +126,8 @@ DWORD WINAPI installThread(LPVOID) {
         return 0;
     }
     requestSceneRenderHook(binding);
+    billboardInstall(binding);
+    shimInstall(binding);
 
     logf("ready. '1' toggles stereo.");
     return 0;

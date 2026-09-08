@@ -3,14 +3,18 @@ project(gplvr CXX)
 
 # There are two builds here, and they are different bitnesses on purpose.
 #
-#   default (32-bit)                    -- gplvr.dll, gplvr.exe (loader), gplvr-xr32.exe
+#   default (32-bit)                    -- gplvr.dll, gplvr.exe (loader)
 #   -DGPLVR_PRESENTER_ONLY=ON (64-bit)  -- gplvr-xr.exe
 #
 # gplc67.exe is a Win32 process, so anything injected into it must be 32-bit. OpenXR is
-# the exception: runtimes are increasingly 64-bit only, which is why BFVR ended up with
-# an x64 companion process. gplvr-xr32 and gplvr-xr are the same survey tool built both
-# ways, so "does this runtime exist for 32-bit at all" is a question the user's own
-# machine answers rather than one we guess.
+# the exception: runtimes are 64-bit only in practice, which is why this ended up with an
+# x64 companion process, as BFVR did.
+#
+# A 32-bit build of the survey tool used to be produced here so that "does a 32-bit OpenXR
+# runtime exist at all" was answered by the machine rather than assumed. It answered no,
+# the cross-process design is built on that answer, and nothing since has been in doubt --
+# so it is no longer built. Re-add a `gplvr_add_survey(gplvr_xr32 "gplvr-xr32")` line if a
+# runtime ever ships 32-bit support and the question becomes live again.
 #
 #   cmake -S . -B build     -G "Visual Studio 17 2022" -A Win32
 #   cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64 -DGPLVR_PRESENTER_ONLY=ON
@@ -70,14 +74,19 @@ else()
     # -- the mod itself ----------------------------------------------------------
     add_library(gplvr SHARED
         src/dllmain.cpp
+        src/Billboard.cpp
+        src/CursorOverlay.cpp
         src/Discovery.cpp
         src/GlInterop.cpp
         src/Hooks.cpp
         src/Log.cpp
         src/MouseLook.cpp
         src/Pe.cpp
+        src/RenderShim.cpp
         src/RenderTarget.cpp
         src/Stereo.cpp
+        src/SwapControl.cpp
+        src/TaskRate.cpp
         src/VrCamera.cpp
         src/presenter/Producer.cpp
     )
@@ -87,7 +96,11 @@ else()
     # so neither is loaded into the game until VR is switched on -- and with the D3D7
     # rasterizer selected there is no GL at all, which has to stay a logged note rather
     # than a load failure.
-    target_link_libraries(gplvr PRIVATE user32)
+    # gdi32 for the cursor overlay: GetIconInfo hands back HBITMAPs and GetDIBits is the
+    # only way to read them. Unlike d3d11 and opengl32 this costs nothing to import --
+    # gdi32 is already loaded in any GUI process, opengl32 itself depends on it, and it
+    # is a KnownDLL so the import cannot be redirected by anything on disk.
+    target_link_libraries(gplvr PRIVATE user32 gdi32)
 
     # -- the loader --------------------------------------------------------------
     # Starts the game suspended, injects gplvr.dll, resumes. See the comment at the top
@@ -96,8 +109,7 @@ else()
     set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr")
     target_link_libraries(gplvr_loader PRIVATE user32)
 
-    gplvr_add_survey(gplvr_xr32 "gplvr-xr32")
-    set(GPLVR_TARGETS gplvr gplvr_loader gplvr_xr32)
+    set(GPLVR_TARGETS gplvr gplvr_loader)
 endif()
 
 foreach(target ${GPLVR_TARGETS})

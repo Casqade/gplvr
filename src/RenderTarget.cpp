@@ -535,8 +535,62 @@ void destroyFramebuffer(const GlFunctions& gl) {
     g_target.active = false;
 }
 
+// What this driver will actually allow, asked once and reported.
+//
+// Added after vrRenderScale 1.5 (9516x4758) rendered into the top-left corner and then
+// crashed, while 1.25 (7930x3965) was fine. The point is not the guess -- it is that the
+// log could not distinguish "GL refused the size" from "the size was accepted and
+// something downstream mis-laid it out", and those need opposite fixes. Now it says.
+bool sizeWithinGlLimits(const GlFunctions& gl, int width, int height) {
+    if (!gl.getIntegerv) return true;  // cannot ask; do not invent a refusal
+
+    GLint maxTexture = 0;
+    GLint maxRenderbuffer = 0;
+    GLint maxViewport[2] = {0, 0};
+    gl.getIntegerv(0x0D33 /* GL_MAX_TEXTURE_SIZE */, &maxTexture);
+    gl.getIntegerv(0x84E8 /* GL_MAX_RENDERBUFFER_SIZE */, &maxRenderbuffer);
+    gl.getIntegerv(0x0D3A /* GL_MAX_VIEWPORT_DIMS */, maxViewport);
+
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        logf("target: this driver allows textures to %d, renderbuffers to %d and "
+             "viewports to %dx%d",
+             maxTexture, maxRenderbuffer, maxViewport[0], maxViewport[1]);
+    }
+
+    const int longest = width > height ? width : height;
+    int       limit = 0;
+    const char* which = nullptr;
+    if (maxTexture && longest > maxTexture) {
+        limit = maxTexture;
+        which = "a texture";
+    } else if (maxRenderbuffer && longest > maxRenderbuffer) {
+        limit = maxRenderbuffer;
+        which = "a renderbuffer";
+    } else if (maxViewport[0] && (width > maxViewport[0] || height > maxViewport[1])) {
+        limit = maxViewport[0] < maxViewport[1] ? maxViewport[0] : maxViewport[1];
+        which = "a viewport";
+    }
+    if (!which) return true;
+
+    // Say what would fit, because the only useful response is to lower vrRenderScale and
+    // the reader should not have to do the arithmetic. The target is two eyes wide, so
+    // the per-eye ceiling is half the limit on the width and the whole of it on height.
+    logf("target: %dx%d is past what this driver allows as %s (%d) -- staying on the "
+         "window's back buffer, which costs resolution but nothing else. The most that "
+         "fits is %d per eye across and %d down; lower vrRenderScale to about %.2f of "
+         "what you asked for.",
+         width, height, which, limit, limit / 2, limit,
+         width > 0 ? static_cast<double>(limit) / width : 0.0);
+    return false;
+}
+
 bool createFramebuffer(const GlFunctions& gl, int width, int height) {
     destroyFramebuffer(gl);
+
+    // Before allocating 180 MB and finding out the hard way.
+    if (!sizeWithinGlLimits(gl, width, height)) return false;
 
     gl.genTextures(1, &g_target.colour);
     gl.bindTexture(GL_TEXTURE_2D, g_target.colour);

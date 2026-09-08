@@ -16,12 +16,51 @@ struct Options {
     //   0 = off in both eyes   1 = left eye only (default)   2 = both eyes
     int stereoMirror = 1;
 
+    // MIRROR AIM. gpl_mirrorViewCompute puts the mirror eye at the car body origin plus
+    // (0, 0, 0.35) in car space, facing backwards with a 40-degree horizontal fov, and
+    // hands all of it to sceneRender in the params block. So aiming it needs no game
+    // patch and no model change -- these three adjust p[44..46], p[65..73] and p[81] on
+    // the way past, and put them back afterwards.
+    //
+    // Degrees, applied in the MIRROR's own frame: yaw turns it left/right, pitch tilts it
+    // up/down. vrMirrorFov REPLACES the 40-degree default when non-zero -- a wider angle
+    // shows more road at the cost of making everything in it smaller, exactly like a real
+    // convex mirror.
+    float vrMirrorYaw = 0.0f;
+    float vrMirrorPitch = 0.0f;
+    float vrMirrorFov = 0.0f;
+
+    // Metres along the mirror's own axes: +back moves the virtual mirror further behind
+    // the car (a wider, more distant view), +up raises it.
+    float vrMirrorBack = 0.0f;
+    float vrMirrorUp = 0.0f;
+
     // Toggle stereo at runtime. '1' by default; 0 disables.
     //
     // The number row rather than a function key: pribluda and the in-game cameras have
     // F1-F12 between them, and there is no VK_ constant for a digit -- the virtual-key
     // code for '1' is simply 0x31.
     int stereoKey = '1';
+
+    // KEEP DRAWING WHEN THE GAME IS NOT THE FOREGROUND APP.
+    //
+    // GPL has TWO independent draw gates and both are driven by WM_ACTIVATEAPP:
+    //   * roglv2's WindowManager+0x19, read by polyDraw and aaLine -- when it is clear,
+    //     ALL polygon and line rasterisation is skipped;
+    //   * gplc67's gpl_isForeground (0x582550), read by gpl_presentIfForeground -- when it
+    //     is clear the frame is never presented at all.
+    // Between them, a backgrounded GPL renders nothing and shows nothing. That is fine for
+    // an exclusive-fullscreen game from 1998 and wrong for a borderless or windowed one,
+    // and it is wrong for VR too: clicking another window should not black out the headset.
+    //
+    // 1 installs a window proc AHEAD of both subclasses and SWALLOWS the deactivation half
+    // of WM_ACTIVATEAPP, so both gates keep whatever value the last activation gave them.
+    //
+    // Deliberately swallowing rather than rewriting wParam to TRUE: gpl_platformWndProc
+    // also sets a one-shot display-restore flag (byte_94D778 -> sub_502B60) on every
+    // ACTIVATION, and manufacturing activations would fire that restore every time focus
+    // was lost. Swallowing touches nothing.
+    int renderWhenUnfocused = 0;
 
     // Stop the rasterizer forcing its window above everything else.
     //
@@ -37,6 +76,53 @@ struct Options {
     // composites over it, alt-tab included. Losing one pixel is worth being able to
     // switch to another window while testing.
     bool shrinkWindowByOnePixel = true;
+
+    // Break the frame budget into scene / present / gplvr / other, once a second.
+    //
+    // On by default while the frame cost is still being chased. It exists because the
+    // render timing stopped explaining the frame rate the moment vsync came off, and
+    // `other` -- the part the hooks cannot see, which is GPL's own per-frame work
+    // outside the world pass -- turned out to be four to six milliseconds.
+    // Make GPL's vertical-axis billboards face the eye rather than the view plane.
+    //
+    // On by default: it is the more correct construction everywhere, and on a monitor the
+    // difference is a few degrees. In a headset it is up to about 50 degrees at the edge
+    // of vision, which is what makes trees appear to turn as you move your head. See
+    // Billboard.h.
+    bool billboardFaceEye = true;
+
+    // Rasterizer shim, stage 1: forward polyDraw and the state setters unchanged and
+    // measure how many polygons fall between state changes.
+    //
+    // The go/no-go for the whole shim idea. Off by default -- it takes over five of the
+    // game's rasterizer globals, which is cheap but not free of risk. See RenderShim.h.
+    bool shimMeasure = false;
+
+    bool profileFrame = true;
+
+    // Drain the GPU with a glFinish at the end of the scene render, and time it.
+    //
+    // The measurement that decides whether `present` is CPU work or a GPU queue. It
+    // stalls the pipeline once a frame, so it costs frame rate and its frame rate is not
+    // comparable with a run without it. Off by default; turn it on for one session.
+    bool profileGpuWait = false;
+
+    // Count polygons handed to the rasterizer, by thunking the polyDraw entry point.
+    //
+    // Turns the scene time into a cost per polygon, which is what says whether the
+    // renderer is submitting too many primitives or spending too long on each. Off by
+    // default: it writes one of the game's rasterizer globals.
+    bool profilePolys = false;
+
+    // The OpenGL swap interval. 0 disables vsync, 1 enables it, -1 leaves the driver
+    // default alone.
+    //
+    // 0 by default, because the driver default is 1 and NOTHING IN GPL EVER CHANGES IT
+    // -- roglv2 resolves wglSwapIntervalEXT and never calls it, and its `[RasterV2]
+    // VSync` key does not exist. With a 144 Hz display that turns the 6.944 ms frame
+    // budget into a cliff: overrun it and the frame costs 13.889 ms, so the rate steps
+    // straight from 144 to 72 with nothing in between. See SwapControl.h.
+    int swapInterval = 0;
 
     // Swallow ChangeDisplaySettings[Ex] so the rasterizer stops switching the
     // desktop between the menu mode and the sim mode.
@@ -190,12 +276,41 @@ struct Options {
     // the window IS the render and there is nothing to choose.
     int vrMonitorEye = 0;
 
-
+    // Draw the mouse pointer into the VR image.
+    //
+    //   0  off
+    //   1  draw it while Windows says the pointer is showing
+    //   2  draw it always, whatever Windows says
+    //
+    // Windows composites the pointer onto the DESKTOP, never into the game's back
+    // buffer, so the picture the presenter copies has no cursor in it and GPL's whole
+    // front end is unusable in a headset -- the menus answer a pointer nobody can see.
+    //
+    // 1 is the useful setting: it follows the game's own ShowCursor, so nothing is
+    // painted over the driving view. 2 exists because it has NOT been verified that GPL
+    // leaves CURSOR_SHOWING set in its menus, and if it does not then the whole feature
+    // would silently do nothing. Which of the two happened is in gplvr.log either way,
+    // so the answer is one ini digit rather than a rebuild.
+    //
+    // The parser default is 0: new behaviour does not arrive on somebody's existing ini
+    // without them asking for it. The ini shipped alongside this has it on.
+    //
+    // What is drawn is the real HCURSOR -- the user's own arrow, their size, their
+    // theme -- and it follows the shape as it changes. A cursor whose pixels cannot be
+    // read draws nothing and says so in the log; there is no stand-in shape.
+    int vrCursor = 0;
 };
 
 extern Options g_options;
 
 void loadOptions(const char* fileName);
+
+// The game's own window, from its exported GetMainWindowHandle, falling back to
+// enumerating this thread's visible windows.
+//
+// Public because the cursor overlay has to turn a SCREEN position into a position in
+// this window's client area, and that is only meaningful for exactly this HWND.
+HWND gameWindow();
 
 // Replaces the screenDisplay function pointer. That pointer is a plain writable
 // global, so this is a single store -- no code patching involved.
