@@ -1,13 +1,18 @@
 #include "Hud.h"
 
+#include "FrameBudget.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "Pe.h"
+#include "RenderTarget.h"
 #include "Stereo.h"
 #include "Window.h"
 
+#include <windows.h>
+
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace gplvr {
@@ -334,6 +339,272 @@ int         g_lastStampDisparity = -9999;
 int         g_stampCount = 0;
 int         g_stampHighWater = 0;
 
+// -- STAMPED TEXT: WHAT IT SAYS, AND WHAT CAN BE DROPPED -------------------------------
+//
+// The arguments, read from both sides on 2026-09-14:
+//
+//   roglv2 stampDraw (0x20004900): a1 is looked up in the handle table as the destination,
+//   a4 is resolved by sub_20018AC0 into a font object, and rogl_fontBlitGlyph draws glyph
+//   a5 of that font at a2, a3.
+//
+//   gplc67 reads the global at 0x00867628 in two places. sub_4EDE40 draws a string (the
+//   call at 0x004EDF5E) and the routine just before it draws one glyph (0x004EDE2A); both
+//   pass (surface, x, y, font->+33, glyph). The glyph comes from sub_4EDC80: the character
+//   looked up in the font's own map, falling back to the font's default glyph. For a font
+//   in mode 2 or 4 (font->+22) the string routine adds a quarter-pixel phase of 0..3 to the
+//   glyph and advances x in quarter pixels.
+//
+// The census values -- 48, 82, 69 -- are '0', 'R', 'E', so these fonts map characters to
+// their ASCII codes. Text is printed as characters, and any code outside printable ASCII
+// is escaped with its raw value.
+
+// Surfaces a bitmapDraw has touched since the last mode change, as either argument. Pixels
+// are copied out of those, so a stamp on one can reach the frame another way.
+constexpr int kMaxComposited = 32;
+int  g_composited[kMaxComposited] = {};
+int  g_compositedCount = 0;
+bool g_compositedOverflow = false;
+
+void noteComposited(int handle) {
+    for (int i = 0; i < g_compositedCount; ++i)
+        if (g_composited[i] == handle) return;
+    if (g_compositedCount < kMaxComposited)
+        g_composited[g_compositedCount++] = handle;
+    else
+        g_compositedOverflow = true;
+}
+
+// A full table can no longer vouch for any surface, so every surface counts as touched.
+bool wasComposited(int handle) {
+    if (g_compositedOverflow) return true;
+    for (int i = 0; i < g_compositedCount; ++i)
+        if (g_composited[i] == handle) return true;
+    return false;
+}
+
+// Whether a stamp that did not qualify for the per-eye split can be dropped: the rule
+// documented at vrSkipStampText in Hooks.h. A destination no wider than the display and
+// at least 7/8 as wide is a screen-space layer of it; the off-screen frame is wider.
+bool stampUnseen(int handle, void* dest, int width, int height, void* left, void* right,
+                 void* source) {
+    if (!renderTargetActive() || !left || !right || !source) return false;
+    if (dest == left || dest == right || dest == source) return false;
+    int nativeW = 0;
+    int nativeH = 0;
+    if (!renderTargetNativeSize(nativeW, nativeH)) return false;
+    if (width * 8 < nativeW * 7 || width > nativeW) return false;
+    if (height <= 0 || height > nativeH) return false;
+    return !wasComposited(handle);
+}
+
+// One frame's stamps, grouped into strings in call order: a glyph joins the string before
+// it when it has the same destination, set and y, and sits a little to the right.
+constexpr int kMaxFrameStrings = 256;
+constexpr int kMaxStampChars = 80;
+constexpr int kMaxGlyphGap = 64;
+
+struct StampString {
+    int            dest;
+    int            width;
+    int            height;
+    int            set;
+    int            x;
+    int            y;
+    int            lastX;
+    int            length;
+    bool           truncated;
+    unsigned short codes[kMaxStampChars];
+};
+
+StampString g_frameStrings[kMaxFrameStrings];
+int         g_frameStringCount = 0;
+int         g_frameStampCalls = 0;
+int         g_frameUngrouped = 0;
+int         g_frameDropped = 0;
+
+void recordStamp(int dest, int width, int height, int x, int y, int set, int glyph) {
+    unsigned short code =
+        (glyph >= 0 && glyph < 0xFFFF) ? static_cast<unsigned short>(glyph) : 0xFFFF;
+    if (g_frameStringCount > 0) {
+        StampString& s = g_frameStrings[g_frameStringCount - 1];
+        if (s.dest == dest && s.set == set && s.y == y && x > s.lastX &&
+            x - s.lastX <= kMaxGlyphGap) {
+            if (s.length < kMaxStampChars)
+                s.codes[s.length++] = code;
+            else
+                s.truncated = true;
+            s.lastX = x;
+            return;
+        }
+    }
+    if (g_frameStringCount >= kMaxFrameStrings) {
+        ++g_frameUngrouped;
+        return;
+    }
+    StampString& s = g_frameStrings[g_frameStringCount++];
+    s.dest = dest;
+    s.width = width;
+    s.height = height;
+    s.set = set;
+    s.x = x;
+    s.y = y;
+    s.lastX = x;
+    s.length = 1;
+    s.truncated = false;
+    s.codes[0] = code;
+}
+
+// Every string seen since the last mode change, by where it is drawn. A string is logged
+// when it first appears and when its text changes, at most once a second each, and no
+// more than kMaxTextLinesPerSecond lines a second across all of them.
+constexpr int kMaxKnownStrings = 512;
+constexpr int kMaxTextLinesPerSecond = 40;
+
+struct KnownString {
+    int      dest;
+    int      set;
+    int      x;
+    int      y;
+    unsigned loggedHash;
+    DWORD    loggedAt;
+    bool     logged;
+    bool     seen;     // during the current summary second
+    bool     waiting;  // its text changed and the rate limit has held the line back
+};
+
+KnownString g_known[kMaxKnownStrings];
+int         g_knownCount = 0;
+int         g_knownHint = 0;
+
+struct StampWindow {
+    DWORD     start = 0;
+    int       frames = 0;
+    long long calls = 0;
+    int       maxCalls = 0;
+    long long dropped = 0;
+    int       lines = 0;
+    int       untracked = 0;
+    int       ungrouped = 0;
+};
+
+StampWindow g_stampWindow;
+bool        g_loggedStampDrop = false;
+
+unsigned hashStampString(const StampString& s) {
+    unsigned hash = 2166136261u;
+    for (int i = 0; i < s.length; ++i) {
+        hash = (hash ^ (s.codes[i] & 0xFF)) * 16777619u;
+        hash = (hash ^ (s.codes[i] >> 8)) * 16777619u;
+    }
+    return (hash ^ static_cast<unsigned>(s.length) ^ (s.truncated ? 0x80000000u : 0u)) *
+           16777619u;
+}
+
+// Printable ASCII as itself; a quote or backslash escaped; anything else as \xNN or
+// \uNNNN carrying the raw code. True when any code fell outside printable ASCII.
+bool formatStampText(const StampString& s, char* out, size_t size) {
+    size_t used = 0;
+    bool   unusual = false;
+    for (int i = 0; i < s.length && used + 8 < size; ++i) {
+        unsigned code = s.codes[i];
+        if (code == '"' || code == '\\') {
+            out[used++] = '\\';
+            out[used++] = static_cast<char>(code);
+        } else if (code >= 32 && code < 127) {
+            out[used++] = static_cast<char>(code);
+        } else {
+            unusual = true;
+            int n = snprintf(out + used, size - used, code < 256 ? "\\x%02X" : "\\u%04X", code);
+            if (n > 0) used += static_cast<size_t>(n);
+        }
+    }
+    if (s.truncated && used + 4 < size) {
+        memcpy(out + used, "...", 3);
+        used += 3;
+    }
+    out[used] = 0;
+    return unusual;
+}
+
+KnownString* findKnown(const StampString& s) {
+    if (g_knownHint < g_knownCount) {
+        KnownString& k = g_known[g_knownHint];
+        if (k.dest == s.dest && k.set == s.set && k.x == s.x && k.y == s.y) {
+            ++g_knownHint;
+            return &k;
+        }
+    }
+    for (int i = 0; i < g_knownCount; ++i) {
+        KnownString& k = g_known[i];
+        if (k.dest == s.dest && k.set == s.set && k.x == s.x && k.y == s.y) {
+            g_knownHint = i + 1;
+            return &k;
+        }
+    }
+    return nullptr;
+}
+
+void flushStampStrings(DWORD now) {
+    g_knownHint = 0;
+    for (int i = 0; i < g_frameStringCount; ++i) {
+        const StampString& s = g_frameStrings[i];
+        unsigned hash = hashStampString(s);
+
+        KnownString* k = findKnown(s);
+        if (!k) {
+            if (g_knownCount >= kMaxKnownStrings) {
+                ++g_stampWindow.untracked;
+                continue;
+            }
+            k = &g_known[g_knownCount++];
+            *k = KnownString{};
+            k->dest = s.dest;
+            k->set = s.set;
+            k->x = s.x;
+            k->y = s.y;
+            g_knownHint = g_knownCount;
+        }
+        k->seen = true;
+        if (k->logged && k->loggedHash == hash) {
+            k->waiting = false;
+            continue;
+        }
+        if ((k->logged && now - k->loggedAt < 1000) ||
+            g_stampWindow.lines >= kMaxTextLinesPerSecond) {
+            k->waiting = true;
+            continue;
+        }
+
+        char text[512];
+        bool unusual = formatStampText(s, text, sizeof(text));
+        char codes[256];
+        codes[0] = 0;
+        if (unusual) {
+            size_t used = 0;
+            for (int c = 0; c < s.length && used + 8 < sizeof(codes); ++c) {
+                int n = snprintf(codes + used, sizeof(codes) - used, " %u", s.codes[c]);
+                if (n > 0) used += static_cast<size_t>(n);
+            }
+        }
+        logf("hud: stamp text %s on surface %d (%dx%d), set %d, at %d,%d: \"%s\"%s%s",
+             k->logged ? "CHANGED" : "new", s.dest, s.width, s.height, s.set, s.x, s.y,
+             text, unusual ? " -- raw codes:" : "", codes);
+        k->logged = true;
+        k->loggedHash = hash;
+        k->loggedAt = now;
+        k->waiting = false;
+        ++g_stampWindow.lines;
+    }
+}
+
+void resetStampTracking() {
+    g_compositedCount = 0;
+    g_compositedOverflow = false;
+    g_knownCount = 0;
+    g_knownHint = 0;
+    g_loggedStampDrop = false;
+}
+
 // THE IN-RACE HUD, ONCE PER EYE.
 //
 // Established 2026-09-12 after four wrong answers: `stampDraw(109, 2, 1309, 11, 94)` with
@@ -409,8 +680,25 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
     bool spansTheBuffer = fullWidth > 0 && source && fullWidth == bitmapWidth(source) &&
                           fullHeight == bitmapHeight(source);
 
+    // One record per call GPL makes, before any re-issue; flushed by hudEndFrame.
+    ++g_frameStampCalls;
+    if (!g_options.vrSkipStampText) recordStamp(a1, fullWidth, fullHeight, a2, a3, a4, a5);
+
     if (!left || !right || !spansTheBuffer || !stereoEyeRect(0, rect[0]) ||
         !stereoEyeRect(1, rect[1])) {
+        if (g_options.vrSkipStampText &&
+            stampUnseen(a1, dest, fullWidth, fullHeight, left, right, source)) {
+            ++g_frameDropped;
+            if (!g_loggedStampDrop) {
+                g_loggedStampDrop = true;
+                logf("hud: vrSkipStampText -- stampDraw to surface %d (%dx%d) is being "
+                     "dropped, with every stamp like it: not an eye, not the whole "
+                     "side-by-side buffer, a screen-wide layer of the display, and never "
+                     "touched by a bitmapDraw this phase. Counted once a second.",
+                     a1, fullWidth, fullHeight);
+            }
+            return;
+        }
         // Once per distinct destination, so a pass-through that should have been a split
         // says so instead of being silent. Five rounds of this were lost to a branch that
         // declined without comment.
@@ -479,6 +767,8 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
 
 int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     ++g_bitmapDrawCount;
+    noteComposited(source);
+    noteComposited(dest);
 
     if (g_bitmapDrawReports > 0) {
         bool known = false;
@@ -496,11 +786,19 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
         }
     }
 
+    // gpl_sceneRender's mirror copy-out is bitmapDraw(mirror.mip's bitmap, 0, 0, mirror
+    // camera surface): roglv2 binds the FIRST argument's texture and reads the FOURTH's
+    // pixels, the reverse of the names above. The +Y mirror pane's image belongs in the right
+    // half of the texture, so its copy is moved there; roglv2 copies the read surface's own
+    // width, so exactly that half is written.
+    x = stereoMirrorCopyX(dest, x);
+
     return g_bitmapDrawOriginal ? g_bitmapDrawOriginal(source, x, y, dest) : 0;
 }
 
 void __cdecl drawDebugTextThunk(void* surface, unsigned colour, int x, int y,
                                 const char* text, int background) {
+    frameBudgetHudText();
     Call call;
     call.surface = surface;
     call.colour = colour;
@@ -699,6 +997,9 @@ void hudBeginFrame() {
         g_lastReportedCount = 0;
         g_countReports = 8;
         g_seenCount = 0;
+        // Handles are recycled across a mode change, so what was composited or logged
+        // before it says nothing about the surfaces after it.
+        resetStampTracking();
         logf("hud: census reset -- the engine has entered %s, and the counts below are "
              "that phase's own.",
              inFrontEnd ? "the front end" : "a world mode");
@@ -743,12 +1044,80 @@ void hudBeginFrame() {
     g_callCount = 0;
 }
 
+void hudEndFrame() {
+    DWORD now = GetTickCount();
+    if (g_stampWindow.start == 0) g_stampWindow.start = now;
+
+    ++g_stampWindow.frames;
+    g_stampWindow.calls += g_frameStampCalls;
+    if (g_frameStampCalls > g_stampWindow.maxCalls) g_stampWindow.maxCalls = g_frameStampCalls;
+    g_stampWindow.dropped += g_frameDropped;
+    g_stampWindow.ungrouped += g_frameUngrouped;
+
+    if (!g_options.vrSkipStampText) flushStampStrings(now);
+
+    g_frameStringCount = 0;
+    g_frameStampCalls = 0;
+    g_frameDropped = 0;
+    g_frameUngrouped = 0;
+
+    DWORD elapsed = now - g_stampWindow.start;
+    if (elapsed < 1000) return;
+
+    // Silent through a second with no stamps at all, which is every second of the front
+    // end: the thunk counts only world-mode calls.
+    if (g_stampWindow.calls > 0) {
+        double perFrame = static_cast<double>(g_stampWindow.calls) / g_stampWindow.frames;
+        if (g_options.vrSkipStampText) {
+            logf("hud: stamps, last %lu ms: %lld calls over %d frames (%.0f a frame, max %d), "
+                 "%lld dropped (%.0f a frame)",
+                 static_cast<unsigned long>(elapsed), g_stampWindow.calls,
+                 g_stampWindow.frames, perFrame, g_stampWindow.maxCalls,
+                 g_stampWindow.dropped,
+                 static_cast<double>(g_stampWindow.dropped) / g_stampWindow.frames);
+        } else {
+            int distinct = 0;
+            int waiting = 0;
+            int surfaces[16];
+            int surfaceCount = 0;
+            for (int i = 0; i < g_knownCount; ++i) {
+                KnownString& k = g_known[i];
+                if (k.waiting) ++waiting;
+                if (!k.seen) continue;
+                k.seen = false;
+                ++distinct;
+                bool listed = false;
+                for (int j = 0; j < surfaceCount; ++j)
+                    if (surfaces[j] == k.dest) listed = true;
+                if (!listed && surfaceCount < 16) surfaces[surfaceCount++] = k.dest;
+            }
+            logf("hud: stamps, last %lu ms: %lld calls over %d frames (%.0f a frame, max %d), "
+                 "%d distinct strings on %d surface(s); %d text lines logged%s, %d changed "
+                 "strings held back by the rate limit, %d string sightings past the %d-entry "
+                 "table, %d calls past the %d-string frame table",
+                 static_cast<unsigned long>(elapsed), g_stampWindow.calls,
+                 g_stampWindow.frames, perFrame, g_stampWindow.maxCalls, distinct,
+                 surfaceCount, g_stampWindow.lines,
+                 g_stampWindow.lines >= kMaxTextLinesPerSecond ? " (CAPPED)" : "", waiting,
+                 g_stampWindow.untracked, kMaxKnownStrings, g_stampWindow.ungrouped,
+                 kMaxFrameStrings);
+        }
+    }
+    g_stampWindow = StampWindow{};
+    g_stampWindow.start = now;
+}
+
 void hudReplay() {
     if (!g_original || g_callCount == 0) return;
 
     g_replaying = true;
     for (int i = 0; i < g_callCount; ++i) emit(g_calls[i]);
     g_replaying = false;
+}
+
+bool hudBitmapDrawHooked() {
+    return g_bitmapDrawSlot && g_bitmapDrawOriginal &&
+           *g_bitmapDrawSlot == reinterpret_cast<void*>(&bitmapDrawThunk);
 }
 
 }  // namespace gplvr

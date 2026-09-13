@@ -71,6 +71,11 @@ void renderProfileAfterRender();
 // frame it happened in. roglv2 issues them from more than one place.
 void renderProfileSetInPresent(bool inPresent);
 
+// roglv2's glDrawArrays time so far in this window, in rdtsc cycles, for the frame budget's
+// per-span attribution. Zero unless profileStages installed the thunk; reset by
+// renderProfileEndWindow.
+unsigned long long renderProfileDrawCycles();
+
 // The frame, split into four spans that TILE it, from hooks that already existed:
 //
 //   pre      present returns -> sceneRender entry   the game's own loop: sim, input, wait

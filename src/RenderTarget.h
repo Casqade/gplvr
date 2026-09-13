@@ -79,10 +79,31 @@ bool   renderTargetSize(int& width, int& height);
 // Inert unless the off-screen target is active.
 void renderTargetOverrideSurface(void* surfaceHandle);
 
+// The display's own back-buffer size as the engine reported it, before any override.
+// False until it has been learned.
+bool renderTargetNativeSize(int& width, int& height);
+
 // Scale the off-screen frame into the game window, which is what makes the flat window a
-// monitor rather than a blank rectangle. `eye` is 0 for both halves, 1 for the left eye
-// alone, 2 for the right. Aspect-fit, never stretched.
-void renderTargetBlitToWindow(const GlFunctions& gl, int eye);
+// monitor rather than a blank rectangle. `monitorEye` is vrMonitorEye: 0 draws nothing,
+// 1 both halves, 2 the left eye alone, 3 the right. Aspect-fit, never stretched; the
+// letterbox bars are cleared every frame.
+void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye);
+
+// Where the last blit put the off-screen frame in the window, in GL window pixels (origin
+// bottom left): source columns srcX..srcX+srcWidth of a srcHeight-tall frame, drawn at
+// dstX,dstY dstWidth x dstHeight. False when this frame's blit did not happen.
+struct WindowPicture {
+    int windowWidth = 0;
+    int windowHeight = 0;
+    int srcX = 0;
+    int srcWidth = 0;
+    int srcHeight = 0;
+    int dstX = 0;
+    int dstY = 0;
+    int dstWidth = 0;
+    int dstHeight = 0;
+};
+bool renderTargetWindowPicture(WindowPicture& out);
 
 // Drops the framebuffer and puts the engine's back buffer size back. Safe to call when
 // nothing was ever built.

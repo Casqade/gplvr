@@ -56,4 +56,15 @@ void pribludaPollTweak();
 // keeps from the game.
 bool pribludaTweakSwallowsKey(unsigned virtualKey);
 
+// Leave HUD tweak mode if it is on, saving as the key does. `why` is appended to the log
+// line. Mirror tweak mode calls it on entering, since the two share the arrows and Page Up/Down.
+void pribludaTweakExit(const char* why);
+
+// The panel on the monitor, VR only. prib_rasterHook_drawsHud (RVA 0x11950) -- the hook pribluda patches into
+// roglv2's present -- polls its hotkeys, builds its font lists, counts the frame and then
+// calls prib_hudDraw with `call rel32` at RVA 0x119B7. gplvr points that one call at its own
+// function, which skips the monitor draw on frames presenterMonitorHudTaken() reports and
+// calls prib_hudDraw unchanged on every other. True once that redirect is in place.
+bool pribludaMonitorDrawRedirected();
+
 }  // namespace gplvr

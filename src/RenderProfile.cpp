@@ -1,6 +1,7 @@
 #include "RenderProfile.h"
 
 #include "Discovery.h"
+#include "FrameBudget.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
@@ -221,9 +222,11 @@ void WINAPI finishThunk() {
 }
 
 BOOL WINAPI swapThunk(HDC dc) {
+    int                previous = frameBudgetEnter(kSpanSwap);
     unsigned long long begin = __rdtsc();
     BOOL               result = g_realSwap(dc);
     g_swapCycles += __rdtsc() - begin;
+    frameBudgetLeave(previous);
     return result;
 }
 
@@ -411,14 +414,21 @@ void* g_preOriginal4 = nullptr;
 // The event dequeue is called once per event plus once more to terminate, and the present
 // gate appears at three call sites in the loop; first-hit-wins makes both single-valued
 // without the thunks having to know which is which.
+// The frame-budget span each marker opens, on the same timestamp and under the same
+// first-hit rule.
+const BudgetSpan kPreMarkSpan[kPreMarks] = {kSpanWaitTick, kSpanWaitBg, kSpanLatch, kSpanLogic,
+                                            kSpanRedraw};
+
 void __stdcall preMarkImpl(int which) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (which == kMarkLoopBegin) {
         for (int i = 0; i < kPreMarks; ++i) g_preMark[i] = 0;
         g_preMark[kMarkLoopBegin] = now.QuadPart;
+        frameBudgetSwitchAt(kPreMarkSpan[which], now.QuadPart);
     } else if (!g_preMark[which]) {
         g_preMark[which] = now.QuadPart;
+        frameBudgetSwitchAt(kPreMarkSpan[which], now.QuadPart);
     }
 }
 
@@ -478,6 +488,65 @@ __declspec(naked) void preThunk4() {
             popfd
             popad
             jmp  dword ptr [g_preOriginal4] }
+}
+
+// The previous frame's TAIL, after the present gate returns: the post-frame callbacks, the
+// snapshot end, and the BG request service. Same thunk shape; these only open frame-budget
+// spans and leave the `pre` markers alone.
+void* g_tailOriginal0 = nullptr;
+void* g_tailOriginal1 = nullptr;
+void* g_tailOriginal2 = nullptr;
+
+void __stdcall tailMarkImpl(int which) {
+    static const BudgetSpan kTailSpan[3] = {kSpanTailCallbacks, kSpanTailSnapshot,
+                                            kSpanTailService};
+    frameBudgetSwitch(kTailSpan[which]);
+}
+
+PreMarkFn g_tailMarkFn = &tailMarkImpl;
+
+// gpl_fgFrameSnapshotEnd's release takes the BG lock before running the release callbacks,
+// and fgDisableBG waits for the simulation thread to let go of it. That wait is charged to
+// bgRelease; the callbacks stay in the snapshot span. fgDisableBG takes and returns nothing,
+// and its one caller reloads everything it needs from the stack after the call, so an
+// ordinary function can stand in for it.
+typedef void(__cdecl* VoidFn)();
+VoidFn g_releaseDisableOriginal = nullptr;
+
+void __cdecl releaseDisableThunk() {
+    int previous = frameBudgetEnter(kSpanWaitBgRelease);
+    g_releaseDisableOriginal();
+    frameBudgetLeave(previous);
+}
+
+__declspec(naked) void tailThunk0() {
+    __asm { pushad
+            pushfd
+            push 0
+            call dword ptr [g_tailMarkFn]
+            popfd
+            popad
+            jmp  dword ptr [g_tailOriginal0] }
+}
+
+__declspec(naked) void tailThunk1() {
+    __asm { pushad
+            pushfd
+            push 1
+            call dword ptr [g_tailMarkFn]
+            popfd
+            popad
+            jmp  dword ptr [g_tailOriginal1] }
+}
+
+__declspec(naked) void tailThunk2() {
+    __asm { pushad
+            pushfd
+            push 2
+            call dword ptr [g_tailMarkFn]
+            popfd
+            popad
+            jmp  dword ptr [g_tailOriginal2] }
 }
 
 // Instruction patterns are only meaningful in executable sections; the same rule
@@ -572,6 +641,78 @@ bool redirectSites(const std::vector<uintptr_t>& sites, void* thunk, const char*
             return false;
         }
     }
+    return true;
+}
+
+// The three tail markers, in loop order: the post-frame callbacks, the snapshot end, the
+// BG request check. gpl_fgEventLoop runs, after its first present gate:
+//
+//     call gpl_presentIfForeground
+//     ...  call gpl_fgRunPostFrameCallbacks  |  call gate; call gate
+//     call gpl_fgFrameSnapshotEnd
+//     call bgHasRequestedFGAction            <- exported
+//
+// so the exported call is the anchor, the call immediately before it is the snapshot end,
+// and the first call after the first gate site is the callbacks. Each is asserted.
+struct TailSites {
+    uintptr_t site[3] = {};
+    uintptr_t target[3] = {};
+};
+
+bool locateTailMarkers(const ModuleImage& image, const std::vector<uintptr_t>& entries,
+                       uintptr_t loop, uintptr_t loopEnd, uintptr_t gate,
+                       const std::vector<uintptr_t>& gateSites, TailSites& out) {
+    HMODULE exe = GetModuleHandleA(nullptr);
+    auto    requested = exe ? reinterpret_cast<uintptr_t>(GetProcAddress(
+                                  exe, "?bgHasRequestedFGAction@@YA_NXZ"))
+                            : 0;
+    if (!requested || gateSites.empty()) {
+        logf("pre: bgHasRequestedFGAction is not exported -- the tail is not split");
+        return false;
+    }
+
+    std::vector<uintptr_t> serviceSites =
+        sitesInside(findCallSites(image, requested), loop, loopEnd);
+    if (serviceSites.size() != 1) {
+        logf("pre: the frame loop calls bgHasRequestedFGAction %zu times, not once -- the "
+             "tail is not split",
+             serviceSites.size());
+        return false;
+    }
+    uintptr_t serviceSite = serviceSites[0];
+    uintptr_t snapshotSite = serviceSite - 5;
+
+    auto    snapshotCall = reinterpret_cast<const uint8_t*>(snapshotSite);
+    int32_t rel = 0;
+    std::memcpy(&rel, snapshotCall + 1, sizeof(rel));
+    uintptr_t snapshotEnd = serviceSite + rel;
+    if (snapshotCall[0] != 0xE8 ||
+        !std::binary_search(entries.begin(), entries.end(), snapshotEnd)) {
+        logf("pre: the instruction before the BG request check at %08X is not a call -- "
+             "the tail is not split",
+             static_cast<unsigned>(serviceSite));
+        return false;
+    }
+
+    uintptr_t firstGate = *std::min_element(gateSites.begin(), gateSites.end());
+    uintptr_t callbacks = firstCallAfter(image, entries, firstGate + 5, snapshotSite);
+    std::vector<uintptr_t> callbackSites;
+    if (callbacks)
+        callbackSites = sitesInside(findCallSites(image, callbacks), firstGate + 5, snapshotSite);
+    if (!callbacks || callbacks == gate || callbacks == snapshotEnd ||
+        callbackSites.size() != 1) {
+        logf("pre: no single post-frame callback call between the present gate at %08X and "
+             "the snapshot end -- the tail is not split",
+             static_cast<unsigned>(firstGate));
+        return false;
+    }
+
+    out.site[0] = callbackSites[0];
+    out.site[1] = snapshotSite;
+    out.site[2] = serviceSite;
+    out.target[0] = callbacks;
+    out.target[1] = snapshotEnd;
+    out.target[2] = requested;
     return true;
 }
 
@@ -736,6 +877,26 @@ bool installPreMarkers(const ModuleImage& image) {
         sitesInside(findCallSites(image, dequeue), loop, loopEnd);
     const std::vector<uintptr_t> gateSites =
         sitesInside(findCallSites(image, gate), loop, loopEnd);
+    TailSites tail;
+    bool      tailLocated =
+        locateTailMarkers(image, entries, loop, loopEnd, gate, gateSites, tail);
+
+    // The lock inside the snapshot end's release: the one callee of the snapshot end that
+    // holds exactly one fgDisableBG call, other than the tick wait's.
+    uintptr_t releaseDisableSite = 0;
+    if (tailLocated) {
+        uintptr_t snapshotEnd = tail.target[1];
+        for (uintptr_t target :
+             branchTargets(image, snapshotEnd, functionEnd(entries, image, snapshotEnd))) {
+            if (!std::binary_search(entries.begin(), entries.end(), target)) continue;
+            std::vector<uintptr_t> inside =
+                sitesInside(disableSites, target, functionEnd(entries, image, target));
+            if (inside.size() == 1 && inside[0] != disableInside[0]) {
+                releaseDisableSite = inside[0];
+                break;
+            }
+        }
+    }
 
     if (!redirectSites(beginSites, reinterpret_cast<void*>(&preThunk0), "snapshot begin") ||
         !redirectSites(disableInside, reinterpret_cast<void*>(&preThunk1), "tick wait") ||
@@ -756,6 +917,34 @@ bool installPreMarkers(const ModuleImage& image) {
          "the frame rate IS the task rate and most of `pre` is expected to be idle. The "
          "two WAIT spans on the report line are that sleep and the fgDisableBG spin "
          "behind it; anything they do not account for is real work.");
+
+    if (tailLocated) {
+        g_tailOriginal0 = reinterpret_cast<void*>(tail.target[0]);
+        g_tailOriginal1 = reinterpret_cast<void*>(tail.target[1]);
+        g_tailOriginal2 = reinterpret_cast<void*>(tail.target[2]);
+        if (redirectSites(std::vector<uintptr_t>(1, tail.site[0]),
+                          reinterpret_cast<void*>(&tailThunk0), "post-frame callbacks") &&
+            redirectSites(std::vector<uintptr_t>(1, tail.site[1]),
+                          reinterpret_cast<void*>(&tailThunk1), "snapshot end") &&
+            redirectSites(std::vector<uintptr_t>(1, tail.site[2]),
+                          reinterpret_cast<void*>(&tailThunk2), "BG request check"))
+            logf("pre: tail markers on the post-frame callbacks %08X (site %08X), the "
+                 "snapshot end %08X (site %08X) and the BG request check (site %08X)",
+                 static_cast<unsigned>(tail.target[0]), static_cast<unsigned>(tail.site[0]),
+                 static_cast<unsigned>(tail.target[1]), static_cast<unsigned>(tail.site[1]),
+                 static_cast<unsigned>(tail.site[2]));
+
+        g_releaseDisableOriginal = reinterpret_cast<VoidFn>(fgDisableBG);
+        if (releaseDisableSite &&
+            redirectSites(std::vector<uintptr_t>(1, releaseDisableSite),
+                          reinterpret_cast<void*>(&releaseDisableThunk),
+                          "snapshot release lock"))
+            logf("pre: the snapshot release's BG lock (site %08X) is timed as bgRelease",
+                 static_cast<unsigned>(releaseDisableSite));
+        else
+            logf("pre: the snapshot release's BG lock was not found -- it stays inside "
+                 "tail.snapshot");
+    }
     return true;
 }
 
@@ -968,6 +1157,8 @@ void renderProfileSetInPresent(bool inPresent) {
     g_inPresent = inPresent;
     if (inPresent) g_askedBindingThisPresent = false;
 }
+
+unsigned long long renderProfileDrawCycles() { return g_drawCycles; }
 
 void renderProfileNoteScene(long long begin, long long end) {
     if (!g_sceneFirstBegin) g_sceneFirstBegin = begin;

@@ -1,5 +1,6 @@
 #include "Pribluda.h"
 
+#include "FrameBudget.h"
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -34,6 +35,10 @@ constexpr DWORD kRvaFpsFirstCall = 0x000385B0;    // prib_sampleFps: byte, 1 unt
 constexpr DWORD kRvaFpsWindowStart = 0x0003BE64;  // GetTickCount when the window began
 constexpr DWORD kRvaFpsValue = 0x0003BE68;        // float, the readout
 constexpr DWORD kRvaFpsCalls = 0x0003BE6C;        // calls counted in this window
+constexpr DWORD kRvaSampleFps = 0x00006570;       // prib_sampleFps: no arguments, fps in ST0
+// In prib_rasterHook_drawsHud (RVA 0x11950), after prib_pollHotkeys, prib_buildFontLists and
+// the frame counter: `E8 rel32`, the call of prib_hudDraw that draws the MONITOR HUD.
+constexpr DWORD kRvaMonitorDrawCall = 0x000119B7;
 
 // The backdrop boxes' sizes. Every box is filled BEFORE its text is drawn, at the width and
 // height the previous draw measured its text to, and each draw stores its own measurement
@@ -149,6 +154,7 @@ constexpr const char* kDefaultLayout =
 
 typedef unsigned(__cdecl* HudDrawFn)(void*, void*, void*);
 typedef int(__cdecl* GameStateFn)();
+typedef float(__cdecl* SampleFpsFn)();
 
 // prib_sampleFps's state. Its readout is calls to prib_hudDraw per second, so every draw
 // gplvr adds is counted as a frame.
@@ -203,6 +209,29 @@ struct Box {
 Binding g_prib;
 bool    g_examined = false;  // the module is tested once, not once a frame
 bool    g_reportedNoGl = false;
+
+// The monitor HUD redirect: prib_sampleFps, and whether the monitor draw's call now lands in
+// pribludaMonitorDraw.
+SampleFpsFn g_sampleFps = nullptr;
+bool        g_monitorRedirected = false;
+
+// vrHudPanelRate: when the next panel redraw is due, as a QPC value; 0 before the first.
+LONGLONG g_panelDue = 0;
+bool     g_reportedPanelRate = false;
+
+// Stands in for prib_rasterHook_drawsHud's call of prib_hudDraw -- the monitor HUD -- inside
+// roglv2's present. On a frame gplvr drew the headset panel over the monitor picture the draw
+// is skipped. prib_sampleFps is called in its place because prib_hudDraw is its only caller
+// and the readout is calls per second. prib_paintLetterboxBars' flag stays raised until a
+// monitor draw runs again, which is the draw it is meant for. Every other frame calls
+// prib_hudDraw exactly as the hook did.
+unsigned __cdecl pribludaMonitorDraw(void* config, void* session, void* context) {
+    if (presenterMonitorHudTaken()) {
+        g_sampleFps();
+        return 0;
+    }
+    return g_prib.draw(config, session, context);
+}
 
 Layout g_layout;
 char   g_layoutPath[MAX_PATH] = {};
@@ -359,6 +388,48 @@ void loadLayout() {
          g_layoutPath);
 }
 
+// Point the monitor draw's call at pribludaMonitorDraw. pribluda's DllMain has already patched
+// roglv2+0x9B83 to reach the hook by the time bind() runs, and both run on the render thread,
+// so the four bytes cannot change under a call in progress. The call is checked to be exactly
+// `E8` to prib_hudDraw first.
+void redirectMonitorDraw(HMODULE module) {
+    if (!g_options.vr) return;
+    if (*g_prib.rasterizerKind != kRasterizerRoglv2) {
+        logf("pribluda: monitor HUD redirect not engaged -- pribluda reports rasterizer %d, and only "
+             "roglv2's present hook is redirected",
+             *g_prib.rasterizerKind);
+        return;
+    }
+    unsigned char* site = at<unsigned char>(module, kRvaMonitorDrawCall);
+    int32_t        displacement = 0;
+    std::memcpy(&displacement, site + 1, sizeof(displacement));
+    unsigned char* target = site + 5 + displacement;
+    if (site[0] != 0xE8 || target != at<unsigned char>(module, kRvaHudDraw)) {
+        logf("pribluda: monitor HUD redirect not engaged -- +0x%05X holds %02X %02X %02X %02X %02X, not "
+             "a call of the draw at +0x%05X; pribluda keeps drawing its monitor HUD",
+             kRvaMonitorDrawCall, site[0], site[1], site[2], site[3], site[4], kRvaHudDraw);
+        return;
+    }
+    DWORD protection = 0;
+    if (!VirtualProtect(site + 1, sizeof(displacement), PAGE_EXECUTE_READWRITE, &protection)) {
+        logf("pribluda: monitor HUD redirect not engaged -- VirtualProtect on +0x%05X failed (error %lu)",
+             kRvaMonitorDrawCall, GetLastError());
+        return;
+    }
+    g_sampleFps = reinterpret_cast<SampleFpsFn>(at<void>(module, kRvaSampleFps));
+    int32_t replacement = static_cast<int32_t>(
+        reinterpret_cast<intptr_t>(reinterpret_cast<void*>(&pribludaMonitorDraw)) -
+        reinterpret_cast<intptr_t>(site + 5));
+    std::memcpy(site + 1, &replacement, sizeof(replacement));
+    VirtualProtect(site + 1, sizeof(displacement), protection, &protection);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    g_monitorRedirected = true;
+    logf("pribluda: its monitor HUD call at +0x%05X now goes through gplvr -- skipped on frames "
+         "the headset panel is drawn over the monitor, hotkeys and fps readout "
+         "unchanged",
+         kRvaMonitorDrawCall);
+}
+
 // Resolve pribluda once it is loaded. gpl_rasterBegin loads it with LoadLibraryA long
 // after gplvr attaches, and a player who has not installed it never loads it at all, so
 // this keeps looking until it finds the module and then stops for good.
@@ -441,6 +512,8 @@ bool bind() {
              "%s) -- the backdrop boxes stay invisible on the HUD panel",
              g_color4d ? "found" : "missing");
     }
+
+    redirectMonitorDraw(module);
     return true;
 }
 
@@ -722,6 +795,7 @@ void enterTweak() {
              "and placed by %s", g_layoutPath);
         return;
     }
+    mirrorTweakExit(" -- HUD tweak mode entered");
     g_tweak.active = true;
     logf("pribluda: HUD tweak mode on, %s selected -- arrows move it, Page Up/Down select "
          "another, key 0x%02X again saves",
@@ -795,6 +869,15 @@ void pribludaDrawHud() {
     int monitorHeight = *g_prib.screenHeight;
     if (monitorWidth <= 0 || monitorHeight <= 0) return;
 
+    // vrHudPanelRate. Redraws fall due on a fixed schedule, with a quarter period of slack so
+    // a frame landing just before its due time is not pushed a whole frame later. A skipped
+    // frame returns before any GL call and before pribluda is touched, so the headset and the
+    // monitor keep the last image and none of the protections below come into play.
+    LONGLONG now = qpcNow();
+    LONGLONG period =
+        g_options.vrHudPanelRate > 0 ? g_tweak.frequency / g_options.vrHudPanelRate : 0;
+    if (period > 0 && g_panelDue && now + period / 4 < g_panelDue) return;
+
     GlFunctions gl;
     if (!glResolve(gl) || !gl.viewport || !gl.pushAttrib || !gl.popAttrib ||
         !gl.matrixMode || !gl.pushMatrix || !gl.popMatrix || !gl.getIntegerv ||
@@ -832,6 +915,7 @@ void pribludaDrawHud() {
     float font = savedFont;
 
     if (drawn) {
+        frameBudgetSwitch(kSpanPanelDraw);
         InterlockedExchange(&g_drawingHud, 1);
 
         // prib_hudDraw opens with `if (prib_repaintBars) prib_paintLetterboxBars()`: two
@@ -882,14 +966,31 @@ void pribludaDrawHud() {
         InterlockedExchange(&g_drawingHud, 0);
 
         // After the swap back, so g_panelBoxSizes holds what this draw measured.
+        frameBudgetSwitch(kSpanPanelOutline);
         drawTweakOutline(gl, width, height);
         g_tweak.drawnAt = qpcNow();
         g_tweak.panelWidth = width;
         g_tweak.panelHeight = height;
 
         presenterHudEnd();
+
+        // A draw more than a period late starts the schedule again from now rather than
+        // catching up with a burst.
+        if (period > 0)
+            g_panelDue = g_panelDue && now - g_panelDue < period ? g_panelDue + period
+                                                                  : now + period;
+        if (!g_reportedPanelRate) {
+            g_reportedPanelRate = true;
+            if (period > 0)
+                logf("pribluda: the HUD panel is redrawn at most %d times a second "
+                     "(vrHudPanelRate); between redraws the last image stays up",
+                     g_options.vrHudPanelRate);
+            else
+                logf("pribluda: the HUD panel is redrawn every frame (vrHudPanelRate = 0)");
+        }
     }
 
+    frameBudgetSwitch(kSpanPanelRestore);
     gl.matrixMode(GL_MODELVIEW);
     gl.popMatrix();
     gl.matrixMode(GL_PROJECTION);
@@ -977,5 +1078,11 @@ bool pribludaTweakSwallowsKey(unsigned virtualKey) {
     }
     return false;
 }
+
+void pribludaTweakExit(const char* why) {
+    if (g_tweak.active) exitTweak(why);
+}
+
+bool pribludaMonitorDrawRedirected() { return g_monitorRedirected; }
 
 }  // namespace gplvr

@@ -1,5 +1,6 @@
 #include "RenderTarget.h"
 
+#include "FrameBudget.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -717,6 +718,7 @@ void renderTargetRequestSize(int width, int height) {
 }
 
 void renderTargetBeginFrame(const GlFunctions& gl) {
+    frameBudgetSwitch(kSpanRebindSize);
     const bool wanted = g_target.resolved && !g_target.gaveUp &&
                         g_target.requestedWidth > 0 && g_target.requestedHeight > 0;
     if (!wanted) {
@@ -789,7 +791,9 @@ void renderTargetBeginFrame(const GlFunctions& gl) {
     // below. So this is true by construction, where the back buffer's size only happened
     // to look like it should match.
     GLint roglViewport[4] = {0, 0, 0, 0};
+    frameBudgetSwitch(kSpanRebindQuery);
     if (gl.getIntegerv) gl.getIntegerv(0x0BA2 /* GL_VIEWPORT */, roglViewport);
+    frameBudgetSwitch(kSpanRebindSize);
 
     if (!applyDisplaySize(g_target.width, g_target.height, roglViewport[2],
                           roglViewport[3])) {
@@ -814,6 +818,7 @@ void renderTargetBeginFrame(const GlFunctions& gl) {
         return;
     }
 
+    frameBudgetSwitch(kSpanRebindBind);
     gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
 
     // Read the binding back the first time, rather than trusting the call.
@@ -845,10 +850,12 @@ void renderTargetBeginFrame(const GlFunctions& gl) {
     // Re-asserted every frame on purpose. rogl_displaySetupGlState runs again whenever
     // roglv2 rebuilds its display -- every menu-to-sim transition -- and would put the
     // viewport and the ortho back to the window's size underneath us.
+    frameBudgetSwitch(kSpanRebindViewport);
     applyViewport(gl, g_target.width, g_target.height);
 
     g_target.bound = true;
     g_target.active = true;
+    frameBudgetSwitch(kSpanRebind);
 }
 
 void renderTargetEndFrame(const GlFunctions& gl) {
@@ -907,8 +914,60 @@ void renderTargetOverrideSurface(void* surfaceHandle) {
     *heightField = g_target.height;
 }
 
-void renderTargetBlitToWindow(const GlFunctions& gl, int eye) {
-    if (!renderTargetActive() || !gl.blitFramebuffer) return;
+namespace {
+
+// The window rect the last blit fitted into, so a full clear happens only when it moves.
+struct WindowFit {
+    int windowW = 0;
+    int windowH = 0;
+    int rect[4] = {0, 0, 0, 0};
+    int reports = 8;
+};
+
+WindowFit g_fit;
+
+// The picture the current frame's blit drew, for anything drawn over it afterwards.
+WindowPicture g_picture;
+bool          g_pictureValid = false;
+
+void clearRect(const GlFunctions& gl, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    gl.scissor(x, y, w, h);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+}
+
+}  // namespace
+
+bool renderTargetNativeSize(int& width, int& height) {
+    if (g_surface.nativeWidth <= 0 || g_surface.nativeHeight <= 0) return false;
+    width = g_surface.nativeWidth;
+    height = g_surface.nativeHeight;
+    return true;
+}
+
+bool renderTargetWindowPicture(WindowPicture& out) {
+    if (!g_pictureValid) return false;
+    out = g_picture;
+    return true;
+}
+
+void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
+    g_pictureValid = false;
+    if (!renderTargetActive()) return;
+
+    // vrMonitorEye = 0: not one GL call into the window. roglv2 still presents it, so it
+    // shows whatever its back buffer holds with pribluda's monitor overlay on top.
+    if (monitorEye == 0) {
+        if (!g_target.loggedMonitor) {
+            g_target.loggedMonitor = true;
+            logf("target: vrMonitorEye = 0 -- gplvr draws nothing into the game window. It "
+                 "shows whatever its back buffer held, with pribluda's monitor overlay "
+                 "drawn over it every frame and never wiped.");
+        }
+        return;
+    }
+
+    if (!gl.blitFramebuffer) return;
     // Without the read/draw split this would blit the window to itself.
     if (!g_target.splitBinding) return;
 
@@ -922,10 +981,10 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int eye) {
     const int halfW = g_target.width / 2;
     int       srcX = 0;
     int       srcW = g_target.width;
-    if (eye == 1) {
+    if (monitorEye == 2) {
         srcX = 0;
         srcW = halfW;
-    } else if (eye == 2) {
+    } else if (monitorEye == 3) {
         srcX = halfW;
         srcW = g_target.width - halfW;
     }
@@ -943,35 +1002,117 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int eye) {
     const int dstX = (windowW - dstW) / 2;
     const int dstY = (windowH - dstH) / 2;
 
-    const GLboolean scissor = gl.isEnabled ? gl.isEnabled(GL_SCISSOR_TEST) : GL_FALSE;
-    if (scissor && gl.disable) gl.disable(GL_SCISSOR_TEST);
-
     gl.bindFramebuffer(kGlDrawFramebuffer, 0);
     gl.bindFramebuffer(kGlReadFramebuffer, g_target.framebuffer);
     gl.readBuffer(kGlColorAttachment0);
 
+    // The scissor state and everything the clear touches -- clear colour, colour write
+    // mask, draw buffer -- go back exactly as they were found. Pushed with the window's
+    // framebuffer bound, so the draw buffer put back is the window's own.
+    bool saved = gl.pushAttrib && gl.popAttrib;
+    GLboolean scissorWas = GL_FALSE;
+    if (saved)
+        gl.pushAttrib(GL_COLOR_BUFFER_BIT | GL_SCISSOR_BIT);
+    else if (gl.isEnabled)
+        scissorWas = gl.isEnabled(GL_SCISSOR_TEST);
+
+    bool refit = windowW != g_fit.windowW || windowH != g_fit.windowH ||
+                 dstX != g_fit.rect[0] || dstY != g_fit.rect[1] || dstW != g_fit.rect[2] ||
+                 dstH != g_fit.rect[3];
+    if (refit) {
+        // The state this blit inherits, read only when the fit changes so the state
+        // queries stay off the per-frame path.
+        GLint mask[4] = {-1, -1, -1, -1};
+        GLint drawBuffer = 0;
+        if (gl.getIntegerv) {
+            gl.getIntegerv(GL_COLOR_WRITEMASK, mask);
+            gl.getIntegerv(GL_DRAW_BUFFER, &drawBuffer);
+        }
+        bool scissorOn = gl.isEnabled && gl.isEnabled(GL_SCISSOR_TEST);
+        if (g_fit.reports > 0) {
+            --g_fit.reports;
+            logf("target: the window picture is %dx%d at %d,%d in a %dx%d window -- the "
+                 "whole window is cleared this frame and only the bars after. State found: "
+                 "scissor %s, colour write mask %d%d%d%d, draw buffer 0x%04X. A closed "
+                 "mask or a draw buffer other than GL_BACK (0x0405) keeps a clear from "
+                 "reaching the bars.",
+                 dstW, dstH, dstX, dstY, windowW, windowH, scissorOn ? "ON" : "off",
+                 mask[0], mask[1], mask[2], mask[3], static_cast<unsigned>(drawBuffer));
+        }
+        g_fit.windowW = windowW;
+        g_fit.windowH = windowH;
+        g_fit.rect[0] = dstX;
+        g_fit.rect[1] = dstY;
+        g_fit.rect[2] = dstW;
+        g_fit.rect[3] = dstH;
+    }
+
+    // THE LETTERBOX BARS ARE CLEARED EVERY FRAME, because of pribluda.
+    //
+    // In VR with the panel live, pribluda draws nothing into the window and the
+    // panel is drawn inside the picture after this blit (presenterBlitToWindow), so the
+    // bar-only clear is all the window needs. Otherwise:
+    //
+    // Its monitor overlay is drawn inside roglv2's present: pribluda's DllMain patches the
+    // call at roglv2+0x9B83, between rogl_displayPresent's glFinish and its SwapBuffers. So
+    // its text lands in this back buffer AFTER this blit, over the picture and over the
+    // bars alike. The next blit replaces every pixel of the picture; nothing replaces the
+    // bars, so any pixel there that a frame's clear does not reach keeps the text drawn
+    // into it, and text that moves or changes leaves trails. roglv2's pixel format asks
+    // for no PFD_SWAP_COPY either, so what the buffer holds after a swap is undefined.
+    //
+    // When the fit is unchanged, clearing the four bars is the same result as clearing
+    // the window, for less fill. The write mask is opened because glClear honours it.
     if (dstW < windowW || dstH < windowH) {
         gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        gl.clear(GL_COLOR_BUFFER_BIT);
+        if (saved && gl.colorMask) gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (refit || !saved || !gl.scissor || !gl.enable) {
+            if (gl.disable) gl.disable(GL_SCISSOR_TEST);
+            gl.clear(GL_COLOR_BUFFER_BIT);
+        } else {
+            gl.enable(GL_SCISSOR_TEST);
+            clearRect(gl, 0, 0, dstX, windowH);                              // left
+            clearRect(gl, dstX + dstW, 0, windowW - dstX - dstW, windowH);   // right
+            clearRect(gl, dstX, 0, dstW, dstY);                              // bottom
+            clearRect(gl, dstX, dstY + dstH, dstW, windowH - dstY - dstH);   // top
+        }
     }
+
+    // glBlitFramebuffer honours the scissor test too.
+    if (gl.disable) gl.disable(GL_SCISSOR_TEST);
+
     // Both sides are GL framebuffers with the same bottom-left origin, so a straight
     // blit preserves the orientation -- no flip, and no need to know which way up the
     // engine thinks it is drawing.
     gl.blitFramebuffer(srcX, 0, srcX + srcW, g_target.height, dstX, dstY, dstX + dstW,
                        dstY + dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    g_picture.windowWidth = windowW;
+    g_picture.windowHeight = windowH;
+    g_picture.srcX = srcX;
+    g_picture.srcWidth = srcW;
+    g_picture.srcHeight = g_target.height;
+    g_picture.dstX = dstX;
+    g_picture.dstY = dstY;
+    g_picture.dstWidth = dstW;
+    g_picture.dstHeight = dstH;
+    g_pictureValid = true;
 
     // Unbind BEFORE naming GL_BACK: GL_BACK is not a valid read buffer for a
     // framebuffer object, so the other order raises INVALID_OPERATION. The same mistake
     // was in the frame transfer and it took three runs to find there.
     gl.bindFramebuffer(kGlReadFramebuffer, 0);
     gl.readBuffer(GL_BACK);
-    if (scissor && gl.enable) gl.enable(GL_SCISSOR_TEST);
+    if (saved)
+        gl.popAttrib();
+    else if (scissorWas && gl.enable)
+        gl.enable(GL_SCISSOR_TEST);
 
     if (!g_target.loggedMonitor) {
         g_target.loggedMonitor = true;
         logf("target: the game window is showing %s of the %dx%d off-screen frame, "
              "aspect-fitted into %dx%d",
-             eye == 1 ? "the LEFT eye" : (eye == 2 ? "the RIGHT eye" : "both eyes"),
+             monitorEye == 2 ? "the LEFT eye"
+                             : (monitorEye == 3 ? "the RIGHT eye" : "both eyes"),
              g_target.width, g_target.height, windowW, windowH);
     }
 }
@@ -980,6 +1121,9 @@ void renderTargetRelease(const GlFunctions& gl) {
     restoreSurfaceSize();
     if (g_target.bound && gl.bindFramebuffer) gl.bindFramebuffer(kGlFramebuffer, 0);
     destroyFramebuffer(gl);
+    // The next blit clears the whole window again, whatever it held meanwhile.
+    g_fit.windowW = 0;
+    g_fit.windowH = 0;
     // inMenuMode is deliberately NOT reset here: this is called every frame while the
     // menu is up, and clearing the latch would turn one transition line into a pair of
     // them per frame.

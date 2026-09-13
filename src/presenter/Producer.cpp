@@ -3,9 +3,11 @@
 #include "RenderTarget.h"
 
 #include "CursorOverlay.h"
+#include "FrameBudget.h"
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "Pribluda.h"
 #include "Stereo.h"
 #include "VrCamera.h"
 
@@ -14,6 +16,7 @@
 
 #include <new>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -55,20 +58,33 @@ struct State {
     ID3D11Texture2D* textures[kFrameSlots] = {};
     GlSharedTexture  shared[kFrameSlots] = {};
 
-    // Pribluda's panel, two slots like the frame. Separate from the frame textures: its
-    // size follows the panel rather than the render target, and it is drawn into rather
-    // than transferred.
+    // Pribluda's panel, two shared slots like the frame. Separate from the frame textures:
+    // its size follows the panel rather than the render target. pribluda draws into
+    // hudTexture, a plain GL texture of the same size that needs no interop lock, and the
+    // image is copied into the next shared slot inside the frame transfer's lock.
     ID3D11Texture2D* hudTextures[kFrameSlots] = {};
     GlSharedTexture  hudShared[kFrameSlots] = {};
     int              hudWidth = 0;
     int              hudHeight = 0;
-    uint32_t         hudSlot = 0;
+    GLuint           hudTexture = 0;
+    GLuint           hudFramebuffer = 0;
     GLint            hudPreviousFramebuffer = 0;
     bool             hudBound = false;
-    bool             hudPending = false;
+    bool             hudPending = false;  // hudTexture holds an image not yet copied
     bool             hudReportedFailure = false;
     LONGLONG         hudPublishedQpc = 0;  // when the last panel image was published
+    LONGLONG         hudDrawnQpc = 0;      // when pribluda last drew into hudTexture
     LONGLONG         qpcFrequency = 0;
+
+    // The panel on the monitor. The views this frame's eyes were rendered from, kept for the monitor draw
+    // that follows the transfer; whether that draw took over pribluda's monitor HUD this
+    // frame; and the last state logged.
+    SharedView  monitorViews[2] = {};
+    bool        monitorViewsValid = false;
+    bool        monitorHudTaken = false;
+    const char* monitorHudReported = "";
+    int         monitorHudReports = 32;
+    bool        monitorHudGlError = false;
 
     int  width = 0;
     int  height = 0;
@@ -255,6 +271,12 @@ void releaseHudTextures(State& state) {
         if (state.hudTextures[slot]) state.hudTextures[slot]->Release();
         state.hudTextures[slot] = nullptr;
     }
+    if (state.hudFramebuffer && state.gl.deleteFramebuffers)
+        state.gl.deleteFramebuffers(1, &state.hudFramebuffer);
+    if (state.hudTexture && state.gl.deleteTextures)
+        state.gl.deleteTextures(1, &state.hudTexture);
+    state.hudFramebuffer = 0;
+    state.hudTexture = 0;
     state.hudWidth = 0;
     state.hudHeight = 0;
     state.hudPending = false;
@@ -359,13 +381,43 @@ bool createHudTextures(State& state, int width, int height) {
         storeSharedHandle(state.block->hudTextures[slot], state.hudShared[slot].shareHandle);
     }
 
+    // The texture pribluda draws into. Plain GL, so the draw takes no interop lock; its image
+    // reaches a shared slot in the frame transfer's lock.
+    GlFunctions& gl = state.gl;
+    GLint previousTexture = 0;
+    GLint previousFramebuffer = 0;
+    gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    gl.getIntegerv(kGlFramebufferBinding, &previousFramebuffer);
+    gl.genTextures(1, &state.hudTexture);
+    gl.bindTexture(GL_TEXTURE_2D, state.hudTexture);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                  nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kGlClampToEdge);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kGlClampToEdge);
+    gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+    gl.genFramebuffers(1, &state.hudFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, state.hudFramebuffer);
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                            state.hudTexture, 0);
+    GLenum status = gl.checkFramebufferStatus(kGlFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previousFramebuffer));
+    if (status != kGlFramebufferComplete) {
+        logf("vr: the HUD panel's own %dx%d framebuffer is incomplete (0x%04X) -- no panel",
+             width, height, status);
+        releaseHudTextures(state);
+        return false;
+    }
+
     state.hudWidth = width;
     state.hudHeight = height;
     state.block->hudTextureWidth = static_cast<uint32_t>(width);
     state.block->hudTextureHeight = static_cast<uint32_t>(height);
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state.block->hudGeneration));
-    logf("vr: HUD panel textures %dx%d shared, generation %d", width, height,
-         state.block->hudGeneration);
+    logf("vr: HUD panel textures %dx%d shared, generation %d; pribluda draws into GL texture "
+         "%u, copied into the shared slot under the frame transfer's lock",
+         width, height, state.block->hudGeneration, state.hudTexture);
     return true;
 }
 
@@ -404,6 +456,263 @@ bool writeBmp32(const char* path, const unsigned char* pixels, int sourceWidth,
     return ok;
 }
 
+// -- the headset panel over the monitor picture ----------------------------------------
+
+void quatRotate(float qx, float qy, float qz, float qw, const float v[3], float out[3]) {
+    float tx = 2.0f * (qy * v[2] - qz * v[1]);
+    float ty = 2.0f * (qz * v[0] - qx * v[2]);
+    float tz = 2.0f * (qx * v[1] - qy * v[0]);
+    out[0] = v[0] + qw * tx + (qy * tz - qz * ty);
+    out[1] = v[1] + qw * ty + (qz * tx - qx * tz);
+    out[2] = v[2] + qw * tz + (qx * ty - qy * tx);
+}
+
+// The panel's corners in its layer's space -- VIEW for the head, the seat space for the
+// seat -- placed exactly as gplvr-xr.exe places the quad: centre at (right, up, -ahead),
+// turned toward the origin by a yaw about +y after a pitch about +x. Bottom-left,
+// bottom-right, top-right, top-left, which are texture (0,0) (1,0) (1,1) (0,1): GL drew the
+// panel bottom-up.
+void panelCorners(const HudPlacement& placement, float aspect, float corners[4][3]) {
+    float right = placement.right;
+    float up = -placement.down;
+    float ahead = placement.ahead;
+    float level = std::sqrt(right * right + ahead * ahead);
+    float yaw = std::atan2(-right, ahead);
+    float pitch = std::atan2(up, level);
+    float cy = std::cos(yaw * 0.5f);
+    float sy = std::sin(yaw * 0.5f);
+    float cp = std::cos(pitch * 0.5f);
+    float sp = std::sin(pitch * 0.5f);
+    float halfW = placement.width * 0.5f;
+    float halfH = halfW * aspect;
+    static const float kSigns[4][2] = {{-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
+    for (int i = 0; i < 4; ++i) {
+        float local[3] = {kSigns[i][0] * halfW, kSigns[i][1] * halfH, 0.0f};
+        float turned[3];
+        quatRotate(cy * sp, sy * cp, -sy * sp, cy * cp, local, turned);
+        corners[i][0] = right + turned[0];
+        corners[i][1] = up + turned[1];
+        corners[i][2] = -ahead + turned[2];
+    }
+}
+
+constexpr float kMonitorHudNear = 0.02f;  // metres; a corner closer than this is not drawn
+
+// One eye's picture: its corners projected through the pose and fov that eye was rendered
+// with, then drawn as a textured quad with a homogeneous w per vertex, so the texture is
+// interpolated perspective-correctly exactly as the eye camera would have drawn it. False
+// when the quad is behind the eye, off the picture, or the eye is not in the picture.
+bool drawPanelInEye(State& state, const WindowPicture& picture, int eye, bool seat,
+                    const float corners[4][3]) {
+    GlFunctions&      gl = state.gl;
+    const SharedView& view = state.monitorViews[eye];
+    int rx = static_cast<int>(state.block->eyeRect[eye][0]);
+    int ry = static_cast<int>(state.block->eyeRect[eye][1]);
+    int rw = static_cast<int>(state.block->eyeRect[eye][2]);
+    int rh = static_cast<int>(state.block->eyeRect[eye][3]);
+    if (rw <= 0 || rh <= 0 || picture.srcWidth <= 0) return false;
+    if (rx < picture.srcX || rx + rw > picture.srcX + picture.srcWidth) return false;
+
+    // The eye's rect in window pixels. eyeRect counts rows from the top of the frame; GL and
+    // the blit count them from the bottom.
+    float scale = static_cast<float>(picture.dstWidth) / static_cast<float>(picture.srcWidth);
+    float wx = picture.dstX + (rx - picture.srcX) * scale;
+    float wy = picture.dstY + (picture.srcHeight - ry - rh) * scale;
+    float ww = rw * scale;
+    float wh = rh * scale;
+
+    float tanL = std::tan(view.fov.angleLeft);
+    float tanR = std::tan(view.fov.angleRight);
+    float tanU = std::tan(view.fov.angleUp);
+    float tanD = std::tan(view.fov.angleDown);
+    if (tanR - tanL <= 0.0f || tanU - tanD <= 0.0f) return false;
+
+    const SharedPose& pose = view.pose;
+    const SharedPose& seatPose = state.block->seatPose;
+    // VIEW space is the head: between the two eyes, turned as they are.
+    float head[3] = {
+        (state.monitorViews[0].pose.positionX + state.monitorViews[1].pose.positionX) * 0.5f,
+        (state.monitorViews[0].pose.positionY + state.monitorViews[1].pose.positionY) * 0.5f,
+        (state.monitorViews[0].pose.positionZ + state.monitorViews[1].pose.positionZ) * 0.5f};
+
+    float window[4][3];
+    int   left = 0, rightOut = 0, below = 0, above = 0;
+    for (int i = 0; i < 4; ++i) {
+        float local[3];
+        if (seat) {
+            quatRotate(seatPose.orientationX, seatPose.orientationY, seatPose.orientationZ,
+                       seatPose.orientationW, corners[i], local);
+            local[0] += seatPose.positionX;
+            local[1] += seatPose.positionY;
+            local[2] += seatPose.positionZ;
+        } else {
+            quatRotate(pose.orientationX, pose.orientationY, pose.orientationZ,
+                       pose.orientationW, corners[i], local);
+            local[0] += head[0];
+            local[1] += head[1];
+            local[2] += head[2];
+        }
+        float relative[3] = {local[0] - pose.positionX, local[1] - pose.positionY,
+                             local[2] - pose.positionZ};
+        float inEye[3];
+        quatRotate(-pose.orientationX, -pose.orientationY, -pose.orientationZ,
+                   pose.orientationW, relative, inEye);
+        float depth = -inEye[2];
+        if (depth < kMonitorHudNear) return false;
+        float u = (inEye[0] / depth - tanL) / (tanR - tanL);
+        float v = (inEye[1] / depth - tanD) / (tanU - tanD);
+        if (u < 0.0f) ++left;
+        if (u > 1.0f) ++rightOut;
+        if (v < 0.0f) ++below;
+        if (v > 1.0f) ++above;
+        window[i][0] = wx + u * ww;
+        window[i][1] = wy + v * wh;
+        window[i][2] = depth;
+    }
+    if (left == 4 || rightOut == 4 || below == 4 || above == 4) return false;
+
+    int sx = static_cast<int>(std::floor(wx));
+    int sy = static_cast<int>(std::floor(wy));
+    gl.scissor(sx, sy, static_cast<int>(std::ceil(wx + ww)) - sx,
+               static_cast<int>(std::ceil(wy + wh)) - sy);
+
+    static const GLfloat kTexture[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+    gl.begin(GL_QUADS);
+    for (int i = 0; i < 4; ++i) {
+        float w = window[i][2];
+        gl.texCoord2f(kTexture[i][0], kTexture[i][1]);
+        gl.vertex4f(window[i][0] * w, window[i][1] * w, 0.0f, w);
+    }
+    gl.end();
+    return true;
+}
+
+// Logged when the answer changes, capped: entering and leaving races flips it.
+void noteMonitorHud(State& state, const char* reason, int monitorEye) {
+    if (reason == state.monitorHudReported || state.monitorHudReports <= 0) return;
+    --state.monitorHudReports;
+    state.monitorHudReported = reason;
+    if (!reason) {
+        logf("vr: monitor HUD engaged -- the headset panel (%s) is drawn over %s of the "
+             "monitor picture and pribluda's own monitor HUD is skipped",
+             g_options.vrHudLayer == 1 ? "following the head" : "fixed to the seat",
+             monitorEye == 1 ? "each eye" : (monitorEye == 2 ? "the left eye" : "the right eye"));
+    } else {
+        logf("vr: monitor HUD not drawn -- %s; pribluda draws its own monitor HUD", reason);
+    }
+}
+
+// After the eye blit, into the window. Every piece of state touched goes back, the matrix
+// mode included: roglv2 relies on GL_PROJECTION being current.
+void drawMonitorHud(State& state, int monitorEye) {
+    GlFunctions& gl = state.gl;
+
+    WindowPicture picture;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    bool live = state.hudTexture && state.hudDrawnQpc && state.qpcFrequency &&
+                now.QuadPart - state.hudDrawnQpc <
+                    static_cast<LONGLONG>(state.qpcFrequency * kHudGraceSeconds);
+    int  layer = g_options.vrHudLayer;
+
+    const char* reason = nullptr;
+    if (monitorEye == 0)
+        reason = "vrMonitorEye = 0 puts no picture in the window";
+    else if (!pribludaMonitorDrawRedirected())
+        reason = "pribluda's monitor draw is not redirected (see the pribluda: lines)";
+    else if (!live)
+        reason = "no HUD panel drawn in the last 0.25 s (not in a race, or vrHudLayer 0)";
+    else if (!renderTargetWindowPicture(picture))
+        reason = "the window shows no off-screen picture this frame";
+    else if (!state.monitorViewsValid)
+        reason = "this frame has no tracked stereo views to place the panel with";
+    else if (layer != 1 && layer != 2)
+        reason = "vrHudLayer is not 1 or 2";
+    else if (layer == 2 && !state.block->seatGeneration)
+        reason = "no seat has been published yet";
+    else if (!gl.pushAttrib || !gl.popAttrib || !gl.pushMatrix || !gl.popMatrix ||
+             !gl.matrixMode || !gl.loadIdentity || !gl.ortho || !gl.viewport || !gl.enable ||
+             !gl.disable || !gl.scissor || !gl.bindTexture || !gl.texEnvi || !gl.blendFunc ||
+             !gl.color4f || !gl.begin || !gl.end || !gl.texCoord2f || !gl.vertex4f ||
+             !gl.polygonMode || !gl.colorMask || !gl.getIntegerv || !gl.bindFramebuffer)
+        reason = "GL entry points for a textured quad are missing";
+    noteMonitorHud(state, reason, monitorEye);
+    if (reason) return;
+
+    float corners[4][3];
+    panelCorners(layer == 1 ? g_options.vrHudHead : g_options.vrHudSeat,
+                 static_cast<float>(state.hudHeight) / static_cast<float>(state.hudWidth),
+                 corners);
+
+    GLint previousDraw = 0;
+    GLint savedMode = GL_PROJECTION;
+    gl.getIntegerv(kGlFramebufferBinding, &previousDraw);
+    gl.getIntegerv(GL_MATRIX_MODE, &savedMode);
+    if (previousDraw != 0) gl.bindFramebuffer(kGlDrawFramebuffer, 0);
+
+    gl.pushAttrib(static_cast<GLbitfield>(
+        GL_ENABLE_BIT | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT |
+        GL_POLYGON_BIT | GL_SCISSOR_BIT | GL_TEXTURE_BIT | GL_VIEWPORT_BIT | GL_TRANSFORM_BIT));
+    GLint savedTexture = 0;
+    gl.getIntegerv(GL_TEXTURE_BINDING_2D, &savedTexture);
+
+    gl.viewport(0, 0, picture.windowWidth, picture.windowHeight);
+    gl.matrixMode(GL_PROJECTION);
+    gl.pushMatrix();
+    gl.loadIdentity();
+    gl.ortho(0.0, static_cast<double>(picture.windowWidth), 0.0,
+             static_cast<double>(picture.windowHeight), -1.0, 1.0);
+    gl.matrixMode(GL_MODELVIEW);
+    gl.pushMatrix();
+    gl.loadIdentity();
+
+    gl.disable(GL_DEPTH_TEST);
+    gl.disable(GL_ALPHA_TEST);
+    gl.disable(GL_STENCIL_TEST);
+    gl.disable(GL_CULL_FACE);
+    gl.disable(GL_LIGHTING);
+    gl.disable(GL_FOG);
+    gl.disable(GL_COLOR_LOGIC_OP);
+    gl.disable(GL_TEXTURE_1D);
+    gl.polygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.enable(GL_SCISSOR_TEST);
+    gl.enable(GL_TEXTURE_2D);
+    gl.bindTexture(GL_TEXTURE_2D, state.hudTexture);
+    gl.texEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    gl.color4f(1.0f, 1.0f, 1.0f, 1.0f);
+    // The panel is premultiplied: text opaque, pribluda's backdrops black at their coverage.
+    gl.enable(GL_BLEND);
+    gl.blendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    bool seat = layer == 2;
+    if (monitorEye == 1 || monitorEye == 2) drawPanelInEye(state, picture, 0, seat, corners);
+    if (monitorEye == 1 || monitorEye == 3) drawPanelInEye(state, picture, 1, seat, corners);
+
+    gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(savedTexture));
+    gl.matrixMode(GL_MODELVIEW);
+    gl.popMatrix();
+    gl.matrixMode(GL_PROJECTION);
+    gl.popMatrix();
+    gl.popAttrib();
+    gl.matrixMode(static_cast<GLenum>(savedMode));
+    if (previousDraw != 0)
+        gl.bindFramebuffer(kGlDrawFramebuffer, static_cast<GLuint>(previousDraw));
+
+    // A quad entirely off the picture still counts: pribluda's monitor HUD must not pop in
+    // whenever the panel is out of view.
+    state.monitorHudTaken = true;
+
+    if (gl.getError) {
+        GLenum error = gl.getError();
+        if (error != GL_NO_ERROR && !state.monitorHudGlError) {
+            state.monitorHudGlError = true;
+            logf("vr: monitor HUD -- GL error 0x%04X after drawing the panel over the monitor "
+                 "(logged once)",
+                 error);
+        }
+    }
+}
 
 }  // namespace
 
@@ -450,6 +759,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
 
     ControlBlock* block = state.block;
     if (!block) return;
+    state.monitorViewsValid = false;
 
     // The presenter dying is a normal outcome -- no headset, SteamVR refused, the user
     // closed it -- and must not take the game with it.
@@ -556,7 +866,6 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     block->sideBySide = sideBySide ? 1 : 0;
     block->monoScale = g_options.vrMenuScale;
     block->gamma = g_options.vrGamma;
-    block->submitCurrentPose = g_options.vrDebugSubmitCurrentPose ? 1 : 0;
     const HudPlacement& placement =
         g_options.vrHudLayer == 1 ? g_options.vrHudHead : g_options.vrHudSeat;
     block->hudRight = placement.right;
@@ -599,6 +908,15 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     }
     block->renderedViewsValid[slot] = haveRendered ? 1 : 0;
 
+    // The monitor draw after the transfer places the panel in the picture these views
+    // rendered. Only a tracked side-by-side frame drawn at the runtime's frustum maps an eye's
+    // rect exactly onto its fov.
+    if (haveRendered && sideBySide && stretchToFill) {
+        state.monitorViews[0] = rendered[0];
+        state.monitorViews[1] = rendered[1];
+        state.monitorViewsValid = true;
+    }
+
     // Timed, because it is the one per-frame cost with no instrument on it and it runs
     // once per PUBLISHED frame -- so three to six times a tick, each ending in a glFinish
     // that stalls until the GPU drains. At 76.8 MB that is not obviously cheap, and the
@@ -606,33 +924,51 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     if (state.frameSequence > 0 && block->consumedSequence == state.frameSequence - 1)
         ++state.slotOverwrites;
 
+    // The span switch comes before the copy function, so its GPU mark is never issued between
+    // that function's error checks.
+    // A panel pribluda drew since the last copy rides in the same lock as the frame, into the
+    // slot after the one last published; moving hudSequence on by one below names that slot.
+    uint32_t    hudSlot = static_cast<uint32_t>(block->hudSequence + 1) % kFrameSlots;
+    bool        copyPanel = state.hudPending && state.hudFramebuffer &&
+                     state.hudShared[hudSlot].interopObject;
+    GlPanelCopy panelCopy;
+    if (copyPanel) {
+        panelCopy.shared = &state.hudShared[hudSlot];
+        panelCopy.sourceFramebuffer = state.hudFramebuffer;
+        panelCopy.width = state.hudWidth;
+        panelCopy.height = state.hudHeight;
+    }
+
+    int           transferring = frameBudgetEnter(kSpanTransfer);
     LARGE_INTEGER transferBegin, transferEnd;
     QueryPerformanceCounter(&transferBegin);
-    const bool transferred =
-        glInteropCopyBackBuffer(state.gl, state.interopDevice, state.shared[slot], width,
-                                height, renderTargetFramebuffer());
+    const bool transferred = glInteropCopyBackBuffer(
+        state.gl, state.interopDevice, state.shared[slot], width, height,
+        renderTargetFramebuffer(), g_options.vrTransferFinish, copyPanel ? &panelCopy : nullptr);
     QueryPerformanceCounter(&transferEnd);
+    frameBudgetLeave(transferring);
     presenterNoteTransfer(transferEnd.QuadPart - transferBegin.QuadPart);
+    // A panel image not copied because the frame failed stays pending for the next frame.
     if (!transferred) return;
 
-    // The copy above ends in glFinish, so the pixels are complete before the sequence
-    // that advertises them is published. That ordering is the whole reason no lock is
-    // needed here.
+    // The copy above ends in wglDXUnlockObjectsNV, which completes the GL work on the shared
+    // textures, and by default in glFinish as well (vrTransferFinish), so the pixels are
+    // complete before the sequence that advertises them is published. That ordering is the
+    // whole reason no lock is needed here.
     ++state.frameSequence;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
     vrNoteFramePublished();
 
-    // The HUD panel drawn this frame goes out now, after the transfer's glFinish has
-    // drained everything GL was asked to do -- the panel included -- so the presenter can
-    // never copy one that is still being drawn.
-    // presenterHudBegin drew into slot (hudSequence + 1) % kFrameSlots, so moving the
-    // sequence on by one is what names that slot.
-    if (state.hudPending) {
+    // The HUD panel copied under the same lock goes out now, after the same synchronisation,
+    // so the presenter can never copy one that is still being written.
+    if (copyPanel) {
         state.hudPending = false;
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->hudSequence),
-                            block->hudSequence + 1);
-        state.hudPublishedQpc = transferEnd.QuadPart;
+        if (panelCopy.copied) {
+            InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->hudSequence),
+                                block->hudSequence + 1);
+            state.hudPublishedQpc = transferEnd.QuadPart;
+        }
     }
 
     // The layer is published only while the game keeps drawing the panel. pribluda's draw
@@ -694,8 +1030,12 @@ void presenterEndFrame() {
 
 void presenterBlitToWindow(int eye) {
     State& state = g_state;
+    state.monitorHudTaken = false;
     if (state.stage == Stage::Off) return;
     renderTargetBlitToWindow(state.gl, eye);
+    if (state.stage != Stage::Publishing || !state.block) return;
+    frameBudgetSwitch(kSpanWindowHud);
+    drawMonitorHud(state, eye);
 }
 
 void presenterDrawCursor(bool sideBySide) {
@@ -821,12 +1161,13 @@ bool presenterHudBegin(int aspectWidth, int aspectHeight, int& width, int& heigh
     GlFunctions& gl = state.gl;
     if (!gl.bindFramebuffer) glResolveFramebuffer(gl);
     if (!gl.bindFramebuffer || !gl.framebufferTexture2D || !gl.checkFramebufferStatus ||
-        !gl.clear || !gl.clearColor || !gl.viewport || !gl.getIntegerv ||
-        !gl.dxLockObjects || !gl.dxUnlockObjects) {
+        !gl.genFramebuffers || !gl.deleteFramebuffers || !gl.blitFramebuffer || !gl.clear ||
+        !gl.clearColor || !gl.viewport || !gl.getIntegerv || !gl.texImage2D ||
+        !gl.texParameteri || !gl.dxLockObjects || !gl.dxUnlockObjects) {
         if (!state.hudReportedFailure) {
             state.hudReportedFailure = true;
-            logf("vr: the HUD panel needs framebuffer objects and interop locking, and GL "
-                 "did not provide them -- no panel");
+            logf("vr: the HUD panel needs framebuffer objects, framebuffer blits and interop "
+                 "locking, and GL did not provide them -- no panel");
         }
         return false;
     }
@@ -834,44 +1175,20 @@ bool presenterHudBegin(int aspectWidth, int aspectHeight, int& width, int& heigh
     int wantedHeight = static_cast<int>(static_cast<long long>(kHudTextureWidth) *
                                         aspectHeight / aspectWidth);
     if (wantedHeight < 1) wantedHeight = 1;
-    if ((state.hudWidth != kHudTextureWidth || state.hudHeight != wantedHeight) &&
+    if ((state.hudWidth != kHudTextureWidth || state.hudHeight != wantedHeight ||
+         !state.hudFramebuffer) &&
         !createHudTextures(state, kHudTextureWidth, wantedHeight))
         return false;
 
-    // The slot after the one last published. Drawn twice without a publish in between --
-    // a frame that never reached the transfer -- it is simply drawn again.
-    uint32_t slot = static_cast<uint32_t>(state.block->hudSequence + 1) % kFrameSlots;
-    GlSharedTexture& shared = state.hudShared[slot];
-
-    HANDLE object = shared.interopObject;
-    if (!gl.dxLockObjects(state.interopDevice, 1, &object)) {
-        if (!state.hudReportedFailure) {
-            state.hudReportedFailure = true;
-            logf("vr: wglDXLockObjectsNV refused the HUD panel texture -- no panel");
-        }
-        return false;
-    }
-
+    // The panel's own texture: no interop lock here. Drawn twice without a copy in between
+    // -- a frame that never reached the transfer, or a skipped one -- it is simply drawn again.
+    frameBudgetSwitch(kSpanPanelBind);
     gl.getIntegerv(kGlFramebufferBinding, &state.hudPreviousFramebuffer);
-    gl.bindFramebuffer(kGlFramebuffer, shared.framebuffer);
-    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, shared.name,
-                            0);
-    if (gl.checkFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
-        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
-        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(state.hudPreviousFramebuffer));
-        gl.dxUnlockObjects(state.interopDevice, 1, &object);
-        if (!state.hudReportedFailure) {
-            state.hudReportedFailure = true;
-            logf("vr: the HUD panel's framebuffer is incomplete -- no panel");
-        }
-        return false;
-    }
-
+    gl.bindFramebuffer(kGlFramebuffer, state.hudFramebuffer);
     gl.viewport(0, 0, state.hudWidth, state.hudHeight);
     gl.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.clear(GL_COLOR_BUFFER_BIT);
 
-    state.hudSlot = slot;
     state.hudBound = true;
     width = state.hudWidth;
     height = state.hudHeight;
@@ -882,20 +1199,18 @@ void presenterHudEnd() {
     State& state = g_state;
     if (!state.hudBound) return;
     state.hudBound = false;
+    frameBudgetSwitch(kSpanPanelUnbind);
 
-    GlFunctions& gl = state.gl;
-    GlSharedTexture& shared = state.hudShared[state.hudSlot];
+    state.gl.bindFramebuffer(kGlFramebuffer,
+                             static_cast<GLuint>(state.hudPreviousFramebuffer));
 
-    // Detached before the unlock: GL must not still hold an interop object when it is
-    // handed back to Direct3D, or the unlock fails and the image is lost -- the same order
-    // glInteropCopyBackBuffer keeps for the frame.
-    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
-    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(state.hudPreviousFramebuffer));
-    HANDLE object = shared.interopObject;
-    gl.dxUnlockObjects(state.interopDevice, 1, &object);
-
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    state.hudDrawnQpc = now.QuadPart;
     state.hudPending = true;
 }
+
+bool presenterMonitorHudTaken() { return g_state.monitorHudTaken; }
 
 void presenterStop() {
     State& state = g_state;

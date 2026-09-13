@@ -20,10 +20,48 @@ struct Options {
     // bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the head.
     bool stereo = false;
 
-    // The mirror pass, p[43]. Its camera targets a fixed rect of the full render
-    // surface, so it does not follow an eye into its half of the buffer.
-    //   0 = off in both eyes   1 = left eye only (default)   2 = both eyes
-    int stereoMirror = 1;
+    // The mirror pass, p[43]. The car's two mirror glasses sample opposite halves of
+    // mirror.mip, and each half is rendered by a camera aimed as that glass's reflection.
+    //   0 = no mirror
+    //   1 = both panes rendered once a frame, on the left eye's pass, from the head centre;
+    //       the right eye samples the same texture (2 mirror renders a frame)
+    //   2 = both panes rendered on each eye's pass from that eye, so each glass has stereo
+    //       depth (4 mirror renders a frame, default)
+    // Each pane after the first in a pass costs a sceneRender whose main pass is skipped.
+    int stereoMirror = 2;
+
+    // Field of view of each mirror pane as a multiple of the angle its glass subtends from
+    // the eye. 1.0 is life-size; above 1 shows more of the world, smaller. 0.25 to 6.
+    float vrMirrorFovScale = 1.0f;
+
+    // Turn each mirror glass on its mount, in degrees, the way a driver adjusts a real one.
+    // Yaw positive turns the glass face inboard, toward the driver; pitch positive tilts it
+    // up. Mirrored between the two glasses, applied yaw first, and the view swings by twice
+    // the angle, as reflection does. -45 to 45.
+    float vrMirrorYaw = 0.0f;
+    float vrMirrorPitch = 0.0f;
+
+    // Render the mirror pass into a framebuffer of its own instead of the top-left corner
+    // of the frame, where a second mirror pass leaves a square in the left eye.
+    bool vrMirrorOffscreen = true;
+
+    // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
+    // VR only. While on, Left/Right change vrMirrorYaw, Up/Down vrMirrorPitch and Page Up/Down
+    // vrMirrorFovScale, live in both glasses, and those keys do not reach the game; the key
+    // again leaves and logs the values to copy into gplvr.ini. Nothing is written. Entering it
+    // leaves HUD tweak mode, and entering HUD tweak mode leaves it.
+    int vrMirrorTweakKey = 'M';
+
+    // How fast mirror tweak mode turns the glasses, in degrees per second.
+    float vrMirrorTweakAngleSpeed = 10.0f;
+
+    // How fast mirror tweak mode changes vrMirrorFovScale, in doublings per second: 0.5
+    // doubles or halves it every two seconds, the same share of the field at any scale.
+    float vrMirrorTweakFovSpeed = 0.5f;
+
+    // Switch stereoMirror between 1 (head centre) and 2 (per eye) while the game runs. 'N' by
+    // default; 0 disables. Does nothing when stereoMirror is 0. VR only.
+    int vrMirrorModeKey = 'N';
 
 
     // Toggle stereo at runtime. '1' by default; 0 disables.
@@ -280,12 +318,6 @@ struct Options {
     // above 1.0 lifts mid-tones and shadows, with black and white staying put. 0.5 to 3.0.
     float vrGamma = 1.0f;
 
-    // Debug: submit the game's eye images with the current display pose instead of the pose
-    // they were rendered from. Toggled at runtime by vrDebugSubmitCurrentPoseKey (Insert by
-    // default; 0 disables).
-    bool vrDebugSubmitCurrentPose = false;
-    int  vrDebugSubmitCurrentPoseKey = VK_INSERT;
-
     // How far in front of the driver GPL's own in-race HUD appears, in metres. 0 puts it
     // at infinity.
     //
@@ -343,6 +375,13 @@ struct Options {
     // How fast the arrows move an element in tweak mode, in fractions of the panel per second.
     float vrHudTweakSpeed = 0.10f;
 
+    // The most times a second pribluda redraws the HUD panel. 0 redraws it every frame. Between
+    // redraws the headset and the monitor keep showing the last image. pribluda's text changes a
+    // few times a second at most, so 72 loses nothing at 144 fps and halves the panel's cost.
+    // Values from 1 to 9 are raised to 10, so a panel still counts as drawn within the 0.25 s
+    // the lobby hide and tweak mode wait for.
+    int vrHudPanelRate = 72;
+
     // Which eye GPL's OWN in-race text is drawn into: 0 both, 1 the left only, 2 the right
     // only.
     //
@@ -393,10 +432,42 @@ struct Options {
     // becomes the behaviour and the switch goes -- see AGENTS.md on options.
     bool vrOffscreen = false;
 
-    // What the flat window shows while VR is on: 0 both eyes, 1 the left eye, 2 the
-    // right. Only meaningful with vrOffscreen on, because without an off-screen frame
-    // the window IS the render and there is nothing to choose.
-    int vrMonitorEye = 0;
+    // What the flat window shows while VR is on:
+    //
+    //   0  nothing from gplvr: no blit and no clear. roglv2 still presents the window, so
+    //      it shows whatever its back buffer held -- black, or the last picture blitted
+    //      there -- with pribluda's monitor overlay drawn over it every frame, which
+    //      accumulates because nothing wipes it. Saves the blit's GPU time.
+    //   1  both eyes
+    //   2  the left eye
+    //   3  the right eye
+    //
+    // Only meaningful with vrOffscreen on, because without an off-screen frame the window
+    // IS the render and there is nothing to choose. Flat mode (vr = 0) never reads it.
+    int vrMonitorEye = 1;
+
+    // Drain GL with glFinish after the frame transfer's wglDXUnlockObjectsNV, before the frame
+    // is published. 1 (default) keeps it. 0 skips it and relies on the unlock, which hands the
+    // textures to Direct3D and on NVIDIA waits for the GL work on them to complete. If 0 shows
+    // torn, half-drawn or stale frames in the headset, the unlock does not synchronise here.
+    bool vrTransferFinish = true;
+
+    // Drop GPL's stamped text (stampDraw) that cannot reach the headset. VR only.
+    //
+    // In a race GPL stamps up to a few thousand glyphs a frame into the display's own
+    // 2560x1440 back-buffer surface (handle 1) and screen-wide strips of it. With the
+    // off-screen target active that surface is not the frame the headset receives, so the
+    // text is drawn and never seen, and it cost 2-3 ms of CPU and GPU a frame when it
+    // appeared. With this on, a stamp is dropped only when ALL of these hold:
+    //   - the off-screen target is active and stereo has eye surfaces this frame;
+    //   - the destination is not an eye, and does not span the side-by-side buffer (those
+    //     are re-issued once per eye, as before);
+    //   - the destination is at least 7/8 as wide as the display's back buffer, i.e. a
+    //     screen-space layer and never a texture;
+    //   - the destination has not appeared as either argument of a bitmapDraw since the
+    //     engine last changed mode, so a surface whose pixels are copied anywhere is kept.
+    // Everything else, the front end included, is drawn exactly as before.
+    bool vrSkipStampText = false;
 
     // Draw the mouse pointer into the VR image.
     //
@@ -434,6 +505,11 @@ void loadOptions(const char* fileName);
 // this window's client area, and that is only meaningful for exactly this HWND.
 HWND gameWindow();
 
+// Leave mirror tweak mode if it is on, logging the values to copy into gplvr.ini. `why` is
+// appended to the log line. HUD tweak mode calls it on entering, since the two share the
+// arrows and Page Up/Down.
+void mirrorTweakExit(const char* why);
+
 // Replaces the screenDisplay function pointer. That pointer is a plain writable
 // global, so this is a single store -- no code patching involved.
 bool installFrameCounter(Binding& binding);
@@ -444,6 +520,10 @@ bool installFrameCounter(Binding& binding);
 // a worker thread while the render thread is stepping through it would be a race.
 // Requires installFrameCounter() to have succeeded.
 void requestSceneRenderHook(const Binding& binding);
+
+// True once gpl_sceneRender's main world walk (the call at 0x487FAA) goes through gplvr's
+// thunk, which skips it during a mirror-only render. Without it the mirror panes are off.
+bool hooksMainWalkRedirected();
 
 // Remembers our own module so the IAT patcher never redirects our own imports back
 // into our own hooks. Must be called before any patching.

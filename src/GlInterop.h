@@ -50,6 +50,7 @@ typedef void(WINAPI* GlClearColorFn)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void(WINAPI* GlEnableFn)(GLenum);
 typedef GLboolean(WINAPI* GlIsEnabledFn)(GLenum);
 typedef void(WINAPI* GlGetIntegervFn)(GLenum, GLint*);
+typedef void(WINAPI* GlScissorFn)(GLint, GLint, GLsizei, GLsizei);
 
 // Immediate mode, for the cursor overlay. GL 1.1 core, so all of these are plain
 // opengl32 exports rather than extensions -- but they are still checked before use and
@@ -65,12 +66,14 @@ typedef void(WINAPI* GlPopMatrixFn)();
 typedef void(WINAPI* GlBeginFn)(GLenum);
 typedef void(WINAPI* GlEndFn)();
 typedef void(WINAPI* GlVertex2fFn)(GLfloat, GLfloat);
+typedef void(WINAPI* GlVertex4fFn)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void(WINAPI* GlTexCoord2fFn)(GLfloat, GLfloat);
 typedef void(WINAPI* GlColor4fFn)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void(WINAPI* GlPolygonModeFn)(GLenum, GLenum);
 typedef void(WINAPI* GlColorMaskFn)(GLboolean, GLboolean, GLboolean, GLboolean);
 typedef void(WINAPI* GlBlendFuncFn)(GLenum, GLenum);
 typedef void(WINAPI* GlTexEnviFn)(GLenum, GLenum, GLint);
+typedef void(WINAPI* GlDepthMaskFn)(GLboolean);
 
 // EXT_framebuffer_object / GL 3.0. Resolved through wglGetProcAddress, ARB names first
 // and the EXT spelling as a fallback: roglv2 links a GLEW that only ever loads the EXT
@@ -140,6 +143,7 @@ struct GlFunctions {
     GlEnableFn            disable = nullptr;
     GlIsEnabledFn         isEnabled = nullptr;
     GlGetIntegervFn       getIntegerv = nullptr;
+    GlScissorFn           scissor = nullptr;
 
     GlPushAttribFn  pushAttrib = nullptr;
     GlPopAttribFn   popAttrib = nullptr;
@@ -148,12 +152,14 @@ struct GlFunctions {
     GlBeginFn       begin = nullptr;
     GlEndFn         end = nullptr;
     GlVertex2fFn    vertex2f = nullptr;
+    GlVertex4fFn    vertex4f = nullptr;
     GlTexCoord2fFn  texCoord2f = nullptr;
     GlColor4fFn     color4f = nullptr;
     GlPolygonModeFn polygonMode = nullptr;
     GlColorMaskFn   colorMask = nullptr;
     GlBlendFuncFn   blendFunc = nullptr;
     GlTexEnviFn     texEnvi = nullptr;
+    GlDepthMaskFn   depthMask = nullptr;
 
     // Which spelling each framebuffer entry point resolved to. Not cosmetic: the EXT
     // entry points predate GL 3.0's split of the framebuffer binding into a READ and a
@@ -248,9 +254,24 @@ void glInteropUnregister(const GlFunctions& gl, HANDLE interopDevice,
 bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
                      const char* path);
 
+// The HUD panel's image, copied into its shared texture inside the frame transfer: both
+// textures are locked in one wglDXLockObjectsNV and unlocked in one wglDXUnlockObjectsNV, so
+// the frame costs one interop synchronisation rather than two. `sourceFramebuffer` is a
+// framebuffer whose colour attachment 0 holds the panel, `width` x `height` like the shared
+// texture. `copied` comes back true only when the panel reached its texture; a failed panel
+// copy never fails the frame.
+struct GlPanelCopy {
+    const GlSharedTexture* shared = nullptr;
+    GLuint                 sourceFramebuffer = 0;
+    int                    width = 0;
+    int                    height = 0;
+    bool                   copied = false;
+};
+
+// `finish` issues the glFinish after the unlock (vrTransferFinish). `panel` may be null.
 bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
                              const GlSharedTexture& shared, int width, int height,
-                             GLuint sourceFramebuffer);
+                             GLuint sourceFramebuffer, bool finish, GlPanelCopy* panel);
 
 // Pull the back buffer into system memory as BGRA, bottom-up, for the one-shot fov
 // probe. This is the slow path the interop transport exists to avoid -- 1.36 ms and a

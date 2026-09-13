@@ -42,7 +42,7 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 10;  // 10: submitCurrentPose
+inline constexpr uint32_t kControlVersion = 9;  // 9: gamma
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -279,11 +279,6 @@ struct ControlBlock {
     // vrGamma, applied by the presenter to everything it draws: the eyes and the HUD panel.
     // 1 leaves the game's colours as they are; above 1 lifts the mid-tones.
     float gamma = 1.0f;
-
-    // vrDebugSubmitCurrentPose: nonzero submits the game's eye images with the pose located
-    // for this display instead of the pose they were rendered from. The world then gets no
-    // rotational reprojection; a diagnostic for the HUD panel's judder.
-    int32_t submitCurrentPose = 0;
 
     // -- pribluda's overlay on a quad layer, producer to presenter ------------------
     //

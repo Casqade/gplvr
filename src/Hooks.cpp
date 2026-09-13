@@ -1,8 +1,10 @@
 #include "Hooks.h"
 
+#include "FrameBudget.h"
 #include "Hud.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "MirrorTarget.h"
 #include "MouseLook.h"
 #include "Log.h"
 #include "Pribluda.h"
@@ -16,6 +18,7 @@
 #include "Window.h"
 #include "presenter/Producer.h"
 
+#include <cmath>
 #include <cstdio>   // _snprintf_s, for the mirror-refresh fragment
 #include <cstdlib>
 #include <cstring>
@@ -95,7 +98,7 @@ bool      g_stereoKeyLast = false;
 bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
-bool      g_vrSubmitCurrentPoseKeyLast = false;
+bool      g_vrMirrorModeKeyLast = false;
 bool      g_nullDrawKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
@@ -168,11 +171,33 @@ typedef void(__cdecl* CameraBindFn)(void*);
 CameraBindFn           g_originalCameraBind = nullptr;
 std::vector<uintptr_t> g_pendingBindCallSites;
 
+// gpl_sceneRender's MAIN world walk: `call gpl_worldRenderSegmentRange` at 0x487FAA, eight
+// __cdecl arguments cleaned by the caller (`add esp, 20h`). The mirror walk at 0x487A4C calls
+// the same function and is not touched. Its result is never read.
+typedef void(__cdecl* WorldWalkFn)(int, int, int, int, int, int, int, int);
+constexpr uintptr_t     kMainWalkSite = 0x00487FAA;
+constexpr unsigned char kMainWalkStock[5] = {0xE8, 0xB1, 0xD9, 0xFF, 0xFF};
+constexpr uintptr_t     kWorldWalk = 0x00485960;
+bool g_mainWalkPending = false;
+bool g_mainWalkRedirected = false;
+
+// A mirror-only render (Stereo.cpp) fills one mirror pane and must leave the eye untouched,
+// so the main walk is skipped. Everything else in the call runs: the per-pass resets after
+// it (gpl_renderClearDrawnMarks, gpl_renderClearObjectRegistrations) keep the object lists
+// consistent for the eye's own render that follows.
+void __cdecl mainWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7,
+                                int a8) {
+    if (stereoMirrorOnlyPass()) return;
+    reinterpret_cast<WorldWalkFn>(kWorldWalk)(a1, a2, a3, a4, a5, a6, a7, a8);
+}
+unsigned g_sceneMirrorOnlyCalls = 0;  // mirror-only renders, counted apart from the eyes
+
 void reportOncePerSecond() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     const long long elapsed = now.QuadPart - g_windowStart.QuadPart;
     if (elapsed < g_frequency.QuadPart) return;
+    int reporting = frameBudgetEnter(kSpanReport);
 
     const double seconds = static_cast<double>(elapsed) / g_frequency.QuadPart;
     // Per *original* invocation, so the number is directly comparable between mono
@@ -202,11 +227,18 @@ void reportOncePerSecond() {
         _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s | ",
                     g_mirrorRefreshes / seconds);
 
-    logf("fps %.1f | worldFrames %.1f/s, renders %.1f/s (x%.2f), %.2f ms each, "
+    // Mirror-only renders are not counted as renders, but their time is in the scene total
+    // and so in "ms each": per eye render including the pane renders before it.
+    char paneRenders[48] = {};
+    if (g_sceneMirrorOnlyCalls)
+        _snprintf_s(paneRenders, sizeof(paneRenders), _TRUNCATE, " + %.1f/s mirror-only",
+                    g_sceneMirrorOnlyCalls / seconds);
+
+    logf("fps %.1f | worldFrames %.1f/s, renders %.1f/s (x%.2f)%s, %.2f ms each, "
          "%.2f ms worst | transfer %.2f ms x%.1f/frame | %s%s%smode %s",
          g_frames / seconds, g_sceneHookCalls / seconds, g_sceneOrigCalls / seconds,
          g_sceneHookCalls ? static_cast<double>(g_sceneOrigCalls) / g_sceneHookCalls : 0.0,
-         msPerRender, worstMs,
+         paneRenders, msPerRender, worstMs,
          haveTransfer && transfers ? transferMs / transfers : 0.0,
          haveTransfer && g_frames ? static_cast<double>(transfers) / g_frames : 0.0,
          mirror, haveTick ? tick : "", haveTick ? " | " : "",
@@ -222,31 +254,35 @@ void reportOncePerSecond() {
         const double gplvr = g_profGplvrTicks * toMs / g_frames;
         // The finish is inside the scene span, so it is shown as a share of it rather
         // than as another term of the sum -- otherwise the parts would not add up.
-        char extra[80] = {};
-        int  used = 0;
-        if (g_options.profileGpuWait)
-            used = _snprintf_s(extra, sizeof(extra), _TRUNCATE, "  [gpuWait %.2f of scene]",
-                               g_profFinishTicks * toMs / g_frames);
-        if (g_options.profilePolys && used >= 0)
-            _snprintf_s(extra + (used > 0 ? used : 0), sizeof(extra) - (used > 0 ? used : 0),
-                        _TRUNCATE, "  [%u polys/frame, %.0f ns each]",
+        char polys[64] = {};
+        if (g_options.profilePolys)
+            _snprintf_s(polys, sizeof(polys), _TRUNCATE, "  [%u polys/frame, %.0f ns each]",
                         g_profPolys / g_frames,
                         g_profPolys ? 1e6 * scene * g_frames / g_profPolys : 0.0);
+        char extra[112] = {};
+        if (g_options.profileGpuWait)
+            _snprintf_s(extra, sizeof(extra), _TRUNCATE, "  [gpuWait %.2f of scene]%s",
+                        g_profFinishTicks * toMs / g_frames, polys);
+        else
+            strcpy_s(extra, polys);
 
         // `other` used to be a subtraction, which made the largest term in the frame the
         // one nobody could account for. pre and post are measured, so the line now names
         // every part and the leftover is only clock error -- if `rest` is not near zero
         // the spans have stopped tiling and the numbers should not be trusted.
+        // With profileStages the tiled frame replaces both lines below: its spans do not
+        // overlap, and gpuWait is on its wait line.
         FrameSpans mean;
         FrameSpans worst;
-        if (renderProfileTakeSpans(mean, worst)) {
+        bool       tiled = frameBudgetReport(period, polys);
+        if (!tiled && renderProfileTakeSpans(mean, worst)) {
             logf("frame %.2f ms = pre %.2f + scene %.2f + post %.2f + present %.2f + "
                  "gplvr %.2f (rest %.2f)%s | WORST %.2f = pre %.2f + scene %.2f + "
                  "post %.2f + present %.2f",
                  period, mean.pre, scene, mean.post, present, gplvr,
                  period - mean.pre - scene - mean.post - present - gplvr, extra,
                  worst.total, worst.pre, worst.scene, worst.post, worst.present);
-        } else {
+        } else if (!tiled) {
             logf("frame %.2f ms (worst %.2f) = scene %.2f + present %.2f + gplvr %.2f + "
                  "other %.2f%s",
                  period, g_profPeriodWorst * toMs, scene, present, gplvr,
@@ -259,6 +295,11 @@ void reportOncePerSecond() {
     char geometry[288] = {};
     if (renderProfileFormatGeometry(geometry, sizeof(geometry), g_frames))
         logf("%s", geometry);
+
+    // The simulation thread's cost per tick, from the window taskRateFormat closed above.
+    char tickCost[200] = {};
+    if (g_options.profileStages && taskRateFormatTickCost(tickCost, sizeof(tickCost)))
+        logf("%s", tickCost);
 
     char present[320] = {};
     if (renderProfileFormatPresent(present, sizeof(present), seconds, g_frames))
@@ -277,12 +318,14 @@ void reportOncePerSecond() {
     // After every line that reads them, and on every path -- a window that printed nothing
     // must still be drained, or its counts land in the next one.
     renderProfileEndWindow();
+    frameBudgetEndWindow();
 
     g_windowStart = now;
     g_mirrorRefreshes = 0;
     g_frames = 0;
     g_sceneHookCalls = 0;
     g_sceneOrigCalls = 0;
+    g_sceneMirrorOnlyCalls = 0;
     g_sceneTicks = 0;
     g_sceneTicksWorst = 0;
     g_profPresentTicks = 0;
@@ -291,7 +334,147 @@ void reportOncePerSecond() {
     g_profPeriodWorst = 0;
     g_profFinishTicks = 0;
     g_profPolys = 0;
+    frameBudgetLeave(reporting);
 }
+
+// Mirror tweak mode: aiming the glasses from the headset. It changes the g_options fields
+// aimPane reads every frame, so each step shows at once. Nothing is written back; leaving logs
+// the values to copy into gplvr.ini. It shares the arrows and Page Up/Down with HUD tweak
+// mode, so entering either leaves the other.
+constexpr unsigned kMirrorTweakKeys[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
+constexpr double   kMirrorTweakMaxStepSeconds = 0.1;  // the most one poll turns after a stall
+constexpr double   kMirrorTweakLogSeconds = 0.5;      // between progress lines while adjusting
+
+struct MirrorTweak {
+    bool     active = false;
+    bool     keyLast = false;
+    bool     unlogged = false;  // the values changed since the last line
+    LONGLONG frequency = 0;
+    LONGLONG lastPoll = 0;
+    LONGLONG loggedAt = 0;
+};
+
+MirrorTweak g_mirrorTweak;
+
+bool mirrorTweakKeyHeld(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+float mirrorTweakClamp(float value, float low, float high) {
+    return value < low ? low : (value > high ? high : value);
+}
+
+void mirrorTweakLogProgress(LONGLONG now) {
+    g_mirrorTweak.unlogged = false;
+    g_mirrorTweak.loggedAt = now;
+    logf("mirror: yaw %.2f pitch %.2f fovScale %.3f", g_options.vrMirrorYaw,
+         g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+}
+
+void mirrorTweakEnter() {
+    pribludaTweakExit(" -- mirror tweak mode entered");
+    g_mirrorTweak.active = true;
+    g_mirrorTweak.unlogged = false;
+    logf("mirror: tweak mode on -- yaw %.2f pitch %.2f fovScale %.3f", g_options.vrMirrorYaw,
+         g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+    logf("mirror: Left/Right turn the glasses, Up/Down tilt them, Page Up/Down widen and "
+         "narrow the field; key 0x%02X again leaves",
+         g_options.vrMirrorTweakKey);
+}
+
+// Once a frame from the key poll, after HUD tweak mode's.
+void mirrorTweakPoll() {
+    if (!g_options.vr || !g_options.vrMirrorTweakKey) return;
+
+    LARGE_INTEGER counter;
+    if (!g_mirrorTweak.frequency) {
+        QueryPerformanceFrequency(&counter);
+        g_mirrorTweak.frequency = counter.QuadPart;
+    }
+    QueryPerformanceCounter(&counter);
+    LONGLONG now = counter.QuadPart;
+    double seconds = g_mirrorTweak.lastPoll
+                         ? static_cast<double>(now - g_mirrorTweak.lastPoll) /
+                               static_cast<double>(g_mirrorTweak.frequency)
+                         : 0.0;
+    g_mirrorTweak.lastPoll = now;
+    if (seconds > kMirrorTweakMaxStepSeconds) seconds = kMirrorTweakMaxStepSeconds;
+
+    bool toggle = mirrorTweakKeyHeld(g_options.vrMirrorTweakKey);
+    bool togglePressed = toggle && !g_mirrorTweak.keyLast;
+    g_mirrorTweak.keyLast = toggle;
+
+    // Keys typed into another window are not for it.
+    if (GetForegroundWindow() != gameWindow()) return;
+    if (togglePressed) {
+        if (g_mirrorTweak.active) {
+            mirrorTweakExit("");
+        } else {
+            mirrorTweakEnter();
+        }
+        return;
+    }
+    if (!g_mirrorTweak.active) return;
+
+    int turn = (mirrorTweakKeyHeld(VK_RIGHT) ? 1 : 0) - (mirrorTweakKeyHeld(VK_LEFT) ? 1 : 0);
+    int tilt = (mirrorTweakKeyHeld(VK_UP) ? 1 : 0) - (mirrorTweakKeyHeld(VK_DOWN) ? 1 : 0);
+    int widen = (mirrorTweakKeyHeld(VK_PRIOR) ? 1 : 0) - (mirrorTweakKeyHeld(VK_NEXT) ? 1 : 0);
+    if (!turn && !tilt && !widen) {
+        // The end of a hold, which the rate limit may have kept from the log.
+        if (g_mirrorTweak.unlogged) mirrorTweakLogProgress(now);
+        return;
+    }
+
+    float yaw = g_options.vrMirrorYaw;
+    float pitch = g_options.vrMirrorPitch;
+    float fovScale = g_options.vrMirrorFovScale;
+    float angleStep = static_cast<float>(g_options.vrMirrorTweakAngleSpeed * seconds);
+    if (turn) {
+        g_options.vrMirrorYaw = mirrorTweakClamp(yaw + turn * angleStep, -45.0f, 45.0f);
+    }
+    if (tilt) {
+        g_options.vrMirrorPitch = mirrorTweakClamp(pitch + tilt * angleStep, -45.0f, 45.0f);
+    }
+    if (widen) {
+        float factor = static_cast<float>(
+            std::pow(2.0, widen * g_options.vrMirrorTweakFovSpeed * seconds));
+        g_options.vrMirrorFovScale = mirrorTweakClamp(fovScale * factor, 0.25f, 6.0f);
+    }
+    if (g_options.vrMirrorYaw != yaw || g_options.vrMirrorPitch != pitch ||
+        g_options.vrMirrorFovScale != fovScale)
+        g_mirrorTweak.unlogged = true;
+
+    if (g_mirrorTweak.unlogged &&
+        now - g_mirrorTweak.loggedAt >=
+            static_cast<LONGLONG>(g_mirrorTweak.frequency * kMirrorTweakLogSeconds))
+        mirrorTweakLogProgress(now);
+}
+
+// True for a key press the window proc should keep from the game: the toggle key whenever it
+// toggles, which is in VR with a key set, and the adjusting keys while the mode is on. Only
+// presses; releases still reach the game.
+bool mirrorTweakSwallowsKey(unsigned virtualKey) {
+    if (!g_options.vr || !g_options.vrMirrorTweakKey) return false;
+    if (virtualKey == static_cast<unsigned>(g_options.vrMirrorTweakKey)) return true;
+    if (!g_mirrorTweak.active) return false;
+    for (unsigned key : kMirrorTweakKeys) {
+        if (key == virtualKey) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+void mirrorTweakExit(const char* why) {
+    if (!g_mirrorTweak.active) return;
+    g_mirrorTweak.active = false;
+    g_mirrorTweak.unlogged = false;
+    logf("mirror: tweak mode off -- yaw %.2f pitch %.2f fovScale %.3f%s", g_options.vrMirrorYaw,
+         g_options.vrMirrorPitch, g_options.vrMirrorFovScale, why);
+    logf("mirror: not saved -- to keep these, set vrMirrorYaw = %.2f, vrMirrorPitch = %.2f and "
+         "vrMirrorFovScale = %.3f in gplvr.ini",
+         g_options.vrMirrorYaw, g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+}
+
+namespace {
 
 void pollToggle() {
     if (g_options.stereoKey) {
@@ -362,20 +545,22 @@ void pollToggle() {
         g_vrHudLayerKeyLast = down;
     }
 
-    // Debug A/B for the HUD panel's judder: the eye images submitted with the current
-    // display pose instead of the pose they were rendered from.
-    if (g_options.vr && g_options.vrDebugSubmitCurrentPoseKey) {
-        bool down = (GetAsyncKeyState(g_options.vrDebugSubmitCurrentPoseKey) & 0x8000) != 0;
-        if (down && !g_vrSubmitCurrentPoseKeyLast) {
-            g_options.vrDebugSubmitCurrentPose = !g_options.vrDebugSubmitCurrentPose;
-            logf("vr: eye images now submitted with the %s",
-                 g_options.vrDebugSubmitCurrentPose ? "current display pose (debug)"
-                                                    : "pose they were rendered from");
-        }
-        g_vrSubmitCurrentPoseKeyLast = down;
-    }
-
     pribludaPollTweak();
+    mirrorTweakPoll();
+
+    // Per-eye mirrors on and off. The pass loop reads stereoMirror every frame and the main
+    // world walk redirect is installed whenever it started non-zero, so 1 and 2 swap freely.
+    if (g_options.vr && g_options.vrMirrorModeKey && g_options.stereoMirror != 0) {
+        bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
+        if (down && !g_vrMirrorModeKeyLast) {
+            g_options.stereoMirror = g_options.stereoMirror == 2 ? 1 : 2;
+            logf("mirror: stereoMirror now %d -- %s", g_options.stereoMirror,
+                 g_options.stereoMirror == 2 ? "each eye renders both glasses (4 mirror renders)"
+                                             : "both glasses once from the head centre (2 "
+                                               "mirror renders)");
+        }
+        g_vrMirrorModeKeyLast = down;
+    }
 
     // The mouse look toggle, and the mouse itself.
     //
@@ -575,13 +760,21 @@ void renderExtraFrames() {
         // Wait for the presenter to publish a NEW view set. Without this the extra
         // render would draw from the same pose as the frame before it and cost time for
         // an identical image.
+        // One wait span around the whole spin, so a yield costs no timestamps.
+        int  waiting = frameBudgetEnter(kSpanWaitExtra);
+        bool advanced = false;
         for (;;) {
             LARGE_INTEGER current;
             QueryPerformanceCounter(&current);
-            if (current.QuadPart >= deadline) return;
-            if (presenterViewSequence() != before) break;
+            if (current.QuadPart >= deadline) break;
+            if (presenterViewSequence() != before) {
+                advanced = true;
+                break;
+            }
             SwitchToThread();
         }
+        frameBudgetLeave(waiting);
+        if (!advanced) return;
 
         // Do not START a render that cannot finish before the game's next frame.
         //
@@ -645,6 +838,11 @@ void renderExtraFrames() {
 }
 
 int __cdecl screenDisplayHook(void* surface) {
+    frameBudgetSwitch(kSpanHousekeeping);
+
+    // Every stampDraw of this frame has been issued by now, so its strings are complete.
+    if (g_options.vr) hudEndFrame();
+
     // We are on the game's render thread, between frames: sceneRender has already
     // returned and is not on any stack, so its call sites are safe to rewrite.
     applyPendingSceneRenderHook();
@@ -698,15 +896,19 @@ int __cdecl screenDisplayHook(void* surface) {
     // -- belongs to pribluda, which draws raw OpenGL inside roglv2's present for the
     // monitor. A second copy goes into the panel texture the headset shows as a quad
     // layer; it needs the game's GL context, which is current here.
+    frameBudgetSwitch(kSpanPanel);
     pribludaDrawHud();
 
+    frameBudgetSwitch(kSpanCursor);
     presenterDrawCursor(g_stereoRenderedFrame);
 
     // The off-screen frame has to stop being the draw target before the presenter
     // reads it and before the game presents: glCopyTexSubImage2D reads the READ
     // framebuffer, and SwapBuffers only ever shows the window's own.
+    frameBudgetSwitch(kSpanUnbind);
     presenterEndFrame();
 
+    frameBudgetSwitch(kSpanPublish);
     if (g_options.vr) {
         if (!g_vrStarted) {
             g_vrStarted = true;
@@ -731,7 +933,9 @@ int __cdecl screenDisplayHook(void* surface) {
         //
         // Everything gplvr takes off the framebuffer -- the dump below and the headset's
         // copy after it -- has to come after this.
+        frameBudgetSwitch(kSpanFlushPending);
         rasterFlushPending();
+        frameBudgetSwitch(kSpanPublish);
 
         // BEFORE the publish, so what lands on disk is exactly what is handed over.
         if (g_dumpEyesRequested) {
@@ -776,6 +980,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // The window is a monitor of the off-screen frame, not the frame itself. Between
     // the presenter's copy and the present, so what the player sees on the desktop is
     // the same image that went to the headset.
+    frameBudgetSwitch(kSpanWindowBlit);
     presenterBlitToWindow(g_options.vrMonitorEye);
 
     // Put the pixels under the pointer back, now that the frame has gone to the headset
@@ -792,7 +997,9 @@ int __cdecl screenDisplayHook(void* surface) {
     // and the only surface that cannot see it is the headset -- whose copy was taken a
     // few lines above. Do not "fix" this by moving the restore after the present; that
     // puts the trail straight back.
+    frameBudgetSwitch(kSpanCursor);
     presenterRestoreUnderCursor();
+    frameBudgetSwitch(kSpanPublish);
 
     // A WINDOW IN THE BACKGROUND DOES NOT PRESENT.
     //
@@ -835,6 +1042,7 @@ int __cdecl screenDisplayHook(void* surface) {
         }
     }
 
+    frameBudgetSwitch(kSpanPresent);
     LARGE_INTEGER beforePresent, afterPresent;
     QueryPerformanceCounter(&beforePresent);
     renderProfileSetInPresent(true);
@@ -843,6 +1051,7 @@ int __cdecl screenDisplayHook(void* surface) {
     renderProfileSetInPresent(false);
     QueryPerformanceCounter(&afterPresent);
     renderProfileNoteFrame(beforePresent.QuadPart, afterPresent.QuadPart);
+    frameBudgetEndFrame(afterPresent.QuadPart);
     g_profPresentTicks += afterPresent.QuadPart - beforePresent.QuadPart;
     // Our own cost is the whole hook minus the engine's present. Taken here rather than
     // at the bottom so the extra renders below -- which are whole frames of their own and
@@ -861,6 +1070,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // After the sim target, and it declines whenever that one took the frame: the two
     // are mutually exclusive by mode -- the off-screen target owns a world mode, this
     // owns the 640x480 front end -- and the invariant is checked rather than assumed.
+    frameBudgetSwitch(kSpanRebindMenu);
     menuScaleBeginFrame();
 
     // Extra renders go AFTER the present, in the idle tail of the tick.
@@ -868,19 +1078,33 @@ int __cdecl screenDisplayHook(void* surface) {
     // Before it, they would delay the game's own frame by however long they take and
     // cost exactly the frame rate they are meant to improve. After it, they spend time
     // the game thread was going to spend waiting for the next 36 Hz task anyway.
+    frameBudgetSwitch(kSpanExtra);
+    frameBudgetSuppress(true);
     renderExtraFrames();
+    frameBudgetSuppress(false);
+    frameBudgetSwitch(kSpanTailGame);
     return presented;
 }
 
 // One timed invocation of the engine's sceneRender.
 void __cdecl callOriginalSceneRender(void* params) {
+    // A mirror-only render fills a pane for the eye render that follows; the frame budget
+    // charges it to that eye's mirror spans and the report counts it apart.
+    bool mirrorOnly = stereoMirrorOnlyPass();
+    frameBudgetMirrorOnly(mirrorOnly);
+    frameBudgetEyeBegin();
     LARGE_INTEGER begin, end;
     QueryPerformanceCounter(&begin);
     g_originalSceneRender(params);
     QueryPerformanceCounter(&end);
+    frameBudgetEyeEnd();
+    frameBudgetMirrorOnly(false);
 
     const long long ticks = end.QuadPart - begin.QuadPart;
-    ++g_sceneOrigCalls;
+    if (mirrorOnly)
+        ++g_sceneMirrorOnlyCalls;
+    else
+        ++g_sceneOrigCalls;
     g_sceneTicks += ticks;
     if (ticks > g_sceneTicksWorst) g_sceneTicksWorst = ticks;
 
@@ -914,9 +1138,11 @@ void __cdecl callOriginalSceneRender(void* params) {
         }
         if (finish) {
             LARGE_INTEGER f0, f1;
+            int waiting = frameBudgetEnter(kSpanWaitGpu);
             QueryPerformanceCounter(&f0);
             finish();
             QueryPerformanceCounter(&f1);
+            frameBudgetLeave(waiting);
             g_profFinishTicks += f1.QuadPart - f0.QuadPart;
         }
     }
@@ -928,12 +1154,20 @@ bool g_loggedMirror = false;
 // sceneRender overwrites the camera's fov with the game's own, 27 bytes before it calls
 // cameraBind. This hook sits on those two calls, so it runs after that write and before
 // cameraBind rebuilds the projection -- the only window where an eye frustum survives.
+//
+// The original bind is where roglv2 flushes the previous pass's queued polygons (cameraBind
+// -> polySetDest), so the frame budget charges it to that pass's flush span.
 void __cdecl cameraBindHook(void* camera) {
+    auto* scene = static_cast<SceneParams*>(g_lastSceneParams);
+    frameBudgetBindBegin();
     stereoOnCameraBind(camera);
     if (g_originalCameraBind) g_originalCameraBind(camera);
+    mirrorTargetAfterBind(camera, scene);
+    frameBudgetBindEnd(camera && scene && camera == scene->mirrorCamera);
 }
 
 void __cdecl sceneRenderHook(void* params) {
+    frameBudgetSceneBegin();
     ++g_sceneHookCalls;
 
     // Which task are we on? Asked from inside the running game via the exe's own
@@ -1028,10 +1262,12 @@ void __cdecl sceneRenderHook(void* params) {
         g_stereoRenderedFrame = true;
     else
         callOriginalSceneRender(params);
+    mirrorTargetEndScene();
 
     if (fovCorrected) scene->mainFov = savedFov;
     if (overridden)
         std::memcpy(scene->orientation, savedOrientation, sizeof(savedOrientation));
+    frameBudgetSceneEnd();
 }
 
 // -- ChangeDisplaySettings -------------------------------------------------
@@ -1158,6 +1394,29 @@ void applyPendingSceneRenderHook() {
              static_cast<unsigned>(reinterpret_cast<uintptr_t>(&cameraBindHook)));
     }
     g_pendingBindCallSites.clear();
+
+    if (g_mainWalkPending) {
+        g_mainWalkPending = false;
+        auto site = reinterpret_cast<unsigned char*>(kMainWalkSite);
+        const int32_t rel = static_cast<int32_t>(
+            reinterpret_cast<uintptr_t>(&mainWorldWalkThunk) - (kMainWalkSite + 5));
+        if (std::memcmp(site, kMainWalkStock, sizeof(kMainWalkStock)) != 0) {
+            logf("mirror: %08X does not hold the stock `call gpl_worldRenderSegmentRange` "
+                 "(%02X %02X %02X %02X %02X) -- per-pane mirrors are off",
+                 static_cast<unsigned>(kMainWalkSite), site[0], site[1], site[2], site[3],
+                 site[4]);
+        } else if (!patchBytes(site + 1, &rel, sizeof(rel))) {
+            logf("mirror: could not write the main world walk call at %08X -- per-pane "
+                 "mirrors are off",
+                 static_cast<unsigned>(kMainWalkSite));
+        } else {
+            g_mainWalkRedirected = true;
+            logf("mirror: main world walk call at %08X redirected to %08X, which skips it "
+                 "during a mirror-only render",
+                 static_cast<unsigned>(kMainWalkSite),
+                 static_cast<unsigned>(reinterpret_cast<uintptr_t>(&mainWorldWalkThunk)));
+        }
+    }
 }
 
 BOOL WINAPI clipCursorHook(const RECT* rect) {
@@ -1354,6 +1613,13 @@ LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPA
     // mode is on. Only the presses: a release still reaches the game, which keeps its key
     // table right for a key held down across entering or leaving the mode.
     if (message == WM_KEYDOWN && pribludaTweakSwallowsKey(static_cast<unsigned>(wParam)))
+        return 0;
+
+    // Mirror tweak mode steers with the same keys, and its toggle key stops here as well.
+    if (message == WM_KEYDOWN && mirrorTweakSwallowsKey(static_cast<unsigned>(wParam)))
+        return 0;
+    if (message == WM_KEYDOWN && g_options.vr && g_options.vrMirrorModeKey &&
+        static_cast<unsigned>(wParam) == static_cast<unsigned>(g_options.vrMirrorModeKey))
         return 0;
 
     // Only the DEACTIVATION half, and only this message. Activations pass through
@@ -1594,7 +1860,34 @@ void loadOptions(const char* fileName) {
     char text[64] = {};
 
     g_options.stereo = GetPrivateProfileIntA("gplvr", "stereo", 0, path) != 0;
-    g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 1, path);
+    g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 2, path);
+    if (g_options.stereoMirror < 0 || g_options.stereoMirror > 2) g_options.stereoMirror = 2;
+    GetPrivateProfileStringA("gplvr", "vrMirrorFovScale", "1.0", text, sizeof(text), path);
+    g_options.vrMirrorFovScale = static_cast<float>(atof(text));
+    if (!(g_options.vrMirrorFovScale >= 0.25f)) g_options.vrMirrorFovScale = 0.25f;
+    if (g_options.vrMirrorFovScale > 6.0f) g_options.vrMirrorFovScale = 6.0f;
+    auto readMirrorAngle = [&](const char* key) {
+        GetPrivateProfileStringA("gplvr", key, "0.0", text, sizeof(text), path);
+        float degrees = static_cast<float>(atof(text));
+        if (!(degrees >= -45.0f)) degrees = -45.0f;
+        if (degrees > 45.0f) degrees = 45.0f;
+        return degrees;
+    };
+    g_options.vrMirrorYaw = readMirrorAngle("vrMirrorYaw");
+    g_options.vrMirrorPitch = readMirrorAngle("vrMirrorPitch");
+    g_options.vrMirrorOffscreen =
+        GetPrivateProfileIntA("gplvr", "vrMirrorOffscreen", 1, path) != 0;
+    g_options.vrMirrorTweakKey = GetPrivateProfileIntA("gplvr", "vrMirrorTweakKey", 'M', path);
+    g_options.vrMirrorModeKey = GetPrivateProfileIntA("gplvr", "vrMirrorModeKey", 'N', path);
+    GetPrivateProfileStringA("gplvr", "vrMirrorTweakAngleSpeed", "10.0", text, sizeof(text),
+                             path);
+    g_options.vrMirrorTweakAngleSpeed = static_cast<float>(atof(text));
+    if (!(g_options.vrMirrorTweakAngleSpeed >= 0.5f)) g_options.vrMirrorTweakAngleSpeed = 0.5f;
+    if (g_options.vrMirrorTweakAngleSpeed > 90.0f) g_options.vrMirrorTweakAngleSpeed = 90.0f;
+    GetPrivateProfileStringA("gplvr", "vrMirrorTweakFovSpeed", "0.5", text, sizeof(text), path);
+    g_options.vrMirrorTweakFovSpeed = static_cast<float>(atof(text));
+    if (!(g_options.vrMirrorTweakFovSpeed >= 0.05f)) g_options.vrMirrorTweakFovSpeed = 0.05f;
+    if (g_options.vrMirrorTweakFovSpeed > 4.0f) g_options.vrMirrorTweakFovSpeed = 4.0f;
     g_options.stereoKey = GetPrivateProfileIntA("gplvr", "stereoKey", '1', path);
     g_options.profileFrame =
         GetPrivateProfileIntA("gplvr", "profileFrame", 1, path) != 0;
@@ -1655,10 +1948,6 @@ void loadOptions(const char* fileName) {
     g_options.vrGamma = static_cast<float>(atof(text));
     if (g_options.vrGamma < 0.5f) g_options.vrGamma = 0.5f;
     if (g_options.vrGamma > 3.0f) g_options.vrGamma = 3.0f;
-    g_options.vrDebugSubmitCurrentPose =
-        GetPrivateProfileIntA("gplvr", "vrDebugSubmitCurrentPose", 0, path) != 0;
-    g_options.vrDebugSubmitCurrentPoseKey =
-        GetPrivateProfileIntA("gplvr", "vrDebugSubmitCurrentPoseKey", VK_INSERT, path);
     GetPrivateProfileStringA("gplvr", "vrHudDepth", "0.0", text, sizeof(text), path);
     g_options.vrHudDepth = static_cast<float>(atof(text));
     g_options.vrHudLayer = GetPrivateProfileIntA("gplvr", "vrHudLayer", 2, path);
@@ -1715,17 +2004,41 @@ void loadOptions(const char* fileName) {
         g_options.nullDraw = false;
         g_options.nullDrawKey = 0;
         g_options.dumpEyesKey = 0;
+        g_options.vrMirrorTweakKey = 0;
+        g_options.vrMirrorModeKey = 0;
         g_options.shimMeasure = false;
         g_options.profilePolys = false;
         g_options.profileStages = false;
     }
 
-    logf("options: stereo=%d mirror=%d stereoKey=0x%02X",
-         g_options.stereo, g_options.stereoMirror, g_options.stereoKey);
-    g_options.vrOffscreen = GetPrivateProfileIntA("gplvr", "vrOffscreen", 0, path) != 0;
-    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 0, path);
-    if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 2)
-        g_options.vrMonitorEye = 0;
+    logf("options: stereo=%d mirror=%d vrMirrorFovScale=%.2f vrMirrorYaw=%.1f "
+         "vrMirrorPitch=%.1f vrMirrorOffscreen=%d stereoKey=0x%02X",
+         g_options.stereo, g_options.stereoMirror, g_options.vrMirrorFovScale,
+         g_options.vrMirrorYaw, g_options.vrMirrorPitch, g_options.vrMirrorOffscreen ? 1 : 0,
+         g_options.stereoKey);
+    logf("options: vrMirrorTweakKey=0x%02X vrMirrorTweakAngleSpeed=%.2f "
+         "vrMirrorTweakFovSpeed=%.2f vrMirrorModeKey=0x%02X",
+         g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
+         g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
+    g_options.vrOffscreen =GetPrivateProfileIntA("gplvr", "vrOffscreen", 0, path) != 0;
+    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 1, path);
+    if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 3)
+        g_options.vrMonitorEye = 1;
+    g_options.vrTransferFinish =
+        GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
+    g_options.vrHudPanelRate = GetPrivateProfileIntA("gplvr", "vrHudPanelRate", 72, path);
+    if (g_options.vrHudPanelRate < 0) g_options.vrHudPanelRate = 0;
+    if (g_options.vrHudPanelRate > 0 && g_options.vrHudPanelRate < 10)
+        g_options.vrHudPanelRate = 10;
+    logf("options: vrTransferFinish=%d vrHudPanelRate=%d%s", g_options.vrTransferFinish ? 1 : 0,
+         g_options.vrHudPanelRate, g_options.vrHudPanelRate == 0 ? " (every frame)" : "/s");
+    g_options.vrSkipStampText =
+        g_options.vr && GetPrivateProfileIntA("gplvr", "vrSkipStampText", 0, path) != 0;
+    logf("options: vrSkipStampText=%d (%s)", g_options.vrSkipStampText ? 1 : 0,
+         g_options.vrSkipStampText
+             ? "GPL's stamped text on screen-space surfaces the headset cannot see is "
+               "dropped"
+             : "every stamp is drawn, and the stamped strings are logged");
 
     // 0 by default, so an ini written before this existed does not silently gain a
     // cursor. The ini shipped with the mod turns it on, which is where the feature is
@@ -1739,8 +2052,6 @@ void loadOptions(const char* fileName) {
                                           "showing"
                                         : "drawn whatever Windows says"));
 
-    logf("options: vrDebugSubmitCurrentPose=%d key=0x%02X",
-         g_options.vrDebugSubmitCurrentPose ? 1 : 0, g_options.vrDebugSubmitCurrentPoseKey);
     logf("options: vrMenuScale=%.2f vrGamma=%.2f vrHudDepth=%.2f vrRenderScale=%.2f "
          "vrRecentreKey=0x%02X vrOffscreen=%d vrMonitorEye=%d",
          g_options.vrMenuScale, g_options.vrGamma, g_options.vrHudDepth,
@@ -1835,6 +2146,9 @@ void requestSceneRenderHook(const Binding& binding) {
         if (g_pendingBindCallSites.empty())
             logf("requestSceneRenderHook: no cameraBind call sites -- the eye frustum fix "
                  "is OFF and the eyes will use the game's own fov");
+        // Per-pane mirrors only. The sceneRender found by discovery must be the one the
+        // fixed call site lives in.
+        g_mainWalkPending = g_options.stereoMirror > 0 && binding.sceneRender == 0x00487620;
     }
 
     g_sceneHookPending = true;
@@ -1892,6 +2206,8 @@ void setCursorClip(const RECT& rect) {
 }
 
 bool frameAlreadyPublished() { return g_framePublished; }
+
+bool hooksMainWalkRedirected() { return g_mainWalkRedirected; }
 
 bool keepDrawingWhileUnfocused() {
     return g_options.renderWhenUnfocused || g_options.vr;

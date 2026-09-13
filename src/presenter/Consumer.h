@@ -58,9 +58,6 @@ public:
     // The game frame the last update() latched, for telling a new image from a repeat.
     int32_t latchedSequence() const { return current_.sequence; }
 
-    // vrDebugSubmitCurrentPose as the game last published it.
-    bool submitCurrentPose() const { return block_ && block_->submitCurrentPose != 0; }
-
     // The HUD panel as the game published it. False when there is nothing to show: the
     // layer is off, or no texture has been shared yet. On true, `layer` is 1 for
     // head-locked or 2 for the seat, placement is in metres (see ControlBlock), and

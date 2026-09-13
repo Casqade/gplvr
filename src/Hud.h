@@ -49,10 +49,19 @@ void hudEnsureThunk();
 
 void hudBeginFrame();
 
+// The frame's stamped text, flushed. From the present hook, after GPL has issued every
+// stampDraw of the frame: logs new or changed strings under a per-second cap, and once a
+// second a summary of stamp calls, strings and (with vrSkipStampText) dropped calls.
+void hudEndFrame();
+
 // Re-issue this frame's HUD. Called after each EXTRA render, which re-enters
 // gpl_sceneRender underneath a HUD that has already been drawn and paints the world over
 // it -- so without this the HUD survives only on frames with no extra render, which at
 // `vrExtraRenders = 2` is one frame in three.
 void hudReplay();
+
+// True while the bitmapDraw global holds the thunk, which is the only place the mirror
+// panes' copy offset can be applied. Stereo keeps the stock single mirror image without it.
+bool hudBitmapDrawHooked();
 
 }  // namespace gplvr

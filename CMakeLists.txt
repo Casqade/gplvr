@@ -77,12 +77,15 @@ else()
         src/Billboard.cpp
         src/CursorOverlay.cpp
         src/Discovery.cpp
+        src/FrameBudget.cpp
         src/GlInterop.cpp
+        src/GpuTimer.cpp
         src/Hooks.cpp
         src/Hud.cpp
         src/Letterbox.cpp
         src/Log.cpp
         src/MenuScale.cpp
+        src/MirrorTarget.cpp
         src/MouseLook.cpp
         src/Pe.cpp
         src/Pribluda.cpp

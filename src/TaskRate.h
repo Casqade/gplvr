@@ -73,4 +73,10 @@ void taskRateReportThread(const char* what);
 // seconds of ticks labelled as one -- wrong in exactly the case the counter exists for.
 bool taskRateFormat(char* buffer, size_t size, double seconds);
 
+// The BG thread's cost per simulation tick over the window taskRateFormat just closed: busy
+// time (outside bgSleep, so preemption and lock waits count) divided by the ticks stepped,
+// the worst single busy stretch, and the mean's share of the tick period. Call after
+// taskRateFormat; false when the duty-cycle hook is not installed.
+bool taskRateFormatTickCost(char* buffer, size_t size);
+
 }  // namespace gplvr

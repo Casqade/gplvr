@@ -43,6 +43,14 @@ struct Api {
     long long worstTicks = 0;  // worst single stretch
     long long lastReturn = 0;
     bool      dutyHooked = false;
+    volatile LONG stretches = 0;  // busy stretches, one per bgSleep call
+
+    // The last window's tick cost, kept by taskRateFormat for taskRateFormatTickCost.
+    bool   tickWindow = false;
+    double tickBusyMs = 0.0;
+    double tickWorstMs = 0.0;
+    int    tickCount = 0;
+    long   tickStretches = 0;
 
     bool haveBase = false;
     int  baseBg = 0;
@@ -76,6 +84,7 @@ void __cdecl bgSleepHook() {
         const long long busy = now.QuadPart - g_api.lastReturn;
         if (busy > 0) {
             InterlockedExchangeAdd64(&g_api.busyTicks, busy);
+            InterlockedIncrement(&g_api.stretches);
             // Racy against the reader's clear, which can only lose a worst case to the
             // previous window. Not worth a compare-exchange loop on BG's hot path.
             if (busy > g_api.worstTicks) g_api.worstTicks = busy;
@@ -231,6 +240,13 @@ bool taskRateFormat(char* buffer, size_t size, double seconds) {
         const double busyMs = 1000.0 * static_cast<double>(busy) / frequency.QuadPart;
         const double worstMs = 1000.0 * static_cast<double>(worst) / frequency.QuadPart;
         const double percent = 100.0 * busyMs / (seconds * 1000.0);
+
+        long stretches = InterlockedExchange(&g_api.stretches, 0);
+        g_api.tickWindow = percent >= 0.0 && percent <= 200.0;
+        g_api.tickBusyMs = busyMs;
+        g_api.tickWorstMs = worstMs;
+        g_api.tickCount = bg - g_api.baseBg;
+        g_api.tickStretches = stretches;
         // A number outside this range means the snapshot raced with something rather than
         // that BG did anything interesting. Say nothing rather than print nonsense.
         if (percent >= 0.0 && percent <= 200.0)
@@ -272,6 +288,26 @@ bool taskRateFormat(char* buffer, size_t size, double seconds) {
     g_api.baseSv = sv;
     g_api.baseInt = ints;
     g_api.baseIgnored = ignored;
+    return true;
+}
+
+bool taskRateFormatTickCost(char* buffer, size_t size) {
+    if (!buffer || size == 0 || !g_api.tickWindow) return false;
+    g_api.tickWindow = false;
+
+    int sim = taskRateSimHz();
+    if (sim <= 0 || g_api.tickCount <= 0) return false;
+
+    double period = 1000.0 / sim;
+    double mean = g_api.tickBusyMs / g_api.tickCount;
+    double share = 100.0 * mean / period;
+    std::snprintf(buffer, size,
+                  "sim tick %.3f ms busy per tick mean, worst stretch %.2f ms, of a %.2f ms "
+                  "period = %.1f%% | %d ticks, %.1f bgSleep stretches per tick%s",
+                  mean, g_api.tickWorstMs, period, share, g_api.tickCount,
+                  static_cast<double>(g_api.tickStretches) / g_api.tickCount,
+                  share >= 10.0 ? " -- over 10% of the period, the tick needs dissecting"
+                                : "");
     return true;
 }
 

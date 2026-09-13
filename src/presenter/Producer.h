@@ -82,17 +82,21 @@ void presenterPublishSeat(const SharedPose& seat);
 // True once a seat has been published to the presenter.
 bool presenterSeatPublished();
 
-// Pribluda's overlay, drawn into a shared texture the presenter shows as a quad layer.
+// Pribluda's overlay, drawn into a texture the presenter shows as a quad layer.
 //
-// presenterHudBegin makes the next texture slot the GL draw target, cleared transparent,
+// presenterHudBegin makes gplvr's own panel texture the GL draw target, cleared transparent,
 // with the aspect of aspectWidth x aspectHeight; the size chosen comes back in
 // width/height. False means there is no headset channel, no framebuffer support or no
 // texture, and nothing was bound. presenterHudEnd must follow every successful Begin in
-// the same frame: it restores the previous draw target and hands the texture back to
-// Direct3D. The image is published with the frame, after the transfer has drained GL, so
-// the presenter never copies a panel that is still being drawn.
+// the same frame: it restores the previous draw target. No interop lock is taken for the
+// draw: the image is copied into a shared slot inside the next frame transfer's lock and
+// published after it, so the presenter never copies a panel that is still being drawn.
 bool presenterHudBegin(int aspectWidth, int aspectHeight, int& width, int& height);
 void presenterHudEnd();
+
+// True when presenterBlitToWindow drew the headset panel over the monitor picture this frame,
+// so pribluda's own monitor draw, later in roglv2's present, is to be skipped.
+bool presenterMonitorHudTaken();
 
 // The presenter's view-publication counter, or 0 if it is not publishing.
 //

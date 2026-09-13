@@ -1027,7 +1027,6 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     HudLayer hud;
-    bool     loggedSubmitCurrent = false;
 
     // -- frame loop --------------------------------------------------------------
     XrSessionState state = XR_SESSION_STATE_IDLE;
@@ -1450,8 +1449,7 @@ int wmain(int argc, wchar_t** argv) {
                         // rendered pose is what lets it reproject, which is the whole
                         // reason 36 Hz into a 90 Hz compositor is survivable.
                         SharedView rendered[2] = {};
-                        if (presenting && !consumer.submitCurrentPose() &&
-                            consumer.renderedViews(rendered)) {
+                        if (presenting && consumer.renderedViews(rendered)) {
                             const SharedView& source = rendered[i];
                             projectionViews[i].pose.orientation = {
                                 source.pose.orientationX, source.pose.orientationY,
@@ -1532,14 +1530,6 @@ int wmain(int argc, wchar_t** argv) {
 
                 // Pribluda's overlay, composited over the game's image on a quad. Layers
                 // are painted in submission order, so it comes after the projection.
-                bool submitCurrent = presenting && consumer.submitCurrentPose();
-                if (submitCurrent != loggedSubmitCurrent) {
-                    loggedSubmitCurrent = submitCurrent;
-                    logf("xr: eye images submitted with the %s",
-                         submitCurrent ? "CURRENT display pose (debug, no world reprojection)"
-                                       : "pose they were rendered from");
-                }
-
                 Consumer::HudPanel panel;
                 bool hudOn = presenting && consumer.hudPanel(panel);
                 int32_t hudLayerNow = hudOn ? panel.layer : 0;

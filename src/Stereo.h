@@ -163,4 +163,15 @@ bool stereoEyeGeometry(float& fov, float& separation);
 // half shifted every VR frame by an eighth of half-height for as long again.
 void stereoOnCameraBind(void* camera);
 
+// True while stereoRender is inside a MIRROR-ONLY sceneRender: an extra call made before an
+// eye's own render so that both mirror panes are fresh for it. Its main world walk is skipped
+// (Hooks.cpp) and every polygon after its main cameraBind is dropped (Stereo.cpp), so it
+// renders one pane into mirror.mip and nothing into the eye.
+bool stereoMirrorOnlyPass();
+
+// The x at which gpl_sceneRender's mirror copy-out writes into mirror.mip. `readSurface` is
+// the bitmap the copy reads from (bitmapDraw's fourth argument). The +Y pane's copy moves to
+// the right half of the texture, where the +Y glass samples; everything else keeps `x`.
+int stereoMirrorCopyX(int readSurface, int x);
+
 }  // namespace gplvr
