@@ -79,15 +79,21 @@ else()
         src/Discovery.cpp
         src/GlInterop.cpp
         src/Hooks.cpp
+        src/Hud.cpp
+        src/Letterbox.cpp
         src/Log.cpp
+        src/MenuScale.cpp
         src/MouseLook.cpp
         src/Pe.cpp
+        src/Pribluda.cpp
+        src/RenderProfile.cpp
         src/RenderShim.cpp
         src/RenderTarget.cpp
         src/Stereo.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
         src/VrCamera.cpp
+        src/Window.cpp
         src/presenter/Producer.cpp
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")

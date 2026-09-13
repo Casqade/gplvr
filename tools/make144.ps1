@@ -6,9 +6,9 @@
   Runs the three tools in order with the exact recipe of the working build
   (out/gplc67-144.json), producing:
 
-      tools\78 144fps v32.xml                (gplrategen.py)
+      tools\78 144fps v34.xml                (gplrategen.py)
       out\gpla67-144.ini                     (gplaiscale.py)
-      out\gplc67-144-v32.exe                 (gplexegen.ps1 + GPLPatchDLL.dll)
+      out\gplc67-144-v34.exe                 (gplexegen.ps1 + GPLPatchDLL.dll)
 
   THE PATCH IS SELF-CONTAINED. Nothing third-party is applied: no 77G, no 60FPSv2
   scaffolding. gplrategen emits the rate, timer and sound-callback registrations, the
@@ -141,9 +141,9 @@ foreach ($need in @(
     }
 }
 
-$aiXml   = Join-Path $tools ('78 {0}fps v32.xml' -f $Rate)
-$outExe  = Join-Path $outDir 'gplc67-144-v32.exe'
-$manifest= Join-Path $outDir 'gplc67-144-v32.json'
+$aiXml   = Join-Path $tools ('78 {0}fps v34.xml' -f $Rate)
+$outExe  = Join-Path $outDir 'gplc67-144-v34.exe'
+$manifest= Join-Path $outDir 'gplc67-144-v34.json'
 $aiIni   = Join-Path $outDir ('gpla67-{0}.ini' -f $Rate)
 
 New-Item -ItemType Directory -Force $outDir | Out-Null
@@ -179,10 +179,12 @@ if ($Rate -ne 144) { throw "the exe recipe is pinned to 144" }
 # The XML list of the known-good build. Order matters: gpl67's own numbered patches, then
 # ours. Nothing third-party appears here -- the 144 Hz XML is self-contained, and applying
 # 77G alongside it would land on the same caves with no collision detection to catch it.
-$xmlList = @(
+$gem = @(
     '05.xml','09.xml','10.xml','15.xml','20.xml','21.xml','22.xml','23.xml','24.xml',
     '25.xml','26.xml','30.xml','31.xml','32.xml','33.xml','40.xml','45.xml','50.xml',
-    '60.xml','77Dv3 No Letterbox.xml','90.xml','95.xml' | ForEach-Object { Join-Path $gpl67 $_ }
+    '60.xml','90.xml','95.xml')
+$xmlList = @(
+    $gem | ForEach-Object { Join-Path $gpl67 $_ }
 ) + @(
     (Join-Path $tools 'gpl67-carset-names.xml'),
     $aiXml

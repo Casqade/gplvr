@@ -70,7 +70,29 @@ void presenterStop();
 // The most recent eye views the presenter published, or false if none yet. This is what
 // Phase 3 will feed into the scene parameter block; nothing consumes it today beyond the
 // log line that proves the return path works.
-bool presenterLatestViews(SharedView views[2], SharedPose& head);
+//
+// `motion`, when given, receives the head velocity and display clock published with them.
+bool presenterLatestViews(SharedView views[2], SharedPose& head,
+                          SharedMotion* motion = nullptr);
+
+// Publish the seat -- the recentred head pose, heading only, in the presenter's LOCAL
+// space -- so a layer can be placed relative to it. Called on every recentre.
+void presenterPublishSeat(const SharedPose& seat);
+
+// True once a seat has been published to the presenter.
+bool presenterSeatPublished();
+
+// Pribluda's overlay, drawn into a shared texture the presenter shows as a quad layer.
+//
+// presenterHudBegin makes the next texture slot the GL draw target, cleared transparent,
+// with the aspect of aspectWidth x aspectHeight; the size chosen comes back in
+// width/height. False means there is no headset channel, no framebuffer support or no
+// texture, and nothing was bound. presenterHudEnd must follow every successful Begin in
+// the same frame: it restores the previous draw target and hands the texture back to
+// Direct3D. The image is published with the frame, after the transfer has drained GL, so
+// the presenter never copies a panel that is still being drawn.
+bool presenterHudBegin(int aspectWidth, int aspectHeight, int& width, int& height);
+void presenterHudEnd();
 
 // The presenter's view-publication counter, or 0 if it is not publishing.
 //

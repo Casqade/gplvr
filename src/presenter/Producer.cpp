@@ -55,11 +55,35 @@ struct State {
     ID3D11Texture2D* textures[kFrameSlots] = {};
     GlSharedTexture  shared[kFrameSlots] = {};
 
+    // Pribluda's panel, two slots like the frame. Separate from the frame textures: its
+    // size follows the panel rather than the render target, and it is drawn into rather
+    // than transferred.
+    ID3D11Texture2D* hudTextures[kFrameSlots] = {};
+    GlSharedTexture  hudShared[kFrameSlots] = {};
+    int              hudWidth = 0;
+    int              hudHeight = 0;
+    uint32_t         hudSlot = 0;
+    GLint            hudPreviousFramebuffer = 0;
+    bool             hudBound = false;
+    bool             hudPending = false;
+    bool             hudReportedFailure = false;
+    LONGLONG         hudPublishedQpc = 0;  // when the last panel image was published
+    LONGLONG         qpcFrequency = 0;
+
     int  width = 0;
     int  height = 0;
     int  frameSequence = 0;
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
+
+    // Pose diagnostics, logged every two seconds. viewLag counts, per published frame, how
+    // many view sets the presenter had published after the one the eyes were rendered from
+    // (0, 1, 2, 3+). slotOverwrites counts frames written into the slot holding the frame
+    // the presenter drew last, before it had latched anything newer.
+    int32_t  acquiredViewSequence = 0;
+    int      viewLag[4] = {};
+    int      slotOverwrites = 0;
+    LONGLONG poseReportQpc = 0;
 };
 
 State g_state;
@@ -225,12 +249,24 @@ bool createDevice(State& state) {
     return state.interopDevice != nullptr;
 }
 
+void releaseHudTextures(State& state) {
+    for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
+        glInteropUnregister(state.gl, state.interopDevice, state.hudShared[slot]);
+        if (state.hudTextures[slot]) state.hudTextures[slot]->Release();
+        state.hudTextures[slot] = nullptr;
+    }
+    state.hudWidth = 0;
+    state.hudHeight = 0;
+    state.hudPending = false;
+}
+
 void releaseTextures(State& state) {
     for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
         glInteropUnregister(state.gl, state.interopDevice, state.shared[slot]);
         if (state.textures[slot]) state.textures[slot]->Release();
         state.textures[slot] = nullptr;
     }
+    releaseHudTextures(state);
 }
 
 bool createTextures(State& state, int width, int height) {
@@ -281,6 +317,55 @@ bool createTextures(State& state, int width, int height) {
 
     logf("vr: published %u shared textures at %dx%d, generation %d", kFrameSlots, width,
          height, state.block->textureGeneration);
+    return true;
+}
+
+// Pribluda's panel is 2048 texels wide whatever the monitor is: at the default 0.6 m that
+// is over three texels a millimetre, finer than a headset resolves at arm's length.
+constexpr int kHudTextureWidth = 2048;
+
+// How long the panel layer stays published after the last panel image. Long enough to ride
+// over a frame that skips the draw, short enough that leaving a race clears it at once.
+constexpr double kHudGraceSeconds = 0.25;
+
+bool createHudTextures(State& state, int width, int height) {
+    releaseHudTextures(state);
+
+    for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = static_cast<UINT>(width);
+        desc.Height = static_cast<UINT>(height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+        if (FAILED(state.device->CreateTexture2D(&desc, nullptr,
+                                                 &state.hudTextures[slot]))) {
+            logf("vr: CreateTexture2D %dx%d failed for HUD panel slot %u", width, height,
+                 slot);
+            state.hudTextures[slot] = nullptr;
+            releaseHudTextures(state);
+            return false;
+        }
+        if (!glInteropRegister(state.gl, state.interopDevice, state.hudTextures[slot],
+                               state.hudShared[slot])) {
+            releaseHudTextures(state);
+            return false;
+        }
+        storeSharedHandle(state.block->hudTextures[slot], state.hudShared[slot].shareHandle);
+    }
+
+    state.hudWidth = width;
+    state.hudHeight = height;
+    state.block->hudTextureWidth = static_cast<uint32_t>(width);
+    state.block->hudTextureHeight = static_cast<uint32_t>(height);
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state.block->hudGeneration));
+    logf("vr: HUD panel textures %dx%d shared, generation %d", width, height,
+         state.block->hudGeneration);
     return true;
 }
 
@@ -470,6 +555,14 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
 
     block->sideBySide = sideBySide ? 1 : 0;
     block->monoScale = g_options.vrMenuScale;
+    block->gamma = g_options.vrGamma;
+    block->submitCurrentPose = g_options.vrDebugSubmitCurrentPose ? 1 : 0;
+    const HudPlacement& placement =
+        g_options.vrHudLayer == 1 ? g_options.vrHudHead : g_options.vrHudSeat;
+    block->hudRight = placement.right;
+    block->hudUp = -placement.down;
+    block->hudAhead = placement.ahead;
+    block->hudWidth = placement.width;
     block->eyeHalfWidth = static_cast<uint32_t>(stereoEyeWidth());
 
     // Where each eye actually landed. Published every frame rather than at setup,
@@ -510,6 +603,9 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     // once per PUBLISHED frame -- so three to six times a tick, each ending in a glFinish
     // that stalls until the GPU drains. At 76.8 MB that is not obviously cheap, and the
     // frame budget cannot be reasoned about while one of its terms is unknown.
+    if (state.frameSequence > 0 && block->consumedSequence == state.frameSequence - 1)
+        ++state.slotOverwrites;
+
     LARGE_INTEGER transferBegin, transferEnd;
     QueryPerformanceCounter(&transferBegin);
     const bool transferred =
@@ -525,7 +621,51 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     ++state.frameSequence;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
+    vrNoteFramePublished();
+
+    // The HUD panel drawn this frame goes out now, after the transfer's glFinish has
+    // drained everything GL was asked to do -- the panel included -- so the presenter can
+    // never copy one that is still being drawn.
+    // presenterHudBegin drew into slot (hudSequence + 1) % kFrameSlots, so moving the
+    // sequence on by one is what names that slot.
+    if (state.hudPending) {
+        state.hudPending = false;
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->hudSequence),
+                            block->hudSequence + 1);
+        state.hudPublishedQpc = transferEnd.QuadPart;
+    }
+
+    // The layer is published only while the game keeps drawing the panel. pribluda's draw
+    // stops when the race ends, and a layer left on would go on showing its last image over
+    // the lobby. Written after the sequence, so a panel coming back is never shown for a
+    // display frame with the image from before.
+    if (!state.qpcFrequency) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        state.qpcFrequency = frequency.QuadPart;
+    }
+    bool hudLive = state.hudPublishedQpc &&
+                   transferEnd.QuadPart - state.hudPublishedQpc <
+                       static_cast<LONGLONG>(state.qpcFrequency * kHudGraceSeconds);
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->hudLayer),
+                        hudLive ? g_options.vrHudLayer : 0);
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block->producedFrames));
+
+    if (haveRendered && state.acquiredViewSequence) {
+        int lag = block->viewSequence - state.acquiredViewSequence;
+        ++state.viewLag[lag <= 0 ? 0 : (lag >= 3 ? 3 : lag)];
+    }
+    if (!state.poseReportQpc) state.poseReportQpc = transferEnd.QuadPart;
+    if (transferEnd.QuadPart - state.poseReportQpc >= 2 * state.qpcFrequency) {
+        logf("vr: pose age at publish -- view sets the presenter published after the rendered "
+             "one 0:%d 1:%d 2:%d 3+:%d | written over the slot of the presenter's last drawn "
+             "frame %d times",
+             state.viewLag[0], state.viewLag[1], state.viewLag[2], state.viewLag[3],
+             state.slotOverwrites);
+        for (int& count : state.viewLag) count = 0;
+        state.slotOverwrites = 0;
+        state.poseReportQpc = transferEnd.QuadPart;
+    }
 
     if (!state.loggedFirstFrame) {
         state.loggedFirstFrame = true;
@@ -627,7 +767,7 @@ int32_t presenterViewSequence() {
     return state.block->viewsValid ? state.block->viewSequence : 0;
 }
 
-bool presenterLatestViews(SharedView views[2], SharedPose& head) {
+bool presenterLatestViews(SharedView views[2], SharedPose& head, SharedMotion* motion) {
     State& state = g_state;
     if (state.stage != Stage::Publishing || !state.block) return false;
 
@@ -645,11 +785,116 @@ bool presenterLatestViews(SharedView views[2], SharedPose& head) {
         views[0] = block->views[0];
         views[1] = block->views[1];
         head = block->headPose;
+        if (motion) *motion = block->motion;
 
         // If the sequence has not moved, nothing was published underneath the copy.
-        if (block->viewSequence == sequence) return true;
+        if (block->viewSequence == sequence) {
+            // The eye cameras ask for the motion; that call is the one a frame renders from.
+            if (motion) state.acquiredViewSequence = sequence;
+            return true;
+        }
     }
     return false;
+}
+
+void presenterPublishSeat(const SharedPose& seat) {
+    State& state = g_state;
+    if (!state.block) return;
+
+    ControlBlock* block = state.block;
+    block->seatPose = seat;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block->seatGeneration));
+}
+
+bool presenterSeatPublished() {
+    State& state = g_state;
+    return state.block && state.block->seatGeneration != 0;
+}
+
+bool presenterHudBegin(int aspectWidth, int aspectHeight, int& width, int& height) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block || !state.device ||
+        !state.interopDevice || !state.glContext || state.hudBound)
+        return false;
+    if (aspectWidth <= 0 || aspectHeight <= 0) return false;
+
+    GlFunctions& gl = state.gl;
+    if (!gl.bindFramebuffer) glResolveFramebuffer(gl);
+    if (!gl.bindFramebuffer || !gl.framebufferTexture2D || !gl.checkFramebufferStatus ||
+        !gl.clear || !gl.clearColor || !gl.viewport || !gl.getIntegerv ||
+        !gl.dxLockObjects || !gl.dxUnlockObjects) {
+        if (!state.hudReportedFailure) {
+            state.hudReportedFailure = true;
+            logf("vr: the HUD panel needs framebuffer objects and interop locking, and GL "
+                 "did not provide them -- no panel");
+        }
+        return false;
+    }
+
+    int wantedHeight = static_cast<int>(static_cast<long long>(kHudTextureWidth) *
+                                        aspectHeight / aspectWidth);
+    if (wantedHeight < 1) wantedHeight = 1;
+    if ((state.hudWidth != kHudTextureWidth || state.hudHeight != wantedHeight) &&
+        !createHudTextures(state, kHudTextureWidth, wantedHeight))
+        return false;
+
+    // The slot after the one last published. Drawn twice without a publish in between --
+    // a frame that never reached the transfer -- it is simply drawn again.
+    uint32_t slot = static_cast<uint32_t>(state.block->hudSequence + 1) % kFrameSlots;
+    GlSharedTexture& shared = state.hudShared[slot];
+
+    HANDLE object = shared.interopObject;
+    if (!gl.dxLockObjects(state.interopDevice, 1, &object)) {
+        if (!state.hudReportedFailure) {
+            state.hudReportedFailure = true;
+            logf("vr: wglDXLockObjectsNV refused the HUD panel texture -- no panel");
+        }
+        return false;
+    }
+
+    gl.getIntegerv(kGlFramebufferBinding, &state.hudPreviousFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, shared.framebuffer);
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, shared.name,
+                            0);
+    if (gl.checkFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
+        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(state.hudPreviousFramebuffer));
+        gl.dxUnlockObjects(state.interopDevice, 1, &object);
+        if (!state.hudReportedFailure) {
+            state.hudReportedFailure = true;
+            logf("vr: the HUD panel's framebuffer is incomplete -- no panel");
+        }
+        return false;
+    }
+
+    gl.viewport(0, 0, state.hudWidth, state.hudHeight);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+
+    state.hudSlot = slot;
+    state.hudBound = true;
+    width = state.hudWidth;
+    height = state.hudHeight;
+    return true;
+}
+
+void presenterHudEnd() {
+    State& state = g_state;
+    if (!state.hudBound) return;
+    state.hudBound = false;
+
+    GlFunctions& gl = state.gl;
+    GlSharedTexture& shared = state.hudShared[state.hudSlot];
+
+    // Detached before the unlock: GL must not still hold an interop object when it is
+    // handed back to Direct3D, or the unlock fails and the image is lost -- the same order
+    // glInteropCopyBackBuffer keeps for the frame.
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(state.hudPreviousFramebuffer));
+    HANDLE object = shared.interopObject;
+    gl.dxUnlockObjects(state.interopDevice, 1, &object);
+
+    state.hudPending = true;
 }
 
 void presenterStop() {

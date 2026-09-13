@@ -12,8 +12,13 @@
 #include "Billboard.h"
 #include "Discovery.h"
 #include "Hooks.h"
+#include "Hud.h"
+#include "Letterbox.h"
+#include "MenuScale.h"
+#include "RenderProfile.h"
 #include "RenderShim.h"
 #include "Log.h"
+#include "Window.h"
 
 #include <windows.h>
 
@@ -126,10 +131,38 @@ DWORD WINAPI installThread(LPVOID) {
         return 0;
     }
     requestSceneRenderHook(binding);
-    billboardInstall(binding);
+
+    // Headset only. The per-eye HUD thunks and the billboard fix change what the game
+    // draws, and flat mode is the vanilla game in a borderless window.
+    if (g_options.vr) {
+        hudBind(binding);
+        billboardInstall(binding);
+    }
     shimInstall(binding);
 
-    logf("ready. '1' toggles stereo.");
+    // Before the first menu-to-race transition, which is the moment the screenBegin
+    // thunk earns its keep. Discovery has already run, so the rasterizer is loaded and
+    // its window manager exists.
+    windowInstall(binding);
+    menuScaleInstall(binding);
+
+    // After windowInstall, which is what resolves the engine's mode: the layout thunks
+    // size the middle panel from it the first time a race is entered.
+    letterboxInstall();
+
+    // After shimInstall, so nullDraw can see whether the shim took polyDraw first. The
+    // driver thunks go in here too: roglv2 is loaded by now, because discovery keys off
+    // its entry points.
+    renderProfileDiscover(binding);
+    renderProfileInstallDriverThunks();
+    renderProfileInstallNullDraw(binding);
+
+    if (g_options.vr)
+        logf("ready. '1' toggles stereo.");
+    else
+        logf("ready -- flat mode: borderless window, letterbox and widescreen fixes, "
+             "front-end scaling, roglv2's glFinish drop and swap interval, mouselook. "
+             "Stereo, the HUD split, billboards and the profilers need vr = 1.");
     return 0;
 }
 
@@ -162,6 +195,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         if (HANDLE thread = CreateThread(nullptr, 0, &installThread, nullptr, 0, nullptr))
             CloseHandle(thread);
     } else if (reason == DLL_PROCESS_DETACH) {
+        // Before the log closes, and before this module's code stops being callable.
+        windowProcUnchain();
         logf("detaching");
         logClose();
     }

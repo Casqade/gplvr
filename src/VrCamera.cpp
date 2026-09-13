@@ -57,13 +57,224 @@ struct State {
     bool  lookSeeded = false;
     float lookYaw = 0.0f;
     float lookPitch = 0.0f;
+
+    // Position prediction. acquireQpc is when the pose for the frame in progress was read,
+    // renderTicks how long a frame then takes to be published, smoothed.
+    LONGLONG  qpcFrequency = 0;
+    LONGLONG  acquireQpc = 0;
+    double    renderTicks = 0.0;
+    bool      loggedNoPrediction = false;
+    ULONGLONG predictReportTick = 0;
+    int       predictFrames = 0;
+    int       predictDisplays[4] = {};  // reached the display 1, 2, 3+ periods on
+    double    predictShiftSum = 0.0;
 };
 
 State g_state;
 
+// Move each eye to where it will be when the frame being rendered now is displayed.
+//
+// The runtime predicted these views for the display the presenter was preparing when it
+// published them. This frame reaches a LATER display: it is picked up at the first
+// presenter latch after it is published, and because GPL's frame is tied to its sim tick
+// rather than to the headset, how many displays later varies from frame to frame. SteamVR
+// reprojects the orientation of whatever it is handed, but has no depth to reproject
+// position with, so eyes one display behind on one frame and two behind on the next make
+// near geometry step while the head moves sideways.
+//
+// So the displays in between are counted, and each eye moves by its own velocity -- the
+// head's, plus the head's rotation carrying the eye around it -- over that many periods.
+// Orientation is left to reprojection, and the pose echoed with the frame carries the
+// moved positions, so the image is reprojected from where it was really drawn.
+constexpr double kMaxPredictSeconds = 0.05;
+constexpr float  kMaxPredictMetres = 0.05f;
+
+void predictEyePositions(SharedView views[2], const SharedPose& head,
+                         const SharedMotion& motion, LONGLONG now) {
+    if (!(motion.flags & kMotionTiming) || !(motion.flags & kMotionLinear)) {
+        if (!g_state.loggedNoPrediction) {
+            g_state.loggedNoPrediction = true;
+            logf("vr: position prediction is waiting -- the presenter has not published %s",
+                 (motion.flags & kMotionTiming)
+                     ? "a head velocity"
+                     : "the display clock (XR_KHR_win32_convert_performance_counter_time)");
+        }
+        return;
+    }
+    if (!g_state.qpcFrequency) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        g_state.qpcFrequency = frequency.QuadPart;
+    }
+
+    LONGLONG period = loadQpc(motion.period);
+    LONGLONG latch = loadQpc(motion.latchTime);
+    if (period <= 0 || g_state.qpcFrequency <= 0) return;
+
+    // The first latch at or after this frame is ready. These views were read after the
+    // latch they were published with, so at least one period always passes.
+    LONGLONG ready = now + static_cast<LONGLONG>(g_state.renderTicks);
+    LONGLONG displays = (ready - latch + period - 1) / period;
+    if (displays < 1) displays = 1;
+
+    double seconds = static_cast<double>(displays * period) /
+                     static_cast<double>(g_state.qpcFrequency);
+    if (seconds > kMaxPredictSeconds) seconds = kMaxPredictSeconds;
+
+    float angular[3] = {0.0f, 0.0f, 0.0f};
+    if (motion.flags & kMotionAngular) {
+        angular[0] = motion.angularVelocity[0];
+        angular[1] = motion.angularVelocity[1];
+        angular[2] = motion.angularVelocity[2];
+    }
+
+    float firstShift = 0.0f;
+    for (int eye = 0; eye < 2; ++eye) {
+        SharedPose& pose = views[eye].pose;
+        float r[3] = {pose.positionX - head.positionX, pose.positionY - head.positionY,
+                      pose.positionZ - head.positionZ};
+        // v_eye = v_head + w x r
+        float velocity[3] = {
+            motion.linearVelocity[0] + angular[1] * r[2] - angular[2] * r[1],
+            motion.linearVelocity[1] + angular[2] * r[0] - angular[0] * r[2],
+            motion.linearVelocity[2] + angular[0] * r[1] - angular[1] * r[0]};
+        float shift[3] = {static_cast<float>(velocity[0] * seconds),
+                          static_cast<float>(velocity[1] * seconds),
+                          static_cast<float>(velocity[2] * seconds)};
+        float length =
+            std::sqrt(shift[0] * shift[0] + shift[1] * shift[1] + shift[2] * shift[2]);
+        if (length > kMaxPredictMetres) {
+            float scale = kMaxPredictMetres / length;
+            shift[0] *= scale;
+            shift[1] *= scale;
+            shift[2] *= scale;
+            length = kMaxPredictMetres;
+        }
+        pose.positionX += shift[0];
+        pose.positionY += shift[1];
+        pose.positionZ += shift[2];
+        if (eye == 0) firstShift = length;
+    }
+
+    ++g_state.predictFrames;
+    ++g_state.predictDisplays[displays < 3 ? displays : 3];
+    g_state.predictShiftSum += firstShift;
+
+    ULONGLONG tick = GetTickCount64();
+    if (!g_state.predictReportTick) g_state.predictReportTick = tick;
+    if (tick - g_state.predictReportTick >= 2000) {
+        int frames = g_state.predictFrames;
+        logf("vr: position prediction -- %d frames reached the display 1 period on %d times, "
+             "2 on %d, 3 or more on %d; pose read to publish %.1f ms; mean eye shift %.2f mm",
+             frames, g_state.predictDisplays[1], g_state.predictDisplays[2],
+             g_state.predictDisplays[3],
+             g_state.renderTicks * 1000.0 / static_cast<double>(g_state.qpcFrequency),
+             frames ? g_state.predictShiftSum / frames * 1000.0 : 0.0);
+        g_state.predictReportTick = tick;
+        g_state.predictFrames = 0;
+        g_state.predictDisplays[1] = g_state.predictDisplays[2] = g_state.predictDisplays[3] = 0;
+        g_state.predictShiftSum = 0.0;
+    }
+}
+
+// The presenter places seat-locked layers from this same pose, so a panel fixed to the seat
+// and the eyes the game renders share one origin.
+void publishOrigin() {
+    SharedPose seat;
+    seat.orientationX = g_state.originOrientation.x;
+    seat.orientationY = g_state.originOrientation.y;
+    seat.orientationZ = g_state.originOrientation.z;
+    seat.orientationW = g_state.originOrientation.w;
+    seat.positionX = g_state.originPosition[0];
+    seat.positionY = g_state.originPosition[1];
+    seat.positionZ = g_state.originPosition[2];
+    presenterPublishSeat(seat);
+}
+
+// Take `head` as the seat: the recentre.
+void captureOrigin(const SharedPose& head) {
+    g_state.haveOrigin = true;
+    g_state.recentreRequested = false;
+
+    const Quat headQuat = {head.orientationX, head.orientationY, head.orientationZ,
+                           head.orientationW};
+
+    // Keep only the HEADING. Discard the pitch and roll the head happened to
+    // have when this fired.
+    //
+    // Measured: a seat captured with -4.2 degrees of pitch turned an 88.9 degree
+    // head yaw into 5.2 degrees of roll, from a head carrying -1.0. Composing a
+    // yaw against a tilted frame rotates about a tilted axis, and the tilt comes
+    // back as roll that grows with yaw -- the "ladder", and the reason counter-
+    // rolling never straightened it: the roll was manufactured, not observed.
+    //
+    // A seat is a heading. Its up axis is the world's up axis, always.
+    // Position and HEADING only -- never pitch, never roll. Not a preference:
+    // OpenXR's LOCAL space is gravity-aligned by definition, every runtime's own
+    // recentre (Meta, SteamVR, WMR) resets translation and yaw alone, and every sim
+    // that ships a centre-view key does the same. The reason is vestibular: your
+    // inner ear knows which way down is, and a virtual horizon that disagrees with
+    // it is the strongest single trigger for simulator sickness. Yaw carries no such
+    // conflict, because rotating about the gravity vector does not move "down".
+    //
+    // Measured here before this was unconditional: a head carrying just -1.0 degrees
+    // of roll at recentre produced 5.2 degrees of roll at 89 degrees of head yaw. A
+    // tilted origin does not merely offset the view, it poisons every later rotation
+    // by giving the yaw a tilted axis to turn about.
+    //
+    // Someone wanting a head-down neutral posture needs a deliberate pitch offset
+    // applied after this, which is how sims expose it -- not a tilted origin.
+    const float forwardIn[3] = {0.0f, 0.0f, -1.0f};
+    float       forward[3];
+    rotate(headQuat, forwardIn, forward);
+
+    // Looking straight up or down leaves no heading to recover; keep the one already
+    // in force rather than snapping to an arbitrary one.
+    const float planar =
+        std::sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
+    if (planar > 0.01f) {
+        const float yaw = std::atan2(-forward[0], -forward[2]);
+        g_state.originOrientation = {0.0f, std::sin(yaw * 0.5f), 0.0f,
+                                     std::cos(yaw * 0.5f)};
+    }
+    g_state.originPosition[0] = head.positionX;
+    g_state.originPosition[1] = head.positionY;
+    g_state.originPosition[2] = head.positionZ;
+    // Say what was thrown away, because a large pitch here means the recentre
+    // fired while the head was somewhere unintended -- which is worth seeing.
+    const float upIn[3] = {0.0f, 1.0f, 0.0f};
+    const float fwdIn[3] = {0.0f, 0.0f, -1.0f};
+    float       up[3], fwd[3], right[3];
+    const float rightIn[3] = {1.0f, 0.0f, 0.0f};
+    rotate(headQuat, upIn, up);
+    rotate(headQuat, fwdIn, fwd);
+    rotate(headQuat, rightIn, right);
+    const float sinPitch = fwd[1] < -1.0f ? -1.0f : (fwd[1] > 1.0f ? 1.0f : fwd[1]);
+    logf("vr: recentred on head (%.3f, %.3f, %.3f) -- this pose is now the seat. "
+         "Head pitch %.1f roll %.1f deg %s",
+         head.positionX, head.positionY, head.positionZ,
+         std::asin(sinPitch) * 57.29578f,
+         std::atan2(right[1], up[1]) * 57.29578f,
+         "-- discarded, the seat keeps position and heading only");
+
+    publishOrigin();
+}
+
 }  // namespace
 
 void vrRequestRecentre() { g_state.recentreRequested = true; }
+
+bool vrPublishSeat() {
+    if (g_state.haveOrigin) {
+        publishOrigin();
+        return true;
+    }
+    SharedView views[2] = {};
+    SharedPose head = {};
+    if (!presenterLatestViews(views, head)) return false;
+    captureOrigin(head);
+    return true;
+}
 
 bool vrLookOverrideActive() { return g_options.vrMouseLook; }
 
@@ -148,6 +359,17 @@ void vrClearRendered() {
 
 bool vrFrustumInjected() { return g_state.injected; }
 
+void vrNoteFramePublished() {
+    if (!g_state.acquireQpc) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double ticks = static_cast<double>(now.QuadPart - g_state.acquireQpc);
+    g_state.acquireQpc = 0;
+    if (ticks <= 0.0) return;
+    g_state.renderTicks =
+        g_state.renderTicks > 0.0 ? g_state.renderTicks * 0.9 + ticks * 0.1 : ticks;
+}
+
 bool vrLastRenderedViews(SharedView out[2]) {
     if (!g_state.haveRendered) return false;
     out[0] = g_state.rendered[0];
@@ -166,72 +388,15 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
     // long time chasing.
     SharedView renderedLocal[2] = {};
     SharedPose head = {};
-    if (!presenterLatestViews(views, head)) return false;
+    SharedMotion motion;
+    if (!presenterLatestViews(views, head, &motion)) return false;
 
-    const Quat headQuat = {head.orientationX, head.orientationY, head.orientationZ,
-                           head.orientationW};
+    LARGE_INTEGER acquired;
+    QueryPerformanceCounter(&acquired);
+    g_state.acquireQpc = acquired.QuadPart;
+    if (g_options.vrPredictPosition) predictEyePositions(views, head, motion, acquired.QuadPart);
 
-    if (!g_state.haveOrigin || g_state.recentreRequested) {
-        g_state.haveOrigin = true;
-        g_state.recentreRequested = false;
-        // Keep only the HEADING. Discard the pitch and roll the head happened to
-        // have when this fired.
-        //
-        // Measured: a seat captured with -4.2 degrees of pitch turned an 88.9 degree
-        // head yaw into 5.2 degrees of roll, from a head carrying -1.0. Composing a
-        // yaw against a tilted frame rotates about a tilted axis, and the tilt comes
-        // back as roll that grows with yaw -- the "ladder", and the reason counter-
-        // rolling never straightened it: the roll was manufactured, not observed.
-        //
-        // A seat is a heading. Its up axis is the world's up axis, always.
-        // Position and HEADING only -- never pitch, never roll. Not a preference:
-        // OpenXR's LOCAL space is gravity-aligned by definition, every runtime's own
-        // recentre (Meta, SteamVR, WMR) resets translation and yaw alone, and every sim
-        // that ships a centre-view key does the same. The reason is vestibular: your
-        // inner ear knows which way down is, and a virtual horizon that disagrees with
-        // it is the strongest single trigger for simulator sickness. Yaw carries no such
-        // conflict, because rotating about the gravity vector does not move "down".
-        //
-        // Measured here before this was unconditional: a head carrying just -1.0 degrees
-        // of roll at recentre produced 5.2 degrees of roll at 89 degrees of head yaw. A
-        // tilted origin does not merely offset the view, it poisons every later rotation
-        // by giving the yaw a tilted axis to turn about.
-        //
-        // Someone wanting a head-down neutral posture needs a deliberate pitch offset
-        // applied after this, which is how sims expose it -- not a tilted origin.
-        const float forwardIn[3] = {0.0f, 0.0f, -1.0f};
-        float       forward[3];
-        rotate(headQuat, forwardIn, forward);
-
-        // Looking straight up or down leaves no heading to recover; keep the one already
-        // in force rather than snapping to an arbitrary one.
-        const float planar =
-            std::sqrt(forward[0] * forward[0] + forward[2] * forward[2]);
-        if (planar > 0.01f) {
-            const float yaw = std::atan2(-forward[0], -forward[2]);
-            g_state.originOrientation = {0.0f, std::sin(yaw * 0.5f), 0.0f,
-                                         std::cos(yaw * 0.5f)};
-        }
-        g_state.originPosition[0] = head.positionX;
-        g_state.originPosition[1] = head.positionY;
-        g_state.originPosition[2] = head.positionZ;
-        // Say what was thrown away, because a large pitch here means the recentre
-        // fired while the head was somewhere unintended -- which is worth seeing.
-        const float upIn[3] = {0.0f, 1.0f, 0.0f};
-        const float fwdIn[3] = {0.0f, 0.0f, -1.0f};
-        float       up[3], fwd[3], right[3];
-        const float rightIn[3] = {1.0f, 0.0f, 0.0f};
-        rotate(headQuat, upIn, up);
-        rotate(headQuat, fwdIn, fwd);
-        rotate(headQuat, rightIn, right);
-        const float sinPitch = fwd[1] < -1.0f ? -1.0f : (fwd[1] > 1.0f ? 1.0f : fwd[1]);
-        logf("vr: recentred on head (%.3f, %.3f, %.3f) -- this pose is now the seat. "
-             "Head pitch %.1f roll %.1f deg %s",
-             head.positionX, head.positionY, head.positionZ,
-             std::asin(sinPitch) * 57.29578f,
-             std::atan2(right[1], up[1]) * 57.29578f,
-             "-- discarded, the seat keeps position and heading only");
-    }
+    if (!g_state.haveOrigin || g_state.recentreRequested) captureOrigin(head);
 
     const Quat inverseOrigin = conjugate(g_state.originOrientation);
 

@@ -11,6 +11,12 @@
         The AI's OTHER half is in gpla67.ini, in ticks, and no exe
         patch touches it. See STATUS.md. -->
 
+   <ExeSection>
+      <Name>modtext</Name>
+      <!-- highest byte this patch writes here: 0x00988BE4 -->
+      <MinimumFileSize>0x00008BE5</MinimumFileSize>
+   </ExeSection>
+
    <BinaryPatch>
       <!-- substep dt = 1/288 -->
       <VirtualAddress>0x004A4CD5</VirtualAddress>
@@ -303,6 +309,12 @@
       <!-- the off-track give-up counter's threshold (car+1171), on the same post-contact path as the four line holds: 18 -> 72 ticks, 0.500 s either way -->
       <VirtualAddress>0x00444B58</VirtualAddress>
       <Data>48</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- the .lp corridor-correction give-up window (car+1151) in gpl_aiState_tickDecisionsAndCorridorClamp: 11 -> 44 ticks, 0.306 s either way -->
+      <VirtualAddress>0x00496A26</VirtualAddress>
+      <Data>2C</Data>
    </BinaryPatch>
 
    <BinaryPatch>
@@ -999,6 +1011,12 @@
       <!-- flagman state 6: frame 0..10, wraps: one step in 16 ticks, unchanged at 144 Hz in wall-clock terms -->
       <VirtualAddress>0x004817D5</VirtualAddress>
       <Data>0F</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- trackside scenery animation clock: getBGCount() >> 2 before the modulo, so a 12-tick flag cycle stays 1/3 s of wall clock at 144 Hz instead of cycling 4x too fast -->
+      <VirtualAddress>0x004CF84E</VirtualAddress>
+      <Data>C1F80299F77E0452DB0424585E59C3</Data>
    </BinaryPatch>
 
    <BinaryPatch>

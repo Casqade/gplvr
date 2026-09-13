@@ -27,9 +27,19 @@
 // value points from the eye toward the sprite, which is what keeps the winding and the
 // UVs the right way round.
 //
-// Only the vertical-axis variant is patched. sub_4D69F0 (fully screen-aligned) needs a
-// whole basis rather than one vector, and the particle billboards in sub_47AE20 are
-// rotationally symmetric puffs where screen-aligned is not wrong.
+// The fully screen-aligned variant, sub_4D69F0, spans its quad along modelview rows 1 and
+// 2 (camera left and up), so in the headset it turns and ROLLS with the head. That is the
+// pit board: pitboard.3do is a single type-3 node on pitboard.srb, whose SRH2 chunk sets
+// the sprite's +32 byte that selects this variant; the board's position is car-fixed
+// (gpl_pitBoardTrackCar_perTick), only its orientation followed the head. Both row reads
+// are redirected to a basis facing the eye position with its up in the vertical plane.
+// The particle billboards in gpl_particleRender read the same accessors through their own
+// calls and are left alone: rotationally symmetric puffs, where screen-aligned is not wrong.
+//
+// Unconditional. "Face the viewer" is the more correct construction at every field of
+// view, and the only place the difference is large enough to see is the one gplvr
+// exists for; the `billboardFaceEye` key that used to gate it was an A/B against stock
+// that has been run.
 
 namespace gplvr {
 

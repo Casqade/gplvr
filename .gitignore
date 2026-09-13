@@ -1,3 +1,4 @@
 disasm/
 CMakeLists.txt.user
 out/
+__pycache__/

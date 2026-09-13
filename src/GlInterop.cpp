@@ -4,6 +4,8 @@
 
 #include <d3d11.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace gplvr {
@@ -279,6 +281,39 @@ bool glReadBackBufferBgra(const GlFunctions& gl, int width, int height, void* pi
     gl.readPixels(0, 0, width, height, kGlBgraExt, GL_UNSIGNED_BYTE, pixels);
     gl.finish();
     return gl.getError() == GL_NO_ERROR;
+}
+
+bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
+                     const char* path) {
+    if (!gl.readPixels || width <= 0 || height <= 0) return false;
+
+    // 0x80E0 is GL_BGR_EXT, which is the byte order TGA stores, so the rows go straight
+    // out with no per-pixel shuffle.
+    size_t stride = static_cast<size_t>(width) * 3;
+    size_t bytes = stride * static_cast<size_t>(height);
+    unsigned char* pixels = static_cast<unsigned char*>(std::malloc(bytes));
+    if (!pixels) return false;
+
+    gl.readPixels(x, y, width, height, 0x80E0, GL_UNSIGNED_BYTE, pixels);
+
+    unsigned char header[18] = {};
+    header[2] = 2;  // uncompressed true-colour
+    header[12] = static_cast<unsigned char>(width & 0xFF);
+    header[13] = static_cast<unsigned char>((width >> 8) & 0xFF);
+    header[14] = static_cast<unsigned char>(height & 0xFF);
+    header[15] = static_cast<unsigned char>((height >> 8) & 0xFF);
+    header[16] = 24;
+
+    bool ok = false;
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "wb") == 0 && file) {
+        ok = std::fwrite(header, 1, sizeof(header), file) == sizeof(header) &&
+             std::fwrite(pixels, 1, bytes, file) == bytes;
+        std::fclose(file);
+    }
+
+    std::free(pixels);
+    return ok;
 }
 
 bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,

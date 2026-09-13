@@ -23,7 +23,7 @@ steps-per-tick to a wrong constant. Its `taskBegin` cave read `dword_94D25C` ins
 as exact reciprocals rather than 77G's four-decimal roundings, which integrated as though
 the rate were 144.0092 Hz.
 
-The table below holds **228 sites**, and that is the `<BinaryPatch>` count in the shipped
+The table below holds **230 sites**, and that is the `<BinaryPatch>` count in the shipped
 file. It is not the whole story of what was read: **19 more are parsed out of the 60 fps
 reference and deliberately dropped**, listed in section Z.
 
@@ -33,7 +33,7 @@ rather than write the immediate this patch replaces the whole instruction with a
 a stub that does `push imm32` -- family O. The fourth, `0x004E8078`, would fit perfectly
 well; it is dropped because nothing reads it (report 18).
 
-The 228 emitted are not all inherited: many are synthesised here -- the tick-count tables,
+The 230 emitted are not all inherited: many are synthesised here -- the tick-count tables,
 the caves, the operand relocations, the handshake -- and have no counterpart in the 60 fps
 patch at all. The 19 dropped are the only ones read and then discarded.
 
@@ -82,11 +82,11 @@ section below. The exponent column is the k that was matched.
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
 | `004432AF` | `004432AF` | gpl_aiState_tryToOutbrake +0xFF | 36 | 144 | 1 | 4 | rate^+1 |
-| `00443340` | `00443340` | gpl_aiState_tryToOutbrake +0x190 | 36 | 144 | 1 | 4 | rate^+1 |
+| `00443340` | `00443340` | gpl_aiState_crashing_enter -0x20 | 36 | 144 | 1 | 4 | rate^+1 |
 | `00443593` | `00443593` | gpl_aiPredictOneTickBallistic +0x13 | 0.027777778 | 0.0069444445 | -1 | 4 | rate^-1 |
 | `0044362E` | `0044362E` | gpl_aiPredictOneTickBallistic +0xAE | 0.027777778 | 0.0069444445 | -1 | 4 | rate^-1 |
 | `004436E1` | `004436E1` | gpl_aiPredictOneTickBallistic +0x161 | -0.00756199984 | -0.00047262499 | -2 | 4 | rate^-2 |
-| `0044392A` | `0044392A` | gpl_aiPredictOneTickBallistic +0x3AA | -0.00756199984 | -0.00047262499 | -2 | 4 | rate^-2 |
+| `0044392A` | `0044392A` | gpl_aiState_crashed_freezeAndBrake +0xAA | -0.00756199984 | -0.00047262499 | -2 | 4 | rate^-2 |
 | `00443AC9` | `00443AC9` | gpl_aiState_returnToPitting_handler +0x149 | 72 | 288 | 1 | 4 | rate^+1 |
 | `00447A7A` | `00447A7A` | gpl_aiSetDecisionHoldTicks +0x1A | 36 | 144 | 1 | 4 | rate^+1 |
 | `0044B66D` | `0044B66D` | gpl_aiUpdateAllDrivers +0x36D | 72 | 288 | 1 | 4 | rate^+1 |
@@ -117,7 +117,7 @@ each `ret` as `fmul dword ptr [0x449C6C]; ret`, converting ON READ. The float is
 
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
-| `00449C6C` | `00449C6C` | gpl_aiLineGetDlatSpeedAt +0x61C | -5.7020719e-29 | 0.25 | rate-conversion | 4 | 36/144, the factor the AI accessors multiply by |
+| `00449C6C` | `00449C6C` | gpl_aiGetDlongSpeedMaximum -0x4 | -5.7020719e-29 | 0.25 | rate-conversion | 4 | 36/144, the factor the AI accessors multiply by |
 | `00449C76` | `00449C76` | gpl_aiGetDlongSpeedMaximum +0x6 | `C390909090909090` | `D80D6C9C4400C390` | rate-conversion | 8 | fmul dword ptr [00449C6C]; ret |
 | `00449C86` | `00449C86` | gpl_aiGetDlongSpeedAdjCoeff +0x6 | `C390909090909090` | `D80D6C9C4400C390` | rate-conversion | 8 | fmul dword ptr [00449C6C]; ret |
 
@@ -132,7 +132,7 @@ that folds in 36/rate.
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
 | `00498244` | `00498244` | gpl_aiDlatSpringAccel +0x1C4 | `D8861A040000` | `E807074F0090` | rate-conversion | 6 | car+1050, the +dlat side is a lateral VELOCITY (m/tick) added to an m/tick^2 ceiling, so at 144 Hz it is 4x too strong and saturates the lateral command whenever a car is alongside: routed through a stub that scales it by 36/rate |
-| `004982BF` | `004982BF` | gpl_aiDlatSpringAccel +0x23F | `D88616040000` | `E89C064F0090` | rate-conversion | 6 | car+1046, the -dlat side is a lateral VELOCITY (m/tick) added to an m/tick^2 ceiling, so at 144 Hz it is 4x too strong and saturates the lateral command whenever a car is alongside: routed through a stub that scales it by 36/rate |
+| `004982BF` | `004982BF` | gpl_aiIntegrateYawPerTick -0x31 | `D88616040000` | `E89C064F0090` | rate-conversion | 6 | car+1046, the -dlat side is a lateral VELOCITY (m/tick) added to an m/tick^2 ceiling, so at 144 Hz it is 4x too strong and saturates the lateral command whenever a car is alongside: routed through a stub that scales it by 36/rate |
 | `00988950` | `00988950` | *code cave* | `00000000000000000000000000000000` | `D9861A040000D80D48899800DEC1C3` | rate-conversion | 16 | stub for car+1050, the +dlat side: the fadd, with the 36/rate factor folded in |
 | `00988960` | `00988960` | *code cave* | `00000000000000000000000000000000` | `D98616040000D80D48899800DEC1C3` | rate-conversion | 16 | stub for car+1046, the -dlat side: the fadd, with the 36/rate factor folded in |
 
@@ -180,7 +180,7 @@ See docs/audit-2026-09-08/20-lp-leaks-D-E-F.md.
 |---|---|---|---|---|---|---|---|
 | `00446B1F` | `00446B1F` | gpl_aiState_evaluateBlocker +0x22F | `D905D4875300D8650C` | `E94C1E540090909090` | rate-conversion | 9 | v30 jmp into the cave at 00988970: leak D: straightaway_pass_dlong_sep gate, arg_4 reconverted before 2.0 - r |
 | `00446BEC` | `00446BEC` | gpl_aiState_evaluateBlocker +0x2FC | `D982A40B0000` | `E99F1D540090` | rate-conversion | 6 | v30 jmp into the cave at 00988990: leak E: blocker decel test, the lookahead divisor scaled to match the RHS |
-| `0044A943` | `0044A943` | gpl_aiLpYawRate +0x23 | `D944811CC3909090909090` | `D944811CD80D48899800C3` | rate-conversion | 11 | the .lp target yaw rate (record field +12, rad/tick at 36 Hz) is the one per-tick .lp quantity with no car+376 wrapper: converted here by 0.25 so gpl_aiIntegrateYawPerTick's spring target is a rate in the CURRENT tick |
+| `0044A943` | `0044A943` | gpl_aiLpDlatGradient -0xD | `D944811CC3909090909090` | `D944811CD80D48899800C3` | rate-conversion | 11 | the .lp target yaw rate (record field +12, rad/tick at 36 Hz) is the one per-tick .lp quantity with no car+376 wrapper: converted here by 0.25 so gpl_aiIntegrateYawPerTick's spring target is a rate in the CURRENT tick |
 | `00455636` | `00455636` | gpl_aiComputeDriverSpeedParams +0x96 | `D8642404898670010000` | `E9E53253009090909090` | rate-conversion | 10 | adj-coeff dual-use fix, detour from gpl_aiComputeDriverSpeedParams to the cave at 00988920 |
 | `00459135` | `00459135` | gpl_marshalPostUpdateFlags +0x285 | `DA0DB4D15F00` | `DA0D4C899800` | rate-conversion | 6 | the marshals' white-flag test converts a .lp line speed (m/tick@36) to m/s with the CURRENT tick rate, so at 144 Hz every car counts as a slow vehicle and the flag is shown permanently: fimul repointed at a stock int 36 in the cave tail |
 | `0098138A` | `0098138A` | mod_aiSeedSegmentSpeedTable_FROM_LP36 +0x33 | `D901C1E20B` | `E921760000` | rate-conversion | 5 | v30 jmp into the cave at 009889B0: leak F: mod per-segment .lp speed seed, converted to the current rate |
@@ -217,7 +217,7 @@ exclusivity: each is referenced only from inside that function.
 | `00539274` | `00539274` | *.rdata/.data constant* | 0.200000003 | 0.0500000007 | rate-conversion | 4 | blip machine, rate^-1: 0.2 -> 0.05 (throttle decay per tick) |
 | `00539278` | `00539278` | *.rdata/.data constant* | -3.36805558 | -0.842013896 | rate-conversion | 4 | blip machine, rate^-1: -3.3680556 -> -0.8420139 (RPM delta per tick, = -121.25/36) |
 
-### G. The flagman animation masks  (7 sites)
+### G. The flagman animation masks and the trackside scenery clock  (8 sites)
 
 `gpl_flagmanStepAnims` advances each marshal's animation when `test dl, mask` says the tick
 counter's low bits are clear, so the mask IS the period minus one. Widening 3 -> 0x0F and
@@ -226,6 +226,22 @@ counter's low bits are clear, so the mask IS the period minus one. Widening 3 ->
 These were invisible to an address-displacement sweep: the stepper folds the field offset
 into its base pointer and strides, so nothing addresses the field by displacement. It was
 found by going in through the container's count global instead.
+
+**The trackside scenery clock is in this family too, and it took a year to find because the
+project had recorded it as unfixable.** The animation data really is baked into each track's
+`.3do` files, but the PHASE is not: every trackside object is drawn through the 36-entry node
+table at 0x00570330, and of its 36 handlers exactly one reads a clock -- node type 17, a
+variable-driven child selector, whose variable kind 3 is `getBGCount() % period`. That is a
+raw sim-tick count with no `dt` downstream, so 118 selector nodes across the shipped tracks
+-- Spa's flags, Zandvoort's, AAIOM's bird, Spa67's and Targa's waving trees and spectator
+groups -- have been cycling four times too fast in every 144 build ever made. It is the
+"Moving 3do objects (flags etc..) move too fast on some tracks" line from 60FPSv2's readme.
+
+The COUNTER is shifted, not the period: operator 5 uses the value as a direct index into the
+node's case array, so it has to stay inside `0..period-1`, and the period comes from track
+data the patch cannot reach. The rewrite is length-preserving -- the three bytes for the
+`sar` are bought by turning `mov [esp+4], edx; fild [esp+4]` into `push edx; fild [esp];
+pop eax`.
 
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
@@ -236,6 +252,7 @@ found by going in through the container's count global instead.
 | `004817B1` | `004817B1` | gpl_flagmanStepAnims +0xA1 | 7 | 31 | rate-conversion | 1 | flagman state 4: one-shot 0..4: one step in 32 ticks, unchanged at 144 Hz in wall-clock terms |
 | `004817C3` | `004817C3` | gpl_flagmanStepAnims +0xB3 | 7 | 31 | rate-conversion | 1 | flagman state 5: one-shot 0..5: one step in 32 ticks, unchanged at 144 Hz in wall-clock terms |
 | `004817D5` | `004817D5` | gpl_flagmanStepAnims +0xC5 | 3 | 15 | rate-conversion | 1 | flagman state 6: frame 0..10, wraps: one step in 16 ticks, unchanged at 144 Hz in wall-clock terms |
+| `004CF84E` | `004CF84E` | gpl_lodEvaluateVariable +0x6E | `99F77E0489542404DB4424045E59C3` | `C1F80299F77E0452DB0424585E59C3` | rate-conversion | 15 | trackside scenery animation clock: getBGCount() >> 2 before the modulo, so a 12-tick flag cycle stays 1/3 s of wall clock at 144 Hz instead of cycling 4x too fast |
 
 ### H. Particles and debris  (23 sites)
 
@@ -253,7 +270,7 @@ pointer in ebx freed exactly enough room for an `fmul`.
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
 | `0047C58C` | `0047C58C` | gpl_particleSpawnScrub_type4 +0xBC | `8B4DFCD945108D411C8B4D088B1189108B51048950048B49088948088B55FCC74218040000008B45FCC74014000000008B4DFCD9590C8B55FCA174C77400DB45F48942108B4DFCB801000000D95904` | `8B5DFCD945108D431C8B4D088B1189108B51048950048B4908894808C7431804000000C7431400000000D95B0CA174C77400894310DB45F4D80DE7C54700D95B04B801000000909090909090909090` | rate-conversion | 79 | v23 type-4 puff lifetime: cache the particle pointer in ebx to free room for an fmul, so the 1..8 tick life becomes 4..32 |
-| `0047C5E7` | `0047C5E7` | gpl_particleSpawnScrub_type4 +0x117 | -5.7020719e-29 | 4 | rate-conversion | 4 | v23 type-4 lifetime scale = rate/36 = 4, in the alignment padding after sub_47C4D0's retn |
+| `0047C5E7` | `0047C5E7` | gpl_particleSpawn_type8_streak -0x9 | -5.7020719e-29 | 4 | rate-conversion | 4 | v23 type-4 lifetime scale = rate/36 = 4, in the alignment padding after sub_47C4D0's retn |
 | `0047C630` | `0047C630` | gpl_particleSpawn_type8_streak +0x40 | 5479828 | 9996964 | rate-conversion | 4 | v23 operand relocation at 0047C62E: 00539D94 -> 00988AA4 (the slot is shared with a different unit, so only this reader moves) |
 | `0047C645` | `0047C645` | gpl_particleSpawn_type8_streak +0x55 | 5479828 | 9996964 | rate-conversion | 4 | v23 operand relocation at 0047C643: 00539D94 -> 00988AA4 (the slot is shared with a different unit, so only this reader moves) |
 | `0047CA47` | `0047CA47` | gpl_particleUpdate_perTick +0x57 | 5479824 | 9996972 | rate-conversion | 4 | v23 operand relocation at 0047CA45: 00539D90 -> 00988AAC (the slot is shared with a different unit, so only this reader moves) |
@@ -386,7 +403,7 @@ controls and the helps four times faster.
 | `0053AD4C` | `0053AD4C` | *.rdata/.data constant* | 0.00499999989 | 0.00124999997 | rate-conversion | 4 | audit, rate^-1: 0.005 -> 0.00125 (ambient level FALL step per tick, ramp 1) |
 | `0053AD54` | `0053AD54` | *.rdata/.data constant* | 0.00200000009 | 0.000500000024 | rate-conversion | 4 | audit, rate^-1: 0.002 -> 0.0005 (ambient level FALL step per tick, ramp 2) |
 
-### M. Hardcoded tick counts  (20 sites)
+### M. Hardcoded tick counts  (21 sites)
 
 Countdowns and gates that live as instruction immediates -- not in .data, not in any ini,
 and not in the reference except for one site out of nine. The complete set was found by
@@ -398,18 +415,19 @@ bytes further down the same function.
 
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
-| `0044337F` | `0044337F` | gpl_aiState_tryToOutbrake +0x1CF | 144 | 576 | tick-count | 4 | +1159 reload, AI state machine: 144 -> 576 ticks, 4.000 s either way |
-| `004433D1` | `004433D1` | gpl_aiState_tryToOutbrake +0x221 | 72 | 288 | 1 | 4 | line hold on entering the CRASHING state (sub_443360, the same function whose car+1159 = 144 reload is already scaled) |
-| `004434D7` | `004434D7` | gpl_aiState_tryToOutbrake +0x327 | 72 | 288 | tick-count | 4 | +1139 reload, AI state machine: 72 -> 288 ticks, 2.000 s either way |
+| `0044337F` | `0044337F` | gpl_aiState_crashing_enter +0x1F | 144 | 576 | tick-count | 4 | +1159 reload, AI state machine: 144 -> 576 ticks, 4.000 s either way |
+| `004433D1` | `004433D1` | gpl_aiState_crashing_enter +0x71 | 72 | 288 | 1 | 4 | line hold on entering the CRASHING state (sub_443360, the same function whose car+1159 = 144 reload is already scaled) |
+| `004434D7` | `004434D7` | gpl_aiState_crashing_tick +0xA7 | 72 | 288 | tick-count | 4 | +1139 reload, AI state machine: 72 -> 288 ticks, 2.000 s either way |
 | `00443AED` | `00443AED` | gpl_aiState_returnToPitting_handler +0x16D | 144 | 576 | tick-count | 4 | +1159 reload, AI state machine: 144 -> 576 ticks, 4.000 s either way |
-| `004449CA` | `004449CA` | gpl_aiStateName_returnToMissedPits +0x8A | 144 | 576 | tick-count | 4 | +1159 reload, AI state machine: 144 -> 576 ticks, 4.000 s either way |
-| `00444A8C` | `00444A8C` | gpl_aiStateName_limpingToPits +0x9C | 72 | 288 | 1 | 4 | line hold, off-track recovery (sub_444A20) |
-| `00444B58` | `00444B58` | gpl_aiStateName_limpingToPits +0x168 | 18 | 72 | tick-count | 1 | the off-track give-up counter's threshold (car+1171), on the same post-contact path as the four line holds: 18 -> 72 ticks, 0.500 s either way |
+| `004449CA` | `004449CA` | gpl_aiStateName_limpingToPits -0x26 | 144 | 576 | tick-count | 4 | +1159 reload, AI state machine: 144 -> 576 ticks, 4.000 s either way |
+| `00444A8C` | `00444A8C` | gpl_aiState_limpingToPits_tick +0x6C | 72 | 288 | 1 | 4 | line hold, off-track recovery (sub_444A20) |
+| `00444B58` | `00444B58` | gpl_aiState_limpingToPits_tick +0x138 | 18 | 72 | tick-count | 1 | the off-track give-up counter's threshold (car+1171), on the same post-contact path as the four line holds: 18 -> 72 ticks, 0.500 s either way |
 | `00447ACF` | `00447ACF` | gpl_aiSetDecisionHoldTicks +0x6F | 36 | 144 | tick-count | 4 | rand %N jitter on the car+1115 decision hold, gpl_aiSetDecisionHoldTicks: 36 -> 144 ticks |
 | `00448EDA` | `00448EDA` | gpl_aiSegmentSpeedFilterStep_perLapPerSegment +0x20A | 144 | 576 | tick-count | 4 | +1115 reload: 144 -> 576 ticks, 4.000 s either way |
 | `0044B45A` | `0044B45A` | gpl_aiUpdateAllDrivers +0x15A | 9 | 36 | tick-count | 1 | the every-9-ticks gate on the AI sound and telemetry update: 9 -> 36 ticks, 0.250 s either way |
-| `0044D571` | `0044D571` | gpl_aiIsStillInControl +0xB51 | 72 | 288 | 1 | 4 | line hold, mechanical failure (sub_44D3B0) |
-| `0044D595` | `0044D595` | gpl_aiIsStillInControl +0xB75 | 144 | 576 | tick-count | 4 | +1159 reload: 144 -> 576 ticks, 4.000 s either way |
+| `0044D571` | `0044D571` | sub_44D3B0 +0x1C1 | 72 | 288 | 1 | 4 | line hold, mechanical failure (sub_44D3B0) |
+| `0044D595` | `0044D595` | sub_44D3B0 +0x1E5 | 144 | 576 | tick-count | 4 | +1159 reload: 144 -> 576 ticks, 4.000 s either way |
+| `00496A26` | `00496A26` | gpl_aiState_tickDecisionsAndCorridorClamp +0xF6 | 11 | 44 | tick-count | 1 | the .lp corridor-correction give-up window (car+1151) in gpl_aiState_tickDecisionsAndCorridorClamp: 11 -> 44 ticks, 0.306 s either way |
 | `004978B9` | `004978B9` | gpl_aiComputeDlongSpeedGoal +0x5F9 | 27 | 108 | tick-count | 4 | rand %N for the car+1155 post-lift brake-derate hold, gpl_aiComputeDlongSpeedGoal: 27 -> 108 ticks |
 | `004978C8` | `004978C8` | gpl_aiComputeDlongSpeedGoal +0x608 | 9 | 36 | tick-count | 1 | base of the car+1155 hold (add edx, imm8), same site: 9 -> 36 ticks |
 | `004978E8` | `004978E8` | gpl_aiComputeDlongSpeedGoal +0x628 | 144 | 576 | tick-count | 4 | +1159 reload, the twin 60FPSv2 missed in the same function: 144 -> 576 ticks, 4.000 s either way |
@@ -419,7 +437,7 @@ bytes further down the same function.
 | `00983FAB` | `00983FAB` | mod_aiLappedLetLeaderBy +0x1B9 | 144 | 576 | tick-count | 4 | +1115 reload in mod code, the twin of 0x448EDA: 144 -> 576 ticks, 4.000 s either way |
 | `00987461` | `00987461` | mod_aiSpeedGoalWrapper +0x99 | 6 | 24 | tick-count | 4 | +1167 rev-decay suppression window, mod code: 6 -> 24 ticks, 0.167 s either way |
 
-### N. Constants found by the consumer audit  (38 sites)
+### N. Constants found by the consumer audit  (35 sites)
 
 Everything the reference patch never touched. Each was found by reading its CONSUMER and
 asking what units the expression needs, then confirmed by rate-invariance: express the
@@ -429,13 +447,11 @@ operand relocation instead.
 
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
-| `0044AD8B` | `0044AD8B` | gpl_aiLpDlatGradient +0x43B | 0.166666672 | 0.0416666679 | rate-conversion | 4 | audit, rate^-1: 0.16666667 -> 0.0416666675 (1/6 EMA coefficient shared by four per-tick AI filters: applied dlong accel (0x496C04, 0x497884), car+526 lateral accel (0x496D6E), a traction-usage ratio (0x497920) and car+538 (0x44C0E4)) |
-| `0044ADD2` | `0044ADD2` | gpl_aiLpDlatGradient +0x482 | 0.333333343 | 0.0833333358 | rate-conversion | 4 | audit, rate^-1: 0.33333334 -> 0.083333335 (1/3 EMA coefficient for the rev/load fraction read through sub_44C0D0; its second target car+770 is dead, so the live readers are unit-uniform) |
-| `004930F9` | `004930F9` | gpl_replaySaveToFile +0x99 | 2 | 36866 | rate-conversion | 4 | replay RPLY chunk version = 2 \| (rate << 8) = 0x9002; a cooperative tag for external tools, which need the recording rate to interpret a frame-indexed replay |
+| `0044AD8B` | `0044AD8B` | sub_44AC30 +0x15B | 0.166666672 | 0.0416666679 | rate-conversion | 4 | audit, rate^-1: 0.16666667 -> 0.0416666675 (1/6 EMA coefficient shared by four per-tick AI filters: applied dlong accel (0x496C04, 0x497884), car+526 lateral accel (0x496D6E), a traction-usage ratio (0x497920) and car+538 (0x44C0E4)) |
+| `0044ADD2` | `0044ADD2` | sub_44AC30 +0x1A2 | 0.333333343 | 0.0833333358 | rate-conversion | 4 | audit, rate^-1: 0.33333334 -> 0.083333335 (1/3 EMA coefficient for the rev/load fraction read through sub_44C0D0; its second target car+770 is dead, so the live readers are unit-uniform) |
 | `00496B35` | `00496B35` | gpl_aiFakePhysicsTick +0x85 | 0.620400012 | 0.155100003 | rate-conversion | 4 | audit, rate^-1: 0.6204 -> 0.1551 (clamp assignment paired with flt_53A700 (already rate^-1); v5 scaled the compare and left the assignment, so it amplifies) |
 | `00496C99` | `00496C99` | gpl_aiFakePhysicsTick +0x1E9 | 0.372240007 | 0.0930600017 | rate-conversion | 4 | audit, rate^-1: 0.37224 -> 0.09306 (clamp assignment paired with flt_53A714 (already rate^-1), same v5 regression) |
 | `00496CB2` | `00496CB2` | gpl_aiFakePhysicsTick +0x202 | -0.372240007 | -0.0930600017 | rate-conversion | 4 | audit, rate^-1: -0.37224 -> -0.09306 (clamp assignment paired with flt_53A710 (already rate^-1), same v5 regression) |
-| `004EEF55` | `004EEF55` | gpl_guiDispatchCallback +0x15 | `8B44241050` | `E9469C4900` | rate-conversion | 5 | jmp into the GUI throttle cave at 00988BA0, replacing `mov eax,[esp+10h]; push eax` which the cave replays |
 | `005387E4` | `005387E4` | *.rdata/.data constant* | 9 | 36 | rate-conversion | 4 | audit, rate^+1: 9.0 -> 36.0 (the at-rest tick count that ends the CRASHING state (car+1143)) |
 | `00538808` | `00538808` | *.rdata/.data constant* | 0.0620400012 | 0.0155100003 | rate-conversion | 4 | audit, rate^-1: 0.062040001 -> 0.0155100002 ('blocker is moving' threshold (sub_444410/sub_444A20/sub_4478D0), m/tick) |
 | `00538870` | `00538870` | *.rdata/.data constant* | -0.0500000007 | -0.0125000002 | rate-conversion | 4 | audit, rate^-1: -0.05 -> -0.0125 (the lateral closing rate above which the AI dodges with the ABRUPT line-transition set instead of the basic one) |
@@ -466,7 +482,6 @@ operand relocation instead.
 | `0053A7E4` | `0053A7E4` | *.rdata/.data constant* | 4.88768196 | 78.2029114 | rate-conversion | 4 | audit, rate^+2: 4.88768196105957 -> 78.202911377 (the AI's slipstream range coefficient, tick^2/m (sub_4987E0); LIM = v^2*C + 4.3 m) |
 | `00988046` | `00988046` | mod_aiSessionLpInit +0x294 | 5483852 | 9996912 | rate-conversion | 4 | v25 operand relocation at 00988044: 0053AD4C -> 00988A70 (mod_aiSessionLpInit's .lp-world reader of the ambient fall-step slot: the constant is multiplied by a node byte and added to 1.0, so it is dimensionless and must NOT carry the rate; the slot's four other readers are per-tick and keep rate^-1) |
 | `00988A70` | `00988A70` | *code cave* | 0 | 0.00499999989 | rate-conversion | 4 | v25 stock copy of 0053AD4C = 0.005, for a reader that must not see the scaled value |
-| `00988BA0` | `00988BA0` | *code cave* | `000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000` | `50518B4C241883F90A7629A154D2A0003BC17510A1C01E58002B0550D2A00083F8047C1C890D54D2A000A1C01E5800A350D2A00059588B44241050E97A63B6FF5958C21400` | rate-conversion | 69 | GUI same-id throttle cave, gate 4 ticks (= the 36 Hz cadence). Deliver when the widget id differs from the last one, or when 4 scheduler ticks have passed; a held control is a dense run of one id, a click is a lone callback |
 
 ### O. The two-tier clock: task registrations and substep constants  (13 sites)
 
@@ -500,7 +515,7 @@ consistent with each other.
 | `00988B80` | `00988B80` | *code cave* | `00000000000000000000000000000000` | `8B1564D294006820010000E99EF8B5FF` | rate-conversion | 16 | cave stub for 004E8426: push 288 (taskBegin: the TIMER rate, 2x sim. 77G's cave reads dword_94D25C here, eight low) |
 | `00988B90` | `00988B90` | *code cave* | `000000000000000000000000000000` | `68D0714E006820010000E919E6B5FF` | rate-conversion | 15 | cave stub for 004E71B1: push 288 (gpl_soundTaskRegister: the SOUND callback rate, 2x sim) |
 
-### P. Multiplayer, replay and GUI: the pieces 77G used to supply  (8 sites)
+### P. Multiplayer, replay and GUI: the pieces 77G used to supply  (11 sites)
 
 Re-derived so that no third-party patch is needed. The frame-rate handshake stamps a build
 signature into the join record and compares it during the qualify handshake, so a 144 Hz
@@ -512,14 +527,17 @@ rule fixed held controls but dropped 3 clicks in 4.
 
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
-| `004104BD` | `004104BD` | gpl_main +0x4BCD ? | `5F5EC39090909090909090909090909090` | `C7464890005047C68647000000015F5EC390909090` | rate-conversion | 17 | gpl_driverRecordInit stamps the build signature 47500090 into the join record; esi is the record pointer and is not clobbered after 0x00410421 |
-| `0045D51A` | `0045D51A` | gpl_marshalPostAnimate +0x3F5A ? | `909090909090` | `E9B306000090` | rate-conversion | 6 | entry hop into the signature check |
-| `0045D52C` | `0045D52C` | gpl_marshalPostAnimate +0x3F6C ? | 8052 | 60532 | rate-conversion | 2 | no-password branch retargeted into the check |
-| `0045D53F` | `0045D53F` | gpl_marshalPostAnimate +0x3F7F ? | 3189 | 55669 | rate-conversion | 2 | password-ok branch retargeted into the check |
-| `0045DAF6` | `0045DAF6` | gpl_marshalPostAnimate +0x4536 ? | `90909090909090909090` | `E952FAFFFF9090909090` | rate-conversion | 10 | accepted: resume the stock password/laptime/rating checks |
-| `0045DB3C` | `0045DB3C` | gpl_marshalPostAnimate +0x457C ? | -5.7020719e-29 | -5.70828964e-29 | rate-conversion | 4 | hop 2: the gaps are too small for anything but a short jump |
-| `0045DB7C` | `0045DB7C` | gpl_marshalPostAnimate +0x45BC ? | -5.7020719e-29 | -5.70921409e-29 | rate-conversion | 4 | hop 1: the gaps are too small for anything but a short jump |
-| `0045DBD2` | `0045DBD2` | gpl_marshalPostAnimate +0x4612 ? | `9090909090909090909090909090` | `817E489000504774A1E9D2F9FFFF` | rate-conversion | 14 | cmp the client's signature; match hops on, mismatch jumps to the 'not qualified' reject at 0045D5B2 |
+| `004104BD` | `004104BD` | gpl_driverRecordInit +0xAD | `5F5EC39090909090909090909090909090` | `C7464890005047C68647000000015F5EC390909090` | rate-conversion | 17 | gpl_driverRecordInit stamps the build signature 47500090 into the join record; esi is the record pointer and is not clobbered after 0x00410421 |
+| `0045D51A` | `0045D51A` | gpl_netJoinQualifyDriver -0x6 | `909090909090` | `E9B306000090` | rate-conversion | 6 | entry hop into the signature check |
+| `0045D52C` | `0045D52C` | gpl_netJoinQualifyDriver +0xC | 8052 | 60532 | rate-conversion | 2 | no-password branch retargeted into the check |
+| `0045D53F` | `0045D53F` | gpl_netJoinQualifyDriver +0x1F | 3189 | 55669 | rate-conversion | 2 | password-ok branch retargeted into the check |
+| `0045DAF6` | `0045DAF6` | sub_45DB00 -0xA | `90909090909090909090` | `E952FAFFFF9090909090` | rate-conversion | 10 | accepted: resume the stock password/laptime/rating checks |
+| `0045DB3C` | `0045DB3C` | sub_45DB00 +0x3C | -5.7020719e-29 | -5.70828964e-29 | rate-conversion | 4 | hop 2: the gaps are too small for anything but a short jump |
+| `0045DB7C` | `0045DB7C` | sub_45DB00 +0x7C | -5.7020719e-29 | -5.70921409e-29 | rate-conversion | 4 | hop 1: the gaps are too small for anything but a short jump |
+| `0045DBD2` | `0045DBD2` | sub_45DBE0 -0xE | `9090909090909090909090909090` | `817E489000504774A1E9D2F9FFFF` | rate-conversion | 14 | cmp the client's signature; match hops on, mismatch jumps to the 'not qualified' reject at 0045D5B2 |
+| `004930F9` | `004930F9` | gpl_replaySaveToFile +0x99 | 2 | 36866 | rate-conversion | 4 | replay RPLY chunk version = 2 \| (rate << 8) = 0x9002; a cooperative tag for external tools, which need the recording rate to interpret a frame-indexed replay |
+| `004EEF55` | `004EEF55` | gpl_guiDispatchCallback +0x15 | `8B44241050` | `E9469C4900` | rate-conversion | 5 | jmp into the GUI throttle cave at 00988BA0, replacing `mov eax,[esp+10h]; push eax` which the cave replays |
+| `00988BA0` | `00988BA0` | *code cave* | `000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000` | `50518B4C241883F90A7629A154D2A0003BC17510A1C01E58002B0550D2A00083F8047C1C890D54D2A000A1C01E5800A350D2A00059588B44241050E97A63B6FF5958C21400` | rate-conversion | 69 | GUI same-id throttle cave, gate 4 ticks (= the 36 Hz cadence). Deliver when the widget id differs from the last one, or when 4 scheduler ticks have passed; a held control is a dense run of one id, a click is a lone callback |
 
 ### Q. The GPLRank best-lap block -- NOT a rate fix  (2 sites)
 
@@ -600,20 +618,20 @@ handshake, which this patch now implements independently -- but the remainder at
 | address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
 |---|---|---|---|---|---|---|---|
 | `0040BCA9` | `0040BCA9` | gpl_main +0x3B9 | 36 | -112 | 1 | 1 | rate^+1 |
-| `00410509` | `00410509` | gpl_main +0x4C19 ? | -112 | 7 | code | 1 | copied verbatim |
-| `0041050B` | `0041050B` | gpl_main +0x4C1B ? | -5.7020719e-29 | 5145644 | code | 4 | copied verbatim |
-| `0045D51A` | `0045D51A` | gpl_marshalPostAnimate +0x3F5A ? | `9090909090` | `E993040000` | code | 5 | copied verbatim |
-| `0045D52C` | `0045D52C` | gpl_marshalPostAnimate +0x3F6C ? | 8052 | 60532 | unclassified | 2 | copied verbatim |
-| `0045D53F` | `0045D53F` | gpl_marshalPostAnimate +0x3F7F ? | 3189 | 55669 | unclassified | 2 | copied verbatim |
-| `0045D9B2` | `0045D9B2` | gpl_marshalPostAnimate +0x43F2 ? | `9090909090` | `B82C844E00` | code | 5 | copied verbatim |
-| `0045D9B7` | `0045D9B7` | gpl_marshalPostAnimate +0x43F7 ? | 37008 | 139 | code | 2 | copied verbatim |
-| `0045D9B9` | `0045D9B9` | gpl_marshalPostAnimate +0x43F9 ? | `9090909090` | `E918020000` | code | 5 | copied verbatim |
-| `0045DAF6` | `0045DAF6` | gpl_marshalPostAnimate +0x4536 ? | `9090909090` | `E952FAFFFF` | code | 5 | copied verbatim |
-| `0045DB3C` | `0045DB3C` | gpl_marshalPostAnimate +0x457C ? | 37008 | 47339 | code | 2 | copied verbatim |
-| `0045DB7C` | `0045DB7C` | gpl_marshalPostAnimate +0x45BC ? | 37008 | 48875 | code | 2 | copied verbatim |
-| `0045DBD6` | `0045DBD6` | gpl_marshalPostAnimate +0x4616 ? | `909090` | `3B4648` | code | 3 | copied verbatim |
-| `0045DBD9` | `0045DBD9` | gpl_marshalPostAnimate +0x4619 ? | 37008 | 41332 | code | 2 | copied verbatim |
-| `0045DBDB` | `0045DBDB` | gpl_marshalPostAnimate +0x461B ? | `9090909090` | `E9D2F9FFFF` | code | 5 | copied verbatim |
+| `00410509` | `00410509` | gpl_driverRecordInit +0xF9 | -112 | 7 | code | 1 | copied verbatim |
+| `0041050B` | `0041050B` | gpl_driverRecordInit +0xFB | -5.7020719e-29 | 5145644 | code | 4 | copied verbatim |
+| `0045D51A` | `0045D51A` | gpl_netJoinQualifyDriver -0x6 | `9090909090` | `E993040000` | code | 5 | copied verbatim |
+| `0045D52C` | `0045D52C` | gpl_netJoinQualifyDriver +0xC | 8052 | 60532 | unclassified | 2 | copied verbatim |
+| `0045D53F` | `0045D53F` | gpl_netJoinQualifyDriver +0x1F | 3189 | 55669 | unclassified | 2 | copied verbatim |
+| `0045D9B2` | `0045D9B2` | sub_45D9C0 -0xE | `9090909090` | `B82C844E00` | code | 5 | copied verbatim |
+| `0045D9B7` | `0045D9B7` | sub_45D9C0 -0x9 | 37008 | 139 | code | 2 | copied verbatim |
+| `0045D9B9` | `0045D9B9` | sub_45D9C0 -0x7 | `9090909090` | `E918020000` | code | 5 | copied verbatim |
+| `0045DAF6` | `0045DAF6` | sub_45DB00 -0xA | `9090909090` | `E952FAFFFF` | code | 5 | copied verbatim |
+| `0045DB3C` | `0045DB3C` | sub_45DB00 +0x3C | 37008 | 47339 | code | 2 | copied verbatim |
+| `0045DB7C` | `0045DB7C` | sub_45DB00 +0x7C | 37008 | 48875 | code | 2 | copied verbatim |
+| `0045DBD6` | `0045DBD6` | sub_45DBE0 -0xA | `909090` | `3B4648` | code | 3 | copied verbatim |
+| `0045DBD9` | `0045DBD9` | sub_45DBE0 -0x7 | 37008 | 41332 | code | 2 | copied verbatim |
+| `0045DBDB` | `0045DBDB` | sub_45DBE0 -0x5 | `9090909090` | `E9D2F9FFFF` | code | 5 | copied verbatim |
 | `004930FA` | `004930FA` | gpl_replaySaveToFile +0x9A | `000000` | `3C0000` | code | 3 | copied verbatim |
 | `004E71B7` | `004E71B7` | gpl_soundTaskRegister +0x17 | 72 | - | 1 | 1 | 288 does not fit the 1-byte field at this site |
 | `004E8078` | `004E8078` | taskGetRate +0x8 | 72 | - | 1 | 1 | taskGetRate's fallback for a mode the game never selects; nothing reads it |
@@ -742,8 +760,10 @@ time-to-collision that is ALREADY in current-rate ticks.
 
 ## The other XMLs in the build
 
-`tools/make144.ps1` hands GPLPatchDLL a list: gpl67's own numbered patches, `77Dv3 No
-Letterbox`, then ours. Only the last group is this project's work.
+`tools/make144.ps1` hands GPLPatchDLL a list: gpl67's own numbered patches, then ours --
+`gpl67-carset-names.xml`, the frame-rate XML this table describes, and whichever of the two
+optional FFB preferences were asked for. Only the last group is this project's work. No
+display preference is applied to the exe: the letterbox is gplvr's business at runtime.
 
 ### `gpl67-carset-names.xml`
 Cosmetic. Carset display names; nothing rate-related.
@@ -774,37 +794,14 @@ the accessor to read `dword_581C58` without also scaling that push restores the 
 72/144 case, where the interpolator's gain is -3 and every moving sound slams between its
 clamp rails.
 
-### The direct mirror -- NOT APPLIED, and the XML has been deleted
-`gplmirror32.py` still builds it on demand, but it is wired into nothing. roglv2
-has no render targets at all, so a direct render-to-texture mirror cannot work.
-
-### The three force-feedback XMLs -- `tools/gplffb.py`
+### The two optional force-feedback XMLs -- `tools/gplffb.py`
 
 Each is emitted only when its switch is passed, and each is a SEPARATE file so it can be
-dropped without rebuilding anything else. **Only the first is a rate fix**; GPL's FFB
-averager runs inside the physics substep loop, so it is 288 Hz at every tick rate, and the
-other two are preferences that are equally valid on a stock 36 Hz build.
-
-#### `83 ffb smoothing time constant v1.xml` -- `-FfbSmoothing` -- IN THE CURRENT BUILD
-
-`gpl_ffbUpdate` smooths its output with a one-pole IIR applied once per CALL, so the time
-constant is in SAMPLES: ~56 ms at 36 Hz, ~14 ms at 144.
-
-| address | data | what |
-|---|---|---|
-| `0x00988A00` | `0DEC223E` = 0.15910358 | alpha = 1 - (1-0.5)^(36/144). Not 0.5/4 = 0.125 -- preserving a time constant is exponential, and the linear answer is 27 % off. |
-| `0x00988A04` | `FD44573F` = 0.84089642 | 1 - alpha, the SECOND tap the stock code does not have |
-| `0x00988A80` | 31-byte cave | `fmul alpha; fld state; fmul (1-alpha); faddp; fst state; jmp back` |
-| `0x004A4389` | `E9 F2464E00` + nops | jmp into the cave, replacing fadd/fmul/fst |
-
-It is a cave and not a constant edit for two reasons. The 0.5 slot is shared with an
-arithmetic mean and a half-second timer, so it cannot move. And the stock form is
-`(a + x) * 0.5` -- ONE constant on BOTH taps, DC gain 0.5/(1-0.5) = 1. Substituting alpha
-into that shared constant gives 0.1591/(1-0.1591) = 0.189 and collapses the wheel to 19 %
-of the physics' output. A correct one-pole needs two constants.
-
-"Correct" here means "matches 36 Hz stock", which is MORE smoothing than an unpatched
-144 Hz build gives. The sharper wheel may well be preferred. A/B it.
+dropped without rebuilding anything else. **Neither is a rate fix**: GPL's FFB averager runs
+inside the physics substep loop, so it is 288 Hz at every tick rate, and both are
+preferences that are equally valid on a stock 36 Hz build. The one rate coupling on the FFB
+path, the smoothing filter, is in every build as family R above; it used to be a third
+optional XML here.
 
 #### `81 ffb no spring damper v1.xml` -- `-FfbNoSpringDamper` -- NOT APPLIED
 Zeroes two coefficients at `0x004A1116` and `0x004A113F`: the centring spring and the
@@ -825,7 +822,6 @@ centre notch. A preference, tunable with `-FfbNotchDepth`.
 | dependency | where | stock GEM+? | required? |
 |---|---|---|---|
 | `05 09 10 15 20 21 22 23 24 25 26 30 31 32 33 40 45 50 60 90 95.xml` | `Mods\GEM+\gpl67\` | yes -- the standard gpl67 set | yes, this is the 1967 mod |
-| `77Dv3 No Letterbox.xml` | `Mods\GEM+\gpl67\` | **no** -- third-party, dropped into that folder | not functionally, but see below |
 
 **There is no third-party functional dependency.** `77G 144 fps v1.0.xml` used to be a hard
 one: it supplied the sites our XML omitted, three of which cannot be expressed as a byte
@@ -834,12 +830,21 @@ applied. It **must not be** -- its caves occupy the same region, and nothing in 
 would tell you. The companion build was deleted on 2026-09-09; see
 `docs/audit-2026-09-08/retired/`.
 
-**`77Dv3 No Letterbox.xml` is a cave-layout dependency, not a functional one.** It writes
-a 19-byte cave at `0x00988900..0x00988913`, which is why our own caves start at
-`0x00988920` -- a margin of 13 bytes. Removing the letterbox patch would be harmless.
-REPLACING it with a different variant would not: the variant found in `gplc67.exe.bak` and
-`gplc67.exe.aislow` puts a SECOND cave at `0x00988920`, exactly where our adj-coeff cave
-lives.
+**`77Dv3 No Letterbox.xml` is no longer applied**, and it was never a functional dependency.
+It was a hidden SIZING one. modtext's raw data only reached `0x00988C00` because that XML
+asks for 0x8AE0 bytes and the file alignment rounds it up, and this patch's caves end just
+inside that boundary. Without it GPLPatchDLL asserts on
+`section_offset + length <= GetSectionFileSize`, which names neither the cause nor the
+missing XML. The frame-rate XML now declares its own room:
+`<ExeSection>` modtext `<MinimumFileSize>0x00008BE5</MinimumFileSize>`, derived from
+its highest cave byte, `0x00988BE4`. It is a floor, so it can grow a section another XML
+sized but never shrink one.
+
+The letterbox patch's 19-byte cave at `0x00988900..0x00988913` is why our caves start at
+`0x00988920`, and that range is now simply unused. Do not bring a letterbox XML back into
+the list. gplvr does the job at runtime (report 33), and the variant found in
+`gplc67.exe.bak` and `gplc67.exe.aislow` puts a SECOND cave at `0x00988920`, exactly where
+our adj-coeff cave lives.
 
 ### Read at build time but never applied
 

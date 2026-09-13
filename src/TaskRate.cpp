@@ -246,9 +246,18 @@ bool taskRateFormat(char* buffer, size_t size, double seconds) {
     // Say it in words the first few times, because the consequence is not visible in a
     // pair of numbers: the sim is not stuttering, it is running SLOW while every formula
     // inside it still divides by the nominal rate.
+    //
+    // The threshold is a FRACTION of the rate. It used to be a flat 1.0/s, which was a
+    // 2.8% margin when the sim ran at 36 Hz and silently became a 0.7% one at 144 -- far
+    // inside the sampling noise of a one-second window, which routinely reads a tenth of
+    // a hertz either side of nominal and sometimes above it. That fired the warning on
+    // 142.9/s, a 0.8% shortfall nobody could feel, and an alarm that cries at the noise
+    // floor teaches the reader to ignore it.
+    //
     // Only for a window long enough to mean something -- a 40 ms window can read 25/s
     // from rounding alone and that is not the sim running slow.
-    if (seconds >= 0.5 && bgRate > 0.0 && bgRate < sim - 1.0 &&
+    const double slowThreshold = sim * 0.98;
+    if (seconds >= 0.5 && bgRate > 0.0 && bgRate < slowThreshold &&
         g_api.slowReportsLeft > 0) {
         --g_api.slowReportsLeft;
         logf("tick: the world stepped %.1f times a second but the sim thinks the rate is "

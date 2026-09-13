@@ -252,6 +252,7 @@ struct Eye {
     uint32_t                       width = 0;
     uint32_t                       height = 0;
     std::vector<ID3D11RenderTargetView*> targets;
+    bool                           decodeSrgb = false;  // see swapchainViewFormat
 };
 
 void releaseEye(Eye& eye) {
@@ -261,6 +262,179 @@ void releaseEye(Eye& eye) {
     if (eye.swapchain) g_api.xrDestroySwapchain(eye.swapchain);
     eye.swapchain = XR_NULL_HANDLE;
 }
+
+// The format to draw into a swapchain image through, and whether the blit must decode.
+//
+// GPL's pixels are already sRGB-encoded, and an _SRGB swapchain declares its contents to be
+// encoded, so they belong in it byte for byte -- through a UNORM view of the image, which
+// D3D11 allows only when the runtime created the image TYPELESS. A typed _SRGB image takes
+// only an _SRGB view, which encodes on write, so the blit decodes first and the view puts
+// the bytes back. Any other format holds linear light and needs the decode as well.
+DXGI_FORMAT swapchainViewFormat(ID3D11Texture2D* texture, int64_t format, bool& decodeSrgb,
+                                DXGI_FORMAT& textureFormat) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    textureFormat = desc.Format;
+    decodeSrgb = false;
+    if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+        desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
+        desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS)
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    decodeSrgb = true;
+    return static_cast<DXGI_FORMAT>(format);
+}
+
+// -- pribluda's overlay on a quad layer ----------------------------------------------
+//
+// The game draws the overlay into a shared texture; each new image is copied into a
+// swapchain of the same size and submitted as a quad, following the head in VIEW space or
+// fixed to the seat. Between new images the last released one is submitted again, and the
+// runtime places the quad from the current head pose on every display frame -- which is
+// why the panel holds still however the game's own frames are paced.
+
+struct HudLayer {
+    Eye      image;  // the swapchain and its render target views, sized like the texture
+    uint32_t failedWidth = 0;
+    uint32_t failedHeight = 0;
+    int32_t  drawnSequence = 0;
+    bool     haveImage = false;
+    XrSpace  seatSpace = XR_NULL_HANDLE;
+    int32_t  seatGeneration = 0;
+    int32_t  loggedLayer = -1;
+    bool     loggedNoSeat = false;
+};
+
+bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
+                        uint32_t width, uint32_t height, HudLayer& hud) {
+    releaseEye(hud.image);
+    hud.haveImage = false;
+    hud.drawnSequence = 0;
+
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    info.format = format;
+    info.sampleCount = 1;
+    info.width = width;
+    info.height = height;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!XR_CHECK(g_api.xrCreateSwapchain(session, &info, &hud.image.swapchain))) {
+        hud.image.swapchain = XR_NULL_HANDLE;
+        hud.failedWidth = width;
+        hud.failedHeight = height;
+        logf("xr: the HUD panel swapchain %ux%u could not be created -- no panel", width,
+             height);
+        return false;
+    }
+    hud.image.width = width;
+    hud.image.height = height;
+
+    uint32_t count = 0;
+    XR_CHECK(g_api.xrEnumerateSwapchainImages(hud.image.swapchain, 0, &count, nullptr));
+    std::vector<XrSwapchainImageD3D11KHR> images(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    XR_CHECK(g_api.xrEnumerateSwapchainImages(
+        hud.image.swapchain, count, &count,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
+    DXGI_FORMAT textureFormat = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+    for (const XrSwapchainImageD3D11KHR& image : images) {
+        ID3D11RenderTargetView* target = nullptr;
+        D3D11_RENDER_TARGET_VIEW_DESC desc = {};
+        viewFormat = swapchainViewFormat(image.texture, format, hud.image.decodeSrgb,
+                                         textureFormat);
+        desc.Format = viewFormat;
+        desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (FAILED(device->CreateRenderTargetView(image.texture, &desc, &target))) {
+            logf("xr: CreateRenderTargetView failed for a HUD panel image -- no panel");
+            releaseEye(hud.image);
+            hud.failedWidth = width;
+            hud.failedHeight = height;
+            return false;
+        }
+        hud.image.targets.push_back(target);
+    }
+
+    hud.failedWidth = 0;
+    hud.failedHeight = 0;
+    logf("xr: HUD panel swapchain %ux%u, %u images, %s -- image format %d, drawn through %s%s",
+         width, height, count, dxgiFormatName(format), (int)textureFormat,
+         dxgiFormatName(viewFormat),
+         hud.image.decodeSrgb ? " with an sRGB decode in the blit" : "");
+    return true;
+}
+
+// Copy the game's newest panel image into the swapchain when there is one. True when an
+// image has been released and the quad can be submitted.
+bool updateHudImage(Consumer& consumer, ID3D11DeviceContext* context,
+                    const Consumer::HudPanel& panel, HudLayer& hud) {
+    if (!panel.sequence || panel.sequence == hud.drawnSequence) return hud.haveImage;
+
+    uint32_t imageIndex = 0;
+    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!XR_CHECK(
+            g_api.xrAcquireSwapchainImage(hud.image.swapchain, &acquireInfo, &imageIndex)))
+        return hud.haveImage;
+
+    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    XR_CHECK(g_api.xrWaitSwapchainImage(hud.image.swapchain, &waitInfo));
+
+    bool drawn = imageIndex < hud.image.targets.size() &&
+                 consumer.drawHud(hud.image.targets[imageIndex], hud.image.width,
+                                  hud.image.height, panel.sequence, hud.image.decodeSrgb);
+    // The same reason as the eyes: the copy has to reach the GPU before the image is
+    // released, or the runtime composites the previous contents.
+    context->Flush();
+
+    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    XR_CHECK(g_api.xrReleaseSwapchainImage(hud.image.swapchain, &releaseInfo));
+
+    if (drawn) {
+        hud.drawnSequence = panel.sequence;
+        hud.haveImage = true;
+    }
+    return hud.haveImage;
+}
+
+// The seat space follows the game's recentre: rebuilt from the published seat pose
+// whenever its generation moves.
+void updateSeatSpace(XrSession session, const Consumer& consumer, HudLayer& hud) {
+    SharedPose seat;
+    int32_t    generation = 0;
+    if (!consumer.seat(seat, generation) || generation == hud.seatGeneration) return;
+    hud.seatGeneration = generation;
+
+    if (hud.seatSpace) g_api.xrDestroySpace(hud.seatSpace);
+    hud.seatSpace = XR_NULL_HANDLE;
+
+    XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    info.poseInReferenceSpace.orientation = {seat.orientationX, seat.orientationY,
+                                             seat.orientationZ, seat.orientationW};
+    info.poseInReferenceSpace.position = {seat.positionX, seat.positionY, seat.positionZ};
+    if (!XR_CHECK(g_api.xrCreateReferenceSpace(session, &info, &hud.seatSpace))) {
+        hud.seatSpace = XR_NULL_HANDLE;
+        logf("xr: HUD panel -- the seat space could not be created");
+        return;
+    }
+    logf("xr: HUD panel -- seat space built from recentre %d at (%.3f, %.3f, %.3f)",
+         generation, seat.positionX, seat.positionY, seat.positionZ);
+}
+
+void releaseHud(HudLayer& hud) {
+    if (hud.seatSpace) g_api.xrDestroySpace(hud.seatSpace);
+    hud.seatSpace = XR_NULL_HANDLE;
+    releaseEye(hud.image);
+}
+
+// -- the display clock, for the game's position prediction ----------------------------
+
+constexpr const char* kQpcTimeExtension = "XR_KHR_win32_convert_performance_counter_time";
+typedef XrResult(XRAPI_PTR* ConvertTimeToQpcFn)(XrInstance, XrTime, LARGE_INTEGER*);
 
 // -- world-locked markers ---------------------------------------------------------
 //
@@ -472,7 +646,11 @@ int wmain(int argc, wchar_t** argv) {
     // OpenGL-capable runtime would allow an in-process path with no texture handoff at
     // all. Most PC runtimes are D3D-only, which is why the plan assumes D3D11.
 
-    const char* enabledExtensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    // The display clock as QueryPerformanceCounter values, which the game process can
+    // compare against its own: what position prediction runs on. Optional -- without it
+    // the game renders from the views exactly as they were published.
+    bool        qpcTime = hasExtension(extensions, kQpcTimeExtension);
+    const char* enabledExtensions[2] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, kQpcTimeExtension};
 
     XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
     strcpy_s(createInfo.applicationInfo.applicationName, "gplvr survey");
@@ -481,7 +659,7 @@ int wmain(int argc, wchar_t** argv) {
     createInfo.applicationInfo.engineVersion = 1;
     createInfo.applicationInfo.apiVersion = kRequestedApiVersion;
     if (d3d11) {
-        createInfo.enabledExtensionCount = 1;
+        createInfo.enabledExtensionCount = qpcTime ? 2 : 1;
         createInfo.enabledExtensionNames = enabledExtensions;
     }
 
@@ -492,6 +670,26 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     xrResolveInstanceFunctions(g_api, g_instance);
+
+    ConvertTimeToQpcFn convertTimeToQpc = nullptr;
+    XrResult           qpcResolve = XR_SUCCESS;
+    if (qpcTime && d3d11) {
+        PFN_xrVoidFunction function = nullptr;
+        qpcResolve = g_api.getInstanceProcAddr(
+            g_instance, "xrConvertTimeToWin32PerformanceCounterKHR", &function);
+        if (XR_SUCCEEDED(qpcResolve))
+            convertTimeToQpc = reinterpret_cast<ConvertTimeToQpcFn>(function);
+    }
+    LARGE_INTEGER qpcFrequency = {};
+    QueryPerformanceFrequency(&qpcFrequency);
+    if (convertTimeToQpc)
+        logf("xr: %s -- enabled; the display clock is published for position prediction",
+             kQpcTimeExtension);
+    else
+        logf("xr: %s -- NOT available (listed %s, d3d11 %s, xrGetInstanceProcAddr XrResult "
+             "%d); the game renders from the views unpredicted",
+             kQpcTimeExtension, qpcTime ? "yes" : "no", d3d11 ? "yes" : "no",
+             (int)qpcResolve);
 
     XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
     if (XR_CHECK(g_api.xrGetInstanceProperties(g_instance, &instanceProperties)))
@@ -732,8 +930,9 @@ int wmain(int argc, wchar_t** argv) {
     for (uint32_t i = 0; i < formatCount; ++i)
         logf("xr: swapchain format %lld (%s)", (long long)formats[i],
              dxgiFormatName(formats[i]));
-    // Prefer an sRGB format: the runtime then does the colour conversion, which is what
-    // GPL's 8-bit output wants.
+    // Prefer an sRGB format: GPL's 8-bit output is sRGB-encoded, which is what such a
+    // swapchain declares its contents to be. How the pixels get in unchanged is
+    // swapchainViewFormat's business.
     const int64_t preferred[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                                  DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
                                  DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -798,10 +997,14 @@ int wmain(int argc, wchar_t** argv) {
             eyes[i].swapchain, imageCount, &imageCount,
             reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
 
+        DXGI_FORMAT textureFormat = DXGI_FORMAT_UNKNOWN;
+        DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
         for (uint32_t image = 0; image < imageCount; ++image) {
             ID3D11RenderTargetView* target = nullptr;
             D3D11_RENDER_TARGET_VIEW_DESC desc = {};
-            desc.Format = static_cast<DXGI_FORMAT>(chosenFormat);
+            viewFormat = swapchainViewFormat(images[image].texture, chosenFormat,
+                                             eyes[i].decodeSrgb, textureFormat);
+            desc.Format = viewFormat;
             desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
             if (FAILED(device->CreateRenderTargetView(images[image].texture, &desc,
                                                       &target))) {
@@ -811,8 +1014,10 @@ int wmain(int argc, wchar_t** argv) {
             }
             eyes[i].targets.push_back(target);
         }
-        logf("xr: eye %u swapchain %ux%u, %u images", i, eyes[i].width, eyes[i].height,
-             imageCount);
+        logf("xr: eye %u swapchain %ux%u, %u images -- image format %d, drawn through %s%s", i,
+             eyes[i].width, eyes[i].height, imageCount, (int)textureFormat,
+             dxgiFormatName(viewFormat),
+             eyes[i].decodeSrgb ? " with an sRGB decode in the blit" : "");
     }
 
     if (presenting && !consumer.initialise(device, context)) {
@@ -820,6 +1025,9 @@ int wmain(int argc, wchar_t** argv) {
         consumer.setError(2);
         swapchainsOk = false;
     }
+
+    HudLayer hud;
+    bool     loggedSubmitCurrent = false;
 
     // -- frame loop --------------------------------------------------------------
     XrSessionState state = XR_SESSION_STATE_IDLE;
@@ -832,6 +1040,36 @@ int wmain(int argc, wchar_t** argv) {
     const DWORD startTick = GetTickCount();
     DWORD       lastReport = startTick;
     unsigned    framesThisSecond = 0;
+
+    // Pose diagnostics, reported with the cadence line. Every published view set is kept
+    // for eight frames; each submitted image's rendered pose is looked up among them BIT FOR
+    // BIT, which says how many displays old it is and proves it came from us. The angle is
+    // how far the head turned between that pose and this display; the unexplained part is
+    // what the head's own angular speed over that age does not account for. Unmatched poses
+    // or a large unexplained angle mean the image and its pose disagree; neither means the
+    // round trip is exact and any judder is the runtime's or the stream's.
+    struct PoseSample {
+        XrTime        time = 0;
+        XrQuaternionf orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        float         angularSpeed = 0.0f;  // rad/s
+    };
+    PoseSample poseRing[8];
+    unsigned   poseRingNext = 0;
+    unsigned   poseAge[4] = {};  // 1, 2, 3+ displays old, unmatched
+    unsigned   poseRepeats = 0;
+    unsigned   poseSamples = 0;
+    int32_t    poseLastSequence = 0;
+    double     poseAngleSum = 0.0;
+    double     poseAngleMax = 0.0;
+    double     poseResidualSum = 0.0;
+    double     poseResidualMax = 0.0;
+    // Presenter cadence within each one-second report: the longest gap between two
+    // xrWaitFrame returns, how many gaps skipped a display, and the longest stretch from a
+    // wait's return to its xrEndFrame. A per-second frame count hides a late frame.
+    LONGLONG lastWaitReturn = 0;
+    LONGLONG worstWaitGap = 0;
+    LONGLONG worstFrameWork = 0;
+    unsigned skippedDisplays = 0;
 
     SetConsoleCtrlHandler(consoleControlHandler, TRUE);
     logf("xr: entering the frame loop for %d s -- press Esc%s to stop early",
@@ -870,6 +1108,16 @@ int wmain(int argc, wchar_t** argv) {
             XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
             XrFrameState    frameState{XR_TYPE_FRAME_STATE};
             if (!XR_CHECK(g_api.xrWaitFrame(session, &waitInfo, &frameState))) break;
+            LARGE_INTEGER waitReturn = {};
+            QueryPerformanceCounter(&waitReturn);
+            if (lastWaitReturn) {
+                LONGLONG gap = waitReturn.QuadPart - lastWaitReturn;
+                if (gap > worstWaitGap) worstWaitGap = gap;
+                LONGLONG period =
+                    frameState.predictedDisplayPeriod * qpcFrequency.QuadPart / 1000000000LL;
+                if (period > 0 && gap * 2 > period * 3) ++skippedDisplays;
+            }
+            lastWaitReturn = waitReturn.QuadPart;
 
             XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
             if (!XR_CHECK(g_api.xrBeginFrame(session, &beginInfo))) break;
@@ -877,8 +1125,8 @@ int wmain(int argc, wchar_t** argv) {
             XrCompositionLayerProjectionView projectionViews[2] = {};
             XrCompositionLayerProjection     layer{
                 XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-            const XrCompositionLayerBaseHeader* layers[1] = {
-                reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+            XrCompositionLayerQuad              hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+            const XrCompositionLayerBaseHeader* layers[2] = {};
             uint32_t layerCount = 0;
 
             if (frameState.shouldRender) {
@@ -1006,7 +1254,10 @@ int wmain(int argc, wchar_t** argv) {
                 if (valid && presenting) {
                     // Pick up texture recreation -- the game does that at every
                     // menu-to-sim transition -- and latch the newest published frame,
-                    // once per frame rather than once per eye.
+                    // once per frame rather than once per eye. The latch instant goes to
+                    // the game: a frame it publishes after this is shown at a later display.
+                    LARGE_INTEGER latchQpc = {};
+                    QueryPerformanceCounter(&latchQpc);
                     consumer.update();
 
                     const XrView* publish = views;
@@ -1031,7 +1282,9 @@ int wmain(int argc, wchar_t** argv) {
                     // The head pose goes with them, at the same predicted time, or the
                     // recentre origin would be sampled from a different instant than the
                     // eyes it is subtracted from.
+                    XrSpaceVelocity headVelocity{XR_TYPE_SPACE_VELOCITY};
                     XrSpaceLocation headLocation{XR_TYPE_SPACE_LOCATION};
+                    headLocation.next = &headVelocity;
                     const bool headValid =
                         XR_SUCCEEDED(g_api.xrLocateSpace(viewSpace, appSpace, publishTime,
                                                          &headLocation)) &&
@@ -1045,7 +1298,44 @@ int wmain(int argc, wchar_t** argv) {
                     head.positionY = headLocation.pose.position.y;
                     head.positionZ = headLocation.pose.position.z;
 
-                    consumer.publishViews(shared, head, headValid);
+                    // The head's motion and the display clock, for the game's position
+                    // prediction: the latch and display instants of this frame pin the
+                    // presenter's cadence, so the game can count which later display its own
+                    // frame will reach.
+                    SharedMotion motion;
+                    if (headVelocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
+                        motion.linearVelocity[0] = headVelocity.linearVelocity.x;
+                        motion.linearVelocity[1] = headVelocity.linearVelocity.y;
+                        motion.linearVelocity[2] = headVelocity.linearVelocity.z;
+                        motion.flags |= kMotionLinear;
+                    }
+                    if (headVelocity.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+                        motion.angularVelocity[0] = headVelocity.angularVelocity.x;
+                        motion.angularVelocity[1] = headVelocity.angularVelocity.y;
+                        motion.angularVelocity[2] = headVelocity.angularVelocity.z;
+                        motion.flags |= kMotionAngular;
+                    }
+                    LARGE_INTEGER displayQpc = {};
+                    if (convertTimeToQpc && frameState.predictedDisplayPeriod > 0 &&
+                        XR_SUCCEEDED(convertTimeToQpc(g_instance, publishTime, &displayQpc))) {
+                        storeQpc(motion.displayTime, displayQpc.QuadPart);
+                        storeQpc(motion.latchTime, latchQpc.QuadPart);
+                        storeQpc(motion.period, frameState.predictedDisplayPeriod *
+                                                    qpcFrequency.QuadPart / 1000000000LL);
+                        motion.flags |= kMotionTiming;
+                    }
+
+                    consumer.publishViews(shared, head, headValid, motion);
+
+                    PoseSample& sample = poseRing[poseRingNext++ % 8];
+                    sample.time = publishTime;
+                    sample.orientation = publish[0].pose.orientation;
+                    sample.angularSpeed =
+                        (motion.flags & kMotionAngular)
+                            ? std::sqrt(motion.angularVelocity[0] * motion.angularVelocity[0] +
+                                        motion.angularVelocity[1] * motion.angularVelocity[1] +
+                                        motion.angularVelocity[2] * motion.angularVelocity[2])
+                            : 0.0f;
                 }
 
                 if (valid) {
@@ -1082,7 +1372,8 @@ int wmain(int argc, wchar_t** argv) {
                         if (presenting)
                             drawn = consumer.drawEye(target, eyes[i].width,
                                                      eyes[i].height,
-                                                     static_cast<int>(i));
+                                                     static_cast<int>(i),
+                                                     eyes[i].decodeSrgb);
                         if (!drawn) context->ClearRenderTargetView(target, base[i]);
 
                         if (!presenting && context1) {
@@ -1159,7 +1450,8 @@ int wmain(int argc, wchar_t** argv) {
                         // rendered pose is what lets it reproject, which is the whole
                         // reason 36 Hz into a 90 Hz compositor is survivable.
                         SharedView rendered[2] = {};
-                        if (presenting && consumer.renderedViews(rendered)) {
+                        if (presenting && !consumer.submitCurrentPose() &&
+                            consumer.renderedViews(rendered)) {
                             const SharedView& source = rendered[i];
                             projectionViews[i].pose.orientation = {
                                 source.pose.orientationX, source.pose.orientationY,
@@ -1179,6 +1471,53 @@ int wmain(int argc, wchar_t** argv) {
                         projectionViews[i].subImage.imageArrayIndex = 0;
                     }
 
+                    SharedView submitted[2] = {};
+                    if (presenting && bothEyesReady && consumer.renderedViews(submitted) &&
+                        frameState.predictedDisplayPeriod > 0) {
+                        int32_t sequence = consumer.latchedSequence();
+                        if (sequence == poseLastSequence) ++poseRepeats;
+                        poseLastSequence = sequence;
+
+                        const PoseSample* match = nullptr;
+                        for (const PoseSample& candidate : poseRing) {
+                            if (candidate.time &&
+                                candidate.orientation.x == submitted[0].pose.orientationX &&
+                                candidate.orientation.y == submitted[0].pose.orientationY &&
+                                candidate.orientation.z == submitted[0].pose.orientationZ &&
+                                candidate.orientation.w == submitted[0].pose.orientationW) {
+                                match = &candidate;
+                                break;
+                            }
+                        }
+                        if (!match) {
+                            ++poseAge[3];
+                        } else {
+                            double periods =
+                                static_cast<double>(frameState.predictedDisplayTime -
+                                                    match->time) /
+                                static_cast<double>(frameState.predictedDisplayPeriod);
+                            long age = std::lround(periods);
+                            ++poseAge[age <= 1 ? 0 : (age == 2 ? 1 : 2)];
+
+                            const XrQuaternionf& now = views[0].pose.orientation;
+                            double dot = std::fabs(now.x * submitted[0].pose.orientationX +
+                                                   now.y * submitted[0].pose.orientationY +
+                                                   now.z * submitted[0].pose.orientationZ +
+                                                   now.w * submitted[0].pose.orientationW);
+                            if (dot > 1.0) dot = 1.0;
+                            constexpr double kDegrees = 57.29577951308232;
+                            double angle = 2.0 * std::acos(dot) * kDegrees;
+                            double expected = match->angularSpeed * kDegrees * periods *
+                                              frameState.predictedDisplayPeriod * 1e-9;
+                            double residual = std::fabs(angle - expected);
+                            poseAngleSum += angle;
+                            poseResidualSum += residual;
+                            if (angle > poseAngleMax) poseAngleMax = angle;
+                            if (residual > poseResidualMax) poseResidualMax = residual;
+                            ++poseSamples;
+                        }
+                    }
+
                     // Submitting a projection layer whose second view was never filled
                     // in would hand the runtime an identity pose for one eye. Drop the
                     // whole layer instead; xrEndFrame with no layers is legal.
@@ -1186,8 +1525,89 @@ int wmain(int argc, wchar_t** argv) {
                         layer.space = appSpace;
                         layer.viewCount = 2;
                         layer.views = projectionViews;
-                        layerCount = 1;
+                        layers[layerCount++] =
+                            reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
                     }
+                }
+
+                // Pribluda's overlay, composited over the game's image on a quad. Layers
+                // are painted in submission order, so it comes after the projection.
+                bool submitCurrent = presenting && consumer.submitCurrentPose();
+                if (submitCurrent != loggedSubmitCurrent) {
+                    loggedSubmitCurrent = submitCurrent;
+                    logf("xr: eye images submitted with the %s",
+                         submitCurrent ? "CURRENT display pose (debug, no world reprojection)"
+                                       : "pose they were rendered from");
+                }
+
+                Consumer::HudPanel panel;
+                bool hudOn = presenting && consumer.hudPanel(panel);
+                int32_t hudLayerNow = hudOn ? panel.layer : 0;
+                if (hudLayerNow != hud.loggedLayer) {
+                    hud.loggedLayer = hudLayerNow;
+                    if (hudOn)
+                        logf("xr: HUD panel %s -- %.2f m wide, centre %.2f m ahead, %.2f m "
+                             "up, %.2f m right, from a %ux%u texture",
+                             panel.layer == 1 ? "follows the head" : "fixed to the seat",
+                             panel.width, panel.ahead, panel.up, panel.right,
+                             panel.textureWidth, panel.textureHeight);
+                    else
+                        logf("xr: HUD panel off");
+                }
+                if (hudOn && (hud.image.width != panel.textureWidth ||
+                              hud.image.height != panel.textureHeight)) {
+                    bool failedBefore = hud.failedWidth == panel.textureWidth &&
+                                        hud.failedHeight == panel.textureHeight;
+                    if (failedBefore ||
+                        !createHudSwapchain(session, device, chosenFormat,
+                                            panel.textureWidth, panel.textureHeight, hud))
+                        hudOn = false;
+                }
+
+                XrSpace hudSpace = XR_NULL_HANDLE;
+                if (hudOn && panel.layer == 2) {
+                    updateSeatSpace(session, consumer, hud);
+                    hudSpace = hud.seatSpace;
+                    if (!hudSpace && !hud.loggedNoSeat) {
+                        hud.loggedNoSeat = true;
+                        logf("xr: HUD panel -- no seat yet; it appears once the game has "
+                             "recentred");
+                    }
+                } else if (hudOn) {
+                    hudSpace = viewSpace;
+                }
+
+                if (hudSpace && hud.image.swapchain &&
+                    updateHudImage(consumer, context, panel, hud)) {
+                    // A quad faces +z. Turned toward the eye from where it hangs: a yaw
+                    // about +y toward the centre line, after a pitch about +x toward eye
+                    // height -- negative when the panel is below the eye, which leans its
+                    // face up. q = yaw * pitch.
+                    float level =
+                        std::sqrt(panel.right * panel.right + panel.ahead * panel.ahead);
+                    float yaw = std::atan2(-panel.right, panel.ahead);
+                    float pitch = std::atan2(panel.up, level);
+                    float cy = std::cos(yaw * 0.5f);
+                    float sy = std::sin(yaw * 0.5f);
+                    float cp = std::cos(pitch * 0.5f);
+                    float sp = std::sin(pitch * 0.5f);
+
+                    hudQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    hudQuad.space = hudSpace;
+                    hudQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    hudQuad.subImage.swapchain = hud.image.swapchain;
+                    hudQuad.subImage.imageRect.offset = {0, 0};
+                    hudQuad.subImage.imageRect.extent = {
+                        static_cast<int32_t>(hud.image.width),
+                        static_cast<int32_t>(hud.image.height)};
+                    hudQuad.subImage.imageArrayIndex = 0;
+                    hudQuad.pose.orientation = {cy * sp, sy * cp, -sy * sp, cy * cp};
+                    hudQuad.pose.position = {panel.right, panel.up, -panel.ahead};
+                    hudQuad.size = {panel.width, panel.width *
+                                                     static_cast<float>(hud.image.height) /
+                                                     static_cast<float>(hud.image.width)};
+                    layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudQuad);
                 }
 
                 ++framesThisSecond;
@@ -1196,16 +1616,44 @@ int wmain(int argc, wchar_t** argv) {
                     XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
                     g_api.xrLocateSpace(viewSpace, appSpace,
                                         frameState.predictedDisplayTime, &head);
-                    logf("xr: %u frames/s | head (%.3f, %.3f, %.3f) quat (%.3f, %.3f, "
-                         "%.3f, %.3f)",
-                         framesThisSecond, head.pose.position.x, head.pose.position.y,
+                    double qpcMs = 1000.0 / static_cast<double>(qpcFrequency.QuadPart);
+                    logf("xr: %u frames/s, %u skipped a display, worst wait gap %.1f ms, "
+                         "worst wait-to-end %.1f ms | head (%.3f, %.3f, %.3f) quat (%.3f, "
+                         "%.3f, %.3f, %.3f)",
+                         framesThisSecond, skippedDisplays, worstWaitGap * qpcMs,
+                         worstFrameWork * qpcMs, head.pose.position.x, head.pose.position.y,
                          head.pose.position.z, head.pose.orientation.x,
                          head.pose.orientation.y, head.pose.orientation.z,
                          head.pose.orientation.w);
+                    if (poseSamples || poseAge[3]) {
+                        logf("xr: rendered pose age in displays 1:%u 2:%u 3+:%u UNMATCHED:%u "
+                             "(%u submits repeated an image) | head turned since render mean "
+                             "%.2f max %.2f deg, unexplained by head speed mean %.2f max %.2f "
+                             "deg",
+                             poseAge[0], poseAge[1], poseAge[2], poseAge[3], poseRepeats,
+                             poseSamples ? poseAngleSum / poseSamples : 0.0, poseAngleMax,
+                             poseSamples ? poseResidualSum / poseSamples : 0.0,
+                             poseResidualMax);
+                    }
+                    for (unsigned& count : poseAge) count = 0;
+                    poseRepeats = 0;
+                    poseSamples = 0;
+                    poseAngleSum = 0.0;
+                    poseAngleMax = 0.0;
+                    poseResidualSum = 0.0;
+                    poseResidualMax = 0.0;
                     framesThisSecond = 0;
+                    skippedDisplays = 0;
+                    worstWaitGap = 0;
+                    worstFrameWork = 0;
                     lastReport = now;
                 }
             }
+
+            LARGE_INTEGER endCall = {};
+            QueryPerformanceCounter(&endCall);
+            if (endCall.QuadPart - waitReturn.QuadPart > worstFrameWork)
+                worstFrameWork = endCall.QuadPart - waitReturn.QuadPart;
 
             XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
             endInfo.displayTime = frameState.predictedDisplayTime;
@@ -1257,6 +1705,7 @@ int wmain(int argc, wchar_t** argv) {
     // Before the device it holds views on.
     consumer.close();
     for (Eye& eye : eyes) releaseEye(eye);
+    releaseHud(hud);
     if (viewSpace) g_api.xrDestroySpace(viewSpace);
     if (appSpace) g_api.xrDestroySpace(appSpace);
     g_api.xrDestroySession(session);

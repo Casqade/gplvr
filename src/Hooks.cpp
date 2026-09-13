@@ -1,13 +1,19 @@
 #include "Hooks.h"
 
+#include "Hud.h"
+#include "Letterbox.h"
+#include "MenuScale.h"
 #include "MouseLook.h"
 #include "Log.h"
+#include "Pribluda.h"
+#include "RenderProfile.h"
 #include "RenderShim.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
 #include "SwapControl.h"
 #include "TaskRate.h"
 #include "VrCamera.h"
+#include "Window.h"
 #include "presenter/Producer.h"
 
 #include <cstdio>   // _snprintf_s, for the mirror-refresh fragment
@@ -88,6 +94,31 @@ long long g_sceneTicksWorst = 0;
 bool      g_stereoKeyLast = false;
 bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
+bool      g_vrHudLayerKeyLast = false;
+bool      g_vrSubmitCurrentPoseKeyLast = false;
+bool      g_nullDrawKeyLast = false;
+bool      g_dumpEyesKeyLast = false;
+bool      g_dumpEyesRequested = false;
+bool      g_dumpEyesLate = false;
+
+// One eye's rect to a TGA, read from the framebuffer the headset's copy is taken from.
+//
+// The eye rects are in the coordinates of whatever the frame was rendered into. With the
+// off-screen target that is its own framebuffer -- 6344x3172 for a 3172-per-eye headset --
+// and by the time the dumps run it has already been unbound for the presenter, so a plain
+// glReadPixels reads the WINDOW: the monitor's copy, where the right eye's rect points past
+// the edge. A dump that only looks right when the target happens to fit the window and the
+// window happens to show both eyes is not evidence of anything. GL_FRAMEBUFFER rather than
+// the read target alone, because the EXT entry points do not know GL_READ_FRAMEBUFFER;
+// both bindings are 0 again afterwards, which is what the present expects.
+bool dumpEyeRect(GlFunctions& gl, const int rect[4], const char* path) {
+    GLuint source = renderTargetFramebuffer();
+    bool bound = source && glResolveFramebuffer(gl) && gl.bindFramebuffer;
+    if (bound) gl.bindFramebuffer(kGlFramebuffer, source);
+    bool ok = glDumpRectToTga(gl, rect[0], rect[1], rect[2], rect[3], path);
+    if (bound) gl.bindFramebuffer(kGlFramebuffer, 0);
+    return ok;
+}
 bool      g_vrMouseLookKeyLast = false;
 bool      g_loggedMouseLook = false;
 
@@ -100,6 +131,11 @@ bool      g_loggedMouseLook = false;
 // fill the headset. What matters is whether THIS frame has two eyes in it.
 bool      g_stereoRenderedFrame = false;
 bool      g_warnedLateTick = false;
+
+// Set the instant the headset's copy of the frame is taken, cleared when the next scene
+// render begins. Anything the game draws while this is true is on the monitor's copy
+// only: the monitor presents after the capture, the eyes do not.
+bool      g_framePublished = false;
 
 // The parameter block the last scene render used. Stable across frames -- it is
 // simFrame+81 -- but taken from the hook rather than assumed, so an extra render can
@@ -197,14 +233,50 @@ void reportOncePerSecond() {
                         g_profPolys / g_frames,
                         g_profPolys ? 1e6 * scene * g_frames / g_profPolys : 0.0);
 
-        logf("frame %.2f ms (worst %.2f) = scene %.2f + present %.2f + gplvr %.2f + "
-             "other %.2f%s",
-             period, g_profPeriodWorst * toMs, scene, present, gplvr,
-             period - scene - present - gplvr, extra);
+        // `other` used to be a subtraction, which made the largest term in the frame the
+        // one nobody could account for. pre and post are measured, so the line now names
+        // every part and the leftover is only clock error -- if `rest` is not near zero
+        // the spans have stopped tiling and the numbers should not be trusted.
+        FrameSpans mean;
+        FrameSpans worst;
+        if (renderProfileTakeSpans(mean, worst)) {
+            logf("frame %.2f ms = pre %.2f + scene %.2f + post %.2f + present %.2f + "
+                 "gplvr %.2f (rest %.2f)%s | WORST %.2f = pre %.2f + scene %.2f + "
+                 "post %.2f + present %.2f",
+                 period, mean.pre, scene, mean.post, present, gplvr,
+                 period - mean.pre - scene - mean.post - present - gplvr, extra,
+                 worst.total, worst.pre, worst.scene, worst.post, worst.present);
+        } else {
+            logf("frame %.2f ms (worst %.2f) = scene %.2f + present %.2f + gplvr %.2f + "
+                 "other %.2f%s",
+                 period, g_profPeriodWorst * toMs, scene, present, gplvr,
+                 period - scene - present - gplvr, extra);
+        }
     }
+
+    // Both of these divide by FRAMES, so they read across against the frame budget above
+    // rather than against each other.
+    char geometry[288] = {};
+    if (renderProfileFormatGeometry(geometry, sizeof(geometry), g_frames))
+        logf("%s", geometry);
+
+    char present[320] = {};
+    if (renderProfileFormatPresent(present, sizeof(present), seconds, g_frames))
+        logf("%s", present);
+
+    // `pre` split into spans that tile it, and above all into the part that is WORK and
+    // the part that is the game asleep waiting for the next simulation tick. Takes no
+    // window arguments: it averages over its own count of frames whose markers came out
+    // in order, and says how many that was.
+    char pre[320] = {};
+    if (renderProfileFormatPre(pre, sizeof(pre))) logf("%s", pre);
 
     char shim[320] = {};
     if (shimFormat(shim, sizeof(shim), seconds)) logf("%s", shim);
+
+    // After every line that reads them, and on every path -- a window that printed nothing
+    // must still be drained, or its counts land in the next one.
+    renderProfileEndWindow();
 
     g_windowStart = now;
     g_mirrorRefreshes = 0;
@@ -237,6 +309,30 @@ void pollToggle() {
         g_stereoKeyLast = down;
     }
 
+    // nullDraw has to be a toggle, not a launch option: the measurement it exists for is
+    // the WORST frame on a track, and a worst frame has to be driven to. Blind, it cannot
+    // be. Hold it off, drive into the corner that hurts, tap the key for a couple of
+    // seconds of black, tap it back.
+    if (g_options.nullDrawKey) {
+        const bool down = (GetAsyncKeyState(g_options.nullDrawKey) & 0x8000) != 0;
+        if (down && !g_nullDrawKeyLast) {
+            g_options.nullDraw = !g_options.nullDraw;
+            renderProfileSetNullDraw(g_options.nullDraw);
+        }
+        g_nullDrawKeyLast = down;
+    }
+
+    // Armed here, taken at publish time -- the key is polled on the game thread and the
+    // read has to happen where the frame is complete and still bound.
+    if (g_options.dumpEyesKey) {
+        const bool down = (GetAsyncKeyState(g_options.dumpEyesKey) & 0x8000) != 0;
+        if (down && !g_dumpEyesKeyLast) {
+            g_dumpEyesRequested = true;
+            g_dumpEyesLate = true;
+        }
+        g_dumpEyesKeyLast = down;
+    }
+
     // Recentre: whatever pose the driver is in becomes the seat. Needed because
     // OpenXR's LOCAL space has its origin on the floor, not at the head -- measured,
     // see STATUS.md -- so without this the view starts a standing height too high.
@@ -245,6 +341,41 @@ void pollToggle() {
         if (down && !g_vrRecentreKeyLast) vrRequestRecentre();
         g_vrRecentreKeyLast = down;
     }
+
+    // Pribluda's panel between the head and the seat. Tweak mode is left as it is, so an
+    // element being placed can be looked at both ways. A seat panel with no seat published
+    // would be invisible, so one is published on the spot.
+    if (g_options.vr && g_options.vrHudLayerKey) {
+        bool down = (GetAsyncKeyState(g_options.vrHudLayerKey) & 0x8000) != 0;
+        if (down && !g_vrHudLayerKeyLast) {
+            g_options.vrHudLayer = g_options.vrHudLayer == 1 ? 2 : 1;
+            const char* seat = "";
+            if (g_options.vrHudLayer == 2 && !presenterSeatPublished()) {
+                seat = vrPublishSeat()
+                           ? " -- no seat had been published, so the head pose now is the seat"
+                           : " -- no seat yet and no head pose to take one from; it appears "
+                             "after the first recentre";
+            }
+            logf("vr: HUD panel switched to %s%s",
+                 g_options.vrHudLayer == 1 ? "follow the head" : "the seat", seat);
+        }
+        g_vrHudLayerKeyLast = down;
+    }
+
+    // Debug A/B for the HUD panel's judder: the eye images submitted with the current
+    // display pose instead of the pose they were rendered from.
+    if (g_options.vr && g_options.vrDebugSubmitCurrentPoseKey) {
+        bool down = (GetAsyncKeyState(g_options.vrDebugSubmitCurrentPoseKey) & 0x8000) != 0;
+        if (down && !g_vrSubmitCurrentPoseKeyLast) {
+            g_options.vrDebugSubmitCurrentPose = !g_options.vrDebugSubmitCurrentPose;
+            logf("vr: eye images now submitted with the %s",
+                 g_options.vrDebugSubmitCurrentPose ? "current display pose (debug)"
+                                                    : "pose they were rendered from");
+        }
+        g_vrSubmitCurrentPoseKeyLast = down;
+    }
+
+    pribludaPollTweak();
 
     // The mouse look toggle, and the mouse itself.
     //
@@ -295,6 +426,7 @@ void pollToggle() {
 
 void applyPendingSceneRenderHook();  // defined below
 void enforceNotTopmost();            // defined below
+void pollFocusEdge();                // defined below
 void __cdecl callOriginalSceneRender(void* params);  // defined below
 
 // Re-render the whole scene from a fresher head pose, spread across the idle tail of
@@ -486,6 +618,12 @@ void renderExtraFrames() {
         // entry to gpl_simFrameRender -- it branches on finding it already set.
         extraParams->mirrorCamera = extraMirror;
         if (rendered) {
+            // Same reasoning as the cursor below, and the HUD needs it more: the extra
+            // render has just painted the world over a HUD that was drawn once, in
+            // gpl_simFrameRender, before this loop was reached. Without the replay the
+            // HUD survives only on frames that had no extra render.
+            hudReplay();
+
             // An extra render redraws the world over the frame the cursor was already
             // put into, so it has to go back in before this one is published. Without
             // this the pointer would appear only on the game's own frames and blink at
@@ -521,10 +659,20 @@ int __cdecl screenDisplayHook(void* surface) {
     g_profLastEntry = frameEntry.QuadPart;
     g_profFrameEntry = frameEntry.QuadPart;
 
+    // The scaled front end goes into the window's back buffer FIRST, before anything
+    // reads that buffer. The VR transfer below is one of those readers, which is what
+    // lets the headset show a scaled menu as well as the monitor.
+    menuScaleEndFrameAndBlit();
+
     ++g_frames;
     shimEndFrame();
     taskRateReportThread("present");
     pollToggle();
+    windowFrame();
+    // Every frame, before the rate-limited housekeeping below: a focus change has to be
+    // acted on when it happens, not up to a quarter of a second later.
+    pollFocusEdge();
+    letterboxFrame();
     enforceNotTopmost();
     // Here rather than at discovery time for the same reason presenterStart is: it
     // needs a current GL context. It re-applies itself whenever roglv2 builds a new
@@ -546,6 +694,12 @@ int __cdecl screenDisplayHook(void* surface) {
     // clears it. It is the right question to ask, too: it is "does this frame hold two
     // eyes", not "is the stereo option on", and a menu answers no while the option is
     // on.
+    // The in-race HUD a driver actually reads -- lap times, the boards, tyres, oil, gear
+    // -- belongs to pribluda, which draws raw OpenGL inside roglv2's present for the
+    // monitor. A second copy goes into the panel texture the headset shows as a quad
+    // layer; it needs the game's GL context, which is current here.
+    pribludaDrawHud();
+
     presenterDrawCursor(g_stereoRenderedFrame);
 
     // The off-screen frame has to stop being the draw target before the presenter
@@ -565,7 +719,52 @@ int __cdecl screenDisplayHook(void* surface) {
         // drifting and distorting as you pan.
         if (!g_stereoRenderedFrame) vrClearRendered();
 
+        // FLUSH BEFORE READING THE FRAMEBUFFER, for the same reason the menu blit does.
+        //
+        // The user's eye dumps settled this: both eye rects together cover the whole
+        // 2560x1440 buffer, neither contained the HUD, and the monitor -- which presents
+        // from that same buffer a moment later -- showed it as always. So the HUD reaches
+        // the buffer between our copy and SwapBuffers, and the only thing in between is
+        // roglv2's screenDisplay, whose last-resort flush is exactly where anything still
+        // queued gets issued. The glDrawArrays counter reads zero through a race because
+        // it counts one entry point and a 2D flush does not use it.
+        //
+        // Everything gplvr takes off the framebuffer -- the dump below and the headset's
+        // copy after it -- has to come after this.
+        rasterFlushPending();
+
+        // BEFORE the publish, so what lands on disk is exactly what is handed over.
+        if (g_dumpEyesRequested) {
+            g_dumpEyesRequested = false;
+            GlFunctions gl;
+            int rect[2][4];
+            if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
+                // NEXT TO THE EXE, not wherever the process happens to be standing.
+                // gplc67 runs with its working directory set to the `font` subfolder, so
+                // the first version of this wrote two files nobody could find and
+                // reported success doing it.
+                char base[MAX_PATH] = {};
+                GetModuleFileNameA(nullptr, base, MAX_PATH);
+                if (char* slash = strrchr(base, '\\')) slash[1] = '\0';
+
+                char path[MAX_PATH];
+                for (int eye = 0; eye < 2; ++eye) {
+                    sprintf_s(path, "%sgplvr-eye%d.tga", base, eye);
+                    bool ok = dumpEyeRect(gl, rect[eye], path);
+                    logf("dump: eye %d rect %d,%d %dx%d of framebuffer %u -> %s%s", eye,
+                         rect[eye][0], rect[eye][1], rect[eye][2], rect[eye][3],
+                         renderTargetFramebuffer(), path, ok ? "" : "  <-- FAILED");
+                }
+            } else {
+                logf("dump: nothing written -- GL did not resolve, or there are no eye "
+                     "rects this frame (stereo is not running)");
+            }
+        }
+
         presenterFrame(g_stereoRenderedFrame, vrFrustumInjected());
+        // WHAT THE HEADSET HAS ALREADY BEEN GIVEN. Anything drawn after this point
+        // reaches the monitor, which presents later, and never reaches the eyes.
+        g_framePublished = true;
         // Remembered before it is cleared: an extra render must only ever repeat a
         // frame the game actually rendered a tracked stereo world into. On a menu the
         // saved parameter block is stale, and re-running it would paint the sim over
@@ -595,10 +794,55 @@ int __cdecl screenDisplayHook(void* surface) {
     // puts the trail straight back.
     presenterRestoreUnderCursor();
 
+    // A WINDOW IN THE BACKGROUND DOES NOT PRESENT.
+    //
+    // Clearing roglv2's draw gate on focus loss stops the rasterisation, but the swap
+    // would still go through and put the same finished frame back on the glass 144 times
+    // a second -- which on a window that exactly covers the output is the whole of "the
+    // window I alt-tabbed to never appears". The engine's own rule is the same one
+    // (gpl_presentIfForeground); it is simply never reached, because the WM_ACTIVATEAPP
+    // that would set the flag is swallowed by DirectInput's subclass.
+    //
+    bool background = !keepDrawingWhileUnfocused() && !windowHasFocus();
+
+    // THE LATE DUMP: the same two eye rects, taken as late as gplvr can reach, with only
+    // roglv2's screenDisplay left between here and the swap.
+    //
+    // The early pair above is what the headset receives. If the HUD is in this pair and
+    // not in that one, something draws it between the copy and the present -- pribluda is
+    // the obvious candidate, since gplc67 loads it from the rasterizer's own startup and
+    // it paints its overlay through a hook of its own. If it is in NEITHER pair while the
+    // monitor shows it, it is drawn inside screenDisplay or after it, and the question
+    // becomes which.
+    if (g_dumpEyesLate) {
+        g_dumpEyesLate = false;
+        GlFunctions gl;
+        int rect[2][4];
+        if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
+            char base[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, base, MAX_PATH);
+            if (char* slash = strrchr(base, '\\')) slash[1] = '\0';
+
+            char path[MAX_PATH];
+            for (int eye = 0; eye < 2; ++eye) {
+                sprintf_s(path, "%sgplvr-eye%d-late.tga", base, eye);
+                dumpEyeRect(gl, rect[eye], path);
+            }
+            logf("dump: the LATE pair is written too -- compare gplvr-eye0.tga (what the "
+                 "headset got) against gplvr-eye0-late.tga (the last thing gplvr can see "
+                 "before roglv2 presents). A difference between them is drawn by someone "
+                 "else after our copy.");
+        }
+    }
+
     LARGE_INTEGER beforePresent, afterPresent;
     QueryPerformanceCounter(&beforePresent);
-    const int presented = g_originalScreenDisplay ? g_originalScreenDisplay(surface) : 0;
+    renderProfileSetInPresent(true);
+    const int presented =
+        (!background && g_originalScreenDisplay) ? g_originalScreenDisplay(surface) : 0;
+    renderProfileSetInPresent(false);
     QueryPerformanceCounter(&afterPresent);
+    renderProfileNoteFrame(beforePresent.QuadPart, afterPresent.QuadPart);
     g_profPresentTicks += afterPresent.QuadPart - beforePresent.QuadPart;
     // Our own cost is the whole hook minus the engine's present. Taken here rather than
     // at the bottom so the extra renders below -- which are whole frames of their own and
@@ -613,6 +857,11 @@ int __cdecl screenDisplayHook(void* surface) {
     // returns, so catching only the world would put the world in one buffer and the
     // instruments in another.
     presenterBeginFrame();
+
+    // After the sim target, and it declines whenever that one took the frame: the two
+    // are mutually exclusive by mode -- the off-screen target owns a world mode, this
+    // owns the 640x480 front end -- and the invariant is checked rather than assumed.
+    menuScaleBeginFrame();
 
     // Extra renders go AFTER the present, in the idle tail of the tick.
     //
@@ -634,6 +883,12 @@ void __cdecl callOriginalSceneRender(void* params) {
     ++g_sceneOrigCalls;
     g_sceneTicks += ticks;
     if (ticks > g_sceneTicksWorst) g_sceneTicksWorst = ticks;
+
+    // GPL zeroes its counters at the top of sceneRender and reads them at the bottom, so
+    // this is the one moment they describe the render that just finished. Outside the
+    // timed span above, so the six loads do not land in the scene cost.
+    renderProfileAfterRender();
+    renderProfileNoteScene(begin.QuadPart, end.QuadPart);
 
     // Drain the pipeline here, and time the drain, to find out what `present` is made of.
     //
@@ -733,6 +988,21 @@ void __cdecl sceneRenderHook(void* params) {
     // and then we render normally -- a failed stereo setup must never cost you the game.
     g_lastSceneParams = params;
 
+    // The HUD's twenty drawDebugText calls come AFTER this returns, inline in
+    // gpl_simFrameRender, so this is where last frame's recording is dropped -- and
+    // where the thunk is put back if a mode change re-resolved it away.
+    g_framePublished = false;
+    if (g_options.vr) {
+        hudEnsureThunk();
+        hudBeginFrame();
+    }
+
+    // The lobby's TV feed is a world render issued while the engine is still in the
+    // front end, and it is the one draw in the menu that does not come from the menu's
+    // own code. Asking where it lands separates "the framebuffer flickers" from "this
+    // particular draw misses the framebuffer", which the four scaling gates could not.
+    if (windowInFrontEnd()) menuScaleReportBinding("sceneRender in the front end");
+
     // The look override, on the flat path.
     //
     // With vr = 1 it is applied inside vrAcquireEyes, which writes it over the head
@@ -746,11 +1016,20 @@ void __cdecl sceneRenderHook(void* params) {
     std::memcpy(savedOrientation, scene->orientation, sizeof(savedOrientation));
     const bool overridden = !g_options.vr && vrApplyLookOverride(scene->orientation);
 
+    // The widescreen field of view, on the flat path only. In VR the runtime's per-eye
+    // fov wins and Stereo builds its own cameras, so there is nothing here to correct;
+    // sceneRender stamps p[40] onto whatever camera sits in p[2] on the line before
+    // cameraBind, which is why writing it here reaches the projection at all.
+    float savedFov = scene->mainFov;
+    bool  fovCorrected = !g_options.vr && !g_options.stereo &&
+                        windowCorrectMainFov(savedFov, scene->mainFov);
+
     if (g_options.stereo && stereoRender(scene, &callOriginalSceneRender))
         g_stereoRenderedFrame = true;
     else
         callOriginalSceneRender(params);
 
+    if (fovCorrected) scene->mainFov = savedFov;
     if (overridden)
         std::memcpy(scene->orientation, savedOrientation, sizeof(savedOrientation));
 }
@@ -787,7 +1066,7 @@ LONG WINAPI changeDisplaySettingsAHook(DEVMODEA* mode, DWORD flags) {
         return DISP_CHANGE_SUCCESSFUL;
     }
 
-    if (g_options.blockDisplayChange) {
+    {
         logf("blocked ChangeDisplaySettingsA(%s, flags=%08X)",
              mode ? "mode" : "restore-defaults", flags);
         return DISP_CHANGE_SUCCESSFUL;
@@ -803,7 +1082,7 @@ LONG WINAPI changeDisplaySettingsWHook(DEVMODEW* mode, DWORD flags) {
         return DISP_CHANGE_SUCCESSFUL;
     }
 
-    if (g_options.blockDisplayChange) {
+    {
         logf("blocked ChangeDisplaySettingsW(flags=%08X)", flags);
         return DISP_CHANGE_SUCCESSFUL;
     }
@@ -819,7 +1098,7 @@ LONG WINAPI changeDisplaySettingsExAHook(LPCSTR device, DEVMODEA* mode, HWND win
         return DISP_CHANGE_SUCCESSFUL;
     }
 
-    if (g_options.blockDisplayChange) {
+    {
         if (mode)
             logf("blocked ChangeDisplaySettingsExA -> %ux%u @%u Hz, %u bpp, flags=%08X",
                  mode->dmPelsWidth, mode->dmPelsHeight, mode->dmDisplayFrequency,
@@ -840,7 +1119,7 @@ LONG WINAPI changeDisplaySettingsExWHook(LPCWSTR device, DEVMODEW* mode, HWND wi
         return DISP_CHANGE_SUCCESSFUL;
     }
 
-    if (g_options.blockDisplayChange) {
+    {
         logf("blocked ChangeDisplaySettingsExW(flags=%08X)", flags);
         return DISP_CHANGE_SUCCESSFUL;
     }
@@ -888,7 +1167,8 @@ BOOL WINAPI clipCursorHook(const RECT* rect) {
         return TRUE;
     }
 
-    if (g_options.blockClipCursor) {
+
+    {
         if (rect)
             logf("blocked ClipCursor(%d,%d..%d,%d)", rect->left, rect->top, rect->right,
                  rect->bottom);
@@ -908,7 +1188,7 @@ BOOL WINAPI setWindowPosHook(HWND window, HWND insertAfter, int x, int y, int cx
     ApiGuard guard;
     if (guard.reentered) return TRUE;
 
-    if (!g_options.allowWindowTopmost && insertAfter == HWND_TOPMOST) {
+    if (insertAfter == HWND_TOPMOST) {
         logf("demoted SetWindowPos(HWND_TOPMOST) to HWND_NOTOPMOST");
         insertAfter = HWND_NOTOPMOST;
     }
@@ -960,11 +1240,126 @@ namespace {
 // below, so intercepting here covers both with one hook.
 WNDPROC g_originalWndProc = nullptr;
 
+// ALT-TAB LEAVES GPL HOLDING THE ALT KEY, AND THAT IS WHY THE BUTTONS STOP.
+//
+// gplc67's keyboard proc sets bit 0x100000 of its modifier word on
+// WM_SYSKEYDOWN(VK_MENU). The matching WM_SYSKEYUP is delivered to whatever window TOOK
+// focus, so it never arrives, and nothing in any focus path clears the bit. The binding
+// evaluator then gates joystick BUTTONS and KEYBOARD actions behind an EQUALITY test of
+// the binding's recorded modifier against the live one -- so every binding recorded with
+// no modifier stops matching, permanently. AXES do not go through that test, which is
+// exactly why they keep working and the buttons do not.
+//
+// The fix sends the key release the game never received, through the game's own handler.
+// Deliberately not writing the modifier word directly: GPL's keyboard state lives in two
+// places -- the modifier word and a per-key table -- and its own WM_*KEYUP arm is the one
+// piece of code that is guaranteed to agree with itself about both.
+void releaseStuckModifiers(HWND window, bool activating) {
+    if (!g_originalWndProc) return;
+
+    struct Release {
+        UINT   message;
+        WPARAM key;
+        UINT   scan;
+    };
+    static const Release kReleases[] = {
+        {WM_SYSKEYUP, VK_MENU, 0x38},
+        {WM_KEYUP, VK_CONTROL, 0x1D},
+        {WM_KEYUP, VK_SHIFT, 0x2A},
+    };
+
+    for (const Release& release : kReleases) {
+        // Repeat count 1, the key's scan code, previous state down, transition up --
+        // the lParam a real release carries.
+        LPARAM lParam = static_cast<LPARAM>((release.scan << 16) | 1u | (1u << 30) |
+                                            (1u << 31));
+        CallWindowProcA(g_originalWndProc, window, release.message, release.key, lParam);
+    }
+
+    // Logged for the first few, with the activation state, because "the fix did not
+    // work" and "the fix did not run" look identical from outside and were argued about
+    // once already. If these lines are absent after an alt-tab, the handler is not being
+    // reached and the keyboard is not the thing to look at.
+    static int announced = 0;
+    if (announced < 4) {
+        ++announced;
+        logf("focus: released Alt, Ctrl and Shift through the game's own keyboard proc "
+             "(WM_SYSKEYUP -> sub_4C3060 -> sub_4C3620 -> sub_4C2350). "
+             "Alt-Tab sends GPL the Alt PRESS and sends the release to the window that "
+             "took focus, and GPL gates every unmodified button and key binding on the "
+             "modifier word matching exactly -- so without this, coming back from "
+             "alt-tab leaves the buttons dead while the axes still work. "
+             "WM_ACTIVATEAPP(%s).",
+             activating ? "TRUE" : "FALSE");
+    }
+}
+
+// DOES OUR WINDOW PROC RUN AT ALL, AND DOES WM_ACTIVATEAPP REACH IT?
+//
+// Asked directly, because every indirect answer so far has been wrong. Identity tests on
+// the installed proc cannot answer it -- GetWindowLongPtrA returns an opaque HANDLE, not
+// an address, whenever the proc is not ANSI-callable, which made a comparison against our
+// own function fail and cost a re-install that called itself until the stack ran out.
+// A counter cannot be misread that way.
+unsigned g_wndProcMessages = 0;
+unsigned g_wndProcActivateApp = 0;
+
 LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    ++g_wndProcMessages;
+    if (message == WM_ACTIVATEAPP) ++g_wndProcActivateApp;
+
+    // THE CHAIN OUTLIVES THE MODULE IT POINTS INTO, AND THAT IS A CRASH.
+    //
+    // g_originalWndProc is roglv2's proc (or DirectInput's, which forwards to it).
+    // roglv2 is unloaded at shutdown while the window still exists, so every message
+    // after that moment was being forwarded into freed memory. Windows reports it as
+    // "roglv2.dll_unloaded" at fault offset 0x18470 -- rogl_windowProc exactly -- with
+    // 0xC0000005 followed by 0xC000041D, the code for a fault inside a user-mode
+    // callback. Four entries in the user's event log across two sessions.
+    //
+    // WM_NCDESTROY is the last message any window receives, so unchaining here restores
+    // whatever was in front of us for the teardown itself and leaves nothing of ours
+    // behind. `unchained` is the belt to that brace: once the window is gone we answer
+    // for ourselves rather than calling a pointer we can no longer vouch for.
+    static bool unchained = false;
+    if (unchained) return DefWindowProcA(window, message, wParam, lParam);
+
+    if (message == WM_NCDESTROY) {
+        WNDPROC previous = g_originalWndProc;
+        unchained = true;
+        SetWindowLongPtrA(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous));
+        g_originalWndProc = nullptr;
+        logf("window: proc unchained at WM_NCDESTROY -- roglv2 is unloaded before the "
+             "window dies, and forwarding into it afterwards is the shutdown crash at "
+             "rogl_windowProc.");
+        return previous ? CallWindowProcA(previous, window, message, wParam, lParam)
+                        : DefWindowProcA(window, message, wParam, lParam);
+    }
+
+    // Both halves, and before anything else can swallow the message. On the way out
+    // because the press must not outlive the focus; on the way back in because that is
+    // when it has to be clean, and because the swallow below means the chain may never
+    // have seen the deactivation at all.
+    if (message == WM_ACTIVATEAPP) releaseStuckModifiers(window, wParam != FALSE);
+
+    // The window and menu-scaling messages first. It may answer the message outright
+    // (WM_GETMINMAXINFO, WM_CLOSE) or rewrite lParam and let it carry on down the chain,
+    // which is what the mouse remap does -- the platform wndproc below takes the click
+    // position straight out of lParam.
+    LRESULT handled = 0;
+    if (windowHandleMessage(window, message, wParam, lParam, handled)) return handled;
+
+    // HUD tweak mode steers with the arrows and Page Up/Down. GPL takes its keyboard only
+    // from these messages, in the keyboard proc below, so the presses stop here while the
+    // mode is on. Only the presses: a release still reaches the game, which keeps its key
+    // table right for a key held down across entering or leaving the mode.
+    if (message == WM_KEYDOWN && pribludaTweakSwallowsKey(static_cast<unsigned>(wParam)))
+        return 0;
+
     // Only the DEACTIVATION half, and only this message. Activations pass through
     // untouched so the gates still get set the first time the game is focused, and so
     // the game's own one-shot display restore keeps working exactly as it does now.
-    if (message == WM_ACTIVATEAPP && wParam == FALSE && g_options.renderWhenUnfocused) {
+    if (message == WM_ACTIVATEAPP && wParam == FALSE && keepDrawingWhileUnfocused()) {
         static bool announced = false;
         if (!announced) {
             announced = true;
@@ -975,14 +1370,84 @@ LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPA
         }
         return 0;
     }
-    return CallWindowProcA(g_originalWndProc, window, message, wParam, lParam);
+    return g_originalWndProc
+               ? CallWindowProcA(g_originalWndProc, window, message, wParam, lParam)
+               : DefWindowProcA(window, message, wParam, lParam);
 }
 
 // Lazily, because the window does not exist when the DLL loads and roglv2 subclasses it
 // later still. Called once a second from enforceNotTopmost until it takes.
 void installActivationHook() {
-    if (g_originalWndProc || !g_options.renderWhenUnfocused) return;
+    // ARE WE STILL THE WINDOW PROC?
+    //
+    // This used to return the moment it had installed once, on the assumption that a
+    // subclass stays where it was put. Nothing checked, and when the Alt release and the
+    // cursor re-clip both turned out to be silent -- same handler, no log line, in a
+    // build that provably contained them -- there was no way to tell "the fix is wrong"
+    // from "the fix never ran". Now the invariant is tested every time round and a
+    // displacement is loud, because a chain we are no longer in is the one failure that
+    // makes every window feature look individually broken.
+    if (g_originalWndProc) {
+        HWND current = gameWindow();
+        if (!current) return;
+        auto installed = reinterpret_cast<WNDPROC>(
+            GetWindowLongPtrA(current, GWLP_WNDPROC));
+        if (installed == &activationWndProc) return;
 
+        // NOT NECESSARILY DISPLACED, AND NEVER RE-CHAIN ON THIS EVIDENCE.
+        //
+        // GetWindowLongPtrA returns an opaque HANDLE rather than an address when the
+        // window proc is not ANSI-callable -- 0xFFFF04CB on a window of 0x001204CC, the
+        // low word one apart, is Windows' own encoding and not somebody's code. The
+        // first version of this read that as a displacement, re-installed on top of
+        // ITSELF, and set our predecessor to our own function: the proc called itself
+        // until the stack ran out, which is the crash that came back as 0xc00000fd.
+        //
+        // So this reports and does nothing. The message counters above are the real
+        // instrument; identity here is only worth logging.
+        // NAME THE INTERLOPER, AND NEVER RE-CHAIN.
+        //
+        // GetWindowLongPtrA returns a 0xFFFFxxxx COOKIE, not an address, when the
+        // current procedure is Unicode and the caller is ANSI -- so the A variant cannot
+        // answer this and a comparison against it once reported a displacement that did
+        // not exist, re-chained gplvr onto itself, and blew the stack.
+        //
+        // The W variant returns the real address, and that is worth having: gpl_winMain
+        // registers exactly ONE class, with RegisterClassA, and the image contains no
+        // SetWindowLongW at all -- so a window that reports IsWindowUnicode TRUE can only
+        // have got that way from somebody writing GWLP_WNDPROC with the W variant AFTER
+        // us. VirtualQuery plus GetModuleFileName turns that address into a filename.
+        static bool complained = false;
+        if (!complained) {
+            complained = true;
+
+            auto unicodeProc = reinterpret_cast<void*>(
+                GetWindowLongPtrW(current, GWLP_WNDPROC));
+            char owner[MAX_PATH] = "unknown";
+            MEMORY_BASIC_INFORMATION info = {};
+            if (unicodeProc && VirtualQuery(unicodeProc, &info, sizeof(info))) {
+                GetModuleFileNameA(static_cast<HMODULE>(info.AllocationBase), owner,
+                                   MAX_PATH);
+            }
+            const char* leaf = strrchr(owner, '\\');
+
+            logf("window: the current proc is %p (ANSI view: %p, a cookie), ours is %p, "
+                 "unicode window: %d, and it lives in %s. gplc67 registers one class "
+                 "with RegisterClassA and never calls SetWindowLongW, so a Unicode "
+                 "window means somebody subclassed AFTER us. NOT re-chaining -- the "
+                 "displacer keeps ours as its predecessor and reinstalling makes a ring.",
+                 unicodeProc, reinterpret_cast<void*>(installed),
+                 reinterpret_cast<void*>(&activationWndProc),
+                 IsWindowUnicode(current) ? 1 : 0, leaf ? leaf + 1 : owner);
+        }
+        return;
+    }
+    // Unconditional now. It began as one tenant that had to be asked for -- swallowing
+    // WM_ACTIVATEAPP(FALSE) -- and gained three more: WM_GETMINMAXINFO and WM_CLOSE for
+    // the borderless window, the click position for the scaled front end, and the stuck
+    // Alt release. That last one is a fix for a stock GPL defect that costs every player
+    // their joystick buttons after an alt-tab, and gating a bug fix behind an unrelated
+    // option would be a way of not shipping it.
     HWND window = gameWindow();
     if (!window) return;
 
@@ -997,8 +1462,32 @@ void installActivationHook() {
         return;
     }
     g_originalWndProc = previous;
-    logf("focus: window proc chained ahead of roglv2's and the game's, to swallow "
-         "WM_ACTIVATEAPP(FALSE). renderWhenUnfocused = 1.");
+    logf("window: proc chained ahead of roglv2's and the game's");
+}
+
+// FOCUS IS POLLED, NOT DELIVERED.
+//
+// Every focus-dependent thing in gplvr hung off WM_ACTIVATEAPP, on the authority of
+// three reports and roglv2's own dispatcher, which handles it. On this machine THE
+// MESSAGE IS NEVER SENT: the counters recorded 1373 messages reaching our proc across
+// four focus changes and not one of them was WM_ACTIVATEAPP. The corroboration is that
+// GPL kept rendering the world while unfocused -- roglv2's draw gate is cleared by that
+// same message, so it did not get it either.
+//
+// GetForegroundWindow answers correctly and costs nothing, so the edge is taken from
+// there. Choosing the signal that works over the signal that is documented is not a
+// workaround; the documented one was measured and it is not there.
+void pollFocusEdge() {
+    HWND window = gameWindow();
+    if (!window) return;
+
+    int focused = window == GetForegroundWindow() ? 1 : 0;
+    static int last = -1;
+    if (focused == last) return;
+    last = focused;
+
+    releaseStuckModifiers(window, focused != 0);
+    windowOnFocusChanged(focused != 0);
 }
 
 void enforceNotTopmost() {
@@ -1018,24 +1507,37 @@ void enforceNotTopmost() {
     // Report the state rather than only acting on it -- the last two attempts at this
     // were guesses, and a window that is merely desktop-sized and focused looks exactly
     // like a topmost one from the outside.
+    // Foreground is in the change test, not just the printout. It is the independent
+    // witness for whether WM_ACTIVATEAPP is reaching our proc at all: this line comes
+    // from the frame hook, the focus line comes from the window proc, and a focus change
+    // that produces one without the other says exactly which of the two is broken.
     static LONG lastStyle = 0, lastExStyle = 0;
     static RECT lastRect = {};
-    if (style != lastStyle || exStyle != lastExStyle ||
+    static int lastForeground = -1;
+    int foreground = window == GetForegroundWindow() ? 1 : 0;
+    if (style != lastStyle || exStyle != lastExStyle || foreground != lastForeground ||
         memcmp(&rect, &lastRect, sizeof(rect)) != 0) {
         lastStyle = style;
         lastExStyle = exStyle;
         lastRect = rect;
+        lastForeground = foreground;
 
         char className[64] = {};
         GetClassNameA(window, className, sizeof(className));
         logf("window %p '%s' style=%08lX exStyle=%08lX rect=%ld,%ld..%ld,%ld "
-             "topmost=%d foreground=%d desktop=%dx%d",
+             "topmost=%d foreground=%d desktop=%dx%d | our proc has seen %u messages, "
+             "%u of them WM_ACTIVATEAPP",
              window, className, style, exStyle, rect.left, rect.top, rect.right,
-             rect.bottom, (exStyle & WS_EX_TOPMOST) != 0, window == GetForegroundWindow(),
-             GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+             rect.bottom, (exStyle & WS_EX_TOPMOST) != 0, foreground,
+             GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+             g_wndProcMessages, g_wndProcActivateApp);
     }
 
-    if (g_options.allowWindowTopmost) return;
+    // The geometry itself belongs to the window module, which owns the policy and the
+    // one number -- the target rect -- that the mode override and the menu blit are both
+    // derived from. Before the topmost early-out below, because the two are independent
+    // and a player who wants the window on top still wants it the right size.
+    windowEnforceGeometry();
 
     if ((exStyle & WS_EX_TOPMOST) != 0) {
         logf("demoting WS_EX_TOPMOST on %p", window);
@@ -1043,20 +1545,6 @@ void enforceNotTopmost() {
         realUser32<decltype(&SetWindowPos)>("SetWindowPos")(
             window, HWND_NOTOPMOST, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    }
-
-    // A borderless window exactly covering the screen can be given fullscreen
-    // exclusivity by Windows, and then overlays -- including the alt-tab switcher --
-    // never composite over it. Being one pixel short defeats that.
-    if (g_options.shrinkWindowByOnePixel) {
-        const int screenW = GetSystemMetrics(SM_CXSCREEN);
-        const int screenH = GetSystemMetrics(SM_CYSCREEN);
-        if (rect.right - rect.left >= screenW && rect.bottom - rect.top >= screenH) {
-            logf("shrinking %p by one pixel to defeat fullscreen optimisation", window);
-            realUser32<decltype(&SetWindowPos)>("SetWindowPos")(
-                window, nullptr, rect.left, rect.top, screenW - 1, screenH - 1,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-        }
     }
 }
 
@@ -1076,6 +1564,24 @@ const Replacement kApiReplacements[] = {
 
 }  // namespace
 
+void windowProcUnchain() {
+    if (!g_originalWndProc) return;
+
+    HWND window = gameWindow();
+    WNDPROC previous = g_originalWndProc;
+    g_originalWndProc = nullptr;
+
+    // Only if it is still OURS. Somebody who subclassed after us -- DirectInput does --
+    // would otherwise be torn out of the chain along with us, and their proc would then
+    // be the one pointing at freed memory.
+    if (window && IsWindow(window)) {
+        auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrA(window, GWLP_WNDPROC));
+        if (current == &activationWndProc)
+            SetWindowLongPtrA(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous));
+    }
+}
+
+
 void loadOptions(const char* fileName) {
     char path[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, path, MAX_PATH);
@@ -1089,44 +1595,22 @@ void loadOptions(const char* fileName) {
 
     g_options.stereo = GetPrivateProfileIntA("gplvr", "stereo", 0, path) != 0;
     g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 1, path);
-    GetPrivateProfileStringA("gplvr", "vrMirrorYaw", "0.0", text, sizeof(text), path);
-    g_options.vrMirrorYaw = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrMirrorPitch", "0.0", text, sizeof(text), path);
-    g_options.vrMirrorPitch = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrMirrorFov", "0.0", text, sizeof(text), path);
-    g_options.vrMirrorFov = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrMirrorBack", "0.0", text, sizeof(text), path);
-    g_options.vrMirrorBack = static_cast<float>(atof(text));
-    GetPrivateProfileStringA("gplvr", "vrMirrorUp", "0.0", text, sizeof(text), path);
-    g_options.vrMirrorUp = static_cast<float>(atof(text));
-    // Clamped, not trusted. A wild fov here would build a degenerate frustum, and the
-    // symptom would look like a mirror bug rather than a typo in an ini.
-    if (g_options.vrMirrorFov < 0.0f || g_options.vrMirrorFov > 170.0f)
-        g_options.vrMirrorFov = 0.0f;
-    if (g_options.vrMirrorYaw != 0.0f || g_options.vrMirrorPitch != 0.0f ||
-        g_options.vrMirrorFov != 0.0f || g_options.vrMirrorBack != 0.0f ||
-        g_options.vrMirrorUp != 0.0f)
-        logf("options: mirror aim yaw=%+.1f pitch=%+.1f back=%+.2f up=%+.2f fov=%.1f "
-             "(0 = the stock 40 degrees)",
-             g_options.vrMirrorYaw, g_options.vrMirrorPitch, g_options.vrMirrorBack,
-             g_options.vrMirrorUp, g_options.vrMirrorFov);
     g_options.stereoKey = GetPrivateProfileIntA("gplvr", "stereoKey", '1', path);
     g_options.profileFrame =
         GetPrivateProfileIntA("gplvr", "profileFrame", 1, path) != 0;
     g_options.shimMeasure = GetPrivateProfileIntA("gplvr", "shimMeasure", 0, path) != 0;
-    g_options.billboardFaceEye =
-        GetPrivateProfileIntA("gplvr", "billboardFaceEye", 1, path) != 0;
     g_options.profileGpuWait =
         GetPrivateProfileIntA("gplvr", "profileGpuWait", 0, path) != 0;
     g_options.profilePolys =
         GetPrivateProfileIntA("gplvr", "profilePolys", 0, path) != 0;
+    g_options.profileStages =
+        GetPrivateProfileIntA("gplvr", "profileStages", 0, path) != 0;
+    g_options.nullDraw = GetPrivateProfileIntA("gplvr", "nullDraw", 0, path) != 0;
+    g_options.nullDrawKey = GetPrivateProfileIntA("gplvr", "nullDrawKey", '9', path);
+    g_options.dumpEyesKey = GetPrivateProfileIntA("gplvr", "dumpEyesKey", '0', path);
     g_options.swapInterval = GetPrivateProfileIntA("gplvr", "swapInterval", 0, path);
     if (g_options.swapInterval < -1) g_options.swapInterval = -1;
     if (g_options.swapInterval > 4) g_options.swapInterval = 4;
-    g_options.blockDisplayChange =
-        GetPrivateProfileIntA("gplvr", "blockDisplayChange", 0, path) != 0;
-    g_options.blockClipCursor =
-        GetPrivateProfileIntA("gplvr", "blockClipCursor", 0, path) != 0;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
@@ -1143,16 +1627,98 @@ void loadOptions(const char* fileName) {
     g_options.vrExtraRenders = GetPrivateProfileIntA("gplvr", "vrExtraRenders", 0, path);
     GetPrivateProfileStringA("gplvr", "vrWorldScale", "1.0", text, sizeof(text), path);
     g_options.vrWorldScale = static_cast<float>(atof(text));
+    g_options.windowWidth = GetPrivateProfileIntA("gplvr", "windowWidth", 0, path);
+    g_options.windowHeight = GetPrivateProfileIntA("gplvr", "windowHeight", 0, path);
+    if (g_options.windowWidth < 0) g_options.windowWidth = 0;
+    if (g_options.windowHeight < 0) g_options.windowHeight = 0;
+    // One of the pair on its own would give a window whose other dimension is the whole
+    // monitor, which is never what anybody means by it.
+    if ((g_options.windowWidth == 0) != (g_options.windowHeight == 0)) {
+        logf("options: windowWidth and windowHeight must be given together -- ignoring "
+             "both and covering the monitor exactly");
+        g_options.windowWidth = 0;
+        g_options.windowHeight = 0;
+    }
+    g_options.windowX = GetPrivateProfileIntA("gplvr", "windowX", -1, path);
+    g_options.windowY = GetPrivateProfileIntA("gplvr", "windowY", -1, path);
     g_options.renderWhenUnfocused =
-        GetPrivateProfileIntA("gplvr", "renderWhenUnfocused", 0, path);
-    g_options.allowWindowTopmost =
-        GetPrivateProfileIntA("gplvr", "allowWindowTopmost", 0, path) != 0;
-    g_options.shrinkWindowByOnePixel =
-        GetPrivateProfileIntA("gplvr", "shrinkWindowByOnePixel", 1, path) != 0;
+        GetPrivateProfileIntA("gplvr", "renderWhenUnfocused", 0, path) != 0;
+    g_options.menuFilter = GetPrivateProfileIntA("gplvr", "menuFilter", 2, path);
+    if (g_options.menuFilter < 0 || g_options.menuFilter > 2) g_options.menuFilter = 2;
+    g_options.enableLetterbox =
+        GetPrivateProfileIntA("gplvr", "enableLetterbox", 0, path) != 0;
+    g_options.widescreenFix =
+        GetPrivateProfileIntA("gplvr", "widescreenFix", 0, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrMenuScale", "0.5", text, sizeof(text), path);
     g_options.vrMenuScale = static_cast<float>(atof(text));
+    GetPrivateProfileStringA("gplvr", "vrGamma", "1.0", text, sizeof(text), path);
+    g_options.vrGamma = static_cast<float>(atof(text));
+    if (g_options.vrGamma < 0.5f) g_options.vrGamma = 0.5f;
+    if (g_options.vrGamma > 3.0f) g_options.vrGamma = 3.0f;
+    g_options.vrDebugSubmitCurrentPose =
+        GetPrivateProfileIntA("gplvr", "vrDebugSubmitCurrentPose", 0, path) != 0;
+    g_options.vrDebugSubmitCurrentPoseKey =
+        GetPrivateProfileIntA("gplvr", "vrDebugSubmitCurrentPoseKey", VK_INSERT, path);
+    GetPrivateProfileStringA("gplvr", "vrHudDepth", "0.0", text, sizeof(text), path);
+    g_options.vrHudDepth = static_cast<float>(atof(text));
+    g_options.vrHudLayer = GetPrivateProfileIntA("gplvr", "vrHudLayer", 2, path);
+    if (g_options.vrHudLayer < 0 || g_options.vrHudLayer > 2) g_options.vrHudLayer = 2;
+    // A key that is absent keeps the default the Options struct was built with.
+    auto readFloat = [&](const char* key, float& value) {
+        GetPrivateProfileStringA("gplvr", key, "", text, sizeof(text), path);
+        if (text[0]) value = static_cast<float>(atof(text));
+    };
+    auto clampPlacement = [](HudPlacement& placement) {
+        if (placement.ahead < 0.10f) placement.ahead = 0.10f;
+        if (placement.width < 0.05f) placement.width = 0.05f;
+        if (placement.width > 5.0f) placement.width = 5.0f;
+    };
+    readFloat("vrHudHeadAhead", g_options.vrHudHead.ahead);
+    readFloat("vrHudHeadDown", g_options.vrHudHead.down);
+    readFloat("vrHudHeadRight", g_options.vrHudHead.right);
+    readFloat("vrHudHeadWidth", g_options.vrHudHead.width);
+    clampPlacement(g_options.vrHudHead);
+    readFloat("vrHudSeatAhead", g_options.vrHudSeat.ahead);
+    readFloat("vrHudSeatDown", g_options.vrHudSeat.down);
+    readFloat("vrHudSeatRight", g_options.vrHudSeat.right);
+    readFloat("vrHudSeatWidth", g_options.vrHudSeat.width);
+    clampPlacement(g_options.vrHudSeat);
+    readFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
+    if (g_options.vrHudBackdropOpacity < 0.0f) g_options.vrHudBackdropOpacity = 0.0f;
+    if (g_options.vrHudBackdropOpacity > 1.0f) g_options.vrHudBackdropOpacity = 1.0f;
+    GetPrivateProfileStringA("gplvr", "vrHudTextScale", "1.0", text, sizeof(text), path);
+    g_options.vrHudTextScale = static_cast<float>(atof(text));
+    if (g_options.vrHudTextScale < 0.25f) g_options.vrHudTextScale = 0.25f;
+    if (g_options.vrHudTextScale > 4.0f) g_options.vrHudTextScale = 4.0f;
+    g_options.vrHudLayerKey = GetPrivateProfileIntA("gplvr", "vrHudLayerKey", VK_HOME, path);
+    g_options.vrHudTweakKey = GetPrivateProfileIntA("gplvr", "vrHudTweakKey", VK_END, path);
+    GetPrivateProfileStringA("gplvr", "vrHudTweakSpeed", "0.10", text, sizeof(text), path);
+    g_options.vrHudTweakSpeed = static_cast<float>(atof(text));
+    if (g_options.vrHudTweakSpeed < 0.005f) g_options.vrHudTweakSpeed = 0.005f;
+    if (g_options.vrHudTweakSpeed > 2.0f) g_options.vrHudTweakSpeed = 2.0f;
+    g_options.vrHudEye = GetPrivateProfileIntA("gplvr", "vrHudEye", 0, path);
+    if (g_options.vrHudEye < 0 || g_options.vrHudEye > 2) g_options.vrHudEye = 0;
+    g_options.vrPredictPosition =
+        GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
+
+    // Flat mode is the vanilla game in a borderless window: the window itself, the
+    // letterbox and widescreen fixes, front-end scaling, roglv2's glFinish drop and swap
+    // interval, and mouselook. Stereo and the tools built to develop and measure the
+    // headset path -- nullDraw, the eye dumps, the stage and polygon profilers, the
+    // rasterizer shim -- are for vr only. Switching them off here keeps every installer
+    // and key that reads them inert, without a second check at each one.
+    if (!g_options.vr) {
+        g_options.stereo = false;
+        g_options.stereoKey = 0;
+        g_options.nullDraw = false;
+        g_options.nullDrawKey = 0;
+        g_options.dumpEyesKey = 0;
+        g_options.shimMeasure = false;
+        g_options.profilePolys = false;
+        g_options.profileStages = false;
+    }
 
     logf("options: stereo=%d mirror=%d stereoKey=0x%02X",
          g_options.stereo, g_options.stereoMirror, g_options.stereoKey);
@@ -1173,20 +1739,38 @@ void loadOptions(const char* fileName) {
                                           "showing"
                                         : "drawn whatever Windows says"));
 
-    logf("options: vrMenuScale=%.2f vrRenderScale=%.2f vrRecentreKey=0x%02X "
-         "vrOffscreen=%d vrMonitorEye=%d",
-         g_options.vrMenuScale, g_options.vrRenderScale, g_options.vrRecentreKey,
+    logf("options: vrDebugSubmitCurrentPose=%d key=0x%02X",
+         g_options.vrDebugSubmitCurrentPose ? 1 : 0, g_options.vrDebugSubmitCurrentPoseKey);
+    logf("options: vrMenuScale=%.2f vrGamma=%.2f vrHudDepth=%.2f vrRenderScale=%.2f "
+         "vrRecentreKey=0x%02X vrOffscreen=%d vrMonitorEye=%d",
+         g_options.vrMenuScale, g_options.vrGamma, g_options.vrHudDepth,
+         g_options.vrRenderScale,
+         g_options.vrRecentreKey,
          g_options.vrOffscreen, g_options.vrMonitorEye);
     logf("options: vrExtraRenders=%d vrHorizonLock=%.2f vrWorldScale=%.2f",
          g_options.vrExtraRenders, g_options.vrHorizonLock, g_options.vrWorldScale);
+    logf("options: vrHudLayer=%d vrHudTextScale=%.2f vrHudBackdropOpacity=%.2f vrHudEye=%d "
+         "vrPredictPosition=%d",
+         g_options.vrHudLayer, g_options.vrHudTextScale, g_options.vrHudBackdropOpacity,
+         g_options.vrHudEye, g_options.vrPredictPosition ? 1 : 0);
+    logf("options: HUD head ahead=%.2f down=%.2f right=%.2f width=%.2f | seat ahead=%.2f "
+         "down=%.2f right=%.2f width=%.2f",
+         g_options.vrHudHead.ahead, g_options.vrHudHead.down, g_options.vrHudHead.right,
+         g_options.vrHudHead.width, g_options.vrHudSeat.ahead, g_options.vrHudSeat.down,
+         g_options.vrHudSeat.right, g_options.vrHudSeat.width);
+    logf("options: vrHudLayerKey=0x%02X vrHudTweakKey=0x%02X vrHudTweakSpeed=%.3f",
+         g_options.vrHudLayerKey, g_options.vrHudTweakKey, g_options.vrHudTweakSpeed);
     logf("options: vrMouseLook=%d sensitivity=%.3f invertPitch=%d key=0x%02X",
          g_options.vrMouseLook ? 1 : 0, g_options.vrMouseLookSensitivity,
          g_options.vrMouseLookInvertPitch ? 1 : 0, g_options.vrMouseLookKey);
-    logf("options: vr=%d blockDisplayChange=%d blockClipCursor=%d "
-         "allowWindowTopmost=%d shrinkWindowByOnePixel=%d (from %s)",
-         g_options.vr, g_options.blockDisplayChange,
-         g_options.blockClipCursor, g_options.allowWindowTopmost,
-         g_options.shrinkWindowByOnePixel, path);
+    logf("options: vr=%d (from %s)", g_options.vr, path);
+    logf("options: window=%dx%d at %d,%d menuFilter=%d enableLetterbox=%d "
+         "widescreenFix=%d renderWhenUnfocused=%d%s",
+         g_options.windowWidth, g_options.windowHeight, g_options.windowX,
+         g_options.windowY, g_options.menuFilter, g_options.enableLetterbox ? 1 : 0,
+         g_options.widescreenFix ? 1 : 0, g_options.renderWhenUnfocused ? 1 : 0,
+         (!g_options.renderWhenUnfocused && g_options.vr) ? " (forced on by vr)" : "");
+
 }
 
 bool installFrameCounter(Binding& binding) {
@@ -1226,9 +1810,15 @@ bool installFrameCounter(Binding& binding) {
 }
 
 void requestSceneRenderHook(const Binding& binding) {
-    stereoBind(binding);
-    renderTargetBind(binding);
-    taskRateBind(&binding.image);
+    // The sceneRender call sites are patched in both modes: that hook is where mouselook
+    // and the widescreen field of view reach the camera on the flat path. Stereo, the
+    // off-screen target, the task-rate probe and the eye-frustum hook on cameraBind are
+    // the headset's.
+    if (g_options.vr) {
+        stereoBind(binding);
+        renderTargetBind(binding);
+        taskRateBind(&binding.image);
+    }
 
     if (binding.sceneRenderCallSites.empty()) {
         logf("requestSceneRenderHook: nothing to patch");
@@ -1239,11 +1829,13 @@ void requestSceneRenderHook(const Binding& binding) {
 
     // Without these the eyes render the game's field of view rather than the headset's,
     // so say plainly which of the two is about to happen.
-    g_pendingBindCallSites = binding.cameraBindCallSitesInScene;
     g_originalCameraBind = reinterpret_cast<CameraBindFn>(binding.cameraBind);
-    if (g_pendingBindCallSites.empty())
-        logf("requestSceneRenderHook: no cameraBind call sites -- the eye frustum fix is "
-             "OFF and the eyes will use the game's own fov");
+    if (g_options.vr) {
+        g_pendingBindCallSites = binding.cameraBindCallSitesInScene;
+        if (g_pendingBindCallSites.empty())
+            logf("requestSceneRenderHook: no cameraBind call sites -- the eye frustum fix "
+                 "is OFF and the eyes will use the game's own fov");
+    }
 
     g_sceneHookPending = true;
     logf("requestSceneRenderHook: queued %zu sceneRender and %zu cameraBind call site(s); "
@@ -1293,6 +1885,64 @@ void patchDisplaySettingsImports(HMODULE module) {
             }
         }
     }
+}
+
+void setCursorClip(const RECT& rect) {
+    realUser32<decltype(&ClipCursor)>("ClipCursor")(&rect);
+}
+
+bool frameAlreadyPublished() { return g_framePublished; }
+
+bool keepDrawingWhileUnfocused() {
+    return g_options.renderWhenUnfocused || g_options.vr;
+}
+
+void releaseCursorClip() { realUser32<decltype(&ClipCursor)>("ClipCursor")(nullptr); }
+
+bool patchModuleImport(HMODULE module, const char* name, void* replacement,
+                       void** original) {
+    if (module == g_selfModule) return false;
+
+    ModuleImage image;
+    if (!getModuleImage(module, image)) return false;
+
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.base);
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(image.base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& directory =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!directory.VirtualAddress) return false;
+
+    auto descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+        image.base + directory.VirtualAddress);
+    for (; descriptor->Name; ++descriptor) {
+        auto names = reinterpret_cast<const IMAGE_THUNK_DATA32*>(
+            image.base + (descriptor->OriginalFirstThunk ? descriptor->OriginalFirstThunk
+                                                         : descriptor->FirstThunk));
+        auto slots = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+            const_cast<uint8_t*>(image.base) + descriptor->FirstThunk);
+
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+            auto import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                image.base + names->u1.AddressOfData);
+            if (std::strcmp(reinterpret_cast<const char*>(import->Name), name) != 0)
+                continue;
+
+            auto value = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(replacement));
+            if (slots->u1.Function == value) return true;  // already ours
+
+            *original = reinterpret_cast<void*>(
+                static_cast<uintptr_t>(slots->u1.Function));
+            if (!patchBytes(&slots->u1.Function, &value, sizeof(value))) return false;
+
+            char file[MAX_PATH] = {};
+            GetModuleFileNameA(module, file, MAX_PATH);
+            const char* leaf = strrchr(file, '\\');
+            logf("IAT: %s imports %s -> hooked", leaf ? leaf + 1 : file, name);
+            return true;
+        }
+    }
+    return false;
 }
 
 void setSelfModule(HMODULE module) { g_selfModule = module; }

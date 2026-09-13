@@ -6,6 +6,15 @@
 
 namespace gplvr {
 
+// Where the HUD panel hangs in one mode, in metres: its centre ahead, below and to the
+// right, and its width.
+struct HudPlacement {
+    float ahead;
+    float down;
+    float right;
+    float width;
+};
+
 struct Options {
     // Render each eye into one half of the back buffer: two cameras aimed at
     // bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the head.
@@ -16,24 +25,6 @@ struct Options {
     //   0 = off in both eyes   1 = left eye only (default)   2 = both eyes
     int stereoMirror = 1;
 
-    // MIRROR AIM. gpl_mirrorViewCompute puts the mirror eye at the car body origin plus
-    // (0, 0, 0.35) in car space, facing backwards with a 40-degree horizontal fov, and
-    // hands all of it to sceneRender in the params block. So aiming it needs no game
-    // patch and no model change -- these three adjust p[44..46], p[65..73] and p[81] on
-    // the way past, and put them back afterwards.
-    //
-    // Degrees, applied in the MIRROR's own frame: yaw turns it left/right, pitch tilts it
-    // up/down. vrMirrorFov REPLACES the 40-degree default when non-zero -- a wider angle
-    // shows more road at the cost of making everything in it smaller, exactly like a real
-    // convex mirror.
-    float vrMirrorYaw = 0.0f;
-    float vrMirrorPitch = 0.0f;
-    float vrMirrorFov = 0.0f;
-
-    // Metres along the mirror's own axes: +back moves the virtual mirror further behind
-    // the car (a wider, more distant view), +up raises it.
-    float vrMirrorBack = 0.0f;
-    float vrMirrorUp = 0.0f;
 
     // Toggle stereo at runtime. '1' by default; 0 disables.
     //
@@ -42,40 +33,75 @@ struct Options {
     // code for '1' is simply 0x31.
     int stereoKey = '1';
 
-    // KEEP DRAWING WHEN THE GAME IS NOT THE FOREGROUND APP.
+    // KEEP DRAWING AND PRESENTING WHILE ANOTHER APPLICATION HAS THE FOREGROUND.
     //
-    // GPL has TWO independent draw gates and both are driven by WM_ACTIVATEAPP:
-    //   * roglv2's WindowManager+0x19, read by polyDraw and aaLine -- when it is clear,
-    //     ALL polygon and line rasterisation is skipped;
-    //   * gplc67's gpl_isForeground (0x582550), read by gpl_presentIfForeground -- when it
-    //     is clear the frame is never presented at all.
-    // Between them, a backgrounded GPL renders nothing and shows nothing. That is fine for
-    // an exclusive-fullscreen game from 1998 and wrong for a borderless or windowed one,
-    // and it is wrong for VR too: clicking another window should not black out the headset.
+    // GPL has two draw gates, roglv2's `WindowManager + 0x19` and gplc67's
+    // `gpl_isForeground` (0x582550), and both are driven by WM_ACTIVATEAPP -- which
+    // DirectInput's subclass swallows, so neither ever clears on its own. gplvr therefore
+    // drives them by hand from a polled focus edge, and this says which way.
     //
-    // 1 installs a window proc AHEAD of both subclasses and SWALLOWS the deactivation half
-    // of WM_ACTIVATEAPP, so both gates keep whatever value the last activation gave them.
+    // Off is the right default on a monitor: a backgrounded game rendering at 144 fps is
+    // heat and fan noise for pixels nobody is looking at. On is for anyone who wants the
+    // picture live while they read something over the top of it.
     //
-    // Deliberately swallowing rather than rewriting wParam to TRUE: gpl_platformWndProc
-    // also sets a one-shot display-restore flag (byte_94D778 -> sub_502B60) on every
-    // ACTIVATION, and manufacturing activations would fire that restore every time focus
-    // was lost. Swallowing touches nothing.
-    int renderWhenUnfocused = 0;
+    // FORCED ON IN VR, whatever this says -- clicking another window must not black out
+    // the headset. Read `keepDrawingWhileUnfocused()` rather than this field.
+    //
+    // A per-frame AUTOPAUSE, single-player only, would make the whole question go away:
+    // pause the sim on focus loss and there is nothing to keep drawing. Not built.
+    bool renderWhenUnfocused = false;
 
-    // Stop the rasterizer forcing its window above everything else.
+    // THE WINDOW, in pixels. 0x0 means exactly the current mode of the monitor it is on,
+    // at that monitor's origin -- which is the normal setting and the fast one.
     //
-    // roglv2's WindowManager::SetSize calls SetWindowPos(hwnd, HWND_TOPMOST, ...) on
-    // every mode change; that is the only source, and demoting it there is enough.
-    bool allowWindowTopmost = false;
+    // gplvr always owns the window and the display mode: borderless, the desktop mode
+    // never changed, and the world mode the engine is told about is the window's own
+    // size, so this file rather than core.ini decides what resolution GPL renders at.
+    // There is no option for handing that back, because the game's own policy -- switch
+    // the desktop to 640x480 and back twice a race -- is the thing this exists to stop.
+    int windowWidth = 0;
+    int windowHeight = 0;
 
-    // Make the render window one pixel short of the desktop.
+    // Where that window sits, relative to the monitor. -1 centres it. Ignored at 0x0,
+    // because an exact cover has only one place to be.
+    int windowX = -1;
+    int windowY = -1;
+
+    // How the 640x480 front end is scaled up to the window.
     //
-    // On by default, because this -- not WS_EX_TOPMOST -- turned out to be why the
-    // render window sat above everything: a borderless window exactly covering the
-    // screen gets handed fullscreen exclusivity by Windows, after which nothing
-    // composites over it, alt-tab included. Losing one pixel is worth being able to
-    // switch to another window while testing.
-    bool shrinkWindowByOnePixel = true;
+    //   0  whole-number scale, nearest-neighbour -- every source pixel becomes an exact
+    //      NxN block and the art keeps the shape it was drawn with, at the cost of a
+    //      wider border, since the smaller of the two integer factors wins
+    //   1  aspect-fit, nearest-neighbour -- as large as it goes, hard-edged, with uneven
+    //      block sizes because the scale is fractional
+    //   2  aspect-fit, linear (default) -- as large as it goes, smooth
+    //
+    // The menu is ALWAYS scaled. It cannot be laid out at any other size -- it is 85
+    // fixed 640x480 images with absolute widget coordinates and
+    // gpl_startupScreenInit_640x480 refuses to start on anything else -- so the moment
+    // the window stops being 640x480 the only question left is how.
+    int menuFilter = 2;
+
+    // Show the game's own black bars.
+    //
+    // They are a UI LAYOUT, not a clip: `bar = 50 * height / 480`, three panels, and the
+    // 3D view is one bitmapInstanceAlloc of the middle panel's rect. Off -- the default
+    // -- widens that rect through a rasterizer global gplvr already owns, grows the
+    // middle panel to the whole mode and hides the two bar panels through the screen's
+    // own layout virtual. No exe patch: three writable vtable slots.
+    //
+    // On installs none of it and the game keeps its 4:3 band.
+    bool enableLetterbox = false;
+
+    // Correct the field of view for a surface wider than 4:3.
+    //
+    // GPL fixes the HORIZONTAL angle and derives the vertical from the surface's shape,
+    // so a wider window shows LESS, not more -- a 2560x1440 window keeps three quarters
+    // of the design vertical field with the bars in, 95% with them out, and a 21:9 keeps
+    // far less than either. On widens the horizontal angle so the vertical field is the
+    // one the cockpit art and the mirrors were drawn for; off leaves the game's own,
+    // which on a wide window is the vanilla 4:3 view with less of it visible.
+    bool widescreenFix = false;
 
     // Break the frame budget into scene / present / gplvr / other, once a second.
     //
@@ -83,14 +109,6 @@ struct Options {
     // render timing stopped explaining the frame rate the moment vsync came off, and
     // `other` -- the part the hooks cannot see, which is GPL's own per-frame work
     // outside the world pass -- turned out to be four to six milliseconds.
-    // Make GPL's vertical-axis billboards face the eye rather than the view plane.
-    //
-    // On by default: it is the more correct construction everywhere, and on a monitor the
-    // difference is a few degrees. In a headset it is up to about 50 degrees at the edge
-    // of vision, which is what makes trees appear to turn as you move your head. See
-    // Billboard.h.
-    bool billboardFaceEye = true;
-
     // Rasterizer shim, stage 1: forward polyDraw and the state setters unchanged and
     // measure how many polygons fall between state changes.
     //
@@ -114,6 +132,34 @@ struct Options {
     // default: it writes one of the game's rasterizer globals.
     bool profilePolys = false;
 
+    // Open the two boxes `profileFrame` only weighs: GPL's own geometry counters, and a
+    // breakdown of `present` into driver submission, GPU drain and the swap.
+    //
+    // Both halves are close to free. The counters run whether anything reads them, and
+    // the glFinish being timed is one roglv2 issues itself -- so unlike `profileGpuWait`
+    // this changes nothing about the frame it measures. Off by default because it writes
+    // three of roglv2's import slots. See RenderProfile.h.
+    bool profileStages = false;
+
+    // Drop every polygon at the rasterizer boundary. The picture goes black, and what is
+    // left is the floor no renderer change can go below -- an upper bound on everything a
+    // shim, a merge or a GPU rasterizer could ever recover, for one lap of measurement.
+    //
+    // Mutually exclusive with `shimMeasure`: both want the polyDraw global.
+    bool nullDraw = false;
+
+    // Virtual-key code that toggles `nullDraw` while the game runs. 0 disables the key.
+    // The measurement wants the WORST frame on a track, and a worst frame has to be
+    // driven to, which cannot be done blind.
+    int nullDrawKey = 0;
+
+    // Write each EYE's own rectangle to a .tga next to the game, at the moment the frame
+    // is handed to the headset. Not the combined side-by-side the monitor shows -- the
+    // actual clipped halves, which is the picture that settles whether something is in
+    // the frame or only appears to be. 0 = off.
+    int dumpEyesKey = 0;
+
+
     // The OpenGL swap interval. 0 disables vsync, 1 enables it, -1 leaves the driver
     // default alone.
     //
@@ -123,17 +169,6 @@ struct Options {
     // budget into a cliff: overrun it and the frame costs 13.889 ms, so the rate steps
     // straight from 144 to 72 with nothing in between. See SwapControl.h.
     int swapInterval = 0;
-
-    // Swallow ChangeDisplaySettings[Ex] so the rasterizer stops switching the
-    // desktop between the menu mode and the sim mode.
-    //
-    // Off by default: it works (roglv2 uses the ExW variant), but on its own it
-    // leaves roglv2 with a 640x480 window sized for a mode that was never set. The
-    // window fight is documented in the README -- turn this on as a separate experiment.
-    bool blockDisplayChange = false;
-
-    // Swallow ClipCursor, which is what traps the pointer inside that window.
-    bool blockClipCursor = false;
 
     // Present in a headset. Launches gplvr-xr.exe, hands it the back buffer through a
     // shared D3D11 texture, and lets it own the OpenXR session.
@@ -240,6 +275,93 @@ struct Options {
     // is the only "distance" a projection layer has.
     float vrMenuScale = 0.5f;
 
+    // Gamma the presenter applies to everything it draws in the headset: the eyes, the menus
+    // and the HUD panel. 1.0 leaves the game's colours exactly as the monitor shows them;
+    // above 1.0 lifts mid-tones and shadows, with black and white staying put. 0.5 to 3.0.
+    float vrGamma = 1.0f;
+
+    // Debug: submit the game's eye images with the current display pose instead of the pose
+    // they were rendered from. Toggled at runtime by vrDebugSubmitCurrentPoseKey (Insert by
+    // default; 0 disables).
+    bool vrDebugSubmitCurrentPose = false;
+    int  vrDebugSubmitCurrentPoseKey = VK_INSERT;
+
+    // How far in front of the driver GPL's own in-race HUD appears, in metres. 0 puts it
+    // at infinity.
+    //
+    // The HUD is drawn once per eye at the same eye-local coordinates, which is zero
+    // disparity -- and for a block of 8-pixel text that is the uncomfortable case: the
+    // eyes are converged on cockpit geometry a metre away and have to diverge to infinity
+    // to fuse it. A few pixels of convergent disparity pulls it back to a dash distance
+    // and costs one addition per item.
+    //
+    // Converted to pixels through the runtime's OWN eye separation and the eye's focal
+    // length, so the answer is right for the person wearing the headset rather than for
+    // an assumed 63 mm. Without a tracked frame there is no separation to use, and the
+    // two copies stay identical.
+    float vrHudDepth = 0.0f;
+
+    // Where pribluda's overlay hangs in the headset: 0 not at all, 1 a panel that follows
+    // the head, 2 a panel fixed to the seat -- still while you look around, so it is read
+    // by looking at it, in the sharp middle of the lens.
+    //
+    // The panel is an OpenXR quad layer the runtime draws itself on every display frame and
+    // samples once, straight to the display, so it holds still and stays sharp however the
+    // game's own frames are paced. Its layout is gplvr_pribluda.ini. The seat is the pose
+    // at the last recentre, so a seat panel appears after the first one.
+    int vrHudLayer = 2;
+
+    // Where the panel hangs, one set per mode: its centre this many metres ahead, below and
+    // to the right, and its width in metres (the height follows the monitor's shape). It
+    // turns to face the eye from wherever it hangs. vrHudHead* are measured from the eyes and
+    // move with them, so a head panel sits at the same place in the lens whichever way you
+    // look; vrHudSeat* are measured from the head pose at the last recentre and stay in the
+    // car.
+    HudPlacement vrHudHead = {0.70f, 0.10f, 0.0f, 0.45f};
+    HudPlacement vrHudSeat = {0.70f, 0.25f, 0.0f, 0.60f};
+
+    // How dark pribluda's backdrop boxes are on the panel: 0 invisible, 1 solid black.
+    // pribluda's own boxes darken what is behind them to 70%, which is 0.30. The dash's
+    // boxes, solid black in pribluda, stay solid.
+    float vrHudBackdropOpacity = 0.30f;
+
+    // Text size on the panel, RELATIVE to pribluda's own: 1.0 keeps the share of the panel
+    // the text has of the monitor. Raise it if it is too small at this size and distance.
+    float vrHudTextScale = 1.0f;
+
+    // Switch the panel between following the head (vrHudLayer 1) and fixed to the seat (2)
+    // while the game runs. Home by default; 0 disables. With the panel off it turns it on,
+    // following the head, which needs no seat.
+    int vrHudLayerKey = VK_HOME;
+
+    // HUD tweak mode, for placing pribluda's elements on the panel from the headset. End by
+    // default; 0 disables. Pressed in a race with the panel drawn it outlines one element:
+    // the arrows move it, Page Up/Down select another, and the key again leaves and writes
+    // the positions to gplvr_pribluda.ini. Independent of vrHudLayerKey.
+    int vrHudTweakKey = VK_END;
+
+    // How fast the arrows move an element in tweak mode, in fractions of the panel per second.
+    float vrHudTweakSpeed = 0.10f;
+
+    // Which eye GPL's OWN in-race text is drawn into: 0 both, 1 the left only, 2 the right
+    // only.
+    //
+    // Both is only comfortable when the two copies fuse, and that depends on vrHudDepth
+    // putting them at a distance the eyes are already converged near. One eye cannot be
+    // fused wrongly because there is nothing to fuse; the brain overlays it the way it
+    // does a monocle. Turns the disparity off, since a single copy has none. Pribluda's
+    // overlay is on the panel instead; see vrHudLayer.
+    int vrHudEye = 0;
+
+    // Move each eye to where it will be when its frame is actually displayed.
+    //
+    // GPL's frame follows its sim tick, not the headset, so a frame reaches a display one
+    // or two periods after the one its pose was predicted for, varying frame to frame. The
+    // runtime reprojects orientation but not position, so near geometry steps as the head
+    // moves sideways. With this on, the presenter publishes the head's velocity and its
+    // display clock, and each eye is moved by its velocity over the displays in between.
+    bool vrPredictPosition = true;
+
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //
     // 1.0 keeps the recommendation, which for a Pico 4 is around 3172x3172. Below 1.0
@@ -327,10 +449,46 @@ void requestSceneRenderHook(const Binding& binding);
 // into our own hooks. Must be called before any patching.
 void setSelfModule(HMODULE module);
 
+// Is the pointer currently clipped to a rectangle at the game's request?
+//
+// roglv2 issues ClipCursor with the window rect once per mode activate and never
+// revisits it, so a window that moves afterwards leaves the pointer trapped in the rect
+// the window used to have. Anything that moves the window has to say so.
+void setCursorClip(const RECT& rect);
+
+// Take our window proc back out of the chain, if it is still the outermost one. Called
+// at DLL_PROCESS_DETACH; the proc also unchains itself at WM_NCDESTROY, whichever comes
+// first. Forwarding into roglv2 after it unloads is the shutdown crash at
+// rogl_windowProc, and leaving our own proc installed while this DLL unloads would be
+// the same fault with the modules swapped.
+void windowProcUnchain();
+
+// True once this frame's pixels have been handed to the headset. Anything drawn after
+// that reaches the monitor and not the eyes, which is the difference between "the HUD is
+// in the wrong place" and "the HUD is drawn too late to be seen".
+bool frameAlreadyPublished();
+void releaseCursorClip();
+
+// Whether the game should keep rendering and presenting without the foreground.
+//
+// `renderWhenUnfocused`, or VR, which implies it. One function rather than the expression
+// written out at each of the four sites that need it -- they must agree, and four copies
+// of a condition eventually do not.
+bool keepDrawingWhileUnfocused();
+
 // Rewrites ChangeDisplaySettings* entries in one module's import table.
 // Call once per loaded module; safe to call repeatedly.
 void patchDisplaySettingsImports(HMODULE module);
 
 void patchDisplaySettingsImportsEverywhere();
+
+// Redirect ONE named import of ONE module, keeping the original in `original`.
+//
+// Separate from the sweep above because some hooks must not be applied everywhere:
+// ScreenToClient is rewritten in gplc67 only, where it has a single call site inside
+// gpl_mouseReadClientDelta, and rewriting the rasterizer's copy as well would corrupt
+// coordinate arithmetic that has nothing to do with the front end.
+bool patchModuleImport(HMODULE module, const char* name, void* replacement,
+                       void** original);
 
 }  // namespace gplvr

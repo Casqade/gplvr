@@ -57,8 +57,14 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight);
 // in their chair.
 void vrRequestRecentre();
 
-// The raw runtime views the last successful vrAcquireEyes consumed, unchanged and still
-// in the presenter's own reference space. The producer echoes these back with the frame
+// Publish the seat now, for a layer that needs one: the recentre pose if there is one,
+// otherwise the newest head pose the presenter published, taken as the recentre is. False
+// when there is neither.
+bool vrPublishSeat();
+
+// The runtime views the last successful vrAcquireEyes rendered from, still in the
+// presenter's own reference space: orientation and fov as published, eye positions moved
+// forward by the position prediction when it is on. The producer echoes these back with the frame
 // so the presenter can submit the pose the image was actually drawn from.
 bool vrLastRenderedViews(SharedView out[2]);
 
@@ -100,5 +106,9 @@ void vrClearRendered();
 // presenter needs to know: an image that already carries the runtime's exact fov must be
 // stretched to fill the swapchain, not aspect-fitted into it.
 bool vrFrustumInjected();
+
+// A frame has just been handed to the presenter. Times the span from reading the pose it
+// was rendered with to this moment, which is how far ahead position prediction has to look.
+void vrNoteFramePublished();
 
 }  // namespace gplvr

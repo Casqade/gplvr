@@ -164,7 +164,7 @@ const char* refusalText(Refusal reason, char* scratch, size_t scratchSize) {
                    "glPushAttrib, glPushMatrix, glPolygonMode, glColorMask, "
                    "glCopyTexSubImage2D and glViewport all have to be there";
         case Refusal::NoViewport:
-            return "the GL viewport has no area, so there is no surface to draw into";
+            return "the destination surface has no area, so there is nothing to draw into";
         case Refusal::NoWindow:
             return "the game window could not be found, so a screen position cannot be "
                    "turned into a surface position";
@@ -745,20 +745,6 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
         return;
     }
 
-    // The viewport, not a remembered size. It is what the engine last set from its own
-    // display fields, and it is true of the framebuffer that is bound right now --
-    // whichever of the two that is, the 640x480 menu back buffer or the off-screen
-    // target. A size carried in from elsewhere would be a second copy of a number that
-    // already exists here, and two copies of one number eventually disagree.
-    GLint viewport[4] = {0, 0, 0, 0};
-    gl.getIntegerv(GL_VIEWPORT, viewport);
-    const int surfaceW = viewport[2];
-    const int surfaceH = viewport[3];
-    if (surfaceW <= 0 || surfaceH <= 0) {
-        noteRefusal(Refusal::NoViewport);
-        return;
-    }
-
     // Which framebuffer this frame went into -- asked BEFORE the drain below, on
     // purpose. A driver with no framebuffer objects raises INVALID_ENUM on this query
     // rather than answering, and asking after the drain would leave that error to be
@@ -779,10 +765,35 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
 
     RECT client = {};
     GetClientRect(window, &client);
-    const long clientW = client.right - client.left;
-    const long clientH = client.bottom - client.top;
+    long clientW = client.right - client.left;
+    long clientH = client.bottom - client.top;
     if (clientW <= 0 || clientH <= 0) {
         noteRefusal(Refusal::NoClientArea);
+        return;
+    }
+
+    // The surface this frame is going to be presented from, in its own pixels.
+    // Framebuffer 0 IS the window's client area, so the client rect answers it there; a
+    // framebuffer object is described by the viewport the engine set when it bound it.
+    //
+    // The viewport alone used to answer this for both. It stopped answering when the
+    // front end gained a scaled path: the menu is drawn at 640x480 into its own
+    // framebuffer and blitted out to the window, and by the time the blit is done the
+    // viewport is still the 640x480 the rasterizer set while the bound framebuffer is
+    // the window. Reading it then drew the pointer 1:1 into the window's bottom-left
+    // corner -- the bottom corner rather than a random one because GL counts y up from
+    // there.
+    GLint surface[4] = {0, 0, 0, 0};
+    if (framebuffer == 0) {
+        surface[2] = static_cast<GLint>(clientW);
+        surface[3] = static_cast<GLint>(clientH);
+    } else {
+        gl.getIntegerv(GL_VIEWPORT, surface);
+    }
+    int surfaceW = surface[2];
+    int surfaceH = surface[3];
+    if (surfaceW <= 0 || surfaceH <= 0) {
+        noteRefusal(Refusal::NoViewport);
         return;
     }
 
@@ -795,7 +806,7 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     ScreenToClient(window, &local);
 
     // Clamped rather than dropped when it is outside. ClipCursor normally keeps the
-    // pointer inside the window, but blockClipCursor = 1 turns that off, and a cursor
+    // pointer inside the window, but it is released whenever focus goes, and a cursor
     // pinned to the edge it left by is more use than one that vanishes -- it says "the
     // pointer is off that side", which is the question being asked.
     float fx = static_cast<float>(local.x) / static_cast<float>(clientW);
@@ -882,7 +893,13 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     // group, not in GL_COLOR_BUFFER_BIT, and the save sets it explicitly.
     gl.pushAttrib(static_cast<GLbitfield>(
         GL_ENABLE_BIT | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT |
-        GL_POLYGON_BIT | GL_SCISSOR_BIT | GL_TEXTURE_BIT | GL_PIXEL_MODE_BIT));
+        GL_POLYGON_BIT | GL_SCISSOR_BIT | GL_TEXTURE_BIT | GL_PIXEL_MODE_BIT |
+        GL_VIEWPORT_BIT));
+
+    // The ortho below is in surface pixels, and the viewport is what turns those back
+    // into pixels of the bound framebuffer -- so both have to describe the same surface.
+    // GL_VIEWPORT_BIT above is what puts the engine's own back afterwards.
+    gl.viewport(surface[0], surface[1], surfaceW, surfaceH);
 
     gl.matrixMode(GL_PROJECTION);
     gl.pushMatrix();
@@ -972,7 +989,7 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     g_pending.framebuffer = framebuffer;
     g_pending.slot[0].held = false;
     g_pending.slot[1].held = false;
-    for (int i = 0; i < 4; ++i) g_pending.viewport[i] = viewport[i];
+    for (int i = 0; i < 4; ++i) g_pending.viewport[i] = surface[i];
 
     // Which buffer the copy reads, said rather than inherited. GL_BACK is not a legal
     // read buffer for a framebuffer object -- that exact mistake cost three runs in the
@@ -981,7 +998,7 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
         gl.readBuffer(framebuffer ? kGlColorAttachment0 : static_cast<GLenum>(GL_BACK));
 
     for (int i = 0; i < count; ++i) {
-        if (saveUnderCursor(gl, g_pending.slot[i], quads[i], viewport)) {
+        if (saveUnderCursor(gl, g_pending.slot[i], quads[i], surface)) {
             g_pending.count = count;
             g_pending.armed = true;
         }
@@ -1042,14 +1059,14 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
         g_cursor.lastSideBySide = sideBySideNow;
         g_cursor.lastEyeRects = eyeRectsNow;
         logf("cursor: drawing the system cursor bitmap into framebuffer %u (%s), "
-             "viewport %dx%d, from a %ldx%ld client area -- %s%s",
+             "surface %dx%d, from a %ldx%ld client area -- %s%s",
              framebuffer,
              framebuffer ? "the off-screen target" : "the window's own back buffer",
              surfaceW, surfaceH, clientW, clientH,
              sideBySide ? (usedStereoRects
                                ? "two eyes, one in each of the stereo eye rects"
                                : "two eyes, but the eye rects were unavailable so the "
-                                 "halves of the viewport are used")
+                                 "halves of the surface are used")
                         : "one image for both eyes, one cursor",
              g_cursor.stateReportsLeft
                  ? ""

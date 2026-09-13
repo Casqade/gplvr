@@ -45,16 +45,49 @@ public:
     bool update();
 
     // Draws eye 0 or 1 into the given render target. Safe to call only after update()
-    // has returned true.
+    // has returned true. `decodeSrgb` converts the game's sRGB pixels to linear first, for a
+    // target view that encodes on write.
     bool drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                 int eye);
+                 int eye, bool decodeSrgb);
 
     // The poses the current frame was rendered from. False means the game is not
     // tracking yet, in which case the caller should fall back to the located views --
     // the picture will be head-locked, but there is nothing better to submit.
     bool renderedViews(SharedView out[2]) const;
 
-    void publishViews(const SharedView views[2], const SharedPose& head, bool valid);
+    // The game frame the last update() latched, for telling a new image from a repeat.
+    int32_t latchedSequence() const { return current_.sequence; }
+
+    // vrDebugSubmitCurrentPose as the game last published it.
+    bool submitCurrentPose() const { return block_ && block_->submitCurrentPose != 0; }
+
+    // The HUD panel as the game published it. False when there is nothing to show: the
+    // layer is off, or no texture has been shared yet. On true, `layer` is 1 for
+    // head-locked or 2 for the seat, placement is in metres (see ControlBlock), and
+    // `sequence` names the newest complete image.
+    struct HudPanel {
+        int32_t  layer = 0;
+        float    right = 0.0f;
+        float    up = 0.0f;
+        float    ahead = 0.0f;
+        float    width = 0.0f;
+        uint32_t textureWidth = 0;
+        uint32_t textureHeight = 0;
+        int32_t  sequence = 0;
+    };
+    bool hudPanel(HudPanel& out);
+
+    // Draw HUD image `sequence` into a render target at full size, alpha kept. Only after
+    // hudPanel returned true. `decodeSrgb` as for drawEye.
+    bool drawHud(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                 int32_t sequence, bool decodeSrgb);
+
+    // The seat pose and the generation it was published under. False until the game has
+    // recentred at least once.
+    bool seat(SharedPose& out, int32_t& generation) const;
+
+    void publishViews(const SharedView views[2], const SharedPose& head, bool valid,
+                      const SharedMotion& motion);
 
     // Tell the game whether the runtime allows a modified fov. False means a submitted
     // fov is ignored rather than honoured, so the eye cameras must render exactly what
@@ -75,6 +108,7 @@ private:
 
     bool openTextures();
     void releaseTextures();
+    void releaseHud();
 
     HANDLE        mapping_ = nullptr;
     ControlBlock* block_ = nullptr;
@@ -110,6 +144,10 @@ private:
     };
 
     Slot     slots_[kFrameSlots] = {};
+    Slot     hudSlots_[kFrameSlots] = {};
+    int32_t  hudGeneration_ = 0;
+    uint32_t hudWidth_ = 0;
+    uint32_t hudHeight_ = 0;
     Frame    current_;
     int32_t  openedGeneration_ = 0;
     uint32_t sourceWidth_ = 0;

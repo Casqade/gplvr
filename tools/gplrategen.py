@@ -1532,6 +1532,44 @@ FLAGMAN_MASK_SITES = [
     (0x004817D5, 3, "flagman state 6: frame 0..10, wraps"),
 ]
 
+# THE TRACKSIDE-SCENERY ANIMATION CLOCK. The animation DATA is baked into each track's .3do
+# files; the PHASE is not, and it lives here.
+#
+# Every trackside object is drawn through the 36-entry node table at 0x00570330, and of its
+# 36 handlers exactly one reads a clock: node type 17 (0x004CF9B0), a variable-driven child
+# selector, through gpl_lodEvaluateVariable (0x004CF7E0) variable kind 3:
+#
+#     value = getBGCount() % period       ; getBGCount is `mov eax, gpl_taskBGTickCounter`
+#
+# A raw sim-tick count with no dt anywhere downstream, so it runs rate/36 times too fast.
+# 118 kind-3 nodes ship in the installed tracks -- Spa's flag1, Zandvoort's flagan1, AAIOM's
+# bird, and Spa67's and Targa's waving trees and spectator groups. Nothing outside tracks\
+# uses kind 3, so no car, cockpit or UI model is affected.
+#
+# THE COUNTER IS DIVIDED, NOT THE PERIOD. Operator 5 uses the value as a direct index into
+# the node's case array, so it has to stay in 0..period-1; widening the period would index
+# past the array. The period comes from track data and is not ours to touch, so exactly one
+# scaling is applied and this is not a gate/quantity pair.
+#
+# The rewrite preserves the length. Three bytes for the `sar` are bought by replacing
+# `mov [esp+4], edx; fild [esp+4]` (8 bytes) with `push edx; fild [esp]; pop eax` (5); the
+# stack local the entry `push ecx` allocated goes unused and the epilogue's `pop ecx` still
+# balances. Clobbers are identical (eax, edx) and one value is left on the x87 stack, as
+# before. 0x004CF85D, the default/case-5 arm, is a live jump-table target and is untouched.
+SCENERY_ANIM_VA = 0x004CF84E
+SCENERY_ANIM_STOCK = bytes.fromhex("99" "f77e04" "89542404" "db442404" "5e59c3")
+
+
+def _scenery_anim_block(shift):
+    """The kind-3 arm of gpl_lodEvaluateVariable, with the counter shifted right first."""
+    return (b"\xc1\xf8" + bytes([shift])   # sar  eax, shift
+            + b"\x99"                      # cdq
+            + b"\xf7\x7e\x04"              # idiv dword ptr [esi+4]
+            + b"\x52"                      # push edx
+            + b"\xdb\x04\x24"              # fild dword ptr [esp]
+            + b"\x58"                      # pop  eax
+            + b"\x5e\x59\xc3")             # pop esi; pop ecx; retn
+
 # GEOMETRIC PER-TICK COEFFICIENTS. These do NOT follow this file's stock*scale^k rule, and
 # scaling one linearly is a silent bug -- 0.995 at rate^-1 would become 0.2488, which is not
 # a slow decay but an almost total one.
@@ -1634,6 +1672,30 @@ AI_COUNTDOWN_SITES = [
     # plus a `cmp`. The class has nine members across the AI ranges and is now closed.
     (0x00444B58,  18, 1, "the off-track give-up counter's threshold (car+1171), on the "
                          "same post-contact path as the four line holds"),
+    # THE TENTH MEMBER OF THAT CLASS (v33), found 2026-09-09 while investigating a bot that
+    # crashed and would not recover. It is not on the crash path -- the spin was stock, see
+    # report 21 -- but it is the same up-counter shape and the sweep had missed it.
+    #
+    # gpl_aiState_tickDecisionsAndCorridorClamp clamps the AI's dlat position back inside
+    # the .lp corridor when it strays outside, and feeds the clipped delta into car+518,
+    # car+522 and car+526. car+1151 counts CONSECUTIVE ticks it has been doing that, and
+    # `cmp eax, 0Bh; jge` STOPS correcting past 11 -- a give-up window, reset to zero the
+    # moment the car is back inside. A plain integer compared against an integer with no dt
+    # anywhere downstream, so rate^+1: 0.306 s of correction at 36 Hz, 0.076 s at 144.
+    #
+    # Scaling the count preserves both the wall-clock window AND the total correction
+    # authority, because the per-tick excursion the clamp corrects is itself 4x smaller at
+    # 144 Hz. Nothing of ours scales that delta -- it is computed at runtime from the .lp
+    # offsets -- so this is not a gate-and-quantity pair.
+    #
+    # Exclusivity: a 0x47F displacement sweep gives 7 hits. Three are this function (read
+    # 0x496A20, write 0x496A2C, reset 0x496A8F), one is the ctor zeroing it at 0x44AFCC
+    # alongside car+1147 and car+1159, and the remaining three (0x415192, 0x48BE84,
+    # 0x53337D) decode as coincidental bytes inside unrelated instructions, not struct
+    # accesses. Reached from nine of the fifteen line-state vtables via slot 6, i.e. the
+    # ordinary racing states and NOT the crash states.
+    (0x00496A26,  11, 1, "the .lp corridor-correction give-up window (car+1151) in "
+                         "gpl_aiState_tickDecisionsAndCorridorClamp"),
 ]
 
 PAT = re.compile(
@@ -2167,11 +2229,29 @@ def build(exe_path, ref_xml, rate):
                              "terms" % (note, mask + 1, rate))
             site.out = site.ref
             sites.append(site)
+
+        # The trackside scenery animation clock. See SCENERY_ANIM_VA.
+        shift = int(steps).bit_length() - 1
+        off = image.offset(SCENERY_ANIM_VA)
+        if off is None or data[off:off + len(SCENERY_ANIM_STOCK)] != SCENERY_ANIM_STOCK:
+            raise SystemExit(
+                "REFUSED: %08X does not hold `cdq; idiv [esi+4]; mov [esp+4], edx; "
+                "fild [esp+4]; pop esi; pop ecx; retn` -- gpl_lodEvaluateVariable's kind-3 "
+                "arm is not the code this fix was built for." % SCENERY_ANIM_VA)
+        scenery = _scenery_anim_block(shift)
+        site = Site(SCENERY_ANIM_VA, SCENERY_ANIM_VA, SCENERY_ANIM_STOCK, scenery,
+                    "rate-conversion",
+                    note="trackside scenery animation clock: getBGCount() >> %d before the "
+                         "modulo, so a 12-tick flag cycle stays 1/3 s of wall clock at %g Hz "
+                         "instead of cycling %gx too fast" % (shift, rate, steps))
+        site.out = scenery
+        sites.append(site)
     else:
         sys.stderr.write(
             "note: rate/36 = %g is not a power of two, so the flagman animation masks "
-            "cannot be widened (they are `test dl, imm8`); the flagmen will wave %gx too "
-            "fast.\n" % (steps, steps))
+            "cannot be widened (they are `test dl, imm8`) and the trackside scenery clock "
+            "cannot be shifted (it is `sar eax, imm8`); the flagmen will wave and the "
+            "scenery animate %gx too fast.\n" % (steps, steps))
 
     detour = b"\xe9" + struct.pack("<i", V13_CAVE_VA - (V13_DETOUR_VA + 5)) + b"\x90" * 5
     site = Site(V13_DETOUR_VA, V13_DETOUR_VA, V13_DETOUR_STOCK, detour, "rate-conversion",
@@ -2666,6 +2746,15 @@ def xml_comment_safe(text):
     return COMMENT.sub(fix, text)
 
 
+# The two sections GEM+ appends to the image, and how far apart they are. Read off the
+# section table of a built exe: modtext at 0x00980000 with a 0x80000 virtual span,
+# moddata at 0x00A08000 with 0x20000. Only the bases matter here -- they are what decides
+# which of this patch's sites belongs to which section.
+MODTEXT_VA = 0x00980000
+MODDATA_VA = 0x00A08000
+SECTION_SPAN = 0x00080000
+
+
 def emit(sites, rate, substeps, physics_hz, ref_name):
     out = io.StringIO()
     out.write("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<GPLPatch>\n\n")
@@ -2678,6 +2767,31 @@ def emit(sites, rate, substeps, physics_hz, ref_name):
               % (physics_hz, rate, substeps))
     out.write("        The AI's OTHER half is in gpla67.ini, in ticks, and no exe\n")
     out.write("        patch touches it. See STATUS.md. -->\n\n")
+
+    # THE SECTIONS THIS PATCH'S CAVES LIVE IN, DECLARED BY THIS PATCH.
+    #
+    # They used to be left to the DLL on the reasoning that <ExeSection> is its business.
+    # That was wrong in a way nothing could see until the letterbox patch was taken out of
+    # the build: modtext's raw data only reached 0x00988C00 because '77Dv3 No Letterbox'
+    # asks for 0x8AE0 and the file alignment rounds it up, and the caves here end at
+    # 0x00988BFF -- ONE BYTE inside a boundary a completely unrelated patch happened to
+    # create. Drop that patch and GPLPatchDLL asserts on
+    # `section_offset + length <= GetSectionFileSize`, which names neither the cause nor
+    # the missing dependency.
+    #
+    # A patch is responsible for the room its own caves need. MinimumFileSize is a floor,
+    # so declaring it can only ever grow a section another patch already sized, never
+    # shrink it, and the numbers below are derived from the sites rather than written down.
+    for section, base in (("modtext", MODTEXT_VA), ("moddata", MODDATA_VA)):
+        top = max((s.xml_va + len(s.out) for s in sites
+                   if base <= s.xml_va < base + SECTION_SPAN), default=None)
+        if top is None:
+            continue
+        out.write("   <ExeSection>\n")
+        out.write("      <Name>%s</Name>\n" % section)
+        out.write("      <!-- highest byte this patch writes here: 0x%08X -->\n" % (top - 1))
+        out.write("      <MinimumFileSize>0x%08X</MinimumFileSize>\n" % (top - base))
+        out.write("   </ExeSection>\n\n")
 
     for s in sites:
         out.write("   <BinaryPatch>\n")

@@ -21,6 +21,9 @@ cbuffer Blit : register(b0)
     float4 fit;
     // xy: the eye's sub-rect origin in the source, zw: its size.
     float4 rect;
+    // x: 1 decodes the source from sRGB to linear before writing it.
+    // y: gamma, applied to the game's colours first; 1 leaves them alone.
+    float4 colour;
 };
 
 Texture2D    source : register(t0);
@@ -57,7 +60,20 @@ float4 PixelMain(Varying input) : SV_TARGET
     {
         uv.y = 1.0 - uv.y;
     }
-    return float4(source.Sample(linearClamp, uv).rgb, 1.0);
+    float4 texel = source.Sample(linearClamp, uv);
+    // GPL's pixels are sRGB-encoded. Written through an sRGB view they would be encoded a
+    // second time, so for such a target they are decoded first and the view restores them.
+    float3 rgb = texel.rgb;
+    if (colour.y > 0.0 && abs(colour.y - 1.0) > 0.001)
+    {
+        rgb = pow(saturate(rgb), 1.0 / colour.y);
+    }
+    if (colour.x > 0.5)
+    {
+        rgb = rgb <= 0.04045 ? rgb / 12.92 : pow((rgb + 0.055) / 1.055, 2.4);
+    }
+    // fit.w: 1 keeps the source's alpha, for a panel composited over the scene.
+    return float4(rgb, fit.w > 0.5 ? texel.a : 1.0);
 }
 )";
 
@@ -83,6 +99,7 @@ ID3DBlob* compile(const char* entry, const char* target) {
 struct BlitConstants {
     float fit[4];
     float rect[4];
+    float colour[4];
 };
 
 }  // namespace
@@ -390,7 +407,7 @@ bool Consumer::update() {
 }
 
 bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                       int eye) {
+                       int eye, bool decodeSrgb) {
     if (!target || !context_ || !block_ || !sourceWidth_ || !sourceHeight_)
         return false;
 
@@ -400,7 +417,7 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
 
     // The eye's sub-rect in the source, in texture coordinates.
     // Sample exactly the rect the game rendered, which is not necessarily half the
-    // texture. shrinkWindowByOnePixel makes the buffer 2559 wide; the game then renders
+    // texture. An odd render width -- 2559, say -- makes the buffer 2559 wide; the game then renders
     // columns 0-1278 and 1279-2557 and leaves 2558 belonging to nobody. A clean 0.5
     // split would sample the right eye from 1279.5 onwards -- half a pixel off, and
     // reading that dead column at the edge. Roughly 0.04 degrees of horizontal disparity
@@ -472,6 +489,8 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     constants.rect[1] = rectTop;
     constants.rect[2] = rectWidth;
     constants.rect[3] = rectHeight;
+    constants.colour[0] = decodeSrgb ? 1.0f : 0.0f;
+    constants.colour[1] = block_->gamma;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context_->Map(constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -520,6 +539,135 @@ bool Consumer::renderedViews(SharedView out[2]) const {
     return true;
 }
 
+void Consumer::releaseHud() {
+    for (Slot& slot : hudSlots_) {
+        if (slot.view) slot.view->Release();
+        if (slot.texture) slot.texture->Release();
+        slot.view = nullptr;
+        slot.texture = nullptr;
+    }
+    hudWidth_ = 0;
+    hudHeight_ = 0;
+}
+
+bool Consumer::hudPanel(HudPanel& out) {
+    if (!block_ || !device_) return false;
+    out.layer = block_->hudLayer;
+    if (out.layer != 1 && out.layer != 2) return false;
+
+    int32_t generation = block_->hudGeneration;
+    if (!generation) return false;
+
+    // Opened once per generation, whether or not it works: a handle that cannot be opened
+    // now will not open on the next frame either, and trying 90 times a second would only
+    // repeat the log line.
+    if (generation != hudGeneration_) {
+        releaseHud();
+        hudGeneration_ = generation;
+        for (uint32_t index = 0; index < kFrameSlots; ++index) {
+            HANDLE handle = loadSharedHandle(block_->hudTextures[index]);
+            HRESULT opened =
+                handle ? device_->OpenSharedResource(handle, __uuidof(ID3D11Texture2D),
+                                                     (void**)&hudSlots_[index].texture)
+                       : E_HANDLE;
+            if (FAILED(opened) || !hudSlots_[index].texture) {
+                logf("present: the HUD panel's slot %u could not be opened (hr=0x%08lX)",
+                     index, (unsigned long)opened);
+                hudSlots_[index].texture = nullptr;
+                releaseHud();
+                return false;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc = {};
+            viewDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            viewDesc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(hudSlots_[index].texture, &viewDesc,
+                                                         &hudSlots_[index].view))) {
+                logf("present: CreateShaderResourceView failed for HUD panel slot %u",
+                     index);
+                releaseHud();
+                return false;
+            }
+        }
+        hudWidth_ = block_->hudTextureWidth;
+        hudHeight_ = block_->hudTextureHeight;
+        logf("present: opened the HUD panel textures at %ux%u, generation %d", hudWidth_,
+             hudHeight_, generation);
+    }
+    if (!hudSlots_[0].view || !hudWidth_ || !hudHeight_) return false;
+
+    out.right = block_->hudRight;
+    out.up = block_->hudUp;
+    out.ahead = block_->hudAhead;
+    out.width = block_->hudWidth;
+    out.textureWidth = hudWidth_;
+    out.textureHeight = hudHeight_;
+    out.sequence = block_->hudSequence;
+    return true;
+}
+
+bool Consumer::drawHud(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                       int32_t sequence, bool decodeSrgb) {
+    if (!target || !context_ || !constants_) return false;
+    ID3D11ShaderResourceView* source =
+        hudSlots_[static_cast<uint32_t>(sequence) % kFrameSlots].view;
+    if (!source) return false;
+
+    // The whole texture, flipped because GL drew it bottom-up, alpha kept.
+    BlitConstants constants = {};
+    constants.fit[0] = 1.0f;
+    constants.fit[1] = 1.0f;
+    constants.fit[2] = 1.0f;
+    constants.fit[3] = 1.0f;
+    constants.rect[2] = 1.0f;
+    constants.rect[3] = 1.0f;
+    constants.colour[0] = decodeSrgb ? 1.0f : 0.0f;
+    constants.colour[1] = block_ ? block_->gamma : 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context_->Map(constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        return false;
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_->Unmap(constants_, 0);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(width);
+    viewport.Height = static_cast<float>(height);
+    viewport.MaxDepth = 1.0f;
+
+    const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context_->OMSetRenderTargets(1, &target, nullptr);
+    context_->OMSetBlendState(blend_, blendFactor, 0xFFFFFFFF);
+    context_->RSSetState(rasterizer_);
+    context_->RSSetViewports(1, &viewport);
+    context_->IASetInputLayout(nullptr);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(vertexShader_, nullptr, 0);
+    context_->PSSetShader(pixelShader_, nullptr, 0);
+    context_->PSSetShaderResources(0, 1, &source);
+    context_->PSSetSamplers(0, 1, &sampler_);
+    context_->PSSetConstantBuffers(0, 1, &constants_);
+    context_->Draw(3, 0);
+
+    ID3D11ShaderResourceView* none = nullptr;
+    context_->PSSetShaderResources(0, 1, &none);
+    return true;
+}
+
+bool Consumer::seat(SharedPose& out, int32_t& generation) const {
+    if (!block_) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int32_t before = block_->seatGeneration;
+        if (!before) return false;
+        out = block_->seatPose;
+        if (block_->seatGeneration == before) {
+            generation = before;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Consumer::publishFovMutable(bool mutableFov) {
     if (!block_) return;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->fovMutable),
@@ -527,12 +675,13 @@ void Consumer::publishFovMutable(bool mutableFov) {
 }
 
 void Consumer::publishViews(const SharedView views[2], const SharedPose& head,
-                            bool valid) {
+                            bool valid, const SharedMotion& motion) {
     if (!block_) return;
 
     block_->views[0] = views[0];
     block_->views[1] = views[1];
     block_->headPose = head;
+    block_->motion = motion;
     block_->viewsValid = valid ? 1 : 0;
 
     // Payload before the sequence, so a reader that checks the sequence twice around its
@@ -559,6 +708,7 @@ bool Consumer::producerAlive() const {
 
 void Consumer::close() {
     releaseTextures();
+    releaseHud();
 
     if (rasterizer_) rasterizer_->Release();
     if (blend_) blend_->Release();

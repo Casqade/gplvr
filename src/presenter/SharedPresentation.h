@@ -42,7 +42,7 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 5;  // 5: targetEye* replaces recommendedEye*
+inline constexpr uint32_t kControlVersion = 10;  // 10: submitCurrentPose
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -81,6 +81,41 @@ struct SharedView {
     SharedPose pose;
     SharedFov  fov;
 };
+
+// A QueryPerformanceCounter value, split in halves like the texture handle so the field
+// has the same shape in both builds whatever each compiler does with a 64-bit member's
+// alignment. QPC is one clock for the whole machine, so a value taken in one process names
+// the same instant in the other.
+struct SharedQpc {
+    uint32_t low = 0;
+    uint32_t high = 0;
+};
+
+inline void storeQpc(SharedQpc& slot, int64_t value) {
+    slot.low = static_cast<uint32_t>(static_cast<uint64_t>(value));
+    slot.high = static_cast<uint32_t>(static_cast<uint64_t>(value) >> 32);
+}
+
+inline int64_t loadQpc(const SharedQpc& slot) {
+    return static_cast<int64_t>(static_cast<uint64_t>(slot.low) |
+                                (static_cast<uint64_t>(slot.high) << 32));
+}
+
+// How the head is moving, and the display clock the views belong to. Published with every
+// set of views so the game can move its eyes to where they will be when the frame it is
+// about to render actually reaches the display.
+struct SharedMotion {
+    float     linearVelocity[3] = {};   // m/s, presenter LOCAL space
+    float     angularVelocity[3] = {};  // rad/s, presenter LOCAL space
+    int32_t   flags = 0;                // kMotion* bits
+    SharedQpc displayTime;              // when these views are displayed
+    SharedQpc latchTime;                // when the presenter took the game frame shown then
+    SharedQpc period;                   // one display frame
+};
+
+inline constexpr int32_t kMotionLinear = 1;
+inline constexpr int32_t kMotionAngular = 2;
+inline constexpr int32_t kMotionTiming = 4;
 
 // A legacy D3D11 shared handle -- IDXGIResource::GetSharedHandle, not an NT handle. It
 // is valid in any process on the same adapter, which is what makes this work across the
@@ -208,6 +243,7 @@ struct ControlBlock {
     volatile int32_t fovMutable = 0;
     SharedPose       headPose;
     SharedView       views[2];
+    SharedMotion     motion;
 
     // -- the pose this frame was RENDERED from, echoed back in the presenter's own
     // LOCAL space. Published before frameSequence.
@@ -240,6 +276,44 @@ struct ControlBlock {
     // centimetres from the face.
     float monoScale = 0.5f;
 
+    // vrGamma, applied by the presenter to everything it draws: the eyes and the HUD panel.
+    // 1 leaves the game's colours as they are; above 1 lifts the mid-tones.
+    float gamma = 1.0f;
+
+    // vrDebugSubmitCurrentPose: nonzero submits the game's eye images with the pose located
+    // for this display instead of the pose they were rendered from. The world then gets no
+    // rotational reprojection; a diagnostic for the HUD panel's judder.
+    int32_t submitCurrentPose = 0;
+
+    // -- pribluda's overlay on a quad layer, producer to presenter ------------------
+    //
+    // hudLayer: 0 no panel, 1 head-locked (VIEW space), 2 fixed to the seat. The panel's
+    // centre sits hudRight / hudUp / hudAhead metres from the head or the seat, in OpenXR's
+    // axes with ahead along -z; it faces the eye, and hudWidth is its width in metres, the
+    // height following the texture's aspect.
+    volatile int32_t hudLayer = 0;
+    float            hudRight = 0.0f;
+    float            hudUp = 0.0f;
+    float            hudAhead = 0.0f;
+    float            hudWidth = 0.0f;
+
+    // The panel's pixels, in two slots written alternately like the frame textures:
+    // B8G8R8A8 with coverage in alpha, stored bottom-up. hudGeneration moves when the
+    // textures are recreated -- handles and size are written before it -- and hudSequence
+    // when a new image is complete; the image is in slot (hudSequence % kFrameSlots).
+    SharedTextureHandle hudTextures[kFrameSlots] = {};
+    uint32_t            hudTextureWidth = 0;
+    uint32_t            hudTextureHeight = 0;
+    volatile int32_t    hudGeneration = 0;
+    volatile int32_t    hudSequence = 0;
+
+    // The seat: the head pose captured at the last recentre, in the presenter's own LOCAL
+    // space, heading only -- the same origin the game renders the eyes relative to. A
+    // seat-locked layer is placed in a reference space built from it. The pose is written
+    // before seatGeneration is bumped, so a new generation means the pose beside it is new.
+    volatile int32_t seatGeneration = 0;
+    SharedPose       seatPose;
+
     // -- counters, for the log and nothing else --------------------------------------
     volatile int32_t producedFrames = 0;
     volatile int32_t presentedFrames = 0;
@@ -250,6 +324,7 @@ static_assert(std::is_standard_layout_v<ControlBlock>,
               "the control block is mapped into two processes; it must be POD-shaped");
 static_assert(sizeof(SharedPose) == 28, "SharedPose must not gain padding");
 static_assert(sizeof(SharedView) == 44, "SharedView must not gain padding");
+static_assert(sizeof(SharedMotion) == 52, "SharedMotion must not gain padding");
 static_assert(sizeof(ControlBlock) < 4096, "one page is plenty and keeps mapping simple");
 
 // The mapping name is derived from an instance string -- the game's process id -- so two

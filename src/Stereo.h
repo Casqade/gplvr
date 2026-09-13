@@ -126,7 +126,7 @@ void stereoRelease();
 
 // The width in pixels of one eye's half of the render target, or 0 if the eye targets
 // are not built. The presenter needs the exact value rather than assuming half the
-// texture: an odd-width buffer -- which shrinkWindowByOnePixel produces -- leaves a
+// texture: an odd-width buffer -- which an odd `windowWidth` produces -- leaves a
 // column belonging to neither eye, and sampling a clean 50% split then shifts the right
 // eye by half a pixel relative to what was actually rendered into it.
 int stereoEyeWidth();
@@ -135,6 +135,20 @@ int stereoEyeWidth();
 // are no eye targets. The presenter samples exactly this, which is what lets an eye be a
 // square inside its half rather than the whole half.
 bool stereoEyeRect(int eye, int out[4]);
+
+// The rasterizer surface one eye is rendered into, and the surface the two were carved
+// out of. Both are what `bitmapInstanceAlloc` handed back, which is the same handle space
+// every rasterizer entry point taking a destination uses -- `drawDebugText` included, and
+// that is what lets the HUD be re-issued once per eye with no coordinate arithmetic
+// beyond the anchor remap.
+void* stereoEyeSurface(int eye);
+void* stereoSourceSurface();
+
+// The geometry the last tracked stereo frame was built with: `fov` is ONE eye's full
+// horizontal angle in radians, `separation` the distance between the two eye positions in
+// world units. False until a tracked frame has rendered, and false again after tracking
+// drops -- so a caller that needs the runtime's real IPD cannot silently get a stale one.
+bool stereoEyeGeometry(float& fov, float& separation);
 
 
 // Re-apply the eye frustum to `camera`, if it is one of ours.
