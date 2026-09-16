@@ -4,6 +4,7 @@
 #include "Hooks.h"
 #include "Hud.h"
 #include "Log.h"
+#include "MirrorConfig.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "VrCamera.h"
@@ -554,10 +555,12 @@ int callDriverGetTeamIndex(int driver) {
 
 // The viewed car's glass geometry. Lotus when the team cannot be read, with the reason in
 // paneTeamFallback. `changed` is set when the driver index moved, which is the only time the
-// game is asked.
+// game is asked, or when the car set changed under the same driver. Each ask also selects the
+// car's mirror aim (MirrorConfig); without a viewed car the last car's aim stays.
 const PaneGeometry& viewedCarGlass(bool& changed) {
     State& s = g_state;
     changed = false;
+    if (mirrorConfigCarSetChanged()) s.paneDriver = -1000;
     int driver = *reinterpret_cast<const int*>(kViewCarDriverIndex);
     if (driver == s.paneDriver) return kPaneGeometry[s.paneTeam];
 
@@ -588,6 +591,8 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
                 fallback = "the team index is outside the 1967 table (another carset?)";
         }
     }
+
+    if (driver >= 0 && driver < kDriverSlots) mirrorConfigViewedTeam(team, fallback);
 
     s.paneTeam = fallback ? kTeamLotus : team;
     s.paneTeamFallback = fallback;
@@ -841,8 +846,8 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
     // up axis so its sideways component points at the centreline -- toward -Y for the +Y glass,
     // +Y for the -Y glass, hence the sign -- and pitch then turns it about the car's sideways
     // axis so a positive angle lifts the face.
-    float yaw = sign * g_options.vrMirrorYaw * 0.0174532925f;
-    float pitch = g_options.vrMirrorPitch * 0.0174532925f;
+    float yaw = sign * g_mirrorAim.yaw * 0.0174532925f;
+    float pitch = g_mirrorAim.pitch * 0.0174532925f;
     float cy = std::cos(yaw), sy = std::sin(yaw);
     float cp = std::cos(pitch), sp = std::sin(pitch);
     float yx = n0[0] * cy - n0[1] * sy;
@@ -887,8 +892,8 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
     // the texture half's, and the glass maps that half onto its whole face, so the aspect
     // makes the vertical angle the glass's own: tan(v/2) = tan(h/2) * aspect * height / width.
     float span = distance < kMirrorMinDistance ? kMirrorMinDistance : distance;
-    float fov = 2.0f * std::atan(glass.halfWidth / span) * g_options.vrMirrorFovScale;
-    float fovV = 2.0f * std::atan(glass.halfHeight / span) * g_options.vrMirrorFovScale;
+    float fov = 2.0f * std::atan(glass.halfWidth / span) * g_mirrorAim.fovScale;
+    float fovV = 2.0f * std::atan(glass.halfHeight / span) * g_mirrorAim.fovScale;
     if (fov < kMirrorMinFov) fov = kMirrorMinFov;
     if (fov > kMirrorMaxFov) fov = kMirrorMaxFov;
     if (fovV < kMirrorMinFov) fovV = kMirrorMinFov;

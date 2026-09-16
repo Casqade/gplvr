@@ -10,11 +10,14 @@
 // has no such shared namespace.
 
 #include "Billboard.h"
+#include "CrashGuard.h"
 #include "Discovery.h"
 #include "Hooks.h"
 #include "Hud.h"
+#include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "RenderShim.h"
 #include "Log.h"
@@ -124,6 +127,12 @@ DWORD WINAPI installThread(LPVOID) {
 
     logf("patching import tables...");
     patchDisplaySettingsImportsEverywhere();
+
+    // Flat mode too, and before anything below can abort the install: a crash fix in the
+    // sim, not part of the VR render path. Still in the front end here, where no contact
+    // search is running while its bytes are rewritten.
+    crashGuardInstall();
+
     logf("installing frame counter...");
 
     if (!installFrameCounter(binding)) {
@@ -153,9 +162,16 @@ DWORD WINAPI installThread(LPVOID) {
     // After shimInstall, so nullDraw can see whether the shim took polyDraw first. The
     // driver thunks go in here too: roglv2 is loaded by now, because discovery keys off
     // its entry points.
+    // Pacing and the profiler both redirect the fgDisableBG call in the tick wait. Pacing
+    // locates it while the bytes are still stock, the profiler patches it, and pacing then
+    // takes the site and chains to the profiler's thunk.
+    renderPacingDiscover(binding);
     renderProfileDiscover(binding);
     renderProfileInstallDriverThunks();
     renderProfileInstallNullDraw(binding);
+    renderPacingInstall();
+    // Locates the latch from the tick wait pacing installed at.
+    interpolationInstall();
 
     if (g_options.vr)
         logf("ready. '1' toggles stereo.");
@@ -197,6 +213,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     } else if (reason == DLL_PROCESS_DETACH) {
         // Before the log closes, and before this module's code stops being callable.
         windowProcUnchain();
+        crashGuardLogSummary();
         logf("detaching");
         logClose();
     }

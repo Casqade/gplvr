@@ -71,7 +71,12 @@ int   g_seenCount = 0;
 bool firstSightOf(void* surface) {
     for (int i = 0; i < g_seenCount; ++i)
         if (g_seenSurfaces[i] == surface) return false;
-    if (g_seenCount < 8) g_seenSurfaces[g_seenCount++] = surface;
+    // Surface handles are recycled, so a screen-wide text layer rebuilt every frame is a new
+    // handle each time. Once the table is full, nothing more is reported.
+    if (g_seenCount >= 8) return false;
+    g_seenSurfaces[g_seenCount++] = surface;
+    if (g_seenCount == 8)
+        logf("hud: eight surfaces reported as passed through -- later ones are not logged");
     return true;
 }
 

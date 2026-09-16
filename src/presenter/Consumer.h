@@ -58,6 +58,10 @@ public:
     // The game frame the last update() latched, for telling a new image from a repeat.
     int32_t latchedSequence() const { return current_.sequence; }
 
+    // How many displays past the current one the game wants the published views located
+    // for, 0 to 2. Non-zero only while the game paces its frames.
+    int32_t viewLeadDisplays() const;
+
     // The HUD panel as the game published it. False when there is nothing to show: the
     // layer is off, or no texture has been shared yet. On true, `layer` is 1 for
     // head-locked or 2 for the seat, placement is in metres (see ControlBlock), and

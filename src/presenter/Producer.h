@@ -107,6 +107,25 @@ bool presenterMonitorHudTaken();
 // each rendered frame correspond to one display frame.
 int32_t presenterViewSequence();
 
+// The presenter's display clock from the newest published view set, in QPC ticks. False
+// when it is not publishing, has no valid views, or has not published timing.
+struct PresenterClock {
+    int64_t latchTime = 0;    // when the presenter latched the game frame for that display
+    int64_t displayTime = 0;  // the instant the published views were located for
+    int64_t period = 0;       // one display
+    int32_t viewLead = 0;     // displays between that latch's display and displayTime
+    float   refreshRate = 0;  // queried display refresh rate; 0 = period is the runtime's own
+};
+bool presenterClock(PresenterClock& out);
+
+// Ask the presenter to locate the views it publishes `lead` displays after the display of
+// its current latch, 0 to 2. 0 is the unpaced behaviour.
+void presenterSetViewLead(int lead);
+
+// The last frame sequence this process published, and the last one the presenter drew.
+int32_t presenterPublishedSequence();
+int32_t presenterConsumedSequence();
+
 // False when the runtime forbids the application changing the field of view. Defaults
 // to true until the presenter has reported, so nothing is disabled on a guess.
 bool presenterFovMutable();

@@ -8,6 +8,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "Pribluda.h"
+#include "RenderPacing.h"
 #include "Stereo.h"
 #include "VrCamera.h"
 
@@ -959,6 +960,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
     vrNoteFramePublished();
+    renderPacingNotePublished();
 
     // The HUD panel copied under the same lock goes out now, after the same synchronisation,
     // so the presenter can never copy one that is still being written.
@@ -1135,6 +1137,44 @@ bool presenterLatestViews(SharedView views[2], SharedPose& head, SharedMotion* m
         }
     }
     return false;
+}
+
+bool presenterClock(PresenterClock& out) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return false;
+
+    ControlBlock* block = state.block;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int32_t sequence = block->viewSequence;
+        if (!sequence || !block->viewsValid) return false;
+
+        SharedMotion motion = block->motion;
+        if (block->viewSequence != sequence) continue;
+        if (!(motion.flags & kMotionTiming)) return false;
+
+        out.latchTime = loadQpc(motion.latchTime);
+        out.displayTime = loadQpc(motion.displayTime);
+        out.period = loadQpc(motion.period);
+        out.viewLead = motion.viewLead;
+        out.refreshRate = motion.refreshRate;
+        return out.period > 0;
+    }
+    return false;
+}
+
+void presenterSetViewLead(int lead) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return;
+    if (state.block->viewLeadDisplays == lead) return;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->viewLeadDisplays), lead);
+}
+
+int32_t presenterPublishedSequence() { return g_state.frameSequence; }
+
+int32_t presenterConsumedSequence() {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return 0;
+    return state.block->consumedSequence;
 }
 
 void presenterPublishSeat(const SharedPose& seat) {

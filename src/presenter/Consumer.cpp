@@ -690,6 +690,12 @@ void Consumer::publishViews(const SharedView views[2], const SharedPose& head,
                         ++viewSequence_);
 }
 
+int32_t Consumer::viewLeadDisplays() const {
+    if (!block_) return 0;
+    int32_t lead = block_->viewLeadDisplays;
+    return lead < 0 ? 0 : (lead > 2 ? 2 : lead);
+}
+
 void Consumer::setError(int32_t code) {
     if (!block_) return;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->presenterError), code);

@@ -99,6 +99,7 @@ const SpanInfo kSpan[] = {
     {"rogl", kGroupPresent, kGpuPresent},
     {"swap", kGroupPresent, kGpuPresent},
     {"tick", kGroupWait, kGpuBetween},
+    {"pace", kGroupWait, kGpuBetween},
     {"bg", kGroupWait, kGpuBetween},
     {"bgRelease", kGroupWait, kGpuBetween},
     {"gpuWait", kGroupWait, kGpuScene},
@@ -369,9 +370,10 @@ bool frameBudgetReport(double periodMs, const char* extra) {
         logf("%s", line);
     }
 
-    logf("wait %.2f = tick %.2f + bg %.2f + bgRelease %.2f + gpuWait %.2f + transfer %.2f + "
-         "unlock %.2f + extra %.2f",
-         wait, ms[kSpanWaitTick], ms[kSpanWaitBg], ms[kSpanWaitBgRelease], ms[kSpanWaitGpu],
+    logf("wait %.2f = tick %.2f + pace %.2f + bg %.2f + bgRelease %.2f + gpuWait %.2f + "
+         "transfer %.2f + unlock %.2f + extra %.2f",
+         wait, ms[kSpanWaitTick], ms[kSpanWaitPace], ms[kSpanWaitBg], ms[kSpanWaitBgRelease],
+         ms[kSpanWaitGpu],
          ms[kSpanWaitTransfer], ms[kSpanWaitUnlock], ms[kSpanWaitExtra]);
 
     GpuTimerWindow gpu;

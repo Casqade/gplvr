@@ -75,6 +75,7 @@ else()
     add_library(gplvr SHARED
         src/dllmain.cpp
         src/Billboard.cpp
+        src/CrashGuard.cpp
         src/CursorOverlay.cpp
         src/Discovery.cpp
         src/FrameBudget.cpp
@@ -82,13 +83,16 @@ else()
         src/GpuTimer.cpp
         src/Hooks.cpp
         src/Hud.cpp
+        src/Interpolation.cpp
         src/Letterbox.cpp
         src/Log.cpp
         src/MenuScale.cpp
+        src/MirrorConfig.cpp
         src/MirrorTarget.cpp
         src/MouseLook.cpp
         src/Pe.cpp
         src/Pribluda.cpp
+        src/RenderPacing.cpp
         src/RenderProfile.cpp
         src/RenderShim.cpp
         src/RenderTarget.cpp

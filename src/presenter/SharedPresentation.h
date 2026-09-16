@@ -42,7 +42,7 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 9;  // 9: gamma
+inline constexpr uint32_t kControlVersion = 13;  // 13: eyeSubImageScale removed (rebuild both)
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -108,9 +108,19 @@ struct SharedMotion {
     float     linearVelocity[3] = {};   // m/s, presenter LOCAL space
     float     angularVelocity[3] = {};  // rad/s, presenter LOCAL space
     int32_t   flags = 0;                // kMotion* bits
-    SharedQpc displayTime;              // when these views are displayed
+    SharedQpc displayTime;              // the instant these views were located for
     SharedQpc latchTime;                // when the presenter took the game frame shown then
     SharedQpc period;                   // one display frame
+    // Displays between the display of the latch at latchTime and displayTime: 0 unpaced, 1 or
+    // 2 while the game paces its frames (ControlBlock::viewLeadDisplays, as the presenter
+    // read it for these views).
+    int32_t   viewLead = 0;
+    // The display refresh rate in Hz, queried through XR_FB_display_refresh_rate; 0 when the
+    // runtime does not report one. When non-zero, `period` and the view lead are one refresh
+    // of it; otherwise they are the runtime's predictedDisplayPeriod. SteamVR under PICO
+    // Connect keeps predictedDisplayPeriod at the 90 Hz it started with while the headset
+    // runs at 72.
+    float     refreshRate = 0.0f;
 };
 
 inline constexpr int32_t kMotionLinear = 1;
@@ -280,6 +290,13 @@ struct ControlBlock {
     // 1 leaves the game's colours as they are; above 1 lifts the mid-tones.
     float gamma = 1.0f;
 
+    // Render pacing, producer to presenter: locate the views published at each latch this many
+    // displays after that latch's own display, 0 to 2. 0 while the game is unpaced, which
+    // keeps the views for the display being prepared; 1 while it paces, because a paced frame
+    // rendered from them reaches the display after that one. The presenter echoes the value
+    // it used in motion.viewLead.
+    volatile int32_t viewLeadDisplays = 0;
+
     // -- pribluda's overlay on a quad layer, producer to presenter ------------------
     //
     // hudLayer: 0 no panel, 1 head-locked (VIEW space), 2 fixed to the seat. The panel's
@@ -319,7 +336,7 @@ static_assert(std::is_standard_layout_v<ControlBlock>,
               "the control block is mapped into two processes; it must be POD-shaped");
 static_assert(sizeof(SharedPose) == 28, "SharedPose must not gain padding");
 static_assert(sizeof(SharedView) == 44, "SharedView must not gain padding");
-static_assert(sizeof(SharedMotion) == 52, "SharedMotion must not gain padding");
+static_assert(sizeof(SharedMotion) == 60, "SharedMotion must not gain padding");
 static_assert(sizeof(ControlBlock) < 4096, "one page is plenty and keeps mapping simple");
 
 // The mapping name is derived from an instance string -- the game's process id -- so two

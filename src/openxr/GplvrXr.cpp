@@ -436,6 +436,39 @@ void releaseHud(HudLayer& hud) {
 constexpr const char* kQpcTimeExtension = "XR_KHR_win32_convert_performance_counter_time";
 typedef XrResult(XRAPI_PTR* ConvertTimeToQpcFn)(XrInstance, XrTime, LARGE_INTEGER*);
 
+// The display's refresh rate, asked of the runtime (XR_FB_display_refresh_rate) rather than
+// taken from its frame timing. SteamVR under PICO Connect starts its compositor at 90 Hz and
+// keeps predictedDisplayPeriod there after the driver switches the headset to 72.
+bool g_refreshRateEnabled = false;
+
+// The rate the runtime reports now, or 0 when the extension is off or the call fails.
+float queryRefreshRate(XrSession session) {
+    if (!g_refreshRateEnabled || !g_api.xrGetDisplayRefreshRateFB) return 0.0f;
+    float rate = 0.0f;
+    if (XR_FAILED(g_api.xrGetDisplayRefreshRateFB(session, &rate)) || !(rate > 0.0f))
+        return 0.0f;
+    return rate;
+}
+
+void logRefreshRates(XrSession session) {
+    if (!g_refreshRateEnabled || !g_api.xrEnumerateDisplayRefreshRatesFB) return;
+    uint32_t count = 0;
+    if (!XR_CHECK(g_api.xrEnumerateDisplayRefreshRatesFB(session, 0, &count, nullptr)) || !count)
+        return;
+    std::vector<float> rates(count, 0.0f);
+    if (!XR_CHECK(g_api.xrEnumerateDisplayRefreshRatesFB(session, count, &count, rates.data())))
+        return;
+    char   text[256] = {};
+    size_t used = 0;
+    for (uint32_t i = 0; i < count && used < sizeof(text); ++i) {
+        int wrote = std::snprintf(text + used, sizeof(text) - used, "%s%.2f", i ? ", " : "",
+                                  rates[i]);
+        if (wrote < 0) break;
+        used += static_cast<size_t>(wrote);
+    }
+    logf("xr: the display offers %u refresh rate(s): %s Hz", count, text);
+}
+
 // -- world-locked markers ---------------------------------------------------------
 //
 // The first version of this tool cleared each eye to a flat colour and swept a bar
@@ -650,7 +683,13 @@ int wmain(int argc, wchar_t** argv) {
     // compare against its own: what position prediction runs on. Optional -- without it
     // the game renders from the views exactly as they were published.
     bool        qpcTime = hasExtension(extensions, kQpcTimeExtension);
-    const char* enabledExtensions[2] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, kQpcTimeExtension};
+    bool        refreshRateListed =
+        hasExtension(extensions, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    const char* enabledExtensions[3] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
+    uint32_t    enabledCount = 1;
+    if (qpcTime) enabledExtensions[enabledCount++] = kQpcTimeExtension;
+    if (refreshRateListed)
+        enabledExtensions[enabledCount++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
 
     XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
     strcpy_s(createInfo.applicationInfo.applicationName, "gplvr survey");
@@ -659,8 +698,9 @@ int wmain(int argc, wchar_t** argv) {
     createInfo.applicationInfo.engineVersion = 1;
     createInfo.applicationInfo.apiVersion = kRequestedApiVersion;
     if (d3d11) {
-        createInfo.enabledExtensionCount = qpcTime ? 2 : 1;
+        createInfo.enabledExtensionCount = enabledCount;
         createInfo.enabledExtensionNames = enabledExtensions;
+        g_refreshRateEnabled = refreshRateListed;
     }
 
     if (!XR_CHECK(g_api.xrCreateInstance(&createInfo, &g_instance))) {
@@ -881,6 +921,28 @@ int wmain(int argc, wchar_t** argv) {
     }
     logf("xr: session created");
 
+    float refreshRate = queryRefreshRate(session);
+    if (g_refreshRateEnabled && g_api.xrGetDisplayRefreshRateFB) {
+        logf("xr: %s -- enabled; the display refresh rate query says %.2f Hz%s",
+             XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, refreshRate,
+             refreshRate > 0.0f ? "" : " (no rate: display timing falls back to the runtime's "
+                                       "predictedDisplayPeriod)");
+        logRefreshRates(session);
+    } else {
+        logf("xr: %s -- NOT available (listed %s, d3d11 %s); display timing comes from the "
+             "runtime's predictedDisplayPeriod",
+             XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, refreshRateListed ? "yes" : "no",
+             d3d11 ? "yes" : "no");
+        g_refreshRateEnabled = false;
+    }
+    // A driver can change the rate after the compositor started without sending the event, so
+    // the query is repeated once a second for the first ten seconds and logged on change.
+    DWORD refreshCheckStart = GetTickCount();
+    DWORD refreshCheckLast = refreshCheckStart;
+    int   refreshChecks = 0;
+    bool  loggedFirstPeriod = false;
+    bool  loggedPeriodMismatch = false;
+
     // -- reference space ---------------------------------------------------------
     uint32_t             spaceCount = 0;
     XrReferenceSpaceType spaceTypes[8] = {};
@@ -1054,7 +1116,7 @@ int wmain(int argc, wchar_t** argv) {
     };
     PoseSample poseRing[8];
     unsigned   poseRingNext = 0;
-    unsigned   poseAge[4] = {};  // 1, 2, 3+ displays old, unmatched
+    unsigned   poseAge[5] = {};  // 0, 1, 2, 3+ displays old, unmatched
     unsigned   poseRepeats = 0;
     unsigned   poseSamples = 0;
     int32_t    poseLastSequence = 0;
@@ -1097,6 +1159,18 @@ int wmain(int argc, wchar_t** argv) {
             } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
                 logf("xr: instance loss pending");
                 exitLoop = true;
+            } else if (event.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+                const auto* changed =
+                    reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB*>(&event);
+                float queried = queryRefreshRate(session);
+                logf("xr: display refresh rate changed %.2f -> %.2f Hz (event); the query now "
+                     "says %.2f Hz",
+                     changed->fromDisplayRefreshRate, changed->toDisplayRefreshRate, queried);
+                if (queried > 0.0f)
+                    refreshRate = queried;
+                else if (g_refreshRateEnabled && changed->toDisplayRefreshRate > 0.0f)
+                    refreshRate = changed->toDisplayRefreshRate;
+                loggedPeriodMismatch = false;
             }
             event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
         }
@@ -1109,11 +1183,48 @@ int wmain(int argc, wchar_t** argv) {
             if (!XR_CHECK(g_api.xrWaitFrame(session, &waitInfo, &frameState))) break;
             LARGE_INTEGER waitReturn = {};
             QueryPerformanceCounter(&waitReturn);
+
+            if (g_refreshRateEnabled && refreshChecks < 10 &&
+                GetTickCount() - refreshCheckLast >= 1000) {
+                refreshCheckLast = GetTickCount();
+                ++refreshChecks;
+                float queried = queryRefreshRate(session);
+                if (queried > 0.0f && std::fabs(queried - refreshRate) > 0.01f) {
+                    logf("xr: display refresh rate is now %.2f Hz (was %.2f), seen by the "
+                         "once-a-second query %.1f s after the session was created",
+                         queried, refreshRate, (refreshCheckLast - refreshCheckStart) / 1000.0);
+                    refreshRate = queried;
+                    loggedPeriodMismatch = false;
+                }
+            }
+
+            // The period every display-time calculation here uses: one refresh at the queried
+            // rate, else the runtime's own frame period. xrEndFrame still gets the runtime's
+            // predictedDisplayTime.
+            XrDuration runtimePeriod = frameState.predictedDisplayPeriod;
+            XrDuration displayPeriod = runtimePeriod;
+            if (refreshRate > 0.0f)
+                displayPeriod = static_cast<XrDuration>(1.0e9 / refreshRate + 0.5);
+            double runtimeHz = runtimePeriod > 0 ? 1.0e9 / static_cast<double>(runtimePeriod) : 0.0;
+            if (!loggedFirstPeriod) {
+                loggedFirstPeriod = true;
+                logf("xr: first frame -- the runtime's predictedDisplayPeriod is %.3f ms "
+                     "(%.2f Hz); the display refresh rate query says %.2f Hz%s",
+                     runtimePeriod / 1.0e6, runtimeHz, refreshRate,
+                     refreshRate > 0.0f ? "" : " (none: the runtime's period is used)");
+            }
+            if (refreshRate > 0.0f && runtimeHz > 0.0 && !loggedPeriodMismatch &&
+                std::fabs(runtimeHz - refreshRate) > 0.02 * refreshRate) {
+                loggedPeriodMismatch = true;
+                logf("xr: the runtime's frame timing says %.2f Hz but the display refresh rate "
+                     "is %.2f Hz -- using %.2f",
+                     runtimeHz, refreshRate, refreshRate);
+            }
+
             if (lastWaitReturn) {
                 LONGLONG gap = waitReturn.QuadPart - lastWaitReturn;
                 if (gap > worstWaitGap) worstWaitGap = gap;
-                LONGLONG period =
-                    frameState.predictedDisplayPeriod * qpcFrequency.QuadPart / 1000000000LL;
+                LONGLONG period = displayPeriod * qpcFrequency.QuadPart / 1000000000LL;
                 if (period > 0 && gap * 2 > period * 3) ++skippedDisplays;
             }
             lastWaitReturn = waitReturn.QuadPart;
@@ -1259,8 +1370,40 @@ int wmain(int argc, wchar_t** argv) {
                     QueryPerformanceCounter(&latchQpc);
                     consumer.update();
 
+                    // While the game paces its frames, a frame rendered from these views is
+                    // latched `lead` displays after this one, so the views are located for
+                    // that display. The projection layer still carries the pose each image was
+                    // rendered from, and the runtime reprojects whatever prediction missed.
+                    int32_t       lead = consumer.viewLeadDisplays();
+                    XrView        leadViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                     const XrView* publish = views;
-                    const XrTime  publishTime = frameState.predictedDisplayTime;
+                    XrTime        publishTime = frameState.predictedDisplayTime;
+                    if (lead > 0 && displayPeriod > 0) {
+                        XrViewLocateInfo leadInfo = locateInfo;
+                        leadInfo.displayTime = publishTime + lead * displayPeriod;
+                        XrViewState leadState{XR_TYPE_VIEW_STATE};
+                        uint32_t    leadLocated = 0;
+                        if (XR_SUCCEEDED(g_api.xrLocateViews(session, &leadInfo, &leadState, 2,
+                                                             &leadLocated, leadViews)) &&
+                            leadLocated == 2 &&
+                            (leadState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) &&
+                            (leadState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+                            publish = leadViews;
+                            publishTime = leadInfo.displayTime;
+                        } else {
+                            lead = 0;
+                        }
+                    }
+                    static int32_t loggedLead = 0;
+                    static int     leadReports = 16;
+                    if (lead != loggedLead && leadReports > 0) {
+                        --leadReports;
+                        logf("xr: published views are located %d display(s) after the current "
+                             "one%s%s",
+                             lead, lead ? " -- the game is pacing its frames" : "",
+                             leadReports ? "" : " (further changes not logged)");
+                    }
+                    loggedLead = lead;
 
                     SharedView shared[2] = {};
                     SharedPose head = {};
@@ -1315,14 +1458,16 @@ int wmain(int argc, wchar_t** argv) {
                         motion.flags |= kMotionAngular;
                     }
                     LARGE_INTEGER displayQpc = {};
-                    if (convertTimeToQpc && frameState.predictedDisplayPeriod > 0 &&
+                    if (convertTimeToQpc && displayPeriod > 0 &&
                         XR_SUCCEEDED(convertTimeToQpc(g_instance, publishTime, &displayQpc))) {
                         storeQpc(motion.displayTime, displayQpc.QuadPart);
                         storeQpc(motion.latchTime, latchQpc.QuadPart);
-                        storeQpc(motion.period, frameState.predictedDisplayPeriod *
-                                                    qpcFrequency.QuadPart / 1000000000LL);
+                        storeQpc(motion.period,
+                                 displayPeriod * qpcFrequency.QuadPart / 1000000000LL);
                         motion.flags |= kMotionTiming;
                     }
+                    motion.viewLead = lead;
+                    motion.refreshRate = refreshRate;
 
                     consumer.publishViews(shared, head, headValid, motion);
 
@@ -1471,7 +1616,7 @@ int wmain(int argc, wchar_t** argv) {
 
                     SharedView submitted[2] = {};
                     if (presenting && bothEyesReady && consumer.renderedViews(submitted) &&
-                        frameState.predictedDisplayPeriod > 0) {
+                        displayPeriod > 0) {
                         int32_t sequence = consumer.latchedSequence();
                         if (sequence == poseLastSequence) ++poseRepeats;
                         poseLastSequence = sequence;
@@ -1488,14 +1633,14 @@ int wmain(int argc, wchar_t** argv) {
                             }
                         }
                         if (!match) {
-                            ++poseAge[3];
+                            ++poseAge[4];
                         } else {
                             double periods =
                                 static_cast<double>(frameState.predictedDisplayTime -
                                                     match->time) /
-                                static_cast<double>(frameState.predictedDisplayPeriod);
+                                static_cast<double>(displayPeriod);
                             long age = std::lround(periods);
-                            ++poseAge[age <= 1 ? 0 : (age == 2 ? 1 : 2)];
+                            ++poseAge[age <= 0 ? 0 : (age >= 3 ? 3 : age)];
 
                             const XrQuaternionf& now = views[0].pose.orientation;
                             double dot = std::fabs(now.x * submitted[0].pose.orientationX +
@@ -1506,7 +1651,7 @@ int wmain(int argc, wchar_t** argv) {
                             constexpr double kDegrees = 57.29577951308232;
                             double angle = 2.0 * std::acos(dot) * kDegrees;
                             double expected = match->angularSpeed * kDegrees * periods *
-                                              frameState.predictedDisplayPeriod * 1e-9;
+                                              displayPeriod * 1e-9;
                             double residual = std::fabs(angle - expected);
                             poseAngleSum += angle;
                             poseResidualSum += residual;
@@ -1615,12 +1760,13 @@ int wmain(int argc, wchar_t** argv) {
                          head.pose.position.z, head.pose.orientation.x,
                          head.pose.orientation.y, head.pose.orientation.z,
                          head.pose.orientation.w);
-                    if (poseSamples || poseAge[3]) {
-                        logf("xr: rendered pose age in displays 1:%u 2:%u 3+:%u UNMATCHED:%u "
-                             "(%u submits repeated an image) | head turned since render mean "
-                             "%.2f max %.2f deg, unexplained by head speed mean %.2f max %.2f "
-                             "deg",
-                             poseAge[0], poseAge[1], poseAge[2], poseAge[3], poseRepeats,
+                    if (poseSamples || poseAge[4]) {
+                        logf("xr: rendered pose age in displays 0:%u 1:%u 2:%u 3+:%u "
+                             "UNMATCHED:%u (%u submits repeated an image) | head turned since "
+                             "render mean %.2f max %.2f deg, unexplained by head speed mean "
+                             "%.2f max %.2f deg",
+                             poseAge[0], poseAge[1], poseAge[2], poseAge[3], poseAge[4],
+                             poseRepeats,
                              poseSamples ? poseAngleSum / poseSamples : 0.0, poseAngleMax,
                              poseSamples ? poseResidualSum / poseSamples : 0.0,
                              poseResidualMax);

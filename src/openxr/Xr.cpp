@@ -163,6 +163,7 @@ bool xrResolveInstanceFunctions(XrApi& api, XrInstance instance) {
     // Best effort: null simply means the extension was not enabled on this instance.
 #define GPLVR_XR_RESOLVE(name) resolve(api, instance, #name, api.name, false);
     GPLVR_XR_D3D11_FUNCTIONS(GPLVR_XR_RESOLVE)
+    GPLVR_XR_REFRESH_RATE_FUNCTIONS(GPLVR_XR_RESOLVE)
 #undef GPLVR_XR_RESOLVE
     return ok;
 }

@@ -2,12 +2,15 @@
 
 #include "FrameBudget.h"
 #include "Hud.h"
+#include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "MirrorConfig.h"
 #include "MirrorTarget.h"
 #include "MouseLook.h"
 #include "Log.h"
 #include "Pribluda.h"
+#include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "RenderShim.h"
 #include "RenderTarget.h"
@@ -99,6 +102,7 @@ bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
 bool      g_vrMirrorModeKeyLast = false;
+bool      g_vrInterpolateKeyLast = false;
 bool      g_nullDrawKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
@@ -315,6 +319,15 @@ void reportOncePerSecond() {
     char shim[320] = {};
     if (shimFormat(shim, sizeof(shim), seconds)) logf("%s", shim);
 
+    // Render pacing, once a second while tracked frames were rendered: with vrRenderPacing = 0
+    // it is the unpaced baseline for the same counters.
+    char pacing[640] = {};
+    if (renderPacingFormat(pacing, sizeof(pacing))) logf("%s", pacing);
+
+    // World interpolation, once a second while world frames were latched.
+    char interp[768] = {};
+    if (interpolationFormat(interp, sizeof(interp))) logf("%s", interp);
+
     // After every line that reads them, and on every path -- a window that printed nothing
     // must still be drained, or its counts land in the next one.
     renderProfileEndWindow();
@@ -337,10 +350,10 @@ void reportOncePerSecond() {
     frameBudgetLeave(reporting);
 }
 
-// Mirror tweak mode: aiming the glasses from the headset. It changes the g_options fields
-// aimPane reads every frame, so each step shows at once. Nothing is written back; leaving logs
-// the values to copy into gplvr.ini. It shares the arrows and Page Up/Down with HUD tweak
-// mode, so entering either leaves the other.
+// Mirror tweak mode: aiming the glasses from the headset. It changes g_mirrorAim, which aimPane
+// reads every frame, so each step shows at once. Leaving saves the aim to the viewed car's
+// section of gplvr_cars.ini (MirrorConfig); gplvr.ini is never written. It shares the arrows
+// and Page Up/Down with HUD tweak mode, so entering either leaves the other.
 constexpr unsigned kMirrorTweakKeys[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
 constexpr double   kMirrorTweakMaxStepSeconds = 0.1;  // the most one poll turns after a stall
 constexpr double   kMirrorTweakLogSeconds = 0.5;      // between progress lines while adjusting
@@ -365,16 +378,18 @@ float mirrorTweakClamp(float value, float low, float high) {
 void mirrorTweakLogProgress(LONGLONG now) {
     g_mirrorTweak.unlogged = false;
     g_mirrorTweak.loggedAt = now;
-    logf("mirror: yaw %.2f pitch %.2f fovScale %.3f", g_options.vrMirrorYaw,
-         g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+    logf("mirror: yaw %.2f pitch %.2f fovScale %.3f", g_mirrorAim.yaw, g_mirrorAim.pitch,
+         g_mirrorAim.fovScale);
 }
 
 void mirrorTweakEnter() {
     pribludaTweakExit(" -- mirror tweak mode entered");
     g_mirrorTweak.active = true;
     g_mirrorTweak.unlogged = false;
-    logf("mirror: tweak mode on -- yaw %.2f pitch %.2f fovScale %.3f", g_options.vrMirrorYaw,
-         g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+    const char* key = mirrorConfigKey();
+    logf("mirror: tweak mode on for %s (%s) -- yaw %.2f pitch %.2f fovScale %.3f",
+         key ? key : "no identified car", mirrorConfigPerCar() ? "per-car" : "global",
+         g_mirrorAim.yaw, g_mirrorAim.pitch, g_mirrorAim.fovScale);
     logf("mirror: Left/Right turn the glasses, Up/Down tilt them, Page Up/Down widen and "
          "narrow the field; key 0x%02X again leaves",
          g_options.vrMirrorTweakKey);
@@ -423,24 +438,26 @@ void mirrorTweakPoll() {
         return;
     }
 
-    float yaw = g_options.vrMirrorYaw;
-    float pitch = g_options.vrMirrorPitch;
-    float fovScale = g_options.vrMirrorFovScale;
+    float yaw = g_mirrorAim.yaw;
+    float pitch = g_mirrorAim.pitch;
+    float fovScale = g_mirrorAim.fovScale;
     float angleStep = static_cast<float>(g_options.vrMirrorTweakAngleSpeed * seconds);
     if (turn) {
-        g_options.vrMirrorYaw = mirrorTweakClamp(yaw + turn * angleStep, -45.0f, 45.0f);
+        g_mirrorAim.yaw = mirrorTweakClamp(yaw + turn * angleStep, -45.0f, 45.0f);
     }
     if (tilt) {
-        g_options.vrMirrorPitch = mirrorTweakClamp(pitch + tilt * angleStep, -45.0f, 45.0f);
+        g_mirrorAim.pitch = mirrorTweakClamp(pitch + tilt * angleStep, -45.0f, 45.0f);
     }
     if (widen) {
         float factor = static_cast<float>(
             std::pow(2.0, widen * g_options.vrMirrorTweakFovSpeed * seconds));
-        g_options.vrMirrorFovScale = mirrorTweakClamp(fovScale * factor, 0.25f, 6.0f);
+        g_mirrorAim.fovScale = mirrorTweakClamp(fovScale * factor, 0.25f, 6.0f);
     }
-    if (g_options.vrMirrorYaw != yaw || g_options.vrMirrorPitch != pitch ||
-        g_options.vrMirrorFovScale != fovScale)
+    if (g_mirrorAim.yaw != yaw || g_mirrorAim.pitch != pitch ||
+        g_mirrorAim.fovScale != fovScale) {
         g_mirrorTweak.unlogged = true;
+        mirrorConfigMarkEdited();
+    }
 
     if (g_mirrorTweak.unlogged &&
         now - g_mirrorTweak.loggedAt >=
@@ -467,11 +484,9 @@ void mirrorTweakExit(const char* why) {
     if (!g_mirrorTweak.active) return;
     g_mirrorTweak.active = false;
     g_mirrorTweak.unlogged = false;
-    logf("mirror: tweak mode off -- yaw %.2f pitch %.2f fovScale %.3f%s", g_options.vrMirrorYaw,
-         g_options.vrMirrorPitch, g_options.vrMirrorFovScale, why);
-    logf("mirror: not saved -- to keep these, set vrMirrorYaw = %.2f, vrMirrorPitch = %.2f and "
-         "vrMirrorFovScale = %.3f in gplvr.ini",
-         g_options.vrMirrorYaw, g_options.vrMirrorPitch, g_options.vrMirrorFovScale);
+    logf("mirror: tweak mode off -- yaw %.2f pitch %.2f fovScale %.3f%s", g_mirrorAim.yaw,
+         g_mirrorAim.pitch, g_mirrorAim.fovScale, why);
+    mirrorConfigSave();
 }
 
 namespace {
@@ -562,6 +577,19 @@ void pollToggle() {
         g_vrMirrorModeKeyLast = down;
     }
 
+    // World interpolation on and off, for an A/B in one race. The records keep being copied
+    // while it is off, so the blend resumes on the next frame.
+    if (g_options.vr && g_options.vrInterpolateKey) {
+        bool down = (GetAsyncKeyState(g_options.vrInterpolateKey) & 0x8000) != 0;
+        if (down && !g_vrInterpolateKeyLast) {
+            g_options.vrInterpolate = !g_options.vrInterpolate;
+            logf("interp: vrInterpolate now %d -- %s", g_options.vrInterpolate ? 1 : 0,
+                 g_options.vrInterpolate ? "the world is drawn blended to the display time"
+                                         : "the world is drawn at the newest latched tick");
+        }
+        g_vrInterpolateKeyLast = down;
+    }
+
     // The mouse look toggle, and the mouse itself.
     //
     // Deliberately NOT gated on g_options.vr: the whole reason this exists is to drive
@@ -627,6 +655,17 @@ void __cdecl callOriginalSceneRender(void* params);  // defined below
 // are genuinely newer.
 void renderExtraFrames() {
     if (!g_options.vr || g_options.vrExtraRenders <= 0 || !g_options.stereo) return;
+    // An extra render publishes a frame between two paced ones.
+    if (renderPacingEngaged()) {
+        static bool loggedPaced = false;
+        if (!loggedPaced) {
+            loggedPaced = true;
+            logf("vr: extra renders held at 0 while render pacing is engaged (vrExtraRenders = "
+                 "%d applies to unpaced frames only)",
+                 g_options.vrExtraRenders);
+        }
+        return;
+    }
     if (!g_lastSceneParams || !stereoAvailable()) return;
     if (!g_lastFrameWasStereo || !vrFrustumInjected()) return;
 
@@ -974,6 +1013,8 @@ int __cdecl screenDisplayHook(void* surface) {
         // saved parameter block is stale, and re-running it would paint the sim over
         // the menu.
         g_lastFrameWasStereo = g_stereoRenderedFrame;
+        // The same answer decides whether the next frame's latch is paced.
+        renderPacingEndFrame(g_lastFrameWasStereo && vrFrustumInjected());
         g_stereoRenderedFrame = false;
     }
 
@@ -1989,6 +2030,13 @@ void loadOptions(const char* fileName) {
     if (g_options.vrHudEye < 0 || g_options.vrHudEye > 2) g_options.vrHudEye = 0;
     g_options.vrPredictPosition =
         GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
+    g_options.vrRenderPacing = GetPrivateProfileIntA("gplvr", "vrRenderPacing", 1, path) != 0;
+    GetPrivateProfileStringA("gplvr", "vrPaceMarginMs", "2.0", text, sizeof(text), path);
+    g_options.vrPaceMarginMs = static_cast<float>(atof(text));
+    if (!(g_options.vrPaceMarginMs >= 0.0f)) g_options.vrPaceMarginMs = 0.0f;
+    if (g_options.vrPaceMarginMs > 10.0f) g_options.vrPaceMarginMs = 10.0f;
+    g_options.vrInterpolate = GetPrivateProfileIntA("gplvr", "vrInterpolate", 1, path) != 0;
+    g_options.vrInterpolateKey = GetPrivateProfileIntA("gplvr", "vrInterpolateKey", '7', path);
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2009,6 +2057,9 @@ void loadOptions(const char* fileName) {
         g_options.shimMeasure = false;
         g_options.profilePolys = false;
         g_options.profileStages = false;
+        g_options.vrRenderPacing = false;
+        g_options.vrInterpolate = false;
+        g_options.vrInterpolateKey = 0;
     }
 
     logf("options: stereo=%d mirror=%d vrMirrorFovScale=%.2f vrMirrorYaw=%.1f "
@@ -2020,6 +2071,8 @@ void loadOptions(const char* fileName) {
          "vrMirrorTweakFovSpeed=%.2f vrMirrorModeKey=0x%02X",
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
          g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
+    // The vrMirror* values above are the defaults for any car without a gplvr_cars.ini section.
+    mirrorConfigReset();
     g_options.vrOffscreen =GetPrivateProfileIntA("gplvr", "vrOffscreen", 0, path) != 0;
     g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 1, path);
     if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 3)
@@ -2064,6 +2117,20 @@ void loadOptions(const char* fileName) {
          "vrPredictPosition=%d",
          g_options.vrHudLayer, g_options.vrHudTextScale, g_options.vrHudBackdropOpacity,
          g_options.vrHudEye, g_options.vrPredictPosition ? 1 : 0);
+    logf("options: vrRenderPacing=%d vrPaceMarginMs=%.1f (%s)", g_options.vrRenderPacing ? 1 : 0,
+         g_options.vrPaceMarginMs,
+         g_options.vrRenderPacing
+             ? "in a tracked race each latch waits to publish this many ms before the "
+               "presenter's latch, and the views are located for the display the frame reaches"
+             : "frames start as soon as a sim tick arrives, as stock");
+    logf("options: vrInterpolate=%d vrInterpolateKey=0x%02X (%s)", g_options.vrInterpolate ? 1 : 0,
+         g_options.vrInterpolateKey,
+         g_options.vrInterpolate
+             ? "every car and the view are drawn blended between the two newest latched sim "
+               "ticks at the frame's display time, which adds one sim tick of latency (6.94 ms "
+               "at 144 Hz); render pacing also engages when the display period is not a whole "
+               "number of ticks"
+             : "the world is drawn at the newest latched sim tick, as stock");
     logf("options: HUD head ahead=%.2f down=%.2f right=%.2f width=%.2f | seat ahead=%.2f "
          "down=%.2f right=%.2f width=%.2f",
          g_options.vrHudHead.ahead, g_options.vrHudHead.down, g_options.vrHudHead.right,

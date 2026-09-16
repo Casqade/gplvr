@@ -112,10 +112,14 @@ void predictEyePositions(SharedView views[2], const SharedPose& head,
     if (period <= 0 || g_state.qpcFrequency <= 0) return;
 
     // The first latch at or after this frame is ready. These views were read after the
-    // latch they were published with, so at least one period always passes.
+    // latch they were published with, so at least one period always passes. The presenter
+    // already located them viewLead displays ahead of that latch's display, which a paced
+    // frame's latch matches, leaving nothing to add.
     LONGLONG ready = now + static_cast<LONGLONG>(g_state.renderTicks);
     LONGLONG displays = (ready - latch + period - 1) / period;
     if (displays < 1) displays = 1;
+    if (motion.viewLead > 0) displays -= motion.viewLead;
+    if (displays < 0) displays = 0;
 
     double seconds = static_cast<double>(displays * period) /
                      static_cast<double>(g_state.qpcFrequency);
@@ -164,15 +168,16 @@ void predictEyePositions(SharedView views[2], const SharedPose& head,
     if (!g_state.predictReportTick) g_state.predictReportTick = tick;
     if (tick - g_state.predictReportTick >= 2000) {
         int frames = g_state.predictFrames;
-        logf("vr: position prediction -- %d frames reached the display 1 period on %d times, "
-             "2 on %d, 3 or more on %d; pose read to publish %.1f ms; mean eye shift %.2f mm",
-             frames, g_state.predictDisplays[1], g_state.predictDisplays[2],
-             g_state.predictDisplays[3],
+        logf("vr: position prediction -- %d frames moved 0 periods past their views %d times, "
+             "1 on %d, 2 on %d, 3 or more on %d; pose read to publish %.1f ms; mean eye shift "
+             "%.2f mm",
+             frames, g_state.predictDisplays[0], g_state.predictDisplays[1],
+             g_state.predictDisplays[2], g_state.predictDisplays[3],
              g_state.renderTicks * 1000.0 / static_cast<double>(g_state.qpcFrequency),
              frames ? g_state.predictShiftSum / frames * 1000.0 : 0.0);
         g_state.predictReportTick = tick;
         g_state.predictFrames = 0;
-        g_state.predictDisplays[1] = g_state.predictDisplays[2] = g_state.predictDisplays[3] = 0;
+        for (int& count : g_state.predictDisplays) count = 0;
         g_state.predictShiftSum = 0.0;
     }
 }

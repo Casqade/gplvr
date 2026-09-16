@@ -75,6 +75,12 @@ inline constexpr XrVersion kRequestedApiVersion = XR_MAKE_VERSION(1, 0, 0);
 // Resolved only when the matching extension was enabled, so it may stay null.
 #define GPLVR_XR_D3D11_FUNCTIONS(X) X(xrGetD3D11GraphicsRequirementsKHR)
 
+// XR_FB_display_refresh_rate. Best effort like the D3D11 entry, and callable only when the
+// extension was enabled on the instance.
+#define GPLVR_XR_REFRESH_RATE_FUNCTIONS(X) \
+    X(xrGetDisplayRefreshRateFB)           \
+    X(xrEnumerateDisplayRefreshRatesFB)
+
 struct XrApi {
     HMODULE loader = nullptr;
     PFN_xrGetInstanceProcAddr getInstanceProcAddr = nullptr;
@@ -83,6 +89,7 @@ struct XrApi {
     GPLVR_XR_GLOBAL_FUNCTIONS(GPLVR_XR_DECLARE)
     GPLVR_XR_INSTANCE_FUNCTIONS(GPLVR_XR_DECLARE)
     GPLVR_XR_D3D11_FUNCTIONS(GPLVR_XR_DECLARE)
+    GPLVR_XR_REFRESH_RATE_FUNCTIONS(GPLVR_XR_DECLARE)
 #undef GPLVR_XR_DECLARE
 };
 

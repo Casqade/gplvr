@@ -77,6 +77,7 @@ enum BudgetSpan {
     kSpanSwap,
     // waits
     kSpanWaitTick,
+    kSpanWaitPace,       // render pacing: the tick has arrived, waiting for the latch target
     kSpanWaitBg,
     kSpanWaitBgRelease,  // the BG lock gpl_fgSnapshotRelease takes before its callbacks
     kSpanWaitGpu,

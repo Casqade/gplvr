@@ -30,6 +30,9 @@ struct Options {
     // Each pane after the first in a pass costs a sceneRender whose main pass is skipped.
     int stereoMirror = 2;
 
+    // vrMirrorFovScale, vrMirrorYaw and vrMirrorPitch are the defaults for every car; a car's
+    // section in gplvr_cars.ini overrides each one it holds (MirrorConfig.h).
+    //
     // Field of view of each mirror pane as a multiple of the angle its glass subtends from
     // the eye. 1.0 is life-size; above 1 shows more of the world, smaller. 0.25 to 6.
     float vrMirrorFovScale = 1.0f;
@@ -48,8 +51,9 @@ struct Options {
     // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
     // VR only. While on, Left/Right change vrMirrorYaw, Up/Down vrMirrorPitch and Page Up/Down
     // vrMirrorFovScale, live in both glasses, and those keys do not reach the game; the key
-    // again leaves and logs the values to copy into gplvr.ini. Nothing is written. Entering it
-    // leaves HUD tweak mode, and entering HUD tweak mode leaves it.
+    // again leaves and, if anything changed, writes the three values to the viewed car's
+    // section of gplvr_cars.ini. gplvr.ini is never written. Entering it leaves HUD tweak
+    // mode, and entering HUD tweak mode leaves it (saving the same way).
     int vrMirrorTweakKey = 'M';
 
     // How fast mirror tweak mode turns the glasses, in degrees per second.
@@ -401,6 +405,30 @@ struct Options {
     // display clock, and each eye is moved by its velocity over the displays in between.
     bool vrPredictPosition = true;
 
+    // Pace the render to the headset's display. Each frame's latch waits until the frame will
+    // be published just before the presenter's latch, so every displayed frame is the same
+    // number of sim ticks newer than the last, and the presenter locates the views for the
+    // display the frame reaches. Only while the previous frame was a tracked stereo world
+    // frame, the presenter publishes its display clock, and the display period is a whole
+    // number of sim ticks (72 or 144 Hz at 144). vrExtraRenders is held at 0 while it paces.
+    // VR only. RenderPacing.h.
+    bool vrRenderPacing = true;
+
+    // How long before the presenter's latch a paced frame aims to be published, in
+    // milliseconds, on top of the measured latch-to-publish cost. 0 to 10.
+    float vrPaceMarginMs = 2.0f;
+
+    // Interpolate the world to the frame's display time. Every car and the view -- the cockpit,
+    // the own car, the mirror and trackside cameras -- are drawn blended between the two newest
+    // latched sim ticks, so the world moves evenly at any display rate, and render pacing also
+    // engages when the display period is not a whole number of ticks. Adds one sim tick of
+    // latency (6.94 ms at 144 Hz). VR only. Interpolation.h.
+    bool vrInterpolate = true;
+
+    // Toggle vrInterpolate while the game runs, for an A/B in one race. '7' by default; 0
+    // disables. VR only.
+    int vrInterpolateKey = '7';
+
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //
     // 1.0 keeps the recommendation, which for a Pico 4 is around 3172x3172. Below 1.0
@@ -505,8 +533,8 @@ void loadOptions(const char* fileName);
 // this window's client area, and that is only meaningful for exactly this HWND.
 HWND gameWindow();
 
-// Leave mirror tweak mode if it is on, logging the values to copy into gplvr.ini. `why` is
-// appended to the log line. HUD tweak mode calls it on entering, since the two share the
+// Leave mirror tweak mode if it is on, saving a changed aim to the viewed car's section of
+// gplvr_cars.ini. `why` is appended to the log line. HUD tweak mode calls it on entering, since the two share the
 // arrows and Page Up/Down.
 void mirrorTweakExit(const char* why);
 
