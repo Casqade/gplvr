@@ -33,6 +33,7 @@ constexpr uintptr_t kViewCameraMode = 0x00776164;
 constexpr uintptr_t kViewIsLive = 0x00776168;        // byte: 1 live, 0 replay
 constexpr uintptr_t kViewRecord = 0x00776175;        // scene params p[3..42]
 constexpr uintptr_t kMirrorRecord = 0x00776219;      // scene params p[44..83]
+constexpr uintptr_t kPitBoardRecord = 0x0074E990;    // gpl_pitBoardRenderRecord
 
 struct StockCall {
     uintptr_t     site;
@@ -41,12 +42,14 @@ struct StockCall {
 
 // gpl_simFrameSetup 0x48A9A0: gpl_carLatchRenderRecord 0x46D030 in the two loops over the other
 // cars (live and replay arrays) and for the viewed car; gpl_viewLatchRecord 0x454F80 into
-// 0x776175; gpl_viewGetMirrorRecord 0x454FB0 into 0x776219.
+// 0x776175; gpl_viewGetMirrorRecord 0x454FB0 into 0x776219; gpl_pitBoardGetRenderRecord 0x47FE10
+// into 0x74E990 (live branch only, report 58).
 constexpr StockCall kCarLatchCalls[3] = {{0x0048AE95, {0xE8, 0x96, 0x21, 0xFE, 0xFF}},
                                           {0x0048AF7A, {0xE8, 0xB1, 0x20, 0xFE, 0xFF}},
                                           {0x0048B024, {0xE8, 0x07, 0x20, 0xFE, 0xFF}}};
 constexpr StockCall kViewLatchCall = {0x0048B065, {0xE8, 0x16, 0x9F, 0xFC, 0xFF}};
 constexpr StockCall kMirrorLatchCall = {0x0048B09F, {0xE8, 0x0C, 0x9F, 0xFC, 0xFF}};
+constexpr StockCall kPitBoardLatchCall = {0x0048AEE2, {0xE8, 0x29, 0x4F, 0xFF, 0xFF}};
 
 enum Blend {
     kKeep,    // the newest tick
@@ -145,6 +148,22 @@ constexpr Field kViewFields[] = {
     {136, 6, kKeep, "spin/fov/cx/cy"},
 };
 
+// The pit board record 0x74E990, filled by gpl_pitBoardGetRenderRecord 0x47FE10 from
+// gpl_pitBoardPos 0x74E8A8..B4, which gpl_pitBoardTrackCar_perTick 0x480960 moves on bg a tick at a
+// time. While the board is hidden the latch returns 0 and the record is not in the draw list.
+// gpl_pitBoardRecordDraw 0x47F2B0 reads only the position; the node keeps its own orientation.
+// Nothing but the latch reads or writes r+4..r+27 (xrefs); r+0 is the vtable (sub_47F240).
+//
+//   r+    field                             blend
+//   4     int 4, written by the latch       keep, snap on change
+//   8     no reader or writer               keep
+//   12    dlong, metres (0x74E8B4)          unwrapped at the lap length
+//   16    position (0x74E8A8..B0)           linear
+constexpr int kPitBoardWords = 6;
+constexpr Field kPitBoardFields[] = {
+    {4, 2, kKeep, "type"}, {12, 1, kDlong, "dlong"}, {16, 3, kLinear, "position"},
+};
+
 // Two latched ticks further apart than this are not blended.
 constexpr int   kMaxBlendTicks = 4;
 constexpr float kSnapMetres = 5.0f;
@@ -183,6 +202,8 @@ struct Window {
     unsigned  carsBlended = 0;
     unsigned  viewBlended = 0;
     unsigned  mirrorBlended = 0;
+    unsigned  pitBoardBlended = 0;
+    unsigned  pitBoardSnaps = 0;  // also in snaps[]
     long long costTicks = 0;
 };
 
@@ -196,12 +217,14 @@ struct State {
     History cars[kCarSlots];
     History view;
     History mirror;
+    History pitBoard;
 
     // Filled by the hooks inside this latch, consumed after it.
     int  latched[kCarSlots] = {};
     int  latchedCount = 0;
     bool viewLatched = false;
     bool mirrorLatched = false;
+    bool pitBoardLatched = false;
 
     int  lastTick = 0;
     bool haveLastTick = false;
@@ -585,6 +608,61 @@ void pushView(State& s, History& h, const uint8_t* record, int tick, const int i
     if (h.snapped) ++w.snaps[reason];
 }
 
+// The pit board's copy, after the view's. `view` is the view pair of the same ticks: a camera cut
+// switches the board's offset table (report 58), so the board is drawn at the newest copy whenever
+// the view is.
+void pushPitBoard(State& s, History& h, const uint8_t* record, int tick, const History& view) {
+    Window&        w = s.window;
+    const uint8_t* words = record + 4;
+    size_t         fieldCount = sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]);
+    if (h.copies > 0 && h.ticks[1] == tick) {
+        std::memcpy(h.words[1], words, sizeof(uint32_t) * kPitBoardWords);
+        if (h.copies == 2 && !h.snapped) {
+            int reason = -1;
+            if (view.snapped)
+                reason = kSnapCamera;
+            else if (!pairSane(h, 4, kPitBoardFields, fieldCount))
+                reason = kSnapNonFinite;
+            if (reason >= 0) {
+                h.snapped = true;
+                ++w.snaps[reason];
+                ++w.pitBoardSnaps;
+            }
+        }
+        return;
+    }
+    shift(h, words, kPitBoardWords, tick);
+    if (h.copies < 2) {
+        h.snapped = true;
+        ++w.snaps[kSnapFirst];
+        ++w.pitBoardSnaps;
+        return;
+    }
+
+    int gap = h.ticks[1] - h.ticks[0];
+    int reason = -1;
+    if (gap < 1 || gap > kMaxBlendTicks) {
+        reason = kSnapGap;
+    } else if (h.words[0][0] != 4 || h.words[1][0] != 4) {
+        reason = kSnapIdentity;
+    } else if (view.snapped) {
+        reason = kSnapCamera;
+    } else if (!pairSane(h, 4, kPitBoardFields, fieldCount)) {
+        reason = kSnapNonFinite;
+    } else {
+        float dx = floatAt(h.words[1], 4, 16) - floatAt(h.words[0], 4, 16);
+        float dy = floatAt(h.words[1], 4, 20) - floatAt(h.words[0], 4, 20);
+        float dz = floatAt(h.words[1], 4, 24) - floatAt(h.words[0], 4, 24);
+        // Placed at the pit wall or set to rest at once.
+        if (!(std::sqrt(dx * dx + dy * dy + dz * dz) <= kSnapMetres)) reason = kSnapJump;
+    }
+    h.snapped = reason >= 0;
+    if (h.snapped) {
+        ++w.snaps[reason];
+        ++w.pitBoardSnaps;
+    }
+}
+
 // Blend one record to `target`. True when its pair was usable; only the first such record of a
 // frame goes into the alpha statistics.
 bool blendHistory(State& s, const History& h, uint8_t* record, int base, const Field* fields,
@@ -671,6 +749,13 @@ void blendFrame(State& s, long long now, bool frozen) {
             any = true;
         }
     }
+    if (s.pitBoardLatched &&
+        blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(kPitBoardRecord), 4,
+                     kPitBoardFields, sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]), target,
+                     length, sampled)) {
+        ++w.pitBoardBlended;
+        any = true;
+    }
     if (any) ++w.blended;
 }
 
@@ -704,6 +789,12 @@ void __stdcall afterLatch() {
             int slot = s.latched[i];
             pushCar(s, s.cars[slot], carRecord(slot), tick);
         }
+        // A board hidden in this latch starts a new history when it shows again.
+        if (s.pitBoardLatched)
+            pushPitBoard(s, s.pitBoard, reinterpret_cast<const uint8_t*>(kPitBoardRecord), tick,
+                         s.view);
+        else
+            s.pitBoard.copies = 0;
 
         if (g_options.vrInterpolate) blendFrame(s, now, frozen);
 
@@ -714,6 +805,7 @@ void __stdcall afterLatch() {
     s.latchedCount = 0;
     s.viewLatched = false;
     s.mirrorLatched = false;
+    s.pitBoardLatched = false;
 }
 
 // -- hooks ------------------------------------------------------------------------------------
@@ -726,6 +818,9 @@ using RecordLatchFn = int(__fastcall*)(void* self, void* unused, void* destinati
 CarLatchFn    g_carLatch = nullptr;
 RecordLatchFn g_viewLatch = nullptr;
 RecordLatchFn g_mirrorLatch = nullptr;
+
+using PitBoardLatchFn = void*(__cdecl*)();
+PitBoardLatchFn g_pitBoardLatch = nullptr;
 
 void* __cdecl carLatchHook(void* car) {
     void*  result = g_carLatch(car);
@@ -747,6 +842,13 @@ int __fastcall mirrorLatchHook(void* self, void* unused, void* destination) {
     if (copied && reinterpret_cast<uintptr_t>(destination) == kMirrorRecord)
         g_state.mirrorLatched = true;
     return copied;
+}
+
+// 0 while the board is hidden; the record otherwise.
+void* __cdecl pitBoardLatchHook() {
+    void* record = g_pitBoardLatch();
+    if (reinterpret_cast<uintptr_t>(record) == kPitBoardRecord) g_state.pitBoardLatched = true;
+    return record;
 }
 
 using AfterFn = void(__stdcall*)();
@@ -857,8 +959,8 @@ void interpolationInstall() {
         return;
     }
 
-    const StockCall* calls[5] = {&kCarLatchCalls[0], &kCarLatchCalls[1], &kCarLatchCalls[2],
-                                 &kViewLatchCall, &kMirrorLatchCall};
+    const StockCall* calls[6] = {&kCarLatchCalls[0], &kCarLatchCalls[1], &kCarLatchCalls[2],
+                                 &kViewLatchCall,    &kMirrorLatchCall,  &kPitBoardLatchCall};
     for (const StockCall* call : calls) {
         auto bytes = reinterpret_cast<const uint8_t*>(call->site);
         if (std::memcmp(bytes, call->bytes, sizeof(call->bytes)) != 0) {
@@ -873,6 +975,7 @@ void interpolationInstall() {
     g_carLatch = reinterpret_cast<CarLatchFn>(callTarget(kCarLatchCalls[0].site));
     g_viewLatch = reinterpret_cast<RecordLatchFn>(callTarget(kViewLatchCall.site));
     g_mirrorLatch = reinterpret_cast<RecordLatchFn>(callTarget(kMirrorLatchCall.site));
+    g_pitBoardLatch = reinterpret_cast<PitBoardLatchFn>(callTarget(kPitBoardLatchCall.site));
     g_enableNext = reinterpret_cast<void*>(enableTarget);
 
     LARGE_INTEGER frequency;
@@ -888,19 +991,22 @@ void interpolationInstall() {
     }
     if (!redirect(kViewLatchCall.site, reinterpret_cast<uintptr_t>(&viewLatchHook)) ||
         !redirect(kMirrorLatchCall.site, reinterpret_cast<uintptr_t>(&mirrorLatchHook)) ||
+        !redirect(kPitBoardLatchCall.site, reinterpret_cast<uintptr_t>(&pitBoardLatchHook)) ||
         !redirect(enableSite, reinterpret_cast<uintptr_t>(&afterLatchThunk))) {
-        logf("interp: could not redirect the view latch, mirror latch or fgEnableBG call -- no "
-             "interpolation");
+        logf("interp: could not redirect the view latch, mirror latch, pit board latch or "
+             "fgEnableBG call -- no interpolation");
         return;
     }
     s.installed = true;
 
-    logf("interp: installed -- gpl_carLatchRenderRecord calls at %08X/%08X/%08X, the view and "
-         "mirror record latches at %08X/%08X and the latch's fgEnableBG call at %08X go through "
-         "gplvr; the blend runs after fgEnableBG, before the event pump and the draw. %s",
+    logf("interp: installed -- gpl_carLatchRenderRecord calls at %08X/%08X/%08X, the view, "
+         "mirror and pit board record latches at %08X/%08X/%08X and the latch's fgEnableBG call at "
+         "%08X go through gplvr; the blend runs after fgEnableBG, before the event pump and the "
+         "draw. %s",
          static_cast<unsigned>(kCarLatchCalls[0].site), static_cast<unsigned>(kCarLatchCalls[1].site),
          static_cast<unsigned>(kCarLatchCalls[2].site), static_cast<unsigned>(kViewLatchCall.site),
-         static_cast<unsigned>(kMirrorLatchCall.site), static_cast<unsigned>(enableSite),
+         static_cast<unsigned>(kMirrorLatchCall.site),
+         static_cast<unsigned>(kPitBoardLatchCall.site), static_cast<unsigned>(enableSite),
          g_options.vrInterpolate ? "vrInterpolate = 1."
                                  : "vrInterpolate = 0: records are kept but nothing is blended.");
     logFieldTable("car record R = car+0x4FC (live 006BF080, replay 00790848, 1544 bytes)",
@@ -913,6 +1019,10 @@ void interpolationInstall() {
                   "camera mode, view car or live/replay changing; ticks more than 4 apart; a "
                   "blended value NaN, infinite or over 1e6; the eye moving over 5 m or turning "
                   "over 0.5 rad");
+    logFieldTable("pit board record 0074E990", kPitBoardFields,
+                  sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]),
+                  "hidden in the latch before; type +4 not 4; ticks more than 4 apart; the view "
+                  "pair snapped; a blended value NaN, infinite or over 1e6; a move over 5 m");
 }
 
 bool interpolationActive() { return g_state.installed && g_options.vrInterpolate; }
@@ -930,15 +1040,17 @@ bool interpolationFormat(char* out, size_t size) {
             "interp: %s | %u world frames: %u blended, %u frozen, %u untimed | alpha mean %.2f "
             "min %.2f max %.2f, clamped low %u high %u | snaps first %u identity %u tick gap %u "
             "jump %u camera %u nonfinite %u | view tick gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
-            "| view blended %u, mirror %u | display time from the presenter %u, from the render "
-            "cost %u | target = display - %.2f ms - one tick %.2f ms | cost %.3f ms a frame",
+            "| view blended %u, mirror %u, pit board %u (snapped %u) | display time from the "
+            "presenter %u, from the render cost %u | target = display - %.2f ms - one tick %.2f "
+            "ms | cost %.3f ms a frame",
             g_options.vrInterpolate ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
             w.alphas ? w.alphaSum / w.alphas : 0.0, w.alphas ? w.alphaMin : 0.0,
             w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.snaps[kSnapFirst],
             w.snaps[kSnapIdentity], w.snaps[kSnapGap], w.snaps[kSnapJump], w.snaps[kSnapCamera],
             w.snaps[kSnapNonFinite], w.gaps[0], w.gaps[1], w.gaps[2], w.gaps[3],
             static_cast<double>(w.carsBlended) / w.frames, w.viewBlended, w.mirrorBlended,
-            w.presenterTimed, w.costTimed, s.haveLatency ? s.latency * toMs : 0.0,
+            w.pitBoardBlended, w.pitBoardSnaps, w.presenterTimed, w.costTimed,
+            s.haveLatency ? s.latency * toMs : 0.0,
             simHz > 0 ? 1000.0 / simHz : 0.0, static_cast<double>(w.costTicks) * toMs / w.frames);
     }
     w = Window();

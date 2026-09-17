@@ -1,7 +1,7 @@
 #pragma once
 
-// World interpolation: every car and the view are drawn as they were at the frame's display
-// time, blended between the two newest sim ticks the latch copied.
+// World interpolation: every car, the view and the pit board are drawn as they were at the
+// frame's display time, blended between the two newest sim ticks the latch copied.
 //
 // GPL's latch copies one tick into the car render records and the view record, and the draw
 // takes the cars' and the camera's pose from nothing else (docs/audit-2026-09-14/44-car-draw.md),
@@ -20,8 +20,8 @@
 
 namespace gplvr {
 
-// Redirect gpl_simFrameSetup's three gpl_carLatchRenderRecord calls and its view and mirror
-// record latches, and the fgEnableBG call after the latch. Every site is checked against its
+// Redirect gpl_simFrameSetup's three gpl_carLatchRenderRecord calls and its view, mirror and pit
+// board record latches, and the fgEnableBG call after the latch. Every site is checked against its
 // stock bytes first; nothing is patched unless all match. VR only; call after
 // renderPacingInstall, which locates the tick wait.
 void interpolationInstall();
