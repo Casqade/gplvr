@@ -6,6 +6,8 @@ This is an official page for Grand Prix Legends VR mod, currently in development
 
 Grand Prix Legends is a racing simulator developed by Papyrus Design Group and pushlished by Sierra in 1998.
 
+Gameplay video: https://youtu.be/yPTQwbbPhSg
+
 
 ## Features
 
