@@ -179,8 +179,8 @@ HMODULE moduleOf(const void* address) {
 // replaces that global with gplvr's hook before this runs, so asking it names GPLVR.DLL,
 // the scan below then searches our own image, and the only symptom is "0 candidates".
 // Every slot gplvr can take is disqualified for the same reason -- polyDraw goes to the
-// shim and the null-draw thunk, polySetDest to the shim, bitmapInstanceAlloc to the
-// letterbox thunk installed a few lines above this. What is left are the accessors
+// mirror pane gate and the polygon counter, bitmapInstanceAlloc to the letterbox thunk
+// installed a few lines above this. What is left are the accessors
 // nothing hooks, and the answer is cross-checked against our own module rather than
 // assumed.
 HMODULE rasterizerModule(const Binding& binding) {

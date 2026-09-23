@@ -4,6 +4,7 @@
 #include "Log.h"
 #include "Pe.h"
 #include "RenderPacing.h"
+#include "SimRing.h"
 #include "TaskRate.h"
 
 #include <windows.h>
@@ -115,7 +116,15 @@ constexpr Field kCarFields[] = {
     {212, 3, kAngle, "head angles"},   {224, 7, kLinear, "dials"},
     {252, 4, kKeep, "wheel state"},
 };
-constexpr int kCarIdentity[] = {32, 44, 52, 92, 252, 256, 260, 264};
+// A change here means the two copies describe DIFFERENT objects, so a blend between them is
+// meaningless and the pair snaps: R+32 is the driver index and R+52 the model handle. The other
+// words the record keeps -- the dial range R+44, the two bits of R+92, the wheel-state words at
+// R+252..264 -- are drawn-state selectors. They are `kKeep` fields, so a blended frame already
+// takes the newest value of each; snapping the whole record when one of them changes throws away
+// a position blend that was still valid. R+92 is `(car[275] >> 3) & 3`, recomputed from live
+// state every tick, and it was the likeliest single source of the snaps that put the camera and
+// the car at different ticks (report 78).
+constexpr int kCarIdentity[] = {32, 52};
 
 // The view record, 0xA0 bytes copied by gpl_viewLatchRecord 0x454F80 from the view object +16
 // into scene params p[3..42]; the mirror record at p[44..83] (gpl_viewGetMirrorRecord 0x454FB0)
@@ -204,6 +213,7 @@ struct Window {
     unsigned  mirrorBlended = 0;
     unsigned  pitBoardBlended = 0;
     unsigned  pitBoardSnaps = 0;  // also in snaps[]
+    unsigned  viewCarCoupled = 0;  // frames where the view and the viewed car were snapped together
     long long costTicks = 0;
 };
 
@@ -222,6 +232,9 @@ struct State {
     // Filled by the hooks inside this latch, consumed after it.
     int  latched[kCarSlots] = {};
     int  latchedCount = 0;
+    int  viewedSlot = -1;   // the car the view record is attached to, -1 when it was not latched
+    float    lastAlpha = 0.0f;
+    int      lastTickGap = 0;
     bool viewLatched = false;
     bool mirrorLatched = false;
     bool pitBoardLatched = false;
@@ -381,6 +394,10 @@ float blendDlong(float older, float newest, float a, float length) {
     return value;
 }
 
+// A matrix written apart from its quaternion is blended by itself instead; counted because a
+// rising count means the two are no longer describing the same rotation.
+unsigned g_rotationFallbacks = 0;
+
 // Rotation fields: the matrix, or the quaternion and the matrix derived from it.
 void blendRotation(const History& h, uint8_t* record, int base, const Field& field, float a) {
     if (field.blend == kQuat) {
@@ -392,9 +409,11 @@ void blendRotation(const History& h, uint8_t* record, int base, const Field& fie
         // A matrix written apart from its quaternion is blended by itself instead.
         if (!unitQuat(older) || !unitQuat(newest) || !matrixMatchesQuat(olderMatrix, older) ||
             !matrixMatchesQuat(newestMatrix, newest)) {
+            ++g_rotationFallbacks;
             if (!quatFromMatrix(olderMatrix, older) || !quatFromMatrix(newestMatrix, newest)) return;
             float blended[9];
             matrixFromQuat(slerp(older, newest, a), blended);
+
             std::memcpy(record + field.matrix, blended, sizeof(blended));
             return;
         }
@@ -405,6 +424,7 @@ void blendRotation(const History& h, uint8_t* record, int base, const Field& fie
         storeFloat(record, field.offset + 12, q.w);
         float m[9];
         matrixFromQuat(q, m);
+
         std::memcpy(record + field.matrix, m, sizeof(m));
         return;
     }
@@ -415,6 +435,7 @@ void blendRotation(const History& h, uint8_t* record, int base, const Field& fie
     if (!quatFromMatrix(olderMatrix, older) || !quatFromMatrix(newestMatrix, newest)) return;
     float blended[9];
     matrixFromQuat(slerp(older, newest, a), blended);
+
     std::memcpy(record + field.offset, blended, sizeof(blended));
 }
 
@@ -511,6 +532,21 @@ bool pairSane(const History& h, int base, const Field* fields, size_t count) {
 
 // This latch's copy of a car record becomes the newest of its pair; decide whether the pair may
 // be blended.
+// The car the view record is attached to. Its driver index is R+32 of the car record, which is
+// the same number the view record carries at 0x776144; live cars hold slots 0..19 and replay cars
+// 20..39. -1 when the viewed car was not latched this frame (a pit or menu camera).
+int viewedCarSlot(const State& s, int driverIndex, bool live) {
+    int first = live ? 0 : kCarsPerArray;
+    int last = live ? kCarsPerArray : kCarSlots;
+    for (int i = 0; i < s.latchedCount; ++i) {
+        int slot = s.latched[i];
+        if (slot < first || slot >= last) continue;
+        const History& h = s.cars[slot];
+        if (h.copies > 0 && static_cast<int>(h.words[1][(32 - 4) / 4]) == driverIndex) return slot;
+    }
+    return -1;
+}
+
 void pushCar(State& s, History& h, const uint8_t* record, int tick) {
     const uint8_t* words = record + 4;
     if (h.copies > 0 && h.ticks[1] == tick) {
@@ -663,6 +699,53 @@ void pushPitBoard(State& s, History& h, const uint8_t* record, int tick, const H
     }
 }
 
+// DID THE BLEND WRITE WHAT IT PROMISED?
+//
+// Six hypotheses about how GPL reacts to these records have been measured and killed (reports
+// 76-78 and the walk probe), and not one of them checked the only thing that is entirely ours:
+// that a blended value lies BETWEEN the two copies it was blended from. Nothing else in this file
+// checks it. `pairSane` only rejects non-finite values and magnitudes past 1e6, so a copy that is
+// all zeros passes as sane -- and blending against a zeroed copy drags the eye a fraction of the
+// way to the world origin, which is a camera that was never anywhere, for one frame, with the
+// orientation untouched.
+//
+// Checked on the position, which is the field the artifact points at: the written value must lie
+// within the two copies' range plus a centimetre of slack for the arithmetic.
+unsigned g_blendOutOfRange = 0;
+float    g_blendWorstMetres = 0.0f;
+
+void checkBlendedPosition(const History& h, const uint8_t* record, int base, int offset,
+                          const char* what) {
+    float worst = 0.0f;
+    for (int k = 0; k < 3; ++k) {
+        float older = floatAt(h.words[0], base, offset + 4 * k);
+        float newest = floatAt(h.words[1], base, offset + 4 * k);
+        float wrote = *reinterpret_cast<const float*>(record + offset + 4 * k);
+        float low = older < newest ? older : newest;
+        float high = older < newest ? newest : older;
+        float over = wrote < low ? low - wrote : (wrote > high ? wrote - high : 0.0f);
+        if (over > worst) worst = over;
+    }
+    if (worst <= 0.01f) return;
+
+    ++g_blendOutOfRange;
+    if (worst > g_blendWorstMetres) g_blendWorstMetres = worst;
+    static int dumps = 8;
+    if (dumps <= 0) return;
+    --dumps;
+    logf("interp: THE BLEND LEFT THE PAIR -- %s wrote %.2f %.2f %.2f, %.2f m outside the range of "
+         "older %.2f %.2f %.2f and newest %.2f %.2f %.2f (ticks %d and %d)",
+         what, static_cast<double>(*reinterpret_cast<const float*>(record + offset)),
+         static_cast<double>(*reinterpret_cast<const float*>(record + offset + 4)),
+         static_cast<double>(*reinterpret_cast<const float*>(record + offset + 8)),
+         static_cast<double>(worst), static_cast<double>(floatAt(h.words[0], base, offset)),
+         static_cast<double>(floatAt(h.words[0], base, offset + 4)),
+         static_cast<double>(floatAt(h.words[0], base, offset + 8)),
+         static_cast<double>(floatAt(h.words[1], base, offset)),
+         static_cast<double>(floatAt(h.words[1], base, offset + 4)),
+         static_cast<double>(floatAt(h.words[1], base, offset + 8)), h.ticks[0], h.ticks[1]);
+}
+
 // Blend one record to `target`. True when its pair was usable; only the first such record of a
 // frame goes into the alpha statistics.
 bool blendHistory(State& s, const History& h, uint8_t* record, int base, const Field* fields,
@@ -681,6 +764,8 @@ bool blendHistory(State& s, const History& h, uint8_t* record, int base, const F
     if (high) alpha = 1.0;
     if (!sampled) {
         sampled = true;
+        s.lastAlpha = static_cast<float>(alpha);
+        s.lastTickGap = h.ticks[1] - h.ticks[0];
         Window& w = s.window;
         if (!w.alphas || alpha < w.alphaMin) w.alphaMin = alpha;
         if (!w.alphas || alpha > w.alphaMax) w.alphaMax = alpha;
@@ -730,26 +815,35 @@ void blendFrame(State& s, long long now, bool frozen) {
     float length = trackLengthMetres();
     bool  sampled = false;
     bool  any = false;
-    if (blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
+    int   parts = kPartAll;
+    if ((parts & kPartView) &&
+        blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled)) {
         ++w.viewBlended;
         any = true;
+        // The view record's eye position is the first three floats; the car's is at its byte 16.
+        checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(kViewRecord), 0, 0, "the eye");
     }
-    if (s.mirrorLatched &&
+    if ((parts & kPartMirror) && s.mirrorLatched &&
         blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(kMirrorRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled)) {
         ++w.mirrorBlended;
         any = true;
     }
-    for (int i = 0; i < s.latchedCount; ++i) {
-        int slot = s.latched[i];
-        if (blendHistory(s, s.cars[slot], carRecord(slot), 4, kCarFields,
-                         sizeof(kCarFields) / sizeof(kCarFields[0]), target, length, sampled)) {
-            ++w.carsBlended;
-            any = true;
+    if (parts & kPartCars) {
+        for (int i = 0; i < s.latchedCount; ++i) {
+            int slot = s.latched[i];
+            if (blendHistory(s, s.cars[slot], carRecord(slot), 4, kCarFields,
+                             sizeof(kCarFields) / sizeof(kCarFields[0]), target, length,
+                             sampled)) {
+                ++w.carsBlended;
+                any = true;
+                if (slot == s.viewedSlot)
+                    checkBlendedPosition(s.cars[slot], carRecord(slot), 4, 16, "the viewed car");
+            }
         }
     }
-    if (s.pitBoardLatched &&
+    if ((parts & kPartPitBoard) && s.pitBoardLatched &&
         blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(kPitBoardRecord), 4,
                      kPitBoardFields, sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]), target,
                      length, sampled)) {
@@ -789,6 +883,32 @@ void __stdcall afterLatch() {
             int slot = s.latched[i];
             pushCar(s, s.cars[slot], carRecord(slot), tick);
         }
+        // THE CAMERA AND THE CAR IT IS ATTACHED TO MUST BE AT THE SAME TICK.
+        //
+        // The view record and each car record have their own history, their own snap rules and
+        // their own decision, and the rule sets are disjoint -- kSnapIdentity and kSnapJump exist
+        // only for cars, kSnapCamera only for the view. So one of them could snap to the newest
+        // tick while the other blended to the display time, and the cockpit, the steering wheel
+        // and the front wheels were then drawn up to two ticks away from the eye they are seen
+        // from: about a metre at racing speed, for one frame (report 78). It also put the eye's
+        // dlong and the car's dlong in different track segments, which is what made parts of the
+        // car disappear behind the road of the segment the eye was in (report 77 section 3.3).
+        //
+        // The pit board is already coupled to the view this way; this does the same for the car
+        // the view is attached to, in both directions.
+        int viewedSlot = viewedCarSlot(s, identity[1], identity[2] != 0);
+        s.viewedSlot = viewedSlot;
+        if (viewedSlot >= 0) {
+            History& car = s.cars[viewedSlot];
+            if (car.copies == 2 && s.view.copies == 2 && car.snapped != s.view.snapped) {
+                History& blended = car.snapped ? s.view : car;
+                blended.snapped = true;
+                blended.stepPerTick = -1.0f;
+                ++w.snaps[kSnapCamera];
+                ++w.viewCarCoupled;
+            }
+        }
+
         // A board hidden in this latch starts a new history when it shows again.
         if (s.pitBoardLatched)
             pushPitBoard(s, s.pitBoard, reinterpret_cast<const uint8_t*>(kPitBoardRecord), tick,
@@ -959,10 +1079,16 @@ void interpolationInstall() {
         return;
     }
 
+    // The three car latch sites may already hold the sim ring's hook (SimRing.h), which
+    // installs first and calls the stock latch itself; the blend then runs outside it.
+    uintptr_t ring = simRingCarLatchHookAddress();
+
     const StockCall* calls[6] = {&kCarLatchCalls[0], &kCarLatchCalls[1], &kCarLatchCalls[2],
                                  &kViewLatchCall,    &kMirrorLatchCall,  &kPitBoardLatchCall};
     for (const StockCall* call : calls) {
         auto bytes = reinterpret_cast<const uint8_t*>(call->site);
+        bool isCarLatch = call == calls[0] || call == calls[1] || call == calls[2];
+        if (isCarLatch && ring && bytes[0] == 0xE8 && callTarget(call->site) == ring) continue;
         if (std::memcmp(bytes, call->bytes, sizeof(call->bytes)) != 0) {
             logf("interp: %08X does not hold its stock call (%02X %02X %02X %02X %02X) -- no "
                  "interpolation",
@@ -1027,6 +1153,32 @@ void interpolationInstall() {
 
 bool interpolationActive() { return g_state.installed && g_options.vrInterpolate; }
 
+// The viewed car's own distance along the track, blended, in metres. Record byte 12, the field
+// the sim maintains and the one the mark ring shows moving smoothly to a tenth of a metre while
+// gpl_cameraTrackPositionFromWorld's answer for the same point was spiking 32 m (report 84).
+bool interpolationViewedCarDlong(float& metres) {
+    State& s = g_state;
+    if (!s.installed || s.viewedSlot < 0) return false;
+    if (s.cars[s.viewedSlot].copies < 1) return false;
+    metres = *reinterpret_cast<const float*>(carRecord(s.viewedSlot) + 12);
+    return true;
+}
+
+bool interpolationViewedCarPosition(float blended[3], float newestTick[3]) {
+    State& s = g_state;
+    if (!s.installed || s.viewedSlot < 0) return false;
+    const History& h = s.cars[s.viewedSlot];
+    if (h.copies < 1) return false;
+
+    // Record bytes 16..27 are the car's position, p-record words 323..325.
+    const uint8_t* record = carRecord(s.viewedSlot);
+    for (int k = 0; k < 3; ++k) {
+        blended[k] = *reinterpret_cast<const float*>(record + 16 + 4 * k);
+        newestTick[k] = floatAt(h.words[1], 4, 16 + 4 * k);
+    }
+    return true;
+}
+
 bool interpolationFormat(char* out, size_t size) {
     State& s = g_state;
     if (!s.installed) return false;
@@ -1035,23 +1187,39 @@ bool interpolationFormat(char* out, size_t size) {
     if (report) {
         int    simHz = taskRateSimHz();
         double toMs = 1000.0 / static_cast<double>(s.frequency);
-        std::snprintf(
+        // snprintf returns what the line WOULD have taken, so a line that outgrows its buffer can
+        // be caught instead of silently losing whatever was added last -- which is always the
+        // newest instrument.
+        int wanted = std::snprintf(
             out, size,
             "interp: %s | %u world frames: %u blended, %u frozen, %u untimed | alpha mean %.2f "
             "min %.2f max %.2f, clamped low %u high %u | snaps first %u identity %u tick gap %u "
-            "jump %u camera %u nonfinite %u | view tick gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
-            "| view blended %u, mirror %u, pit board %u (snapped %u) | display time from the "
+            "jump %u camera %u nonfinite %u (%u of them the view and its car coupled) | view tick "
+            "gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
+            "| view blended %u, mirror %u, pit board %u (snapped %u) | rotation: %u matrix "
+            "fallbacks | blend left the pair %u times, worst %.2f m | display time from the "
             "presenter %u, from the render cost %u | target = display - %.2f ms - one tick %.2f "
             "ms | cost %.3f ms a frame",
             g_options.vrInterpolate ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
             w.alphas ? w.alphaSum / w.alphas : 0.0, w.alphas ? w.alphaMin : 0.0,
             w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.snaps[kSnapFirst],
             w.snaps[kSnapIdentity], w.snaps[kSnapGap], w.snaps[kSnapJump], w.snaps[kSnapCamera],
-            w.snaps[kSnapNonFinite], w.gaps[0], w.gaps[1], w.gaps[2], w.gaps[3],
+            w.snaps[kSnapNonFinite], w.viewCarCoupled, w.gaps[0], w.gaps[1], w.gaps[2],
+            w.gaps[3],
             static_cast<double>(w.carsBlended) / w.frames, w.viewBlended, w.mirrorBlended,
-            w.pitBoardBlended, w.pitBoardSnaps, w.presenterTimed, w.costTimed,
+            w.pitBoardBlended, w.pitBoardSnaps, g_rotationFallbacks, g_blendOutOfRange,
+            static_cast<double>(g_blendWorstMetres), w.presenterTimed, w.costTimed,
             s.haveLatency ? s.latency * toMs : 0.0,
             simHz > 0 ? 1000.0 / simHz : 0.0, static_cast<double>(w.costTicks) * toMs / w.frames);
+        if (wanted < 0 || static_cast<size_t>(wanted) >= size) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                logf("interp: THE LINE ABOVE IS TRUNCATED -- it wants %d bytes and has %zu, so "
+                     "its last fields are missing. Grow the buffer in Hooks.cpp.",
+                     wanted, size);
+            }
+        }
     }
     w = Window();
     return report;

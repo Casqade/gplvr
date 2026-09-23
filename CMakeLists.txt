@@ -78,7 +78,9 @@ else()
         src/CrashGuard.cpp
         src/CursorOverlay.cpp
         src/Discovery.cpp
+        src/DrawnMarks.cpp
         src/FrameBudget.cpp
+        src/GlApi.cpp
         src/GlInterop.cpp
         src/GpuTimer.cpp
         src/Hooks.cpp
@@ -91,17 +93,22 @@ else()
         src/MirrorTarget.cpp
         src/MouseLook.cpp
         src/Pe.cpp
+        src/PostProfile.cpp
         src/Pribluda.cpp
         src/RenderPacing.cpp
         src/RenderProfile.cpp
-        src/RenderShim.cpp
         src/RenderTarget.cpp
+        src/SimRing.cpp
         src/Stereo.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
         src/VrCamera.cpp
         src/Window.cpp
         src/presenter/Producer.cpp
+        # The fast text path (fastText = 1): GPL's stamped glyphs drawn from a GPU atlas
+        # instead of one roglv2 glDrawPixels each.
+        src/fast_text/FastText.cpp
+        src/fast_text/TextDraw.cpp
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
     target_include_directories(gplvr PRIVATE src)
@@ -119,7 +126,9 @@ else()
     # Starts the game suspended, injects gplvr.dll, resumes. See the comment at the top
     # of GplvrLoader.cpp for why this rather than a proxy DLL.
     add_executable(gplvr_loader WIN32 src/loader/GplvrLoader.cpp)
-    set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr")
+    # Its own PDB name: with OUTPUT_NAME "gplvr" the loader's link would write gplvr.pdb over
+    # the DLL's.
+    set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr" PDB_NAME "gplvr-loader")
     target_link_libraries(gplvr_loader PRIVATE user32)
 
     set(GPLVR_TARGETS gplvr gplvr_loader)

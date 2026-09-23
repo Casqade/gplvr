@@ -3,6 +3,7 @@
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Hud.h"
+#include "Interpolation.h"
 #include "Log.h"
 #include "MirrorConfig.h"
 #include "Pe.h"
@@ -12,6 +13,7 @@
 #include <windows.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace gplvr {
@@ -34,6 +36,9 @@ typedef void*(__thiscall* CameraCreateFn)(void* self, void* surface, float fov, 
 // camera->fov) -- so binding a camera IS a destination change, which is the whole reason
 // we need it here.
 typedef int(__cdecl* CameraBindFn)(void* camera);
+
+// Defined below, next to the euler round-trip check it exists for.
+void gplMatrixToEuler(const float m[9], float& yaw, float& pitch, float& roll);
 
 namespace {
 
@@ -184,6 +189,10 @@ struct State {
 
     // Set around the mirror-only sceneRender.
     bool mirrorOnly = false;
+
+    // The game's mirror camera for the frame being rendered, so a bind of it can be told apart
+    // from the eye cameras when the panes are not in use.
+    void* frameMirror = nullptr;
     int  paneCopies = 0;
     bool reportedNoCopy = false;
 
@@ -513,8 +522,8 @@ bool ensurePanes(void* mirrorCamera) {
     return true;
 }
 
-// polyDraw(type, count, vertices): roglv2 abandons a polygon with fewer than three vertices,
-// so zeroing the count drops it through the rasterizer's own early-out, as nullDraw does.
+// polyDraw(type, count, vertices, tags): roglv2 abandons a polygon with fewer than three
+// vertices, so zeroing the count drops it through the rasterizer's own early-out.
 __declspec(naked) void paneDropThunk() {
     __asm {
         cmp byte ptr [g_paneDropPolys], 0
@@ -527,6 +536,256 @@ __declspec(naked) void paneDropThunk() {
 
 // Puts the gate on the polyDraw global, chaining whatever is there. Checked every frame:
 // gpl_rasterResolveEntryPoints rewrites the globals on a mode change.
+// -- which segment a pass will walk ------------------------------------------------------------
+//
+// sub_460B40(hint, &out, x, y, z): the search gpl_sceneRender makes at 0x487D73 over the global
+// segment array, seeded by (u16)p[23] and driven by the eye position in dlong units (metres x
+// 19685, dbl_53A020). It reads globals only, so it can be called with the values the pass is
+// about to use. Returns the segment index the walk is centred on.
+using WalkSegmentFn = int(__cdecl*)(int hint, int* out, int x, int y, int z);
+constexpr uintptr_t kWalkSegmentOf = 0x00460B40;
+constexpr double    kDlongUnitsPerMetre = 19685.0;
+
+// THE SUBSTITUTION (vrFixEyeSegment). gpl_sceneRender asks this function where the camera is on
+// the track, and uses the answer to centre the world walk and to set gpl_selectorCameraDlong /
+// Dlat / Height. In flat GPL the camera sits in the cockpit, so the answer is the car's; in VR
+// the head pose moves the point off it -- measured at 0.03 to 0.32 m in the mirror lines, since
+// recentring puts the origin at the driver's own eye -- and at some places, measured at the
+// bottom of Eau Rouge, the search then returns a segment four to six away and the frame walks
+// another part of the track entirely. Asking about the CAR's position instead restores what flat GPL
+// does, keeps all four outputs consistent with each other, and needs no threshold.
+//
+// Both call sites are redirected: 0x487D73 for the eye pass, 0x4877D9 for the mirror pass, so the
+// whole frame is centred on the same point.
+void* g_walkLookupOriginal = nullptr;
+unsigned g_walkSubstituted = 0;   // calls where the car's position was used
+unsigned g_walkPassedThrough = 0; // calls with no viewed car, left alone
+
+// THE DEFECT THIS GUARDS, measured 2026-09-21 (report 84).
+//
+// The walkmark trace caught it directly: for ONE frame -- both eye passes -- the dlong this
+// search writes jumps 32 m and comes straight back, while the eye's and the car's own dlongs in
+// the interpolation ring are smooth to a tenth of a metre across the whole window. So the input
+// is clean and the answer is not.
+//
+// The mechanism is in the search. It steps one segment an iteration from its seed and exits on
+// `while (v8 & v9)` -- it stops as soon as two consecutive probes stop agreeing on which way to
+// go -- and it then writes the dlong of the point measured against WHATEVER SEGMENT IT STOPPED
+// ON. Stop one segment early and the dlong is out by a segment length, which at Spa is tens of
+// metres. gpl_sceneRender hands that dlong straight to gpl_worldRenderSegmentRange as the centre
+// of the walk, so that frame draws a different stretch of track: terrain over everything, no
+// road, the bare ground showing through.
+//
+// THE SEED IS NOT THE VARIABLE, and this is measured, not assumed. An earlier instrument reseated
+// the seed from the blended position and reported `hint reseated 0, corrected 0` -- it never fired
+// -- and the decisive case had the SAME seed (12) with two positions 0.46 m apart answering 12 and
+// 17. A search that steps one segment an iteration cannot legitimately move five segments for
+// 0.46 m of input. What decides where it stops is the ORDER of the probes, not the seed, so any
+// fix that supplies a better seed is a no-op wearing a new hat.
+//
+// So the seed is left exactly as gpl_sceneRender passes it, and the ANSWER is checked instead: a
+// dlong cannot advance further than the car did. When it has, the car's own dlong replaces it --
+// record byte 12, the value the sim maintains, which the mark ring shows moving smoothly to a
+// tenth of a metre through the very frames where this search spiked 32 m. Live authoritative
+// data, not a stale value and not a guess about the search.
+constexpr uintptr_t kTrackLengthDlong = 0x006B3884;
+
+// GPL'S OWN CONTAINMENT ANSWER, which its search asks for and then throws away.
+//
+// gpl_segmentPlacePoint 0x4608D0 projects the point onto one segment and returns:
+//     0  the point is INSIDE this segment -- the dlong it wrote is real
+//     1  the point is past its end
+//     2  the point is before its start
+// On 1 and 2 it still writes a dlong: `segment.baseDlong + projection`, the point EXTRAPOLATED
+// along that segment's axis. That number is only meaningful if the track continues the way this
+// segment does.
+//
+// gpl_cameraTrackPositionFromWorld loops it, stepping one segment towards the point, and exits on
+// `while (v8 & v9)` -- as soon as two consecutive probes stop sharing a bit. A 1 followed by a 2
+// (stepped forward and overshot) shares nothing, so the loop stops there and PUBLISHES THE
+// EXTRAPOLATION from a segment the point is not in. There is no step-back-and-accept.
+//
+// So the failure has a name and a test: the point fell in a seam between two segments'
+// longitudinal spans, and the answer is an extrapolation. Asking this function directly about the
+// segment the search settled on is exactly the check the engine omits -- no threshold in it.
+constexpr uintptr_t kSegmentArray = 0x006B7FD8;   // dword_6B7FD8, the array 0x460B40 indexes
+constexpr uintptr_t kSegmentArrayCount = 0x006AFB08;
+constexpr uintptr_t kSegmentPlacePoint = 0x004608D0;
+using PlacePointFn = int(__cdecl*)(const void* segment, int x, int y, int* dlong, int* dlat);
+
+// 0 inside, 1 past the end, 2 before the start, -1 when it could not be asked.
+int placementOf(int segment, int x, int y) {
+    auto base = *reinterpret_cast<const void* const* const*>(kSegmentArray);
+    int  count = *reinterpret_cast<const int*>(kSegmentArrayCount);
+    if (!base || count <= 0 || count > 8192 || segment < 0 || segment >= count) return -1;
+    const void* node = base[segment];
+    if (!node) return -1;
+    int dlong = 0;
+    int dlat = 0;
+    return reinterpret_cast<PlacePointFn>(kSegmentPlacePoint)(node, x, y, &dlong, &dlat);
+}
+
+int      g_walkLastDlong = 0;
+float    g_walkLastPosition[3] = {};
+bool     g_walkHaveLast = false;
+unsigned g_walkCorrected = 0;      // answers replaced with the car's own dlong
+unsigned g_walkCorrectedBig = 0;   // of those, the ones past kBigExcess
+unsigned g_walkOutside = 0;        // GPL settled on a segment the point is not in
+unsigned g_walkOverMargin = 0;     // the dlong moved further than the car did
+unsigned g_walkNoDlong = 0;        // rejected, but the car's dlong was unavailable
+float    g_walkWorstExcess = 0.0f; // biggest rejected overshoot, metres
+
+// TWO DIFFERENT THINGS LOOK THE SAME TO THE CONTRACT, so they are counted apart.
+//
+// A one-frame excursion of tens of metres moves the walk's centre by more than a segment for a
+// single frame: the frames either side draw the correct range, that one does not, and the change
+// is what the eye sees. That is the artifact.
+//
+// A SUSTAINED disagreement of a few metres is a static shift of a fraction of a segment, held for
+// hundreds of frames. It cannot be seen, and it may not even be the lookup failing: the car
+// record's dlong (byte 12) and its position (bytes 16..27) may simply be measured from different
+// points on the car, with the gap opening in corners. If the big bucket alone is what stops the
+// artifact, the margin should be raised and the small corrections dropped rather than overriding
+// GPL on a quarter of all passes for no visible gain.
+constexpr float kBigExcess = 10.0f;
+
+// Signed difference the short way round the lap, in dlong units.
+int dlongDelta(int from, int to) {
+    int length = *reinterpret_cast<const int*>(kTrackLengthDlong);
+    int delta = to - from;
+    if (length <= 0) return delta;
+    while (delta > length / 2) delta -= length;
+    while (delta < -length / 2) delta += length;
+    return delta;
+}
+
+int __cdecl walkLookupThunk(int hint, int* out, int x, int y, int z) {
+    auto original = reinterpret_cast<WalkSegmentFn>(g_walkLookupOriginal);
+    float blended[3] = {}, tick[3] = {};
+    if (!g_options.vrFixEyeSegment || !interpolationViewedCarPosition(blended, tick)) {
+        ++g_walkPassedThrough;
+        g_walkHaveLast = false;  // the memory is about the substituted point, not this one
+        return original(hint, out, x, y, z);
+    }
+
+    auto toUnits = [](float metres) {
+        return static_cast<int>(static_cast<double>(metres) * kDlongUnitsPerMetre);
+    };
+
+    ++g_walkSubstituted;
+    int ux = toUnits(blended[0]);
+    int uy = toUnits(blended[1]);
+    int uz = toUnits(blended[2]);
+
+    int segment = original(hint, out, ux, uy, uz);
+
+    // How far the car moved since the last accepted answer. All four calls in a frame -- two eyes,
+    // and the mirror pass with them -- use the same substituted point, so within a frame this is
+    // zero and the two eyes have to agree.
+    float dx = blended[0] - g_walkLastPosition[0];
+    float dy = blended[1] - g_walkLastPosition[1];
+    float dz = blended[2] - g_walkLastPosition[2];
+    float moved = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    // THE PRIMARY TEST: did the search settle on a segment the point is actually in?
+    int placement = placementOf(segment, ux, uy);
+    bool extrapolated = placement > 0;
+    if (extrapolated) ++g_walkOutside;
+
+    // The secondary net, for the one failure the containment test cannot see. A segment whose
+    // type is neither 1 nor 2 makes gpl_segmentPlacePoint return 0 -- "inside" -- WITHOUT writing
+    // either out-parameter, and gpl_cameraTrackPositionFromWorld then publishes the values its
+    // in/out arguments arrived with: the seed as the dlong and the y coordinate as the dlat.
+    // Nothing about that is detectable from the return value, but a dlong cannot advance further
+    // than the car did.
+    //
+    // NOT A TUNING KNOB. Measured over 66,160 passes: containment triggered all 308 corrections
+    // and this test caught nothing containment had not, so there is nothing here for anyone to
+    // tune. It is fixed well above any legitimate advance -- a car at 300 km/h covers 0.93 m in a
+    // 90 Hz frame -- because the case it exists for produces a dlong of the SEED, a couple of
+    // hundred units, against a real position thousands of metres along the lap.
+    constexpr float kMargin = 10.0f;
+    constexpr float kGiveUp = 10.0f;  // a restart or teleport really did move; re-learn from it
+    bool impossible = false;
+    float excess = 0.0f;
+    if (g_walkHaveLast && moved < kGiveUp) {
+        excess = std::fabs(static_cast<float>(dlongDelta(g_walkLastDlong, out[0]))) /
+                     static_cast<float>(kDlongUnitsPerMetre) -
+                 moved;
+        impossible = excess > kMargin;
+        if (impossible) ++g_walkOverMargin;
+    }
+
+    if (extrapolated || impossible) {
+        if (excess > g_walkWorstExcess) g_walkWorstExcess = excess;
+
+        // Only out[0] is replaced. out[1], the dlat, feeds gpl_selectorCameraDlat, a
+        // level-of-detail input, and out[2] is the z we passed in, echoed back.
+        float carDlong = 0.0f;
+        if (interpolationViewedCarDlong(carDlong)) {
+            ++g_walkCorrected;
+            if (excess >= kBigExcess) ++g_walkCorrectedBig;
+            out[0] = toUnits(carDlong);
+        } else {
+            ++g_walkNoDlong;
+        }
+    }
+
+    g_walkLastDlong = out[0];
+    g_walkLastPosition[0] = blended[0];
+    g_walkLastPosition[1] = blended[1];
+    g_walkLastPosition[2] = blended[2];
+    g_walkHaveLast = true;
+    return segment;
+}
+
+// Both sites are checked against their stock bytes before either is written, and neither is
+// written unless both match -- half a substitution would centre the eye pass on the car and the
+// mirror pass on the mirror, which is worse than leaving both alone.
+bool installWalkLookup() {
+    struct Site {
+        uintptr_t     address;
+        unsigned char stock[5];
+    };
+    static constexpr Site kSites[] = {
+        {0x00487D73, {0xE8, 0xC8, 0x8D, 0xFD, 0xFF}},  // the eye pass
+        {0x004877D9, {0xE8, 0x62, 0x93, 0xFD, 0xFF}},  // the mirror pass
+    };
+    static bool tried = false;
+    if (tried) return g_walkLookupOriginal != nullptr;
+    tried = true;
+
+    for (const Site& site : kSites) {
+        auto bytes = reinterpret_cast<const uint8_t*>(site.address);
+        if (std::memcmp(bytes, site.stock, sizeof(site.stock)) == 0) continue;
+        logf("walk: %08X does not hold its stock call (%02X %02X %02X %02X %02X) -- the segment "
+             "lookup is left as the game makes it",
+             static_cast<unsigned>(site.address), bytes[0], bytes[1], bytes[2], bytes[3],
+             bytes[4]);
+        return false;
+    }
+
+    int32_t rel = 0;
+    std::memcpy(&rel, reinterpret_cast<const uint8_t*>(kSites[0].address) + 1, sizeof(rel));
+    g_walkLookupOriginal = reinterpret_cast<void*>(kSites[0].address + 5 + rel);
+
+    for (const Site& site : kSites) {
+        int32_t offset = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&walkLookupThunk) -
+                                              (site.address + 5));
+        if (patchBytes(reinterpret_cast<void*>(site.address + 1), &offset, sizeof(offset)))
+            continue;
+        logf("walk: could not redirect the segment lookup at %08X",
+             static_cast<unsigned>(site.address));
+        g_walkLookupOriginal = nullptr;
+        return false;
+    }
+
+    logf("walk: the camera's segment lookup at 004877D9 and 00487D73 now asks about the VIEWED "
+         "CAR's position instead of the eye's, which is what flat GPL asks. Original at %p.",
+         g_walkLookupOriginal);
+    return true;
+}
+
 bool ensurePolyGate() {
     void** slot = g_entries.polyDrawSlot;
     if (!slot || !*slot) return false;
@@ -699,6 +958,39 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 }
 
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
+
+bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
+
+bool stereoWalkFormat(char* out, size_t size) {
+    if (!g_walkSubstituted && !g_walkPassedThrough) return false;
+    // _TRUNCATE returns -1 rather than failing, so a line that outgrows its buffer silently loses
+    // whatever was added last -- which is always the newest instrument. Say so instead.
+    int written = _snprintf_s(
+        out, size, _TRUNCATE,
+        "walk: lookup from the car %u, left alone %u | %u OUTSIDE the segment GPL settled on, %u "
+        "impossible for the distance moved, %u CORRECTED from the car's own dlong (%u of them "
+        "10 m or more, the kind that is visible), worst %.1f m over, %u with no car dlong",
+        g_walkSubstituted, g_walkPassedThrough, g_walkOutside, g_walkOverMargin, g_walkCorrected,
+        g_walkCorrectedBig, static_cast<double>(g_walkWorstExcess), g_walkNoDlong);
+    if (written < 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            logf("walk: THE LINE ABOVE IS TRUNCATED -- it does not fit %zu bytes, so its last "
+                 "fields are missing. Grow the buffer in Hooks.cpp.",
+                 size);
+        }
+    }
+    g_walkSubstituted = 0;
+    g_walkPassedThrough = 0;
+    g_walkCorrected = 0;
+    g_walkCorrectedBig = 0;
+    g_walkOutside = 0;
+    g_walkOverMargin = 0;
+    g_walkNoDlong = 0;
+    g_walkWorstExcess = 0.0f;
+    return true;
+}
 
 int stereoMirrorCopyX(int readSurface, int x) {
     void* surface = g_state.pane[0].surface;
@@ -1190,6 +1482,8 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
 
     std::memcpy(savedOrientation, levelled, sizeof(levelled));
 
+    g_state.frameMirror = savedMirror;
+
     for (int pass = 0; pass < 2; ++pass) {
         // pass 0 draws the left half of the buffer and is the left eye. Proven in
         // game, not assumed: the left viewpoint lands in the left half with no swap
@@ -1217,6 +1511,20 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         params->eyeX = savedX + dx;
         params->eyeY = savedY + dy;
         params->eyeZ = savedZ + dz;
+
+        // WHICH PART OF THE TRACK THIS PASS WILL WALK.
+        //
+        // gpl_sceneRender picks the segment range from the eye POSITION, not from the view
+        // transform: sub_460B40(hint, x, y, z) at 0x487D73, with the position we have just
+        // written. A frame whose selection lands somewhere else draws that part of the track
+        // instead of this one -- distant terrain over everything, no road, the ground plane
+        // showing through -- while the transform, built from the orientation, still looks
+        // right. That is the artifact as the user describes it, so this records the segment
+        // each pass is about to walk and reports jumps.
+        //
+        // The substitution goes in here too, on the render thread between passes, because the
+        // sites it patches are inside the function this call is about to enter.
+        if (g_options.vrFixEyeSegment) installWalkLookup();
 
         // Re-aim at the runtime's frustum. Writing fov and aspect and setting the
         // dirty byte is enough -- cameraBind rebuilds the projection from them on

@@ -28,7 +28,7 @@ enum Unpaced { kUnpacedOff, kUnpacedMenu, kUnpacedClock, kUnpacedStale, kUnpaced
 const char* const kUnpacedName[kUnpacedCount] = {"off", "menu", "no clock", "stale", "ratio"};
 
 const char* const kUnpacedWhy[kUnpacedCount] = {
-    "vrRenderPacing = 0",
+    "vrLockToHeadset = 0",
     "the previous frame was not a tracked stereo world frame",
     "the presenter is not publishing its display clock",
     "the presenter's newest latch is more than 3 display periods old",
@@ -299,7 +299,7 @@ void __stdcall paceBeforeLatch() {
     bool           integral = true;
     const char*    source = nullptr;
     int            why = -1;
-    if (!g_options.vrRenderPacing) {
+    if (!g_options.vrLockToHeadset) {
         why = kUnpacedOff;
     } else if (!s.previousTracked) {
         why = kUnpacedMenu;
@@ -563,9 +563,9 @@ void renderPacingInstall() {
     logf("pace: the tick wait's fgDisableBG call at %08X goes through gplvr, then %s. %s",
          static_cast<unsigned>(s.site),
          current == s.fgDisableBG ? "straight to fgDisableBG" : "to the profiler's tick marker",
-         g_options.vrRenderPacing
+         g_options.vrLockToHeadset
              ? "Frames are paced whenever the conditions on the pace: lines hold."
-             : "vrRenderPacing = 0: frames run unpaced and the pace: line is the baseline.");
+             : "vrLockToHeadset = 0: frames run unpaced and the pace: line is the baseline.");
 }
 
 void renderPacingNotePublished() {

@@ -1,5 +1,7 @@
 #include "Hooks.h"
 
+#include "fast_text/FastText.h"
+#include "DrawnMarks.h"
 #include "FrameBudget.h"
 #include "Hud.h"
 #include "Interpolation.h"
@@ -9,10 +11,11 @@
 #include "MirrorTarget.h"
 #include "MouseLook.h"
 #include "Log.h"
+#include "PostProfile.h"
 #include "Pribluda.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
-#include "RenderShim.h"
+#include "SimRing.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
 #include "SwapControl.h"
@@ -103,7 +106,6 @@ bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
 bool      g_vrMirrorModeKeyLast = false;
 bool      g_vrInterpolateKeyLast = false;
-bool      g_nullDrawKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
 bool      g_dumpEyesLate = false;
@@ -148,6 +150,7 @@ bool      g_framePublished = false;
 // simFrame+81 -- but taken from the hook rather than assumed, so an extra render can
 // never run against a block the game has not handed us.
 void*     g_lastSceneParams = nullptr;
+
 LONGLONG  g_lastPresentTick = 0;
 LONGLONG  g_frameInterval = 0;
 bool      g_loggedExtraRenders = false;
@@ -189,11 +192,18 @@ bool g_mainWalkRedirected = false;
 // so the main walk is skipped. Everything else in the call runs: the per-pass resets after
 // it (gpl_renderClearDrawnMarks, gpl_renderClearObjectRegistrations) keep the object lists
 // consistent for the eye's own render that follows.
+// THE MAIN WALK'S ARGUMENTS, for whoever comes back to this: a2 and a3 are the camera's dlong
+// (the same value twice at cockpit field of view), a4 the heading as a binary angle whose
+// magnitude picks the segment order at 0x40000000 and the distance clamps at 0x20000000 and
+// 0x60000000, a5 an ahead bound read only past 135 degrees, a6 the behind-far bound, a7 the
+// ahead-far bound, a8 the behind near and mid bounds. Repeatable comment at 0x487F8A, and the
+// instruments that measured them are described in docs/audit-2026-09-18/85-instrument-archive.md.
 void __cdecl mainWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7,
                                 int a8) {
     if (stereoMirrorOnlyPass()) return;
     reinterpret_cast<WorldWalkFn>(kWorldWalk)(a1, a2, a3, a4, a5, a6, a7, a8);
 }
+
 unsigned g_sceneMirrorOnlyCalls = 0;  // mirror-only renders, counted apart from the eyes
 
 void reportOncePerSecond() {
@@ -292,7 +302,9 @@ void reportOncePerSecond() {
                  period, g_profPeriodWorst * toMs, scene, present, gplvr,
                  period - scene - present - gplvr, extra);
         }
+        postProfileReport(period);
     }
+    fastTextReport();
 
     // Both of these divide by FRAMES, so they read across against the frame budget above
     // rather than against each other.
@@ -305,7 +317,7 @@ void reportOncePerSecond() {
     if (g_options.profileStages && taskRateFormatTickCost(tickCost, sizeof(tickCost)))
         logf("%s", tickCost);
 
-    char present[320] = {};
+    char present[512] = {};
     if (renderProfileFormatPresent(present, sizeof(present), seconds, g_frames))
         logf("%s", present);
 
@@ -313,20 +325,40 @@ void reportOncePerSecond() {
     // the part that is the game asleep waiting for the next simulation tick. Takes no
     // window arguments: it averages over its own count of frames whose markers came out
     // in order, and says how many that was.
-    char pre[320] = {};
+    char pre[512] = {};
     if (renderProfileFormatPre(pre, sizeof(pre))) logf("%s", pre);
 
-    char shim[320] = {};
-    if (shimFormat(shim, sizeof(shim), seconds)) logf("%s", shim);
+    // The same frame as CPU WORK and CPU WAIT, and what a headset frame would have left.
+    // After the frame budget's and the post split's own lines, because the GPU total on
+    // the headroom line is the one whichever of them owns the timer has just drained.
+    char workWait[640] = {};
+    if (renderProfileFormatWorkWait(workWait, sizeof(workWait), seconds, g_frames))
+        logf("%s", workWait);
+    char headroom[512] = {};
+    if (renderProfileFormatHeadroom(headroom, sizeof(headroom), seconds, g_frames))
+        logf("%s", headroom);
 
-    // Render pacing, once a second while tracked frames were rendered: with vrRenderPacing = 0
+    // Render pacing, once a second while tracked frames were rendered: with vrLockToHeadset = 0
     // it is the unpaced baseline for the same counters.
     char pacing[640] = {};
     if (renderPacingFormat(pacing, sizeof(pacing))) logf("%s", pacing);
 
     // World interpolation, once a second while world frames were latched.
-    char interp[768] = {};
+    char interp[1280] = {};
     if (interpolationFormat(interp, sizeof(interp))) logf("%s", interp);
+
+    // The drawn-mark list's peak and overflows, once a second while the world was drawn. Per
+    // frame, so the clears read against the eye and mirror-only renders on the fps line.
+    char marks[200] = {};
+    if (drawnMarksFormat(marks, sizeof(marks), g_frames)) logf("%s", marks);
+
+    char ring[512] = {};
+    if (simRingFormat(ring, sizeof(ring), g_frames)) logf("%s", ring);
+
+    // Which part of the track each eye pass selected to walk. A jump here is the world being
+    // drawn from somewhere else while the view transform stays put.
+    char walk[768] = {};
+    if (stereoWalkFormat(walk, sizeof(walk))) logf("%s", walk);
 
     // After every line that reads them, and on every path -- a window that printed nothing
     // must still be drained, or its counts land in the next one.
@@ -507,19 +539,6 @@ void pollToggle() {
         g_stereoKeyLast = down;
     }
 
-    // nullDraw has to be a toggle, not a launch option: the measurement it exists for is
-    // the WORST frame on a track, and a worst frame has to be driven to. Blind, it cannot
-    // be. Hold it off, drive into the corner that hurts, tap the key for a couple of
-    // seconds of black, tap it back.
-    if (g_options.nullDrawKey) {
-        const bool down = (GetAsyncKeyState(g_options.nullDrawKey) & 0x8000) != 0;
-        if (down && !g_nullDrawKeyLast) {
-            g_options.nullDraw = !g_options.nullDraw;
-            renderProfileSetNullDraw(g_options.nullDraw);
-        }
-        g_nullDrawKeyLast = down;
-    }
-
     // Armed here, taken at publish time -- the key is polled on the game thread and the
     // read has to happen where the frame is complete and still bound.
     if (g_options.dumpEyesKey) {
@@ -589,6 +608,10 @@ void pollToggle() {
         }
         g_vrInterpolateKeyLast = down;
     }
+
+
+    fastTextPollFrame();
+    postProfilePollFrame();
 
     // The mouse look toggle, and the mouse itself.
     //
@@ -902,7 +925,6 @@ int __cdecl screenDisplayHook(void* surface) {
     menuScaleEndFrameAndBlit();
 
     ++g_frames;
-    shimEndFrame();
     taskRateReportThread("present");
     pollToggle();
     windowFrame();
@@ -1083,7 +1105,12 @@ int __cdecl screenDisplayHook(void* surface) {
         }
     }
 
+    // Every stampDraw of the frame has been issued, so anything the fast text path still has
+    // batched is drawn now -- before roglv2 presents, and after everything GPL drew over it.
+    fastTextEndFrame();
+
     frameBudgetSwitch(kSpanPresent);
+    postProfilePresentBegin();
     LARGE_INTEGER beforePresent, afterPresent;
     QueryPerformanceCounter(&beforePresent);
     renderProfileSetInPresent(true);
@@ -1091,6 +1118,7 @@ int __cdecl screenDisplayHook(void* surface) {
         (!background && g_originalScreenDisplay) ? g_originalScreenDisplay(surface) : 0;
     renderProfileSetInPresent(false);
     QueryPerformanceCounter(&afterPresent);
+    postProfilePresentEnd();
     renderProfileNoteFrame(beforePresent.QuadPart, afterPresent.QuadPart);
     frameBudgetEndFrame(afterPresent.QuadPart);
     g_profPresentTicks += afterPresent.QuadPart - beforePresent.QuadPart;
@@ -1134,10 +1162,17 @@ void __cdecl callOriginalSceneRender(void* params) {
     bool mirrorOnly = stereoMirrorOnlyPass();
     frameBudgetMirrorOnly(mirrorOnly);
     frameBudgetEyeBegin();
+    postProfileSceneBegin();
+    // Any text the fast path still has batched belongs under the world this call is about to
+    // draw, so it goes to the framebuffer first -- and again afterwards, so a stamp issued
+    // inside the scene cannot end up over polygons that followed it.
+    fastTextFlushNow();
     LARGE_INTEGER begin, end;
     QueryPerformanceCounter(&begin);
     g_originalSceneRender(params);
     QueryPerformanceCounter(&end);
+    fastTextFlushNow();
+    postProfileSceneEnd();
     frameBudgetEyeEnd();
     frameBudgetMirrorOnly(false);
 
@@ -1932,15 +1967,24 @@ void loadOptions(const char* fileName) {
     g_options.stereoKey = GetPrivateProfileIntA("gplvr", "stereoKey", '1', path);
     g_options.profileFrame =
         GetPrivateProfileIntA("gplvr", "profileFrame", 1, path) != 0;
-    g_options.shimMeasure = GetPrivateProfileIntA("gplvr", "shimMeasure", 0, path) != 0;
     g_options.profileGpuWait =
         GetPrivateProfileIntA("gplvr", "profileGpuWait", 0, path) != 0;
     g_options.profilePolys =
         GetPrivateProfileIntA("gplvr", "profilePolys", 0, path) != 0;
     g_options.profileStages =
         GetPrivateProfileIntA("gplvr", "profileStages", 0, path) != 0;
-    g_options.nullDraw = GetPrivateProfileIntA("gplvr", "nullDraw", 0, path) != 0;
-    g_options.nullDrawKey = GetPrivateProfileIntA("gplvr", "nullDrawKey", '9', path);
+    g_options.profilePost = GetPrivateProfileIntA("gplvr", "profilePost", 0, path) != 0;
+    g_options.profileWorkWait =
+        GetPrivateProfileIntA("gplvr", "profileWorkWait", 0, path) != 0 ||
+        g_options.profileStages;
+    g_options.profileStallUs = GetPrivateProfileIntA("gplvr", "profileStallUs", 50, path);
+    if (g_options.profileStallUs < 0) g_options.profileStallUs = 0;
+    if (g_options.profileStallUs > 10000) g_options.profileStallUs = 10000;
+    g_options.profileTargetHz = GetPrivateProfileIntA("gplvr", "profileTargetHz", 90, path);
+    if (g_options.profileTargetHz < 30) g_options.profileTargetHz = 30;
+    if (g_options.profileTargetHz > 240) g_options.profileTargetHz = 240;
+    g_options.fastText = GetPrivateProfileIntA("gplvr", "fastText", 1, path) != 0;
+    g_options.fastTextKey = GetPrivateProfileIntA("gplvr", "fastTextKey", '9', path);
     g_options.dumpEyesKey = GetPrivateProfileIntA("gplvr", "dumpEyesKey", '0', path);
     g_options.swapInterval = GetPrivateProfileIntA("gplvr", "swapInterval", 0, path);
     if (g_options.swapInterval < -1) g_options.swapInterval = -1;
@@ -2030,34 +2074,43 @@ void loadOptions(const char* fileName) {
     if (g_options.vrHudEye < 0 || g_options.vrHudEye > 2) g_options.vrHudEye = 0;
     g_options.vrPredictPosition =
         GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
-    g_options.vrRenderPacing = GetPrivateProfileIntA("gplvr", "vrRenderPacing", 1, path) != 0;
+    g_options.vrLockToHeadset = GetPrivateProfileIntA("gplvr", "vrLockToHeadset", 1, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrPaceMarginMs", "2.0", text, sizeof(text), path);
     g_options.vrPaceMarginMs = static_cast<float>(atof(text));
     if (!(g_options.vrPaceMarginMs >= 0.0f)) g_options.vrPaceMarginMs = 0.0f;
     if (g_options.vrPaceMarginMs > 10.0f) g_options.vrPaceMarginMs = 10.0f;
     g_options.vrInterpolate = GetPrivateProfileIntA("gplvr", "vrInterpolate", 1, path) != 0;
+    if (g_options.vrLockToHeadset && !g_options.vrInterpolate) {
+        g_options.vrInterpolate = true;
+        logf("options: vrLockToHeadset = 1 turns vrInterpolate on -- the lock declines every "
+             "frame without it whenever the display period is not a whole number of sim ticks "
+             "(144 Hz into 90 Hz is 1.6), and the game would free-run instead. It costs one sim "
+             "tick of latency. Set vrLockToHeadset = 0 to race unlocked without it.");
+    }
     g_options.vrInterpolateKey = GetPrivateProfileIntA("gplvr", "vrInterpolateKey", '7', path);
+    g_options.vrFixEyeSegment = GetPrivateProfileIntA("gplvr", "vrFixEyeSegment", 1, path) != 0;
+    g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
+    if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
     // Flat mode is the vanilla game in a borderless window: the window itself, the
     // letterbox and widescreen fixes, front-end scaling, roglv2's glFinish drop and swap
     // interval, and mouselook. Stereo and the tools built to develop and measure the
-    // headset path -- nullDraw, the eye dumps, the stage and polygon profilers, the
-    // rasterizer shim -- are for vr only. Switching them off here keeps every installer
+    // headset path -- the eye dumps, the stage and polygon profilers -- are for vr only. Switching them off here keeps every installer
     // and key that reads them inert, without a second check at each one.
     if (!g_options.vr) {
         g_options.stereo = false;
         g_options.stereoKey = 0;
-        g_options.nullDraw = false;
-        g_options.nullDrawKey = 0;
         g_options.dumpEyesKey = 0;
         g_options.vrMirrorTweakKey = 0;
         g_options.vrMirrorModeKey = 0;
-        g_options.shimMeasure = false;
         g_options.profilePolys = false;
+        // profileWorkWait survives: the work/wait split is the one measurement that has to
+        // read the same frame in both modes, and it owns no GPU marks, so it does not
+        // collide with profilePost.
         g_options.profileStages = false;
-        g_options.vrRenderPacing = false;
+        g_options.vrLockToHeadset = false;
         g_options.vrInterpolate = false;
         g_options.vrInterpolateKey = 0;
     }
@@ -2117,12 +2170,19 @@ void loadOptions(const char* fileName) {
          "vrPredictPosition=%d",
          g_options.vrHudLayer, g_options.vrHudTextScale, g_options.vrHudBackdropOpacity,
          g_options.vrHudEye, g_options.vrPredictPosition ? 1 : 0);
-    logf("options: vrRenderPacing=%d vrPaceMarginMs=%.1f (%s)", g_options.vrRenderPacing ? 1 : 0,
+    logf("options: vrLockToHeadset=%d vrPaceMarginMs=%.1f (%s)", g_options.vrLockToHeadset ? 1 : 0,
          g_options.vrPaceMarginMs,
-         g_options.vrRenderPacing
+         g_options.vrLockToHeadset
              ? "in a tracked race each latch waits to publish this many ms before the "
                "presenter's latch, and the views are located for the display the frame reaches"
              : "frames start as soon as a sim tick arrives, as stock");
+    logf("options: vrFixEyeSegment=%d (%s)", g_options.vrFixEyeSegment ? 1 : 0,
+         g_options.vrFixEyeSegment
+             ? "the world walk's lookup asks about the VIEWED CAR's position instead of the "
+               "eye's, which is the point flat GPL asks about, and its answer is checked against "
+               "GPL's own containment test before the walk is centred on it"
+             : "the world walk's lookup asks about the eye's own position and its answer is "
+               "taken as the game gives it");
     logf("options: vrInterpolate=%d vrInterpolateKey=0x%02X (%s)", g_options.vrInterpolate ? 1 : 0,
          g_options.vrInterpolateKey,
          g_options.vrInterpolate
@@ -2131,6 +2191,28 @@ void loadOptions(const char* fileName) {
                "at 144 Hz); render pacing also engages when the display period is not a whole "
                "number of ticks"
              : "the world is drawn at the newest latched sim tick, as stock");
+    logf("options: simRing=%d (%s)", g_options.simRing,
+         g_options.simRing >= 2
+             ? "the sim thread publishes each tick and the car render records are written from "
+               "the ring"
+         : g_options.simRing == 1
+             ? "the sim thread publishes each tick and the ring is verified against GPL's own "
+               "latch; nothing drawn changes"
+             : "off: the sim and the render thread exchange state through GPL's latch alone");
+    logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
+         g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
+                               : "post is one number");
+    logf("options: profileWorkWait=%d profileStallUs=%d profileTargetHz=%d (%s)",
+         g_options.profileWorkWait ? 1 : 0, g_options.profileStallUs, g_options.profileTargetHz,
+         g_options.profileWorkWait
+             ? "every millisecond of the frame is reported as CPU WORK or CPU WAIT"
+             : "no work/wait split -- pre and present stay single numbers");
+    logf("options: fastText=%d fastTextKey=0x%02X (%s)", g_options.fastText ? 1 : 0,
+         g_options.fastTextKey,
+         g_options.fastText
+             ? "GPL's stamped glyphs come from our GPU atlas, a run of them in one draw, "
+               "instead of one glDrawPixels a glyph"
+             : "every glyph is roglv2's glDrawPixels, ~103 us each");
     logf("options: HUD head ahead=%.2f down=%.2f right=%.2f width=%.2f | seat ahead=%.2f "
          "down=%.2f right=%.2f width=%.2f",
          g_options.vrHudHead.ahead, g_options.vrHudHead.down, g_options.vrHudHead.right,
@@ -2213,10 +2295,12 @@ void requestSceneRenderHook(const Binding& binding) {
         if (g_pendingBindCallSites.empty())
             logf("requestSceneRenderHook: no cameraBind call sites -- the eye frustum fix "
                  "is OFF and the eyes will use the game's own fov");
-        // Per-pane mirrors only. The sceneRender found by discovery must be the one the
-        // fixed call site lives in.
-        g_mainWalkPending = g_options.stereoMirror > 0 && binding.sceneRender == 0x00487620;
     }
+
+    // Per-pane mirrors (VR) need this call redirected so a mirror-only render can skip it. The
+    // sceneRender found by discovery must be the one the fixed call site lives in.
+    g_mainWalkPending =
+        g_options.vr && g_options.stereoMirror > 0 && binding.sceneRender == 0x00487620;
 
     g_sceneHookPending = true;
     logf("requestSceneRenderHook: queued %zu sceneRender and %zu cameraBind call site(s); "
@@ -2275,6 +2359,8 @@ void setCursorClip(const RECT& rect) {
 bool frameAlreadyPublished() { return g_framePublished; }
 
 bool hooksMainWalkRedirected() { return g_mainWalkRedirected; }
+
+void* hooksLastSceneParams() { return g_lastSceneParams; }
 
 bool keepDrawingWhileUnfocused() {
     return g_options.renderWhenUnfocused || g_options.vr;

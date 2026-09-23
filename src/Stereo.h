@@ -169,6 +169,14 @@ void stereoOnCameraBind(void* camera);
 // renders one pane into mirror.mip and nothing into the eye.
 bool stereoMirrorOnlyPass();
 
+// True while the polyDraw gate drops every polygon (the mirror-only render after its main
+// cameraBind). A renderer that takes polygons before they reach polyDraw must drop them too.
+bool stereoDroppingPolygons();
+
+// The once-a-second `walk:` line: how often GPL's own "where am I on the track" lookup had to be
+// corrected, and by how much. False when no stereo pass ran in the window. See report 84.
+bool stereoWalkFormat(char* out, size_t size);
+
 // The x at which gpl_sceneRender's mirror copy-out writes into mirror.mip. `readSurface` is
 // the bitmap the copy reads from (bitmapDraw's fourth argument). The +Y pane's copy moves to
 // the right half of the texture, where the +Y glass samples; everything else keeps `x`.

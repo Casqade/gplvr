@@ -2,6 +2,7 @@
 
 #include "Discovery.h"
 #include "FrameBudget.h"
+#include "GpuTimer.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
@@ -20,6 +21,14 @@
 namespace gplvr {
 
 namespace {
+
+// The instruments this file owns run under either key. `profileStages` is the VR-mode
+// switch that also turns on the frame budget and its GPU marks; `profileWorkWait` is the
+// part of it flat mode can have -- the `pre` markers and roglv2's import thunks -- because
+// those carry no GPU marks and so leave profilePost's timer alone. Loading makes
+// profileStages imply profileWorkWait, so a VR session that set the old key keeps
+// everything it had and gains the work/wait lines.
+bool profilingWorkWait() { return g_options.profileWorkWait; }
 
 // ---------------------------------------------------------------------------------------
 // GPL's own render counters
@@ -127,6 +136,25 @@ unsigned long long g_finishCyclesInPresent = 0;
 unsigned long long g_swapCycles = 0;
 unsigned long long g_drawCalls = 0;
 unsigned long long g_finishCalls = 0;
+unsigned long long g_swapCalls = 0;
+
+// A glDrawArrays call that BLOCKED, and the same figures for the part of the frame inside
+// screenDisplay.
+//
+// Submitting a polygon is CPU work; waiting inside the driver because its command queue is
+// full is not, and both happen in the same function. The two are told apart by duration:
+// a call at least `profileStallUs` long is charged to the stall total whole, the rest is
+// submission work. The threshold is converted to TSC cycles once a window from the same
+// ratio the report uses, so the TSC's frequency is never assumed.
+//
+// This is a LOWER BOUND on the driver stalls in a span: glDrawArrays is the only GL entry
+// point timed here, so a stall inside any other call is invisible and lands in WORK.
+unsigned long long g_drawStallCycles = 0;
+unsigned long long g_drawStallCyclesInPresent = 0;
+unsigned long long g_drawCyclesInPresent = 0;
+unsigned long long g_drawStalls = 0;
+unsigned long long g_drawStallsInPresent = 0;
+unsigned long long g_stallCycles = 150000;  // ~50 us at 3 GHz, until a window measures it
 
 // GEOMETRY THAT REACHES GL ONLY AFTER THE FRAME IS OVER.
 //
@@ -148,6 +176,34 @@ bool g_inPresent = false;
 unsigned long long g_windowCycles = 0;
 unsigned long long g_windowCycleStart = 0;
 
+// The window's cycles-to-milliseconds ratio, taken ONCE.
+//
+// Two report lines now convert rdtsc counts, and the conversion closes the cycle window as
+// a side effect: whichever line ran first used to leave the other with a window of a few
+// microseconds and figures hundreds of times too large. Taken once per report and reused,
+// reset by renderProfileEndWindow.
+bool   g_ratioTaken = false;
+double g_msPerCycle = 0.0;
+
+double windowMsPerCycle(double seconds) {
+    if (!g_ratioTaken) {
+        g_ratioTaken = true;
+        unsigned long long now = __rdtsc();
+        g_windowCycles = now - g_windowCycleStart;
+        g_windowCycleStart = now;
+        g_msPerCycle = g_windowCycles ? 1000.0 * seconds / g_windowCycles : 0.0;
+
+        // The stall threshold in the units the thunk compares against, from this window's
+        // own ratio rather than an assumed clock.
+        if (g_msPerCycle > 0.0 && g_options.profileStallUs > 0)
+            g_stallCycles = static_cast<unsigned long long>(
+                (g_options.profileStallUs / 1000.0) / g_msPerCycle);
+        else if (g_options.profileStallUs <= 0)
+            g_stallCycles = ~0ull;  // nothing is a stall; every draw is submission work
+    }
+    return g_msPerCycle;
+}
+
 using DrawArraysFn = void(WINAPI*)(unsigned mode, int first, int count);
 using FinishFn = void(WINAPI*)();
 using SwapFn = BOOL(WINAPI*)(HDC);
@@ -159,10 +215,22 @@ SwapFn       g_realSwap = nullptr;
 void WINAPI drawArraysThunk(unsigned mode, int first, int count) {
     unsigned long long begin = __rdtsc();
     g_realDrawArrays(mode, first, count);
-    g_drawCycles += __rdtsc() - begin;
+    unsigned long long spent = __rdtsc() - begin;
+    g_drawCycles += spent;
     ++g_drawCalls;
 
+    bool stalled = spent >= g_stallCycles;
+    if (stalled) {
+        g_drawStallCycles += spent;
+        ++g_drawStalls;
+    }
+
     if (g_inPresent) {
+        g_drawCyclesInPresent += spent;
+        if (stalled) {
+            g_drawStallCyclesInPresent += spent;
+            ++g_drawStallsInPresent;
+        }
         ++g_drawCallsInPresent;
         // The binding is asked for once per present, at the first such call: glGetIntegerv
         // on every draw would cost more than the frame it is measuring.
@@ -226,6 +294,7 @@ BOOL WINAPI swapThunk(HDC dc) {
     unsigned long long begin = __rdtsc();
     BOOL               result = g_realSwap(dc);
     g_swapCycles += __rdtsc() - begin;
+    ++g_swapCalls;
     frameBudgetLeave(previous);
     return result;
 }
@@ -302,31 +371,6 @@ int patchImportsByName(HMODULE module, const DriverHook* hooks, int count) {
         }
     }
     return taken;
-}
-
-// ---------------------------------------------------------------------------------------
-// nullDraw
-// ---------------------------------------------------------------------------------------
-//
-// polyDraw's SECOND argument is the vertex count, which it compares against 3 and
-// abandons the call below that. Writing zero into that argument therefore drops the
-// polygon through the engine's own early-out, leaving roglv2's SEH frame and batch
-// bookkeeping to run exactly as they do for any degenerate polygon, and leaving the
-// rasterizer's own polygon counter correctly un-incremented.
-
-void* g_originalPolyDraw = nullptr;
-
-// The thunk is installed once and gated on this byte, so the key can toggle it mid-corner
-// without ever writing the rasterizer global again. Turning a hook on and off by patching
-// a function pointer the renderer is actively calling is a race; testing a byte is not.
-volatile unsigned char g_nullDrawActive = 0;
-
-__declspec(naked) void nullDrawThunk() {
-    __asm { cmp byte ptr [g_nullDrawActive], 0
-            je  passThrough
-            mov dword ptr [esp+8], 0
-        passThrough:
-            jmp dword ptr [g_originalPolyDraw] }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -951,7 +995,7 @@ bool installPreMarkers(const ModuleImage& image) {
 }  // namespace
 
 void renderProfileDiscover(const Binding& binding) {
-    if (!g_options.profileStages) return;
+    if (!profilingWorkWait()) return;
 
     g_haveCounters = findCounters(binding.image);
 
@@ -979,7 +1023,7 @@ void renderProfileInstallDriverThunks() {
     // rather than execution, and SwapBuffers flushes by itself -- so the drain bought
     // nothing and cost the whole CPU/GPU overlap.
     //
-    int wanted = g_options.profileStages ? kDriverHookCount : 1;
+    int wanted = profilingWorkWait() ? kDriverHookCount : 1;
 
     HMODULE roglv2 = GetModuleHandleA("roglv2.dll");
     if (!roglv2) {
@@ -997,46 +1041,6 @@ void renderProfileInstallDriverThunks() {
         logf("raster: glFinish is DROPPED; glDrawArrays and SwapBuffers are timed");
 
     g_windowCycleStart = __rdtsc();
-}
-
-void renderProfileSetNullDraw(bool active) {
-    if (!g_originalPolyDraw) {
-        logf("nullDraw: not installed, so the key does nothing -- set nullDraw or "
-             "nullDrawKey in gplvr.ini before launching");
-        return;
-    }
-    g_nullDrawActive = active ? 1 : 0;
-    logf("nullDraw %s", active ? "ON -- the picture is black; the frame line now shows the "
-                                "floor no renderer change can go below"
-                              : "off");
-}
-
-void renderProfileInstallNullDraw(const Binding& binding) {
-    if (!g_options.nullDraw && !g_options.nullDrawKey) return;
-
-    if (g_options.shimMeasure) {
-        logf("nullDraw: refused -- shimMeasure already owns polyDraw, and both want the "
-             "same function pointer. Run them one at a time.");
-        return;
-    }
-    if (!binding.raster.polyDraw || !*binding.raster.polyDraw) {
-        logf("nullDraw: polyDraw is not resolved, so there is nothing to suppress");
-        return;
-    }
-
-    g_originalPolyDraw = *binding.raster.polyDraw;
-    void* thunk = reinterpret_cast<void*>(&nullDrawThunk);
-    if (!patchBytes(binding.raster.polyDraw, &thunk, sizeof(thunk))) {
-        logf("nullDraw: could not write the polyDraw global");
-        return;
-    }
-    g_nullDrawActive = g_options.nullDraw ? 1 : 0;
-    logf("nullDraw: installed, currently %s%s. Every polygon is dropped at the rasterizer "
-         "boundary; the frame time that remains is the floor no renderer change can go "
-         "below.",
-         g_nullDrawActive ? "ON" : "off",
-         g_options.nullDrawKey ? " -- press the nullDrawKey to toggle it while driving"
-                               : " (no nullDrawKey set, so it cannot be toggled)");
 }
 
 namespace {
@@ -1088,6 +1092,13 @@ Hitch g_worst;
 double   g_sumPre = 0.0;
 double   g_sumPost = 0.0;
 unsigned g_spanFrames = 0;
+
+// The other two spans and the whole frame, summed over the same frames, so the work/wait
+// line can tile the frame without borrowing the caller's own scene and present totals --
+// which are summed over RENDERS and over a different set of frames.
+double g_sumScene = 0.0;
+double g_sumPresent = 0.0;
+double g_sumFrame = 0.0;
 
 long long g_qpcFreq = 0;
 long long g_lastPresentEnd = 0;
@@ -1201,6 +1212,9 @@ void renderProfileNoteFrame(long long presentBegin, long long presentEnd) {
 
         g_sumPre += sample.pre;
         g_sumPost += sample.post;
+        g_sumScene += sample.scene;
+        g_sumPresent += sample.present;
+        g_sumFrame += sample.total;
         ++g_spanFrames;
 
         if (sample.total > g_worst.total) g_worst = sample;
@@ -1215,7 +1229,7 @@ void renderProfileNoteFrame(long long presentBegin, long long presentEnd) {
 }
 
 void renderProfileAfterRender() {
-    if (!g_options.profileStages) return;
+    if (!profilingWorkWait()) return;
 
     ++g_renders;
     if (g_haveCounters)
@@ -1252,9 +1266,19 @@ void renderProfileEndWindow() {
     g_drawCalls = 0;
     g_drawCallsInPresent = 0;
     g_finishCalls = 0;
+    g_swapCalls = 0;
+    g_drawStallCycles = 0;
+    g_drawStallCyclesInPresent = 0;
+    g_drawCyclesInPresent = 0;
+    g_drawStalls = 0;
+    g_drawStallsInPresent = 0;
+    g_ratioTaken = false;
 
     g_sumPre = 0.0;
     g_sumPost = 0.0;
+    g_sumScene = 0.0;
+    g_sumPresent = 0.0;
+    g_sumFrame = 0.0;
     g_spanFrames = 0;
     g_worst = Hitch();
 
@@ -1265,7 +1289,7 @@ void renderProfileEndWindow() {
 }
 
 bool renderProfileFormatGeometry(char* out, size_t size, unsigned long long frames) {
-    if (!g_options.profileStages || !g_renders || !frames) return false;
+    if (!profilingWorkWait() || !g_renders || !frames) return false;
     if (!g_haveCounters && !g_polysDrawn) return false;
 
     double perFrame = 1.0 / frames;
@@ -1328,26 +1352,223 @@ bool renderProfileFormatPre(char* out, size_t size) {
     // true and none of the parts should be read.
     double rest = pre - (tail + waitTick + waitBg + latch + logic + redraw + eyes);
 
+    // Every span carries its verdict, so the line can be read without knowing which of the
+    // seven names is a wait. WORK is the render thread doing something; WAIT is the render
+    // thread blocked on the simulation thread.
     _snprintf_s(out, size, _TRUNCATE,
-                "pre %.2f = tail %.2f + WAIT.tick %.2f + WAIT.bg %.2f + latch %.2f + "
-                "logic %.2f + redraw %.2f + eyes %.2f (rest %.2f) | %.2f ms of it is IDLE "
-                "(%.0f%%) -- headroom, not cost | %u of %u frames ordered",
-                pre, tail, waitTick, waitBg, latch, logic, redraw, eyes, rest, idle,
+                "pre %.2f = tail %.2f WORK + tick %.2f WAIT + bg %.2f WAIT + latch %.2f "
+                "WORK + logic %.2f WORK + redraw %.2f WORK + eyes %.2f WORK (rest %.2f) | "
+                "WORK %.2f + WAIT %.2f (%.0f%% of pre) -- the wait is headroom, not cost | "
+                "%u of %u frames ordered",
+                pre, tail, waitTick, waitBg, latch, logic, redraw, eyes, rest,
+                tail + latch + logic + redraw + eyes, idle,
                 pre > 0.0 ? 100.0 * idle / pre : 0.0, g_preOrdered, g_preFrames);
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------
+// The whole frame as WORK or WAIT
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+// One frame of the window, already split. Both lines below read the same numbers, so they
+// are computed once here rather than twice in two places that could drift apart.
+struct WorkWait {
+    double frame = 0.0;
+    double preWork = 0.0;   // tail, latch, logic, redraw and any earlier eye renders
+    double waitTick = 0.0;
+    double waitBg = 0.0;
+    double sceneWork = 0.0;
+    double sceneStall = 0.0;
+    double post = 0.0;
+    double presentWork = 0.0;
+    double presentStall = 0.0;
+    double swap = 0.0;
+    double renders = 1.0;  // sceneRender calls per frame: 1 flat, 2 in stereo, more with panes
+};
+
+bool takeWorkWait(WorkWait& w, double seconds, unsigned long long frames) {
+    if (!profilingWorkWait() || !g_preInstalled || !g_preOrdered || !g_spanFrames || !frames)
+        return false;
+
+    double perPre = 1.0 / g_preOrdered;
+    w.waitTick = g_preSum[kPreWaitTick] * perPre;
+    w.waitBg = g_preSum[kPreWaitBg] * perPre;
+    w.preWork = (g_preSum[kPreTail] + g_preSum[kPreLatch] + g_preSum[kPreLogic] +
+                 g_preSum[kPreRedraw] + g_preSum[kPreEyes]) *
+                perPre;
+
+    double perFrame = 1.0 / g_spanFrames;
+    double scene = g_sumScene * perFrame;
+    double present = g_sumPresent * perFrame;
+    w.post = g_sumPost * perFrame;
+    w.frame = g_sumFrame * perFrame;
+
+    double msPerCycle = windowMsPerCycle(seconds);
+    double perWindowFrame = msPerCycle / frames;
+    w.swap = g_swapCycles * perWindowFrame;
+    w.presentStall = g_drawStallCyclesInPresent * perWindowFrame;
+    w.sceneStall = (g_drawStallCycles - g_drawStallCyclesInPresent) * perWindowFrame;
+
+    // A term measured on the TSC over the window's frames against one measured on the QPC
+    // over the tiling's frames: a menu window or a window that lost frames to the ordering
+    // check can make the first exceed the second, and a negative span would be read as a
+    // measurement rather than as the mismatch it is.
+    if (w.swap > present) w.swap = present;
+    if (w.presentStall > present - w.swap) w.presentStall = present - w.swap;
+    if (w.sceneStall > scene) w.sceneStall = scene;
+
+    w.sceneWork = scene - w.sceneStall;
+    w.presentWork = present - w.swap - w.presentStall;
+
+    w.renders = g_renders ? static_cast<double>(g_renders) / frames : 1.0;
+    if (w.renders < 1.0) w.renders = 1.0;
+    return true;
+}
+
+}  // namespace
+
+// The question the VR budget turns on: of the 6.9 ms a flat frame costs on a heavy map, how
+// much is the render thread doing something and how much is it blocked? Time spent blocked
+// is budget a ring-buffer hand-off could give back (report 72 job 2); time spent working is
+// not, and a 90 Hz headset frame would have to fit inside what is left.
+//
+// The four top spans tile the frame, `pre` is tiled by its own seven, and each leaf is WORK
+// or WAIT by where it blocks:
+//
+//   WAIT  pre.tick          Sleep(1) until getBGCount advances -- the simulation thread
+//   WAIT  pre.bg            Sleep(1) spinning for the BG lock -- the simulation thread
+//   WAIT  present.swap      inside SwapBuffers -- the frame cap, vsync or a full driver
+//                           queue, i.e. the display or the GPU
+//   WAIT  scene.driver      glDrawArrays calls at least profileStallUs long, during the
+//   WAIT  present.driver    scene and inside screenDisplay -- the driver's queue
+//   WORK  everything else
+//
+// The two driver terms are LOWER BOUNDS, and they are the one attribution here that is a
+// rule rather than a span boundary: glDrawArrays is the only GL entry point timed, so a
+// stall inside any other call is charged to WORK, and a submission genuinely slower than
+// the threshold is charged to WAIT. The line prints the threshold and the call counts so
+// the rule can be judged, and profileStallUs = 0 turns it off.
+bool renderProfileFormatWorkWait(char* out, size_t size, double seconds,
+                                 unsigned long long frames) {
+    WorkWait w;
+    if (!takeWorkWait(w, seconds, frames)) return false;
+
+    double work = w.preWork + w.sceneWork + w.post + w.presentWork;
+    double wait = w.waitTick + w.waitBg + w.swap + w.sceneStall + w.presentStall;
+
+    char stalls[160] = {};
+    if (g_options.profileStallUs > 0)
+        _snprintf_s(stalls, sizeof(stalls), _TRUNCATE,
+                    " | a driver stall is a glDrawArrays call of %d us or more (%.1f/frame "
+                    "in the scene, %.1f in the flush, of %.0f calls) -- no other GL call is "
+                    "timed, so both are LOWER bounds",
+                    g_options.profileStallUs,
+                    static_cast<double>(g_drawStalls - g_drawStallsInPresent) / frames,
+                    static_cast<double>(g_drawStallsInPresent) / frames,
+                    static_cast<double>(g_drawCalls) / frames);
+    else
+        _snprintf_s(stalls, sizeof(stalls), _TRUNCATE,
+                    " | profileStallUs = 0: every glDrawArrays counts as submission WORK");
+
+    _snprintf_s(out, size, _TRUNCATE,
+                "work/wait %.2f ms/frame = WORK %.2f + WAIT %.2f (rest %.2f) | WAIT = "
+                "pre.tick %.2f + pre.bg %.2f + present.swap %.2f + scene.driver %.2f + "
+                "present.driver %.2f | WORK = pre %.2f + scene %.2f + post %.2f + "
+                "present %.2f%s",
+                w.frame, work, wait, w.frame - work - wait, w.waitTick, w.waitBg, w.swap,
+                w.sceneStall, w.presentStall, w.preWork, w.sceneWork, w.post, w.presentWork,
+                stalls);
+    return true;
+}
+
+// What the measurement is FOR: does a headset frame fit in what the work leaves?
+//
+// The arithmetic is deliberately crude and stated in full on the line, because the honest
+// answer is a bound rather than a prediction. Per-eye cost is the scene and the submission
+// work of one render; everything else in the frame -- the latch, the game's logic, the
+// window redraw, the HUD -- happens once whatever the eye count is. A second eye therefore
+// adds one eye's worth of scene and submission and nothing else, and the GPU doubles.
+bool renderProfileFormatHeadroom(char* out, size_t size, double seconds,
+                                 unsigned long long frames) {
+    WorkWait w;
+    if (!takeWorkWait(w, seconds, frames)) return false;
+
+    double budget = 1000.0 / g_options.profileTargetHz;
+
+    // A stereo frame already contains both eyes and both mirror passes, so projecting a
+    // second eye from one render's cost would count the eyes twice. There the measured
+    // frame IS the headset frame and the only question is whether it fits the budget.
+    if (g_options.vr && w.renders >= 2.0) {
+        double work = w.preWork + w.sceneWork + w.post + w.presentWork;
+
+        char gpu[200] = {};
+        GpuTimerWindow window;
+        if (gpuTimerLastWindow(window) && window.frameMs > 0.0) {
+            _snprintf_s(gpu, sizeof(gpu), _TRUNCATE,
+                        " | GPU busy %.2f ms/frame, %.0f%% of the budget (the last window "
+                        "the GPU timer's owner drained)",
+                        window.frameMs, 100.0 * window.frameMs / budget);
+        } else {
+            _snprintf_s(gpu, sizeof(gpu), _TRUNCATE,
+                        " | no GPU total in this window (the frame budget's or the post "
+                        "split's GPU line is what fills it)");
+        }
+
+        _snprintf_s(out, size, _TRUNCATE,
+                    "work/wait headroom: a %d Hz frame is %.2f ms. This frame already draws "
+                    "both eyes (%.2f renders a frame, mirrors included): CPU works %.2f ms "
+                    "= pre %.2f + scene %.2f + post %.2f + submission %.2f, %.0f%% of the "
+                    "budget, leaving %.2f ms%s",
+                    g_options.profileTargetHz, budget, w.renders, work, w.preWork,
+                    w.sceneWork, w.post, w.presentWork, 100.0 * work / budget, budget - work,
+                    gpu);
+        return true;
+    }
+
+    // Flat: one render is one eye, so a second eye repeats the scene and its submission and
+    // nothing else. This is the projection that answers "would two eyes fit".
+    double perEye = (w.sceneWork + w.presentWork) / w.renders;
+    double once = w.preWork + w.post;
+    double twoEyes = once + 2.0 * perEye;
+
+    char gpu[200] = {};
+    GpuTimerWindow window;
+    if (gpuTimerLastWindow(window) && window.frameMs > 0.0) {
+        double gpuPerEye = window.frameMs / w.renders;
+        _snprintf_s(gpu, sizeof(gpu), _TRUNCATE,
+                    " | GPU busy %.2f ms/frame (the last window the GPU timer's owner "
+                    "drained), %.2f of it per render -> two eyes %.2f ms (%.0f%% of the "
+                    "budget) at this resolution",
+                    window.frameMs, gpuPerEye, 2.0 * gpuPerEye,
+                    100.0 * 2.0 * gpuPerEye / budget);
+    } else {
+        _snprintf_s(gpu, sizeof(gpu), _TRUNCATE,
+                    " | no GPU total in this window (the frame budget's or the post "
+                    "split's GPU line is what fills it)");
+    }
+
+    _snprintf_s(out, size, _TRUNCATE,
+                "work/wait headroom: a %d Hz frame is %.2f ms. Per render the CPU works "
+                "%.2f ms (scene %.2f + submission %.2f over %.2f renders/frame); the "
+                "once-a-frame work is %.2f ms -> two eyes cost %.2f ms, %.0f%% of the "
+                "budget, leaving %.2f ms%s",
+                g_options.profileTargetHz, budget, perEye, w.sceneWork / w.renders,
+                w.presentWork / w.renders, w.renders, once, twoEyes,
+                100.0 * twoEyes / budget, budget - twoEyes, gpu);
     return true;
 }
 
 bool renderProfileFormatPresent(char* out, size_t size, double seconds,
                                 unsigned long long frames) {
-    if (!g_options.profileStages || !frames || !g_realDrawArrays) return false;
+    if (!profilingWorkWait() || !frames || !g_realDrawArrays) return false;
 
-    unsigned long long now = __rdtsc();
-    g_windowCycles = now - g_windowCycleStart;
-    g_windowCycleStart = now;
-    if (!g_windowCycles) return false;
+    // Cycles to milliseconds, from this window's own ratio rather than an assumed clock,
+    // and taken once per report however many lines need it.
+    double msPerCycle = windowMsPerCycle(seconds);
+    if (msPerCycle <= 0.0) return false;
 
-    // Cycles to milliseconds, from this window's own ratio rather than an assumed clock.
-    double msPerCycle = 1000.0 * seconds / g_windowCycles;
     double draw = g_drawCycles * msPerCycle / frames;
     double finish = g_finishCycles * msPerCycle / frames;
     double inPresent = g_finishCyclesInPresent * msPerCycle / frames;
@@ -1376,12 +1597,22 @@ bool renderProfileFormatPresent(char* out, size_t size, double seconds,
              g_finishSites, sites);
     }
 
+    // The draw total, and the part of it that blocked. Both halves are per frame, and the
+    // swap is called out as a WAIT because SwapBuffers is where the frame cap, vsync and a
+    // full driver queue all land.
+    double stall = g_drawStallCycles * msPerCycle / frames;
+    double inPresentDraw = g_drawCyclesInPresent * msPerCycle / frames;
+
     _snprintf_s(out, size, _TRUNCATE,
-                "present = draw %.2f ms (%.0f calls, %.0f ns each) + swap %.2f | %.0f of "
-                "those calls/frame reached GL INSIDE screenDisplay, after the menu blit | "
-                "glFinish DROPPED, %.1f calls/frame would have been made (%llu in the "
-                "window over %llu frames)",
-                draw, calls, calls ? 1e6 * draw / calls : 0.0, swap, late, finishes,
+                "present = draw %.2f ms (%.0f calls, %.0f ns each; %.2f of it in calls over "
+                "%d us = driver stalls, WAIT) + swap %.2f WAIT (%.1f calls/frame) | %.0f "
+                "draw calls/frame and %.2f ms of that draw time reached GL INSIDE "
+                "screenDisplay, after the menu blit -- the rest is the scene's | glFinish "
+                "DROPPED, %.1f calls/frame would have been made (%llu in the window over "
+                "%llu frames)",
+                draw, calls, calls ? 1e6 * draw / calls : 0.0, stall,
+                g_options.profileStallUs, swap,
+                static_cast<double>(g_swapCalls) / frames, late, inPresentDraw, finishes,
                 g_finishCalls, frames);
     (void)finish;
     (void)inPresent;

@@ -29,6 +29,26 @@ void interpolationInstall();
 // True while the hooks are installed and vrInterpolate is on.
 bool interpolationActive();
 
+// Which records the blend rewrites, as a bitmask. All of them, always; the bisect that cycled
+// these lives in docs/audit-2026-09-18/85-instrument-archive.md if it is ever wanted again.
+enum InterpolateParts {
+    kPartCars = 1,
+    kPartView = 2,
+    kPartMirror = 4,
+    kPartPitBoard = 8,
+    kPartAll = 15,
+};
+
+// The viewed car's world position as the blend left it, and the same car's position at the
+// newest latched tick. False when no car is being viewed (a pit or TV camera), which is also the
+// case where the camera genuinely is somewhere else and must keep its own answers.
+bool interpolationViewedCarPosition(float blended[3], float newestTick[3]);
+
+// The viewed car's own blended distance along the track, in metres (car record byte 12). The
+// value gpl_cameraTrackPositionFromWorld is supposed to be computing, taken from the sim
+// instead of from a search that can answer a segment out. False when there is no viewed car.
+bool interpolationViewedCarDlong(float& metres);
+
 // The once-a-second interp: line. False when the window latched no world frame.
 bool interpolationFormat(char* out, size_t size);
 

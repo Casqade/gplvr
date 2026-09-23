@@ -34,11 +34,6 @@
 //  the next simulation tick, which is why the frame rate equals the task rate exactly with
 //  vsync off -- so the answer to "why is `pre` 4.5 ms" is expected to be "because the game
 //  is asleep", and the point of the split is to prove that rather than assume it.
-//
-// And one deliberately destructive switch, `nullDraw`, which drops every polygon at the
-// rasterizer boundary by forcing polyDraw's vertex count to zero. The picture goes black
-// and the frame time that remains is the floor no shim, no merge and no GPU rasterizer can
-// ever go below. One lap, one number, and it bounds every renderer optimisation at once.
 
 #include <cstddef>
 
@@ -53,15 +48,6 @@ void renderProfileDiscover(const Binding& binding);
 // Take over roglv2's glDrawArrays / glFinish / SwapBuffers imports. Safe to call more than
 // once; it notices slots that are already ours.
 void renderProfileInstallDriverThunks();
-
-// Force polyDraw's vertex count to zero. Refuses when the measurement shim already owns
-// polyDraw, because both want the same function pointer. Installed whenever `nullDraw` or
-// `nullDrawKey` is set, so the key can turn it on later.
-void renderProfileInstallNullDraw(const Binding& binding);
-
-// Toggle it. The worst frame on a track has to be driven to, and it cannot be driven to
-// blind, so this is the only way to measure one.
-void renderProfileSetNullDraw(bool active);
 
 // Latch GPL's counters. Called from the sceneRender hook once the original has returned,
 // which is where they hold the render that just finished.
@@ -135,5 +121,21 @@ bool renderProfileFormatPresent(char* out, size_t size, double seconds,
 // out in the guaranteed order, and prints that count against the total so a window where
 // the ordering broke down cannot be read as a measurement.
 bool renderProfileFormatPre(char* out, size_t size);
+
+// The whole frame as CPU WORK and CPU WAIT, and what that leaves for a headset frame
+// (docs/audit-2026-09-18/72-work-vs-wait.md).
+//
+// The frame line says where the time goes; these two say whether it is spent or merely
+// passed. Waits: the tick poll and the BG-lock spin at the top of the loop, SwapBuffers,
+// and glDrawArrays calls long enough to be the driver's queue rather than submission
+// (`profileStallUs`, named on the line). Everything else is work. The headroom line puts
+// the work against a `profileTargetHz` frame with two eyes' worth of scene and submission.
+//
+// Both run under `profileWorkWait`, which `profileStages` implies and which -- unlike
+// profileStages -- survives flat mode, so the same frame can be read in both.
+bool renderProfileFormatWorkWait(char* out, size_t size, double seconds,
+                                 unsigned long long frames);
+bool renderProfileFormatHeadroom(char* out, size_t size, double seconds,
+                                 unsigned long long frames);
 
 }  // namespace gplvr

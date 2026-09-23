@@ -6,6 +6,11 @@
 
 namespace gplvr {
 
+// The scene parameter block of the last frame rendered, or null before the first one. GPL reuses
+// one block, so this is the same pointer every frame; p[0] leads to the track object the segment
+// lookups take.
+void* hooksLastSceneParams();
+
 // Where the HUD panel hangs in one mode, in metres: its centre ahead, below and to the
 // right, and its width.
 struct HudPlacement {
@@ -151,13 +156,6 @@ struct Options {
     // render timing stopped explaining the frame rate the moment vsync came off, and
     // `other` -- the part the hooks cannot see, which is GPL's own per-frame work
     // outside the world pass -- turned out to be four to six milliseconds.
-    // Rasterizer shim, stage 1: forward polyDraw and the state setters unchanged and
-    // measure how many polygons fall between state changes.
-    //
-    // The go/no-go for the whole shim idea. Off by default -- it takes over five of the
-    // game's rasterizer globals, which is cheap but not free of risk. See RenderShim.h.
-    bool shimMeasure = false;
-
     bool profileFrame = true;
 
     // Drain the GPU with a glFinish at the end of the scene render, and time it.
@@ -183,17 +181,49 @@ struct Options {
     // three of roglv2's import slots. See RenderProfile.h.
     bool profileStages = false;
 
-    // Drop every polygon at the rasterizer boundary. The picture goes black, and what is
-    // left is the floor no renderer change can go below -- an upper bound on everything a
-    // shim, a merge or a GPU rasterizer could ever recover, for one lap of measurement.
+    // Report every millisecond of the frame as CPU WORK or CPU WAIT, in both modes
+    // (docs/audit-2026-09-18/72-work-vs-wait.md).
     //
-    // Mutually exclusive with `shimMeasure`: both want the polyDraw global.
-    bool nullDraw = false;
+    // `pre` and `present` are the two largest terms in the flat frame line, and neither says
+    // how much of itself is the render thread doing something and how much is it blocked on
+    // the sim tick, the BG lock or the driver. The answer decides whether VR fits: time spent
+    // waiting is budget a ring-buffer hand-off could give back, time spent working is not.
+    //
+    // It installs the same `pre` markers and roglv2 import thunks profileStages installs, and
+    // it is the part of them that flat mode can have: profileStages also owns the frame
+    // budget's GPU marks, which in flat mode belong to profilePost. profileStages implies it.
+    bool profileWorkWait = false;
 
-    // Virtual-key code that toggles `nullDraw` while the game runs. 0 disables the key.
-    // The measurement wants the WORST frame on a track, and a worst frame has to be
-    // driven to, which cannot be done blind.
-    int nullDrawKey = 0;
+    // A glDrawArrays call at least this long is counted as a driver stall rather than as
+    // submission work, on the work/wait line. 0 turns the attribution off and charges every
+    // glDrawArrays to WORK.
+    int profileStallUs = 50;
+
+    // The headset rate the work/wait headroom line measures the frame against.
+    int profileTargetHz = 90;
+
+    // Break `post` of the flat frame line into the scene, GPL's 2D drawing entry point by entry
+    // point and the present, on the CPU and with GPU timestamps, and say whether the frame is
+    // CPU- or GPU-bound (PostProfile.h). Flat mode. Off by default: the GPU timer reads
+    // GL_TIMESTAMP once a frame.
+    bool profilePost = false;
+
+    // Draw GPL's stamped text ourselves instead of letting roglv2 blit it a glyph at a time
+    // (FastText.h, docs/audit-2026-09-18/71-fast-text.md).
+    //
+    // roglv2 draws every glyph with glRasterPos2i + glDrawPixels of an 8-bit colour-index image,
+    // rebuilding the four GL_PIXEL_MAP_I_TO_* tables first. That is about 103 us a glyph on this
+    // driver: at 2560x1440 the 56 stamps of a flat frame cost 5.78 ms of an 8.83 ms frame, more
+    // than the scene, the rasterizer's flush and the present together. With this on, each glyph
+    // is uploaded once into a GPU atlas and a run of glyphs is one quad list, drawn in the
+    // rasterizer's own context under its own 2D transform, with the palette it would have built.
+    // Stamps into anything that is not the GL framebuffer stay the rasterizer's and are counted.
+    // Flat mode only: in VR the same entry points belong to Hud.cpp.
+    bool fastText = true;
+
+    // Switch it off and on in a race, to compare the picture and the frame time. 0 disables.
+    // '9': '6' is the mouse-look toggle and '8' the memo mark.
+    int fastTextKey = '9';
 
     // Write each EYE's own rectangle to a .tga next to the game, at the moment the frame
     // is handed to the headset. Not the combined side-by-side the monitor shows -- the
@@ -405,14 +435,19 @@ struct Options {
     // display clock, and each eye is moved by its velocity over the displays in between.
     bool vrPredictPosition = true;
 
-    // Pace the render to the headset's display. Each frame's latch waits until the frame will
-    // be published just before the presenter's latch, so every displayed frame is the same
-    // number of sim ticks newer than the last, and the presenter locates the views for the
-    // display the frame reaches. Only while the previous frame was a tracked stereo world
-    // frame, the presenter publishes its display clock, and the display period is a whole
-    // number of sim ticks (72 or 144 Hz at 144). vrExtraRenders is held at 0 while it paces.
+    // LOCK THE FRAME RATE TO THE HEADSET'S REFRESH RATE. Each frame's latch waits until the
+    // frame will be published just before the presenter's latch, so every displayed frame is the
+    // same number of sim ticks newer than the last, and the presenter locates the views for the
+    // display the frame reaches. Without it the game free-runs and the presenter drops whatever
+    // it cannot show. Only while the previous frame was a tracked stereo world frame and the
+    // presenter publishes its display clock. vrExtraRenders is held at 0 while it locks.
     // VR only. RenderPacing.h.
-    bool vrRenderPacing = true;
+    //
+    // IT TURNS vrInterpolate ON when it is off, because it cannot work without it unless the
+    // display period is a whole number of sim ticks: 144 Hz into 90 Hz is 1.6 ticks a frame, and
+    // holding a frame to a display deadline at a fractional ratio would show one tick twice and
+    // skip the next. Interpolation costs one sim tick of latency.
+    bool vrLockToHeadset = true;
 
     // How long before the presenter's latch a paced frame aims to be published, in
     // milliseconds, on top of the measured latch-to-publish cost. 0 to 10.
@@ -428,6 +463,29 @@ struct Options {
     // Toggle vrInterpolate while the game runs, for an A/B in one race. '7' by default; 0
     // disables. VR only.
     int vrInterpolateKey = '7';
+
+    // Centre the world walk on the CAR rather than on the eye.
+    //
+    // gpl_sceneRender asks sub_460B40 where the camera is on the track (0x487D73 for the eye
+    // pass, 0x4877D9 for the mirror pass) and uses the answer to pick the segment range to walk
+    // and to set gpl_selectorCameraDlong/Dlat/Height. That search steps one segment at a time
+    // from a hint and stops when it stops getting a consistent answer, so a point it cannot place
+    // sends it several segments away: measured at the bottom of Eau Rouge returning segment 17
+    // against a hint of 12, for one frame, with the eye 0.46 m from where it had just been. The
+    // frame then walks another part of the track -- terrain over everything, no road, the ground
+    // plane showing through. In flat GPL the camera sits in the cockpit and the point is the
+    // car's; in VR the head pose moves it off. This asks about the car's position instead, which
+    // is what flat GPL asks, and keeps all four of the lookup's outputs consistent. 0 to compare.
+    bool vrFixEyeSegment = true;
+
+    // The sim/render state ring (SimRing.h, docs/audit-2026-09-18/72-work-vs-wait.md section 6).
+    // The sim thread publishes each finished tick's car sources into one of four slots.
+    // 0 off. 1 publishes and VERIFIES: the render thread rebuilds each car's render record from
+    // the ring and compares it with what GPL's own latch wrote, and nothing drawn changes.
+    // 2 writes the record from the ring instead of reading live sim state. GPL's tick wait and
+    // its lock bracket are still GPL's in both, so neither reclaims the wait yet -- that is
+    // stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
+    int simRing = 0;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

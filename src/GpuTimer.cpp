@@ -226,6 +226,18 @@ void gpuTimerEndFrame(int firstGroup) {
     gpuTimerMark(firstGroup);
 }
 
+namespace {
+// What the last drain returned, for readers that must not drain (GpuTimer.h).
+GpuTimerWindow g_lastWindow;
+bool           g_lastWindowValid = false;
+}  // namespace
+
+bool gpuTimerLastWindow(GpuTimerWindow& out) {
+    if (!g_lastWindowValid) return false;
+    out = g_lastWindow;
+    return true;
+}
+
 bool gpuTimerTake(GpuTimerWindow& out) {
     State& s = g_gpu;
     out = GpuTimerWindow();
@@ -249,6 +261,11 @@ bool gpuTimerTake(GpuTimerWindow& out) {
     s.lateFrames = 0;
     s.framesRead = 0;
     s.skipped = 0;
+
+    if (measured) {
+        g_lastWindow = out;
+        g_lastWindowValid = true;
+    }
     return measured;
 }
 

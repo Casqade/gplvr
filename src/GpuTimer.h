@@ -47,4 +47,12 @@ struct GpuTimerWindow {
 // nothing was measured.
 bool gpuTimerTake(GpuTimerWindow& out);
 
+// The window the last gpuTimerTake drained, without draining anything.
+//
+// Exactly one reporter owns the drain -- the frame budget when profileStages is on, the post
+// split in flat mode -- and a second caller of gpuTimerTake would silently take the counts
+// away from the owner. The work/wait summary needs the same GPU total, so it reads the copy
+// the owner's drain left behind. False until a drain has happened in this window.
+bool gpuTimerLastWindow(GpuTimerWindow& out);
+
 }  // namespace gplvr

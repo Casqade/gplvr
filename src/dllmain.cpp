@@ -12,14 +12,16 @@
 #include "Billboard.h"
 #include "CrashGuard.h"
 #include "Discovery.h"
+#include "DrawnMarks.h"
 #include "Hooks.h"
 #include "Hud.h"
+#include "fast_text/FastText.h"
 #include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
-#include "RenderShim.h"
+#include "SimRing.h"
 #include "Log.h"
 #include "Window.h"
 
@@ -132,6 +134,12 @@ DWORD WINAPI installThread(LPVOID) {
     // sim, not part of the VR render path. Still in the front end here, where no contact
     // search is running while its bytes are rewritten.
     crashGuardInstall();
+    // Flat mode too: a stock overflow in the render walk (report 53). The patch stays on the
+    // stock list until the next clear, so it may go in with a pass under way.
+    drawnMarksInstall();
+    // Flat mode too, and before interpolationInstall: it chains onto the same three car latch
+    // call sites and expects to find either their stock bytes or this hook.
+    simRingInstall();
 
     logf("installing frame counter...");
 
@@ -147,7 +155,9 @@ DWORD WINAPI installThread(LPVOID) {
         hudBind(binding);
         billboardInstall(binding);
     }
-    shimInstall(binding);
+    // The flat-mode fast text path takes the same seven 2D globals Hud.cpp takes in VR, so it
+    // declines to install when they are already spoken for.
+    fastTextBind(binding);
 
     // Before the first menu-to-race transition, which is the moment the screenBegin
     // thunk earns its keep. Discovery has already run, so the rasterizer is loaded and
@@ -159,8 +169,7 @@ DWORD WINAPI installThread(LPVOID) {
     // size the middle panel from it the first time a race is entered.
     letterboxInstall();
 
-    // After shimInstall, so nullDraw can see whether the shim took polyDraw first. The
-    // driver thunks go in here too: roglv2 is loaded by now, because discovery keys off
+    // The driver thunks go in here: roglv2 is loaded by now, because discovery keys off
     // its entry points.
     // Pacing and the profiler both redirect the fgDisableBG call in the tick wait. Pacing
     // locates it while the bytes are still stock, the profiler patches it, and pacing then
@@ -168,7 +177,6 @@ DWORD WINAPI installThread(LPVOID) {
     renderPacingDiscover(binding);
     renderProfileDiscover(binding);
     renderProfileInstallDriverThunks();
-    renderProfileInstallNullDraw(binding);
     renderPacingInstall();
     // Locates the latch from the tick wait pacing installed at.
     interpolationInstall();
@@ -214,6 +222,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // Before the log closes, and before this module's code stops being callable.
         windowProcUnchain();
         crashGuardLogSummary();
+        drawnMarksLogSummary();
+        simRingLogSummary();
         logf("detaching");
         logClose();
     }
