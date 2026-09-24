@@ -10,9 +10,10 @@
 // the renderer stops the simulation clock for as long as it latches (report 72 section 4.3).
 //
 // The ring reverses the hand-off: the sim thread publishes a finished tick into one of four
-// slots and never waits; the render thread takes the newest complete slot. Four slots is what
-// makes "never waits" true -- at most two are pinned by the renderer (interpolation reads two)
-// and one is the newest, so a free slot always exists.
+// slots and never waits; the render thread takes the newest complete slot. A free slot always
+// exists because the sim skips the newest and whatever the renderer has pinned. Stage 2 holds
+// ONE pin, for the length of a single car's latch, so three slots would do; the fourth is
+// provisioned for stage 3, where the blend's two copies become two pinned slots.
 //
 // THIS IS STAGE 2 OF THE STAGED PLAN, and it is deliberately not the decoupling yet:
 //

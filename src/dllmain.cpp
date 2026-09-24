@@ -13,6 +13,7 @@
 #include "CrashGuard.h"
 #include "Discovery.h"
 #include "DrawnMarks.h"
+#include "FlatFrames.h"
 #include "Hooks.h"
 #include "Hud.h"
 #include "fast_text/FastText.h"
@@ -22,6 +23,7 @@
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "SimRing.h"
+#include "Stereo.h"
 #include "Log.h"
 #include "Window.h"
 
@@ -180,13 +182,26 @@ DWORD WINAPI installThread(LPVOID) {
     renderPacingInstall();
     // Locates the latch from the tick wait pacing installed at.
     interpolationInstall();
+    // After it: an extra frame with nothing to re-blend is a duplicate, so this declines to
+    // install unless the blend is running.
+    flatFramesInstall();
+    // The segment-lookup fix of report 84 is not a VR one. It needs a BLENDED position judged
+    // against the latch's KEPT seed, and flat mode does that as soon as frames are drawn between
+    // the ticks -- so it goes in whenever the blend is actually running. In VR stereoRender
+    // installs it itself, between passes.
+    if (!g_options.vr && interpolationActive()) stereoInstallWalkLookup();
 
     if (g_options.vr)
         logf("ready. '1' toggles stereo.");
     else
         logf("ready -- flat mode: borderless window, letterbox and widescreen fixes, "
-             "front-end scaling, roglv2's glFinish drop and swap interval, mouselook. "
-             "Stereo, the HUD split, billboards and the profilers need vr = 1.");
+             "front-end scaling, roglv2's glFinish drop and swap interval, mouselook, the fast "
+             "text path%s. Stereo, the HUD split, billboards and the headset profilers need "
+             "vr = 1.",
+             g_options.flatExtraFrames > 0
+                 ? ", and frames drawn between the simulation's ticks with the world "
+                   "interpolated onto them"
+                 : " (flatExtraFrames = 0: one frame per simulation tick, as GPL ships)");
     return 0;
 }
 

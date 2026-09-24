@@ -79,6 +79,7 @@ else()
         src/CursorOverlay.cpp
         src/Discovery.cpp
         src/DrawnMarks.cpp
+        src/FlatFrames.cpp
         src/FrameBudget.cpp
         src/GlApi.cpp
         src/GlInterop.cpp

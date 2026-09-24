@@ -22,12 +22,21 @@ namespace gplvr {
 
 // Redirect gpl_simFrameSetup's three gpl_carLatchRenderRecord calls and its view, mirror and pit
 // board record latches, and the fgEnableBG call after the latch. Every site is checked against its
-// stock bytes first; nothing is patched unless all match. VR only; call after
-// renderPacingInstall, which locates the tick wait.
+// stock bytes first; nothing is patched unless all match. Installs in VR, and in flat mode when
+// flatExtraFrames asks for frames between the ticks. Call after renderPacingInstall, which
+// locates the tick wait in VR.
 void interpolationInstall();
 
-// True while the hooks are installed and vrInterpolate is on.
+// True while the hooks are installed and the blend is on for this mode.
 bool interpolationActive();
+
+// Re-blend the records of the last latch to the present instant, for a frame drawn between two
+// sim ticks (FlatFrames.h). The blend always works from the two kept copies rather than from
+// what it last left in the record, so repeating it with a later target is exact.
+//
+// False when there is nothing to blend -- no tick model yet, or the last latch left no usable
+// pair -- in which case the extra frame draws the same world as the one before it.
+bool interpolationExtraFrame();
 
 // Which records the blend rewrites, as a bitmask. All of them, always; the bisect that cycled
 // these lives in docs/audit-2026-09-18/85-instrument-archive.md if it is ever wanted again.

@@ -2,6 +2,7 @@
 
 #include "fast_text/FastText.h"
 #include "DrawnMarks.h"
+#include "FlatFrames.h"
 #include "FrameBudget.h"
 #include "Hud.h"
 #include "Interpolation.h"
@@ -105,7 +106,7 @@ bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
 bool      g_vrMirrorModeKeyLast = false;
-bool      g_vrInterpolateKeyLast = false;
+bool      g_interpolateKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
 bool      g_dumpEyesLate = false;
@@ -346,6 +347,11 @@ void reportOncePerSecond() {
     // World interpolation, once a second while world frames were latched.
     char interp[1280] = {};
     if (interpolationFormat(interp, sizeof(interp))) logf("%s", interp);
+
+    // Frames drawn between the simulation's ticks (flat mode). After the interp line, which says
+    // what the blend did with them.
+    char flat[384] = {};
+    if (flatFramesFormat(flat, sizeof(flat), seconds)) logf("%s", flat);
 
     // The drawn-mark list's peak and overflows, once a second while the world was drawn. Per
     // frame, so the clears read against the eye and mirror-only renders on the fps line.
@@ -597,16 +603,26 @@ void pollToggle() {
     }
 
     // World interpolation on and off, for an A/B in one race. The records keep being copied
-    // while it is off, so the blend resumes on the next frame.
-    if (g_options.vr && g_options.vrInterpolateKey) {
-        bool down = (GetAsyncKeyState(g_options.vrInterpolateKey) & 0x8000) != 0;
-        if (down && !g_vrInterpolateKeyLast) {
-            g_options.vrInterpolate = !g_options.vrInterpolate;
-            logf("interp: vrInterpolate now %d -- %s", g_options.vrInterpolate ? 1 : 0,
-                 g_options.vrInterpolate ? "the world is drawn blended to the display time"
-                                         : "the world is drawn at the newest latched tick");
+    // while it is off, so the blend resumes on the next frame. Each mode toggles its own key,
+    // because the two are separate settings and flat mode's is what decides whether the frames
+    // between the ticks move the world or repeat it.
+    if (g_options.interpolateKey) {
+        bool down = (GetAsyncKeyState(g_options.interpolateKey) & 0x8000) != 0;
+        if (down && !g_interpolateKeyLast) {
+            bool on = false;
+            if (g_options.vr) {
+                g_options.vrInterpolate = !g_options.vrInterpolate;
+                on = g_options.vrInterpolate;
+            } else {
+                g_options.flatInterpolate = !g_options.flatInterpolate;
+                on = g_options.flatInterpolate;
+            }
+            logf("interp: %s now %d -- %s", g_options.vr ? "vrInterpolate" : "flatInterpolate",
+                 on ? 1 : 0,
+                 on ? "the world is drawn blended between the two newest ticks"
+                    : "the world is drawn at the newest latched tick");
         }
-        g_vrInterpolateKeyLast = down;
+        g_interpolateKeyLast = down;
     }
 
 
@@ -2087,9 +2103,11 @@ void loadOptions(const char* fileName) {
              "(144 Hz into 90 Hz is 1.6), and the game would free-run instead. It costs one sim "
              "tick of latency. Set vrLockToHeadset = 0 to race unlocked without it.");
     }
-    g_options.vrInterpolateKey = GetPrivateProfileIntA("gplvr", "vrInterpolateKey", '7', path);
-    g_options.vrFixEyeSegment = GetPrivateProfileIntA("gplvr", "vrFixEyeSegment", 1, path) != 0;
+    g_options.interpolateKey = GetPrivateProfileIntA("gplvr", "interpolateKey", '7', path);
+    g_options.fixEyeSegment = GetPrivateProfileIntA("gplvr", "fixEyeSegment", 1, path) != 0;
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
+    g_options.flatExtraFrames = GetPrivateProfileIntA("gplvr", "flatExtraFrames", 0, path);
+    g_options.flatInterpolate = GetPrivateProfileIntA("gplvr", "flatInterpolate", 1, path) != 0;
     if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
@@ -2112,7 +2130,9 @@ void loadOptions(const char* fileName) {
         g_options.profileStages = false;
         g_options.vrLockToHeadset = false;
         g_options.vrInterpolate = false;
-        g_options.vrInterpolateKey = 0;
+        // interpolateKey SURVIVES: flat mode blends too, once flatExtraFrames draws frames
+        // between the ticks, and the key toggles flatInterpolate there. It is the A/B for the
+        // whole feature, so switching it off in the mode that gained it would be backwards.
     }
 
     logf("options: stereo=%d mirror=%d vrMirrorFovScale=%.2f vrMirrorYaw=%.1f "
@@ -2176,21 +2196,23 @@ void loadOptions(const char* fileName) {
              ? "in a tracked race each latch waits to publish this many ms before the "
                "presenter's latch, and the views are located for the display the frame reaches"
              : "frames start as soon as a sim tick arrives, as stock");
-    logf("options: vrFixEyeSegment=%d (%s)", g_options.vrFixEyeSegment ? 1 : 0,
-         g_options.vrFixEyeSegment
+    logf("options: fixEyeSegment=%d (%s)", g_options.fixEyeSegment ? 1 : 0,
+         g_options.fixEyeSegment
              ? "the world walk's lookup asks about the VIEWED CAR's position instead of the "
                "eye's, which is the point flat GPL asks about, and its answer is checked against "
                "GPL's own containment test before the walk is centred on it"
              : "the world walk's lookup asks about the eye's own position and its answer is "
                "taken as the game gives it");
-    logf("options: vrInterpolate=%d vrInterpolateKey=0x%02X (%s)", g_options.vrInterpolate ? 1 : 0,
-         g_options.vrInterpolateKey,
+    logf("options: vrInterpolate=%d interpolateKey=0x%02X (%s; the key toggles whichever of "
+         "vrInterpolate and flatInterpolate belongs to this mode)",
+         g_options.vrInterpolate ? 1 : 0, g_options.interpolateKey,
          g_options.vrInterpolate
              ? "every car and the view are drawn blended between the two newest latched sim "
                "ticks at the frame's display time, which adds one sim tick of latency (6.94 ms "
                "at 144 Hz); render pacing also engages when the display period is not a whole "
                "number of ticks"
-             : "the world is drawn at the newest latched sim tick, as stock");
+         : g_options.vr ? "the world is drawn at the newest latched sim tick, as stock"
+                        : "VR only; flat mode blends under flatExtraFrames/flatInterpolate");
     logf("options: simRing=%d (%s)", g_options.simRing,
          g_options.simRing >= 2
              ? "the sim thread publishes each tick and the car render records are written from "
@@ -2199,6 +2221,13 @@ void loadOptions(const char* fileName) {
              ? "the sim thread publishes each tick and the ring is verified against GPL's own "
                "latch; nothing drawn changes"
              : "off: the sim and the render thread exchange state through GPL's latch alone");
+    logf("options: flatExtraFrames=%d flatInterpolate=%d (%s)", g_options.flatExtraFrames,
+         g_options.flatInterpolate ? 1 : 0,
+         g_options.vr ? "VR: ignored, the presenter sets the cadence"
+         : g_options.flatExtraFrames > 0
+             ? "flat: frames are drawn between the simulation's ticks, so the world moves at the "
+               "display rate while the sim keeps its own"
+             : "off: flat GPL draws one frame per simulation tick");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
@@ -2271,14 +2300,19 @@ bool installFrameCounter(Binding& binding) {
 
 void requestSceneRenderHook(const Binding& binding) {
     // The sceneRender call sites are patched in both modes: that hook is where mouselook
-    // and the widescreen field of view reach the camera on the flat path. Stereo, the
-    // off-screen target, the task-rate probe and the eye-frustum hook on cameraBind are
-    // the headset's.
+    // and the widescreen field of view reach the camera on the flat path. Stereo and the
+    // off-screen target, and the eye-frustum hook on cameraBind below, are the headset's.
     if (g_options.vr) {
         stereoBind(binding);
         renderTargetBind(binding);
-        taskRateBind(&binding.image);
     }
+
+    // BOTH MODES. It resolves four exported scheduler functions and patches nothing, and what it
+    // answers -- the simulation's tick rate -- is read by the blend and by three report lines.
+    // Behind the VR gate it left taskRateSimHz() returning 0 for every flat session, which is
+    // not "slow" but "wrong": Interpolation could not tell 36 Hz from 144 and had to measure the
+    // period for itself.
+    taskRateBind(&binding.image);
 
     if (binding.sceneRenderCallSites.empty()) {
         logf("requestSceneRenderHook: nothing to patch");

@@ -20,6 +20,9 @@ namespace {
 // before anything is patched; the data addresses are what the functions at those sites read and
 // write.
 constexpr uintptr_t kLatchedTickCount = 0x00582114;  // gpl_fgLastLatchedBgCount
+// gpl_fgWaitForTickAndSnapshot 0x4E8F20's fgDisableBG call, which opens the latch. RenderPacing
+// searches for this; flat mode has no RenderPacing and takes it as an address.
+constexpr uintptr_t kFlatTickWaitSite = 0x004E8F51;
 constexpr uintptr_t kSegmentCount = 0x006AFB08;      // track segments
 constexpr uintptr_t kSegmentTable = 0x006AEA1C;      // float rows: +4 start m, +12 scale, +16 length
 constexpr int       kSegmentRowWords = 360;          // 1440 bytes a row
@@ -204,6 +207,9 @@ struct Window {
     double    alphaMin = 0.0;
     double    alphaMax = 0.0;
     unsigned  alphas = 0;
+    unsigned  extraFrames = 0;   // frames drawn between two ticks (flatExtraFrames)
+    unsigned  extraBlended = 0;  // of those, the ones that found a usable pair
+    long long extraCostTicks = 0;
     unsigned  clampedLow = 0;
     unsigned  clampedHigh = 0;
     unsigned  snaps[kSnaps] = {};
@@ -233,6 +239,14 @@ struct State {
     int  latched[kCarSlots] = {};
     int  latchedCount = 0;
     int  viewedSlot = -1;   // the car the view record is attached to, -1 when it was not latched
+
+    // The same list, kept past the latch so an extra frame can re-blend the cars the last latch
+    // touched. `latched` is cleared when the latch ends; this is not.
+    int  blendCars[kCarSlots] = {};
+    int  blendCarCount = 0;
+    bool blendMirror = false;
+    bool blendPitBoard = false;
+    bool blendable = false;  // the last latch produced a pair worth re-blending
     float    lastAlpha = 0.0f;
     int      lastTickGap = 0;
     bool viewLatched = false;
@@ -245,6 +259,15 @@ struct State {
     // Display time less the time right after the latch, smoothed, in QPC ticks.
     double latency = 0.0;
     bool   haveLatency = false;
+
+    // When the ticks arrive, measured here rather than taken from RenderPacing, which is a VR
+    // module and is not installed in flat mode. One latch to the next, smoothed, with the tick
+    // it belonged to, so any tick number can be dated: arrival(n) = lastLatchQpc +
+    // (n - lastLatchTick) * period.
+    long long lastLatchQpc = 0;
+    int       lastLatchTick = 0;
+    double    tickPeriod = 0.0;
+    bool      haveTickModel = false;
 
     Window window;
 };
@@ -748,13 +771,32 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
 
 // Blend one record to `target`. True when its pair was usable; only the first such record of a
 // frame goes into the alpha statistics.
+// Whether the records get blended at all. In VR that is `vrInterpolate`. In flat mode the blend
+// only means anything when frames are drawn between the ticks, so it follows flatExtraFrames as
+// well as its own key -- with flatInterpolate = 0 the extra frames redraw an unchanged world,
+// which is the control that says how much of the smoothness is the blend.
+bool blendingEnabled() {
+    if (g_options.vr) return g_options.vrInterpolate;
+    return g_options.flatExtraFrames > 0 && g_options.flatInterpolate;
+}
+
+// When a tick arrived, in QPC. RenderPacing's model is preferred where it exists; its own is
+// fitted to the tick counter over a whole run, while this one is a two-point extrapolation from
+// the last latch.
+bool tickArrival(const State& s, int count, double& qpc) {
+    if (renderPacingTickArrival(count, qpc)) return true;
+    if (!s.haveTickModel || s.tickPeriod <= 0.0) return false;
+    qpc = static_cast<double>(s.lastLatchQpc) + (count - s.lastLatchTick) * s.tickPeriod;
+    return true;
+}
+
 bool blendHistory(State& s, const History& h, uint8_t* record, int base, const Field* fields,
-                  size_t count, double target, float length, bool& sampled) {
+                  size_t count, double target, float length, bool& sampled, bool rewriteAtOne) {
     if (h.copies < 2 || h.snapped) return false;
     double older = 0.0;
     double newest = 0.0;
-    if (!renderPacingTickArrival(h.ticks[0], older) ||
-        !renderPacingTickArrival(h.ticks[1], newest) || !(newest > older))
+    if (!tickArrival(s, h.ticks[0], older) || !tickArrival(s, h.ticks[1], newest) ||
+        !(newest > older))
         return false;
 
     double alpha = (target - older) / (newest - older);
@@ -774,10 +816,77 @@ bool blendHistory(State& s, const History& h, uint8_t* record, int base, const F
         if (low) ++w.clampedLow;
         if (high) ++w.clampedHigh;
     }
-    // At the newest tick the record already holds what the latch wrote.
-    if (alpha < 1.0)
+    // At the newest tick the record already holds what the latch wrote -- unless an earlier
+    // frame of this same tick blended it somewhere else, which is what an extra frame does.
+    if (alpha < 1.0 || rewriteAtOne)
         blendFields(h, record, base, fields, count, static_cast<float>(alpha), length);
     return true;
+}
+
+// RESEATING THE LOOKUP'S SEED WAS TRIED AND DISPROVED -- do not build it again.
+//
+// The seed gpl_sceneRender passes is p[23] = view record byte 80, a KEPT field, so it holds the
+// latch's newest tick while the position handed to the search is blended. Reseating it from the
+// blended position looks obviously right and is not: the instrument that did it reported
+// `hint reseated 0, corrected 0`, and the decisive case had the SAME seed (12) with two positions
+// 0.46 m apart answering 12 and 17. Where that search stops depends on the ORDER of its probes,
+// through `while (v8 & v9)`, not on where it starts.
+//
+// What does work is checking its ANSWER: Stereo.cpp's walkLookupThunk replaces the dlong with the
+// car's own (record byte 12) whenever the lookup's has moved further than the car did. See
+// report 84.
+
+// Rewrite every record of the last latch to `target`, a QPC instant between the two ticks it
+// holds. Always from the two kept copies, never from what a previous call left in the record, so
+// calling it again with a later target is exactly as correct as calling it once.
+//
+// `cars` and `carCount` name the cars to rewrite: the list the latch filled while it ran, or the
+// copy kept past it when an extra frame re-blends.
+void applyBlend(State& s, double target, const int* cars, int carCount, bool haveMirror,
+                bool havePitBoard, bool rewriteAtOne) {
+    Window& w = s.window;
+    float   length = trackLengthMetres();
+    bool    sampled = false;
+    bool    any = false;
+    int     parts = kPartAll;
+    if ((parts & kPartView) &&
+        blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
+                     sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
+                     rewriteAtOne)) {
+        ++w.viewBlended;
+        any = true;
+        // The view record's eye position is the first three floats; the car's is at its byte 16.
+        checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(kViewRecord), 0, 0, "the eye");
+    }
+    if ((parts & kPartMirror) && haveMirror &&
+        blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(kMirrorRecord), 0, kViewFields,
+                     sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
+                     rewriteAtOne)) {
+        ++w.mirrorBlended;
+        any = true;
+    }
+    if (parts & kPartCars) {
+        for (int i = 0; i < carCount; ++i) {
+            int slot = cars[i];
+            if (blendHistory(s, s.cars[slot], carRecord(slot), 4, kCarFields,
+                             sizeof(kCarFields) / sizeof(kCarFields[0]), target, length, sampled,
+                             rewriteAtOne)) {
+                ++w.carsBlended;
+                any = true;
+                if (slot == s.viewedSlot)
+                    checkBlendedPosition(s.cars[slot], carRecord(slot), 4, 16, "the viewed car");
+            }
+        }
+    }
+    if ((parts & kPartPitBoard) && havePitBoard &&
+        blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(kPitBoardRecord), 4,
+                     kPitBoardFields, sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]), target,
+                     length, sampled, rewriteAtOne)) {
+        ++w.pitBoardBlended;
+        any = true;
+    }
+    if (any) ++w.blended;
+    s.blendable = any;
 }
 
 void blendFrame(State& s, long long now, bool frozen) {
@@ -787,6 +896,22 @@ void blendFrame(State& s, long long now, bool frozen) {
         ++w.frozen;
         return;
     }
+    // Flat mode has neither of the two clocks the VR path is built on: no presenter publishing a
+    // display time, and no task-rate probe (it is bound in VR only), so taskRateSimHz answers 0.
+    // The target is the one interpolationExtraFrame uses -- one measured tick behind the wall
+    // clock -- so that the latched frame and the frames drawn between the ticks sweep the same
+    // line instead of meeting in a sawtooth.
+    if (!g_options.vr) {
+        if (!s.haveTickModel || s.tickPeriod <= 0.0) {
+            ++w.untimed;
+            return;
+        }
+        ++w.costTimed;
+        applyBlend(s, static_cast<double>(now) - s.tickPeriod, s.latched, s.latchedCount,
+                   s.mirrorLatched, s.pitBoardLatched, false);
+        return;
+    }
+
     int       simHz = taskRateSimHz();
     long long display = 0;
     bool      fromPresenter = false;
@@ -812,45 +937,7 @@ void blendFrame(State& s, long long now, bool frozen) {
     }
     double target = static_cast<double>(display) - s.latency - tick;
 
-    float length = trackLengthMetres();
-    bool  sampled = false;
-    bool  any = false;
-    int   parts = kPartAll;
-    if ((parts & kPartView) &&
-        blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
-                     sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled)) {
-        ++w.viewBlended;
-        any = true;
-        // The view record's eye position is the first three floats; the car's is at its byte 16.
-        checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(kViewRecord), 0, 0, "the eye");
-    }
-    if ((parts & kPartMirror) && s.mirrorLatched &&
-        blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(kMirrorRecord), 0, kViewFields,
-                     sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled)) {
-        ++w.mirrorBlended;
-        any = true;
-    }
-    if (parts & kPartCars) {
-        for (int i = 0; i < s.latchedCount; ++i) {
-            int slot = s.latched[i];
-            if (blendHistory(s, s.cars[slot], carRecord(slot), 4, kCarFields,
-                             sizeof(kCarFields) / sizeof(kCarFields[0]), target, length,
-                             sampled)) {
-                ++w.carsBlended;
-                any = true;
-                if (slot == s.viewedSlot)
-                    checkBlendedPosition(s.cars[slot], carRecord(slot), 4, 16, "the viewed car");
-            }
-        }
-    }
-    if ((parts & kPartPitBoard) && s.pitBoardLatched &&
-        blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(kPitBoardRecord), 4,
-                     kPitBoardFields, sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]), target,
-                     length, sampled)) {
-        ++w.pitBoardBlended;
-        any = true;
-    }
-    if (any) ++w.blended;
+    applyBlend(s, target, s.latched, s.latchedCount, s.mirrorLatched, s.pitBoardLatched, false);
 }
 
 // Right after the latch. Every record the latch wrote this frame is copied into its history,
@@ -869,6 +956,34 @@ void __stdcall afterLatch() {
         ++w.frames;
         int  tick = *reinterpret_cast<const int*>(kLatchedTickCount);
         bool frozen = s.haveLastTick && tick == s.lastTick;
+
+        // Date this tick, so an extra frame can place a target between it and the one before.
+        // Only a latch that actually advanced the counter carries timing; a repeat says nothing
+        // about the period, and a gap of more than one tick is divided by the gap.
+        if (!frozen) {
+            // Measured from the previous latch, which is the only source that works in both
+            // modes: taskRateSimHz is the scheduler's own figure and the probe behind it is
+            // bound in VR only, so in flat mode it answers 0 for the whole session. It is used
+            // where it is available, to start from a sensible figure before two latches exist.
+            bool   measurable = s.lastLatchQpc != 0 && tick > s.lastLatchTick;
+            double span = measurable ? static_cast<double>(now - s.lastLatchQpc) /
+                                           (tick - s.lastLatchTick)
+                                     : 0.0;
+            // A span this far outside the plausible range is a loading pause or a session
+            // change, not a tick: 1 ms to 1 s covers 1000 Hz down to 1 Hz.
+            double floor = static_cast<double>(s.frequency) / 1000.0;
+            double ceiling = static_cast<double>(s.frequency);
+            if (span >= floor && span <= ceiling) {
+                s.tickPeriod = s.tickPeriod > 0.0 ? s.tickPeriod * 0.9 + span * 0.1 : span;
+            } else if (s.tickPeriod <= 0.0) {
+                int simHz = taskRateSimHz();
+                s.tickPeriod = simHz > 0 ? static_cast<double>(s.frequency) / simHz : 0.0;
+            }
+            s.lastLatchQpc = now;
+            s.lastLatchTick = tick;
+            s.haveTickModel = s.tickPeriod > 0.0;
+        }
+
         s.lastTick = tick;
         s.haveLastTick = true;
 
@@ -916,7 +1031,14 @@ void __stdcall afterLatch() {
         else
             s.pitBoard.copies = 0;
 
-        if (g_options.vrInterpolate) blendFrame(s, now, frozen);
+        // Keep what an extra frame needs to repeat this blend at a later target.
+        s.blendCarCount = s.latchedCount;
+        for (int i = 0; i < s.latchedCount; ++i) s.blendCars[i] = s.latched[i];
+        s.blendMirror = s.mirrorLatched;
+        s.blendPitBoard = s.pitBoardLatched;
+        s.blendable = false;
+
+        if (blendingEnabled()) blendFrame(s, now, frozen);
 
         LARGE_INTEGER done;
         QueryPerformanceCounter(&done);
@@ -1039,9 +1161,13 @@ void logFieldTable(const char* what, const Field* fields, size_t count, const ch
 
 void interpolationInstall() {
     State& s = g_state;
-    if (!g_options.vr) return;
+    if (!g_options.vr && g_options.flatExtraFrames <= 0) return;
 
+    // RenderPacing finds the tick wait by searching, and it is a VR module. In flat mode take
+    // the address directly; every byte of the latch around it is checked below either way, so a
+    // wrong address is refused rather than patched.
     uintptr_t wait = renderPacingTickWaitSite();
+    if (!wait && !g_options.vr) wait = kFlatTickWaitSite;
     HMODULE   exe = GetModuleHandleA(nullptr);
     uintptr_t enable =
         exe ? reinterpret_cast<uintptr_t>(GetProcAddress(exe, "?fgEnableBG@@YAXXZ")) : 0;
@@ -1133,8 +1259,11 @@ void interpolationInstall() {
          static_cast<unsigned>(kCarLatchCalls[2].site), static_cast<unsigned>(kViewLatchCall.site),
          static_cast<unsigned>(kMirrorLatchCall.site),
          static_cast<unsigned>(kPitBoardLatchCall.site), static_cast<unsigned>(enableSite),
-         g_options.vrInterpolate ? "vrInterpolate = 1."
-                                 : "vrInterpolate = 0: records are kept but nothing is blended.");
+         blendingEnabled() ? (g_options.vr ? "vrInterpolate = 1."
+                                           : "flat mode: the blend follows flatExtraFrames.")
+         : g_options.vr    ? "vrInterpolate = 0: records are kept but nothing is blended."
+                           : "flat mode with flatInterpolate = 0: records are kept but nothing "
+                             "is blended.");
     logFieldTable("car record R = car+0x4FC (live 006BF080, replay 00790848, 1544 bytes)",
                   kCarFields, sizeof(kCarFields) / sizeof(kCarFields[0]),
                   "driver +32, dial range +44, model +52, flags +92 or wheel state +252..264 "
@@ -1151,7 +1280,33 @@ void interpolationInstall() {
                   "pair snapped; a blended value NaN, infinite or over 1e6; a move over 5 m");
 }
 
-bool interpolationActive() { return g_state.installed && g_options.vrInterpolate; }
+bool interpolationActive() { return g_state.installed && blendingEnabled(); }
+
+bool interpolationExtraFrame() {
+    State& s = g_state;
+    if (!s.installed || !blendingEnabled() || !s.haveTickModel || s.tickPeriod <= 0.0)
+        return false;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    // One tick behind the wall clock, which is where the latch's own blend put the world and
+    // where it stays: at the instant of a latch this is the tick before it, and it reaches that
+    // latch's own tick just as the next one lands. The lag is the sim tick interpolation has
+    // always cost, not a new one.
+    double target = static_cast<double>(now.QuadPart) - s.tickPeriod;
+
+    Window& w = s.window;
+    ++w.extraFrames;
+    applyBlend(s, target, s.blendCars, s.blendCarCount, s.blendMirror, s.blendPitBoard, true);
+    if (s.blendable) ++w.extraBlended;
+
+    LARGE_INTEGER done;
+    QueryPerformanceCounter(&done);
+    // Its own total: `costTicks` is divided by the latched frames, which an extra frame is not.
+    w.extraCostTicks += done.QuadPart - now.QuadPart;
+    return s.blendable;
+}
 
 // The viewed car's own distance along the track, blended, in metres. Record byte 12, the field
 // the sim maintains and the one the mark ring shows moving smoothly to a tenth of a metre while
@@ -1199,8 +1354,8 @@ bool interpolationFormat(char* out, size_t size) {
             "| view blended %u, mirror %u, pit board %u (snapped %u) | rotation: %u matrix "
             "fallbacks | blend left the pair %u times, worst %.2f m | display time from the "
             "presenter %u, from the render cost %u | target = display - %.2f ms - one tick %.2f "
-            "ms | cost %.3f ms a frame",
-            g_options.vrInterpolate ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
+            "ms | cost %.3f ms a frame | between ticks %u frames, %u re-blended, %.3f ms each",
+            blendingEnabled() ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
             w.alphas ? w.alphaSum / w.alphas : 0.0, w.alphas ? w.alphaMin : 0.0,
             w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.snaps[kSnapFirst],
             w.snaps[kSnapIdentity], w.snaps[kSnapGap], w.snaps[kSnapJump], w.snaps[kSnapCamera],
@@ -1210,7 +1365,10 @@ bool interpolationFormat(char* out, size_t size) {
             w.pitBoardBlended, w.pitBoardSnaps, g_rotationFallbacks, g_blendOutOfRange,
             static_cast<double>(g_blendWorstMetres), w.presenterTimed, w.costTimed,
             s.haveLatency ? s.latency * toMs : 0.0,
-            simHz > 0 ? 1000.0 / simHz : 0.0, static_cast<double>(w.costTicks) * toMs / w.frames);
+            simHz > 0 ? 1000.0 / simHz : s.tickPeriod * toMs,
+            static_cast<double>(w.costTicks) * toMs / w.frames,
+            w.extraFrames, w.extraBlended,
+            w.extraFrames ? static_cast<double>(w.extraCostTicks) * toMs / w.extraFrames : 0.0);
         if (wanted < 0 || static_cast<size_t>(wanted) >= size) {
             static bool said = false;
             if (!said) {

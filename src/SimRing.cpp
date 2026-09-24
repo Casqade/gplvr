@@ -85,7 +85,7 @@ struct State {
 
     Slot                slots[kSlots];
     std::atomic<int>    newest{-1};
-    std::atomic<int>    pinned[2] = {};
+    std::atomic<int>    pinned{-1};
     std::atomic<unsigned> publishes{0};
 
     BgSleepFn  bgSleep = nullptr;
@@ -201,15 +201,18 @@ void captureCar(CarSource& out, const uint32_t* car, int slot) {
     out.present = 1;
 }
 
-// The lowest slot that is neither the newest nor pinned. With four slots, two pins and one
-// newest there is always one, so the sim never blocks here.
+// The lowest slot that is neither the newest nor pinned; with four slots and at most two of
+// them spoken for there is always one, so the sim never blocks here.
+//
+// The pin is advisory. It is stored before the reader validates and read here without any
+// ordering against that store, so this can miss a pin that has just been taken -- what makes
+// the reader safe is the sequence counter, not this.
 int freeSlot() {
     State& s = g_state;
     int newest = s.newest.load(std::memory_order_acquire);
-    int pin0 = s.pinned[0].load(std::memory_order_acquire);
-    int pin1 = s.pinned[1].load(std::memory_order_acquire);
+    int pin = s.pinned.load(std::memory_order_acquire);
     for (int i = 0; i < kSlots; ++i) {
-        if (i == newest || i == pin0 || i == pin1) continue;
+        if (i == newest || i == pin) continue;
         return i;
     }
     return (newest + 1) % kSlots;
@@ -220,7 +223,11 @@ void publishTick() {
     int    index = freeSlot();
     Slot&  slot = s.slots[index];
 
-    slot.sequence.fetch_add(1, std::memory_order_release);  // odd: being written
+    slot.sequence.fetch_add(1, std::memory_order_relaxed);  // odd: being written
+    // The counter has to reach the reader before the words it guards do. Release on the
+    // increment itself orders what came BEFORE it, which is the wrong side; the fence is what
+    // keeps the writes below from being seen ahead of the odd count.
+    std::atomic_thread_fence(std::memory_order_release);
     for (int i = 0; i < kCarSlots; ++i) captureCar(slot.cars[i], carWords(i), i);
     slot.bgTick = s.getBGCount ? s.getBGCount() : 0;
     slot.qpc = now();
@@ -246,7 +253,7 @@ int pinNewest(unsigned& sequence) {
     for (int attempt = 0; attempt < 4; ++attempt) {
         int index = s.newest.load(std::memory_order_acquire);
         if (index < 0) return -1;
-        s.pinned[0].store(index, std::memory_order_release);
+        s.pinned.store(index, std::memory_order_release);
         unsigned before = s.slots[index].sequence.load(std::memory_order_acquire);
         if ((before & 1u) == 0 && s.newest.load(std::memory_order_acquire) == index) {
             sequence = before;
@@ -254,11 +261,11 @@ int pinNewest(unsigned& sequence) {
         }
         ++s.windowRepins;
     }
-    s.pinned[0].store(-1, std::memory_order_release);
+    s.pinned.store(-1, std::memory_order_release);
     return -1;
 }
 
-void unpin() { g_state.pinned[0].store(-1, std::memory_order_release); }
+void unpin() { g_state.pinned.store(-1, std::memory_order_release); }
 
 // gpl_carLatchRenderRecord 0x46D030, written out of the slot. `r` is the 66-word record --
 // car[320..385] itself, or a scratch copy for the verify -- and `car` its owner; the two lookups
@@ -333,10 +340,11 @@ bool comparedWord(int index) {
     }
 }
 
-// What the slot would have written, against what GPL's own latch just wrote. Only meaningful
-// while the two describe the same tick: the render thread holds gpl_taskFgBgLock here, so the
-// sim is blocked at bgSleep and its last publish is the state GPL has just read -- unless a
-// grant slipped in before the lock, which the tick numbers catch.
+// What the slot would have written, against what GPL's own latch just wrote. `source` is the
+// caller's own validated copy. Only meaningful while the two describe the same tick: the render
+// thread holds gpl_taskFgBgLock here, so the sim is blocked at bgSleep and its last publish is
+// the state GPL has just read -- unless a grant slipped in before the lock, which the tick
+// numbers catch.
 void verify(uint32_t* car, const CarSource& source, unsigned publish) {
     State&   s = g_state;
     uint32_t expected[kRecordWords];
@@ -378,34 +386,45 @@ void* __cdecl carLatchHook(void* car) {
         return s.carLatch(car);
     }
 
-    const Slot&      published = s.slots[index];
-    const CarSource& source = published.cars[slot];
-    bool             sameTick = s.getBGCount && published.bgTick == s.getBGCount();
-    bool             usable = source.present != 0 && sameTick;
+    // Take the slot's words into private storage BEFORE asking whether they are whole. The
+    // sequence says only that nothing moved between the two reads of it, so anything derived
+    // from a slot has to be derived from a copy the check covers. Nothing below may look at
+    // s.slots[index] again.
+    //
+    // materialise() feeds source.driverIndex to gpl_driverDataOf 0x4A5A30 and
+    // gpl_carModelHandleOf 0x46F050, and both index GPL's 147-byte driver records at 0x6CB4F8
+    // with no range check -- the second then dereferences three lookups deep. A torn index
+    // there is a wild pointer, not a wrong number, so the check has to come first.
+    const Slot& published = s.slots[index];
+    CarSource   source = published.cars[slot];
+    int         bgTick = published.bgTick;
+    unsigned    publish = published.publish;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    bool whole = published.sequence.load(std::memory_order_relaxed) == sequence;
+    unpin();
 
-    if (mode >= 2 && usable) {
+    if (!whole) {
+        // A slot overwritten under the pin is a mix of two ticks; the live latch puts it right.
+        ++s.windowRepins;
+        ++s.windowSkipped;
+        return s.carLatch(car);
+    }
+    if (!source.present || !s.getBGCount || bgTick != s.getBGCount()) {
+        ++s.windowSkipped;
+        return s.carLatch(car);
+    }
+
+    if (mode >= 2) {
         materialise(reinterpret_cast<uint32_t*>(car), source,
                     reinterpret_cast<uint32_t*>(car) + kRecordFirst);
         ++s.windowMaterialised;
-        // The pin is only good while the sequence has not moved; a slot overwritten under it
-        // means the words above are a mix of two ticks, so the live latch puts it right.
-        if (published.sequence.load(std::memory_order_acquire) != sequence) {
-            unpin();
-            ++s.windowRepins;
-            return s.carLatch(car);
-        }
-        unpin();
+        // gpl_carLatchRenderRecord returns `a1 + 271` -- the source words, not the record.
         return reinterpret_cast<uint32_t*>(car) + kCarFirstWord;
     }
 
     void* result = s.carLatch(car);
-    if (usable && published.sequence.load(std::memory_order_acquire) == sequence) {
-        verify(reinterpret_cast<uint32_t*>(car), source, published.publish);
-        ++s.windowVerified;
-    } else {
-        ++s.windowSkipped;
-    }
-    unpin();
+    verify(reinterpret_cast<uint32_t*>(car), source, publish);
+    ++s.windowVerified;
     return result;
 }
 
@@ -454,7 +473,7 @@ void simRingInstall() {
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     s.frequency = frequency.QuadPart;
-    for (std::atomic<int>& pin : s.pinned) pin.store(-1, std::memory_order_relaxed);
+    s.pinned.store(-1, std::memory_order_relaxed);
 
     if (!redirect(kBgSleepSite, reinterpret_cast<uintptr_t>(&bgSleepHook))) {
         logf("ring: could not redirect the sim thread's bgSleep call at %08X -- no sim ring",

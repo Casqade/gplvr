@@ -45,6 +45,17 @@ struct Binding;
 // is not fatal: the geometry line simply does not appear.
 void renderProfileDiscover(const Binding& binding);
 
+// The slot the snapshot-begin marker jumps through, or null when that marker is not installed.
+//
+// The marker owns gpl_fgEventLoop's only call to gpl_fgFrameSnapshotBegin, and FlatFrames.h
+// wants the same call. Writing this slot puts a second hook BEHIND the marker instead of in
+// front of it, so the marker still runs on every frame and its span still tiles: an extra frame
+// shows up as a `pre` of nearly nothing, which is what it is.
+void** renderProfileSnapshotBeginSlot();
+
+// The same for the tail marker on gpl_fgFrameSnapshotEnd, or null when it is not installed.
+void** renderProfileSnapshotEndSlot();
+
 // Take over roglv2's glDrawArrays / glFinish / SwapBuffers imports. Safe to call more than
 // once; it notices slots that are already ours.
 void renderProfileInstallDriverThunks();

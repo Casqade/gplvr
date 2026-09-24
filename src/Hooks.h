@@ -462,7 +462,7 @@ struct Options {
 
     // Toggle vrInterpolate while the game runs, for an A/B in one race. '7' by default; 0
     // disables. VR only.
-    int vrInterpolateKey = '7';
+    int interpolateKey = '7';
 
     // Centre the world walk on the CAR rather than on the eye.
     //
@@ -476,7 +476,7 @@ struct Options {
     // plane showing through. In flat GPL the camera sits in the cockpit and the point is the
     // car's; in VR the head pose moves it off. This asks about the car's position instead, which
     // is what flat GPL asks, and keeps all four of the lookup's outputs consistent. 0 to compare.
-    bool vrFixEyeSegment = true;
+    bool fixEyeSegment = true;
 
     // The sim/render state ring (SimRing.h, docs/audit-2026-09-18/72-work-vs-wait.md section 6).
     // The sim thread publishes each finished tick's car sources into one of four slots.
@@ -486,6 +486,25 @@ struct Options {
     // its lock bracket are still GPL's in both, so neither reclaims the wait yet -- that is
     // stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
     int simRing = 0;
+
+    // FLAT MODE: draw this many extra frames between two simulation ticks (FlatFrames.h).
+    //
+    // gpl_fgEventLoop opens every frame with a poll that sleeps until the simulation has
+    // produced a new tick, so stock flat GPL draws exactly one frame per tick -- 36 a second on
+    // a stock install, whatever the monitor can do. With this set, a frame whose tick has not
+    // arrived yet is drawn anyway from the last latched tick, with the blend advanced to that
+    // instant, so the world moves at the display rate while the simulation goes on ticking at
+    // its own. 3 gives 144 frames a second on a 36 Hz sim; 7 is the ceiling.
+    //
+    // The simulation rate is NOT changed, so nothing the AI or the physics depend on moves. The
+    // cost is the sim tick of latency interpolation has always cost, and the GPU time for the
+    // extra frames. 0 leaves the loop exactly as GPL wrote it.
+    int flatExtraFrames = 0;
+
+    // Blend the world on those extra frames. With 0 they redraw the last tick unchanged, which
+    // is the control that says how much of the smoothness is the blend and how much is merely
+    // presenting more often.
+    bool flatInterpolate = true;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

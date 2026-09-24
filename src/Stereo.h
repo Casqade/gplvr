@@ -169,6 +169,14 @@ void stereoOnCameraBind(void* camera);
 // renders one pane into mirror.mip and nothing into the eye.
 bool stereoMirrorOnlyPass();
 
+// Patch gpl_sceneRender's two segment-lookup calls (0x487D73 eye, 0x4877D9 mirror) so the walk
+// is centred on the viewed car and GPL's answer is containment-checked. Idempotent.
+//
+// The defect it guards is not a VR one -- it needs a BLENDED position judged against the latch's
+// KEPT seed, and flat mode does that too once frames are drawn between the ticks (FlatFrames.h).
+// In VR stereoRender calls this itself, between passes; flat mode calls it at install.
+void stereoInstallWalkLookup();
+
 // True while the polyDraw gate drops every polygon (the mirror-only render after its main
 // cameraBind). A renderer that takes polygons before they reach polyDraw must drop them too.
 bool stereoDroppingPolygons();

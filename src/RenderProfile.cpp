@@ -1322,6 +1322,12 @@ bool renderProfileFormatGeometry(char* out, size_t size, unsigned long long fram
     return true;
 }
 
+void** renderProfileSnapshotBeginSlot() {
+    return g_preInstalled && g_preOriginal0 ? &g_preOriginal0 : nullptr;
+}
+
+void** renderProfileSnapshotEndSlot() { return g_tailOriginal1 ? &g_tailOriginal1 : nullptr; }
+
 bool renderProfileFormatPre(char* out, size_t size) {
     if (!g_preInstalled || !g_preFrames) return false;
 

@@ -546,7 +546,7 @@ using WalkSegmentFn = int(__cdecl*)(int hint, int* out, int x, int y, int z);
 constexpr uintptr_t kWalkSegmentOf = 0x00460B40;
 constexpr double    kDlongUnitsPerMetre = 19685.0;
 
-// THE SUBSTITUTION (vrFixEyeSegment). gpl_sceneRender asks this function where the camera is on
+// THE SUBSTITUTION (fixEyeSegment). gpl_sceneRender asks this function where the camera is on
 // the track, and uses the answer to centre the world walk and to set gpl_selectorCameraDlong /
 // Dlat / Height. In flat GPL the camera sits in the cockpit, so the answer is the car's; in VR
 // the head pose moves the point off it -- measured at 0.03 to 0.32 m in the mirror lines, since
@@ -662,7 +662,7 @@ int dlongDelta(int from, int to) {
 int __cdecl walkLookupThunk(int hint, int* out, int x, int y, int z) {
     auto original = reinterpret_cast<WalkSegmentFn>(g_walkLookupOriginal);
     float blended[3] = {}, tick[3] = {};
-    if (!g_options.vrFixEyeSegment || !interpolationViewedCarPosition(blended, tick)) {
+    if (!g_options.fixEyeSegment || !interpolationViewedCarPosition(blended, tick)) {
         ++g_walkPassedThrough;
         g_walkHaveLast = false;  // the memory is about the substituted point, not this one
         return original(hint, out, x, y, z);
@@ -781,7 +781,10 @@ bool installWalkLookup() {
     }
 
     logf("walk: the camera's segment lookup at 004877D9 and 00487D73 now asks about the VIEWED "
-         "CAR's position instead of the eye's, which is what flat GPL asks. Original at %p.",
+         "CAR's position, and GPL's answer is checked for containment before the walk is centred "
+         "on it (report 84). In flat mode this matters as soon as frames are drawn between the "
+         "ticks: the defect needs a blended position against the latch's kept seed, which is "
+         "what the blend makes in either mode. Original at %p.",
          g_walkLookupOriginal);
     return true;
 }
@@ -958,6 +961,10 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 }
 
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
+
+void stereoInstallWalkLookup() {
+    if (g_options.fixEyeSegment) installWalkLookup();
+}
 
 bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
 
@@ -1524,7 +1531,7 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         //
         // The substitution goes in here too, on the render thread between passes, because the
         // sites it patches are inside the function this call is about to enter.
-        if (g_options.vrFixEyeSegment) installWalkLookup();
+        if (g_options.fixEyeSegment) installWalkLookup();
 
         // Re-aim at the runtime's frustum. Writing fov and aspect and setting the
         // dirty byte is enough -- cameraBind rebuilds the projection from them on
