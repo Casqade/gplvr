@@ -1,6 +1,6 @@
 #pragma once
 
-// Frames drawn between two sim ticks, in flat mode (`flatExtraFrames`).
+// Frames drawn between two sim ticks (`frameRate`).
 //
 // GPL's frame loop gpl_fgEventLoop 0x4F3570 opens every iteration with
 // gpl_fgFrameSnapshotBegin 0x4EF5F0, which reaches gpl_fgWaitForTickAndSnapshot 0x4E8F20:
@@ -36,8 +36,10 @@
 // ring (SimRing.h) and is unaffected by it. Stage 3 of report 72 section 6.5, which drops the
 // brackets, remains unbuilt and is not a prerequisite.
 //
-// Flat mode only: in VR the presenter drives the cadence and vrExtraRenders already re-renders
-// from a fresher head pose.
+// BOTH MODES. `frameRate` decides whether the wait is skipped and what, if anything, gates a
+// frame afterwards: 1 draws one frame per display frame (per published view set in VR, per
+// refresh in flat mode, where SwapBuffers does the blocking), 2 draws them as fast as they can
+// be drawn, 0 leaves the loop exactly as GPL wrote it.
 
 #include <cstddef>
 
@@ -51,8 +53,19 @@ namespace gplvr {
 // the frame before it, so this declines to install when the blend did not.
 void flatFramesInstall();
 
-// The once-a-second `flat:` line: frames drawn, how many were extra, how they were spaced and
-// what stopped the rest. False when no frame was drawn in the window.
+// True when the frame loop's wait is ours. In VR this is frameRate = 2 free-running, and it
+// makes the extra-render tail in the present hook redundant: every frame now goes through GPL's
+// own loop, with its mirror pass and its HUD, instead of being a partial repeat after the
+// present. The tail stays as the fallback for when these call sites could not be taken.
+bool flatFramesActive();
+
+// Where this frame sits in the tick: 0 for one that latched a new sim tick, then 1, 2, ... for
+// the frames drawn between that tick and the next. Always 0 when the loop's wait is GPL's own,
+// which is what makes `every Nth frame` mean `every frame` there.
+int flatFramesTickFrameIndex();
+
+// The once-a-second `frames:` line: frames drawn, how many were between ticks, and what stopped
+// the rest. False when no frame was drawn in the window.
 bool flatFramesFormat(char* out, size_t size, double seconds);
 
 }  // namespace gplvr

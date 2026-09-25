@@ -207,7 +207,7 @@ struct Window {
     double    alphaMin = 0.0;
     double    alphaMax = 0.0;
     unsigned  alphas = 0;
-    unsigned  extraFrames = 0;   // frames drawn between two ticks (flatExtraFrames)
+    unsigned  extraFrames = 0;   // frames drawn between two ticks (frameRate)
     unsigned  extraBlended = 0;  // of those, the ones that found a usable pair
     long long extraCostTicks = 0;
     unsigned  clampedLow = 0;
@@ -221,6 +221,7 @@ struct Window {
     unsigned  pitBoardSnaps = 0;  // also in snaps[]
     unsigned  viewCarCoupled = 0;  // frames where the view and the viewed car were snapped together
     long long costTicks = 0;
+
 };
 
 using CountFn = int(__cdecl*)();
@@ -259,6 +260,7 @@ struct State {
     // Display time less the time right after the latch, smoothed, in QPC ticks.
     double latency = 0.0;
     bool   haveLatency = false;
+
 
     // When the ticks arrive, measured here rather than taken from RenderPacing, which is a VR
     // module and is not installed in flat mode. One latch to the next, smoothed, with the tick
@@ -771,14 +773,11 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
 
 // Blend one record to `target`. True when its pair was usable; only the first such record of a
 // frame goes into the alpha statistics.
-// Whether the records get blended at all. In VR that is `vrInterpolate`. In flat mode the blend
-// only means anything when frames are drawn between the ticks, so it follows flatExtraFrames as
-// well as its own key -- with flatInterpolate = 0 the extra frames redraw an unchanged world,
-// which is the control that says how much of the smoothness is the blend.
-bool blendingEnabled() {
-    if (g_options.vr) return g_options.vrInterpolate;
-    return g_options.flatExtraFrames > 0 && g_options.flatInterpolate;
-}
+// Whether the records get blended at all -- the same question in both modes, which is why the
+// option is not named after either of them. With it off the frames `frameRate` adds redraw an
+// unchanged world, which is the control that says how much of the smoothness is the blend and
+// how much is merely presenting more often.
+bool blendingEnabled() { return g_options.interpolate; }
 
 // When a tick arrived, in QPC. RenderPacing's model is preferred where it exists; its own is
 // fitted to the tick counter over a whole run, while this one is a two-point extrapolation from
@@ -1161,7 +1160,7 @@ void logFieldTable(const char* what, const Field* fields, size_t count, const ch
 
 void interpolationInstall() {
     State& s = g_state;
-    if (!g_options.vr && g_options.flatExtraFrames <= 0) return;
+    if (!g_options.vr && g_options.frameRate <= 0) return;
 
     // RenderPacing finds the tick wait by searching, and it is a VR module. In flat mode take
     // the address directly; every byte of the latch around it is checked below either way, so a
@@ -1259,11 +1258,9 @@ void interpolationInstall() {
          static_cast<unsigned>(kCarLatchCalls[2].site), static_cast<unsigned>(kViewLatchCall.site),
          static_cast<unsigned>(kMirrorLatchCall.site),
          static_cast<unsigned>(kPitBoardLatchCall.site), static_cast<unsigned>(enableSite),
-         blendingEnabled() ? (g_options.vr ? "vrInterpolate = 1."
-                                           : "flat mode: the blend follows flatExtraFrames.")
-         : g_options.vr    ? "vrInterpolate = 0: records are kept but nothing is blended."
-                           : "flat mode with flatInterpolate = 0: records are kept but nothing "
-                             "is blended.");
+         blendingEnabled()
+             ? "interpolate = 1."
+             : "interpolate = 0: records are kept but nothing is blended.");
     logFieldTable("car record R = car+0x4FC (live 006BF080, replay 00790848, 1544 bytes)",
                   kCarFields, sizeof(kCarFields) / sizeof(kCarFields[0]),
                   "driver +32, dial range +44, model +52, flags +92 or wheel state +252..264 "
@@ -1284,17 +1281,53 @@ bool interpolationActive() { return g_state.installed && blendingEnabled(); }
 
 bool interpolationExtraFrame() {
     State& s = g_state;
-    if (!s.installed || !blendingEnabled() || !s.haveTickModel || s.tickPeriod <= 0.0)
-        return false;
+    if (!s.installed || !blendingEnabled()) return false;
+
+    if (!s.haveTickModel || s.tickPeriod <= 0.0) return false;
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    // One tick behind the wall clock, which is where the latch's own blend put the world and
-    // where it stays: at the instant of a latch this is the tick before it, and it reaches that
-    // latch's own tick just as the next one lands. The lag is the sim tick interpolation has
-    // always cost, not a new one.
-    double target = static_cast<double>(now.QuadPart) - s.tickPeriod;
+    // THE INSTANT THIS FRAME WILL BE SEEN, less a tick -- not the instant it is drawn.
+    //
+    // Three versions of this were wrong before this one, and the third looked most right:
+    //
+    //   display - latency - tick   the latched frame's expression, asked again through
+    //                              renderPacingDisplayTime -- which anchors on the frame's
+    //                              LATCH. The latch does not move between two sim ticks, so
+    //                              every frame between them blended to the same instant: 275
+    //                              blended frames against 36 display times in the log.
+    //   now + latency - tick       `latency` is already display - now, so adding it double
+    //                              counts. Measured: alpha min 0.65 and 202 of 232 frames
+    //                              CLAMPED at 1.00 -- two thirds of every tick drawn at the
+    //                              newest state.
+    //   now - tickPeriod           sweeps the tick correctly and still judders, because `now`
+    //                              is when the frame is DRAWN. The interval from drawing to
+    //                              being displayed is not constant -- the presenter shows
+    //                              whichever frame is newest at its latch -- so the world's
+    //                              sampled instant jitters by that much. At 55 m/s a 3 ms
+    //                              jitter is 17 cm, which is roadside objects stepping as you
+    //                              pass them.
+    //
+    // Anchoring the display query on THIS frame instead quantises the answer to the presenter's
+    // own latches: frames headed for the same display get the same world, frames headed for
+    // different displays get consecutive ones, and the draw-time jitter cancels because it is
+    // no longer in the expression.
+    //
+    // Flat mode has no such clock -- renderPacingInstall is VR-only -- so there the wall clock
+    // is all there is, and SwapBuffers' own blocking is what keeps the draw-to-display interval
+    // steady enough for it.
+    double target = 0.0;
+    if (g_options.vr) {
+        long long display = 0;
+        bool      fromPresenter = false;
+        if (!s.haveLatency ||
+            !renderPacingDisplayTimeAt(now.QuadPart, now.QuadPart, display, fromPresenter))
+            return false;
+        target = static_cast<double>(display) - s.latency - s.tickPeriod;
+    } else {
+        target = static_cast<double>(now.QuadPart) - s.tickPeriod;
+    }
 
     Window& w = s.window;
     ++w.extraFrames;

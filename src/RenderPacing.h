@@ -48,12 +48,34 @@ void renderPacingObserveTick(long long qpc, int count);
 // at the current sim rate.
 bool renderPacingTickArrival(int count, double& qpc);
 
+// When the tick after the newest one observed is due, in QPC ticks.
+//
+// This is the deadline for anything that runs in the tick's idle tail, and it is NOT "now plus
+// a tick": by the time the frame has been drawn and presented, most of the tick is already
+// gone. Budgeting from `now` is how the extra frames came to believe they had 24 ms when they
+// had 13, started renders that could not finish, and pushed the game's own frame late.
+bool renderPacingNextTickDue(double& qpc);
+
 // When the frame whose latch has just run reaches the display, in QPC ticks. With the
 // presenter's clock: the presenter latch the frame aims for (paced) or the first it can make
 // after its measured cost (unpaced or over budget), mapped to that latch's display;
 // `fromPresenter` true.
 // Without it: the latch plus the measured latch-to-publish cost.
 bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter);
+
+// The same, for a frame that is not the one whose latch just ran -- a frame drawn between two
+// sim ticks. `anchorQpc` is when that frame starts, and the answer is the display IT reaches.
+//
+// This distinction is the difference between smooth and juddering, and it is not obvious. The
+// answer is quantised to the presenter's latches, so two frames headed for the same display get
+// the same one and two headed for different displays get different ones -- which is exactly
+// right, and is what makes the world's sampled instant depend on when a frame will be SEEN
+// rather than on when it happened to be drawn. Anchoring on the latch instead quantises to the
+// sim tick, so every frame between two ticks blended to one instant; anchoring on nothing and
+// using the wall clock lets the world's instant jitter by however much the draw-to-display
+// interval jitters, which is roadside objects stepping as you pass them.
+bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& display,
+                               bool& fromPresenter);
 
 // The once-a-second pacing line. False when the window held no tracked stereo frame.
 bool renderPacingFormat(char* out, size_t size);

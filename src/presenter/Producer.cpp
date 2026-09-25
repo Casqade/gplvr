@@ -93,6 +93,21 @@ struct State {
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
 
+    // vrDirectToShared, report 80. The slot the frame is being drawn straight into --
+    // locked from before its first draw call until it is published -- or -1 when the frame
+    // goes into our own target and is copied across at publish. `directGaveUp` is one-way:
+    // a lock or an attachment that fails takes the session back to the copy for good,
+    // because a path that alternates between the two would be neither measurable nor
+    // debuggable.
+    int  directSlot = -1;
+    bool directGaveUp = false;
+    bool directReported = false;
+    bool directNotYetReported = false;
+    // The window's picture has to be taken while the shared texture is still locked, which
+    // is before the publish rather than after it. Set there, cleared by the blit that would
+    // otherwise repeat it.
+    bool windowBlitDone = false;
+
     // Pose diagnostics, logged every two seconds. viewLag counts, per published frame, how
     // many view sets the presenter had published after the one the eyes were rendered from
     // (0, 1, 2, 3+). slotOverwrites counts frames written into the slot holding the frame
@@ -283,7 +298,20 @@ void releaseHudTextures(State& state) {
     state.hudPending = false;
 }
 
+// Hand back a slot that is being rendered into without publishing it. The frame in it is
+// lost, which is the right outcome everywhere this is called from: the textures are about
+// to be unregistered, and unregistering one that GL still holds is the same fault as
+// unlocking one that is still attached.
+void dropDirect(State& state) {
+    if (state.directSlot < 0) return;
+    renderTargetAttachColour(state.gl, 0);
+    glInteropPublishDirect(state.gl, state.interopDevice,
+                           state.shared[state.directSlot], false, nullptr);
+    state.directSlot = -1;
+}
+
 void releaseTextures(State& state) {
+    dropDirect(state);
     for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
         glInteropUnregister(state.gl, state.interopDevice, state.shared[slot]);
         if (state.textures[slot]) state.textures[slot]->Release();
@@ -341,6 +369,85 @@ bool createTextures(State& state, int width, int height) {
     logf("vr: published %u shared textures at %dx%d, generation %d", kFrameSlots, width,
          height, state.block->textureGeneration);
     return true;
+}
+
+void directGiveUp(State& state, const char* why) {
+    if (state.directGaveUp) return;
+    state.directGaveUp = true;
+    renderTargetAttachColour(state.gl, 0);
+    logf("vr: rendering straight into the shared texture is off for this session -- %s. The "
+         "frame is copied into it at publish instead, as it was before vrDirectToShared.",
+         why);
+}
+
+// Take the slot the next frame will be drawn into, lock it, and make it the off-screen
+// target's colour attachment.
+//
+// Called after every publish rather than once a frame, because an extra render is a whole
+// frame of its own and publishes on its own: between two of them there is no other moment
+// at which a new slot could be taken.
+//
+// Everything that is not ready yet is a silent no-op, not a failure -- the textures are
+// created at publish time and the framebuffer at bind time, so the first frames of a
+// session, of a mode change and of a resolution change legitimately have neither. Those
+// frames take the copy path, which is also the fallback if this is ever refused.
+// Say once that the option is on and has not taken. Every reason below is a silent `return`,
+// and a silently inert option reads exactly like one that is working.
+void directNotYet(State& state, const char* why) {
+    if (state.directReported || state.directNotYetReported) return;
+    state.directNotYetReported = true;
+    logf("vr: vrDirectToShared = 1 but the frame is still being copied -- %s. If this is the "
+         "last word on it, the option did nothing this session.",
+         why);
+}
+
+void acquireDirect(State& state) {
+    if (!g_options.vrDirectToShared || state.directGaveUp) return;
+    if (state.stage != Stage::Publishing || state.directSlot >= 0) return;
+    if (!state.gl.dxLockObjects || !state.gl.dxUnlockObjects || !state.interopDevice) {
+        directNotYet(state, "WGL_NV_DX_interop's lock entry points or the interop device are "
+                            "not there");
+        return;
+    }
+
+    int width = 0;
+    int height = 0;
+    if (!renderTargetSize(width, height)) {
+        directNotYet(state, "there is no off-screen render target to attach it to (vrOffscreen "
+                            "is off, or the target did not build)");
+        return;
+    }
+    if (width != state.width || height != state.height) return;
+
+    // The same arithmetic the publish uses: the presenter reads slot
+    // (frameSequence % kFrameSlots), so the frame about to be drawn is numbered
+    // frameSequence + 1 and belongs in the other one.
+    uint32_t               slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
+    const GlSharedTexture& shared = state.shared[slot];
+    if (!shared.interopObject || !shared.name) {
+        directNotYet(state, "the shared textures are not registered with GL");
+        return;
+    }
+
+    if (!glInteropLockDirect(state.gl, state.interopDevice, shared)) {
+        directGiveUp(state, "wglDXLockObjectsNV would not give GL the slot");
+        return;
+    }
+    if (!renderTargetAttachColour(state.gl, shared.name)) {
+        glInteropPublishDirect(state.gl, state.interopDevice, shared, false, nullptr);
+        directGiveUp(state, "the shared texture would not serve as the off-screen "
+                            "framebuffer's colour attachment");
+        return;
+    }
+
+    state.directSlot = static_cast<int>(slot);
+    if (!state.directReported) {
+        state.directReported = true;
+        logf("vr: the frame is rendered straight into the shared texture -- slot %u, GL "
+             "texture %u, %dx%d. No copy at publish; the interop lock is held for the whole "
+             "frame.",
+             slot, shared.name, width, height);
+    }
 }
 
 // Pribluda's panel is 2048 texels wide whatever the monitor is: at the default 0.6 m that
@@ -858,8 +965,17 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         if (state.width)
             logf("vr: render size changed %dx%d -> %dx%d, recreating shared textures",
                  state.width, state.height, width, height);
+        bool wasDirect = state.directSlot >= 0;
         if (!createTextures(state, width, height)) {
             fail("the shared textures could not be created");
+            return;
+        }
+        // On the direct path this frame was drawn into a texture that has just been thrown
+        // away with the rest, so there is nothing to publish: take a slot of the new size
+        // and let the next frame be the first one at it. The copy path has the frame in its
+        // own target and carries on.
+        if (wasDirect) {
+            acquireDirect(state);
             return;
         }
     }
@@ -887,13 +1003,27 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->stretchToFill),
                         stretchToFill ? 1 : 0);
 
+    // The off-screen target rebuilds itself on a mode change as well as a resolution
+    // change, and a rebuilt framebuffer has the target's OWN texture attached again. When
+    // that has happened the frame did not land in the slot being held, so the slot is given
+    // back unpublished and this frame takes the copy path.
+    if (state.directSlot >= 0 &&
+        renderTargetAttachedColour() != state.shared[state.directSlot].name)
+        dropDirect(state);
+
     // The poses this frame was drawn from, echoed back untouched. Written before the
     // frame sequence that advertises the pixels, so the presenter never pairs a new
     // image with the previous frame's pose.
     // The slot must be the one the published sequence names, not the one before it:
     // the presenter reads slot (frameSequence % kFrameSlots), so the frame we are about
     // to write is numbered frameSequence + 1 and belongs in that slot.
-    const uint32_t slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
+    //
+    // On the direct path the frame is already IN a slot -- chosen by this same arithmetic
+    // when it was locked, before the frame's first draw call -- and that one is what gets
+    // published, whatever the arithmetic says now.
+    const uint32_t slot = state.directSlot >= 0
+                              ? static_cast<uint32_t>(state.directSlot)
+                              : static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
 
     // The poses go in the SAME slot as the pixels they belong to. Version 1 kept one
     // shared copy, written before frameSequence moved, so a consumer could latch
@@ -943,9 +1073,28 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     int           transferring = frameBudgetEnter(kSpanTransfer);
     LARGE_INTEGER transferBegin, transferEnd;
     QueryPerformanceCounter(&transferBegin);
-    const bool transferred = glInteropCopyBackBuffer(
-        state.gl, state.interopDevice, state.shared[slot], width, height,
-        renderTargetFramebuffer(), g_options.vrTransferFinish, copyPanel ? &panelCopy : nullptr);
+    bool transferred;
+    if (state.directSlot >= 0) {
+        // The pixels are already where the presenter will read them. What is left is
+        // everything that still has to happen while GL holds the texture: the pointer's
+        // saved pixels go back into the frame, the texture comes off the framebuffer -- the
+        // unlock fails if it does not -- and the panel rides out under the same unlock.
+        //
+        // The window's picture was taken in presenterEndFrame, for the same reason the
+        // restore is here: after the unlock this texture belongs to Direct3D.
+        cursorOverlayRestore(state.gl);
+        renderTargetAttachColour(state.gl, 0);
+        transferred = glInteropPublishDirect(state.gl, state.interopDevice,
+                                             state.shared[slot], g_options.vrTransferFinish,
+                                             copyPanel ? &panelCopy : nullptr);
+        state.directSlot = -1;
+    } else {
+        transferred = glInteropCopyBackBuffer(state.gl, state.interopDevice,
+                                              state.shared[slot], width, height,
+                                              renderTargetFramebuffer(),
+                                              g_options.vrTransferFinish,
+                                              copyPanel ? &panelCopy : nullptr);
+    }
     QueryPerformanceCounter(&transferEnd);
     frameBudgetLeave(transferring);
     presenterNoteTransfer(transferEnd.QuadPart - transferBegin.QuadPart);
@@ -961,6 +1110,12 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
                         state.frameSequence);
     vrNoteFramePublished();
     renderPacingNotePublished();
+
+    // The next frame's slot is taken here rather than at the top of the next frame: an
+    // extra render draws and publishes a whole frame of its own between the two, and the
+    // game's own next frame starts drawing without passing through presenterBeginFrame
+    // again when it does.
+    acquireDirect(state);
 
     // The HUD panel copied under the same lock goes out now, after the same synchronisation,
     // so the presenter can never copy one that is still being written.
@@ -1028,13 +1183,30 @@ void presenterEndFrame() {
     State& state = g_state;
     if (state.stage == Stage::Off) return;
     renderTargetEndFrame(state.gl);
+
+    // On the direct path the window's picture is read out of the shared texture, so it has
+    // to be taken here -- the frame is finished and the texture is still locked to GL. The
+    // publish that follows hands it to Direct3D, after which GL may not read it at all.
+    //
+    // Only the blit moves. The panel that goes over the picture is drawn into the window's
+    // own buffer and stays where it was, after the publish, so it still uses the views this
+    // frame was rendered from.
+    if (state.directSlot >= 0) {
+        frameBudgetSwitch(kSpanWindowBlit);
+        renderTargetBlitToWindow(state.gl, g_options.vrMonitorEye);
+        state.windowBlitDone = true;
+    }
 }
 
 void presenterBlitToWindow(int eye) {
     State& state = g_state;
     state.monitorHudTaken = false;
+    // Cleared before the stage is looked at, so a stage that changed between the two calls
+    // cannot leave the flag set and cost the next frame its picture.
+    bool alreadyBlitted = state.windowBlitDone;
+    state.windowBlitDone = false;
     if (state.stage == Stage::Off) return;
-    renderTargetBlitToWindow(state.gl, eye);
+    if (!alreadyBlitted) renderTargetBlitToWindow(state.gl, eye);
     if (state.stage != Stage::Publishing || !state.block) return;
     frameBudgetSwitch(kSpanWindowHud);
     drawMonitorHud(state, eye);
@@ -1068,11 +1240,18 @@ void presenterBeginFrame() {
     if (!g_options.vr || !g_options.vrOffscreen) {
         // Not merely "do not bind": the engine's back buffer size has to go back to what
         // roglv2 believes, or the next frame is laid out for a surface that is no longer
-        // the render target.
+        // the render target. A slot still held goes back first -- the framebuffer it is
+        // attached to is about to be deleted.
+        dropDirect(state);
         renderTargetRelease(state.gl);
         return;
     }
     renderTargetBeginFrame(state.gl);
+
+    // After the bind, not before it: the framebuffer the slot is attached to is built in
+    // there. Inert whenever a slot is already held, which is the usual case -- the publish
+    // takes the next one as soon as it lets the last one go.
+    acquireDirect(state);
 }
 
 namespace {
@@ -1108,6 +1287,8 @@ int32_t presenterViewSequence() {
     if (state.stage != Stage::Publishing || !state.block) return 0;
     return state.block->viewsValid ? state.block->viewSequence : 0;
 }
+
+int32_t presenterAcquiredViewSequence() { return g_state.acquiredViewSequence; }
 
 bool presenterLatestViews(SharedView views[2], SharedPose& head, SharedMotion* motion) {
     State& state = g_state;

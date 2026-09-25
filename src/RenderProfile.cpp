@@ -1134,7 +1134,7 @@ double msBetween(long long a, long long b) {
 }
 
 // One frame's worth, only if the five markers and the two scene timestamps came out in the
-// order the loop guarantees. They do not always: with vrExtraRenders the scene is rendered
+// order the loop guarantees. They do not always: with frameRate = 2 the scene is rendered
 // again AFTER the present, so the frame's first render lands before its own loop iteration
 // began, and every span computed from it would be nonsense. Counting the rejects and
 // printing the ratio is what turns that from a silent lie into a visible condition.
@@ -1334,10 +1334,10 @@ bool renderProfileFormatPre(char* out, size_t size) {
     if (!g_preOrdered) {
         _snprintf_s(out, size, _TRUNCATE,
                     "pre: not one of this window's %u frames had its markers in order, so "
-                    "nothing is reported. The usual cause is vrExtraRenders > 0 -- an "
-                    "extra render runs AFTER the present, so the frame's first "
-                    "sceneRender no longer lies inside the frame's own loop iteration. "
-                    "Set vrExtraRenders = 0 to read this line.",
+                    "nothing is reported. The usual cause is frameRate = 2 -- an extra "
+                    "frame is rendered AFTER the present, so the frame's first sceneRender "
+                    "no longer lies inside the frame's own loop iteration. Lower "
+                    "frameRate to read this line.",
                     g_preFrames);
         return true;
     }

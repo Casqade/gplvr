@@ -35,6 +35,21 @@ struct Options {
     // Each pane after the first in a pass costs a sceneRender whose main pass is skipped.
     int stereoMirror = 2;
 
+    // Render the mirror on one frame in N, counting from the frame that latched the sim tick.
+    //
+    // With `frameRate` above 0 the frames between two ticks are GPL's own frames, so they redraw
+    // everything the tick frame did -- the mirror included. Measured at frameRate = 2: 463
+    // renders a second of which 231 were mirror-only, against a simulation ticking 36 times.
+    // That doubles the cost of every frame, and since the cost of one frame is exactly what
+    // limits the rate, it halves the rate.
+    //
+    // What the mirror shows changes with the sim tick and with your head. The tick is 36 Hz, and
+    // a reflection in a rear-view mirror is the last place a few milliseconds of head lag is
+    // noticed -- so skipping it on most of the frames between ticks costs little and buys a lot.
+    // 1 renders it on every frame, as before. The `mirror N/s` figure on the fps line says what
+    // the setting actually produced.
+    int stereoMirrorEvery = 1;
+
     // vrMirrorFovScale, vrMirrorYaw and vrMirrorPitch are the defaults for every car; a car's
     // section in gplvr_cars.ini overrides each one it holds (MirrorConfig.h).
     //
@@ -328,19 +343,6 @@ struct Options {
     // assumption nothing has yet verified.
     float vrWorldScale = 1.0f;
 
-    // Extra whole-scene renders per game frame, 0 to 3.
-    //
-    // The 36 Hz is the sim TASK RATE, not a rendering limit: sceneRender costs about a
-    // millisecond an eye out of an 11 ms budget at 90 Hz, and the game thread spends
-    // the rest of each tick idle. Rendering the scene again from a fresh head pose
-    // produces a real head-tracked frame rather than a reprojected one -- the world
-    // still animates at 36 Hz, but head motion, which is what causes discomfort, gets
-    // smooth.
-    //
-    // 1 gives 72 Hz of head tracking, 2 gives 108. Off by default because it spends
-    // idle time that the game may want back on a slower machine, and because it is new.
-    int vrExtraRenders = 0;
-
     // How much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
     // world render behind them, so at 1.0 they fill the whole 104-degree view a few
     // centimetres from your face. The layer sits at infinity either way -- angular size
@@ -435,19 +437,32 @@ struct Options {
     // display clock, and each eye is moved by its velocity over the displays in between.
     bool vrPredictPosition = true;
 
-    // LOCK THE FRAME RATE TO THE HEADSET'S REFRESH RATE. Each frame's latch waits until the
-    // frame will be published just before the presenter's latch, so every displayed frame is the
-    // same number of sim ticks newer than the last, and the presenter locates the views for the
-    // display the frame reaches. Without it the game free-runs and the presenter drops whatever
-    // it cannot show. Only while the previous frame was a tracked stereo world frame and the
-    // presenter publishes its display clock. vrExtraRenders is held at 0 while it locks.
-    // VR only. RenderPacing.h.
+    // WHAT SETS THE FRAME RATE. The vsync question, and nothing about it is VR-specific: `vr`
+    // already says which mode the game is in, so this does not repeat it.
     //
-    // IT TURNS vrInterpolate ON when it is off, because it cannot work without it unless the
-    // display period is a whole number of sim ticks: 144 Hz into 90 Hz is 1.6 ticks a frame, and
-    // holding a frame to a display deadline at a fractional ratio would show one tick twice and
-    // skip the next. Interpolation costs one sim tick of latency.
-    bool vrLockToHeadset = true;
+    //   0  THE SIM'S RATE. One frame per sim tick -- 36 on a stock exe, 144 on a patched one --
+    //      because GPL's frame loop opens by sleeping until the tick lands. Stock behaviour,
+    //      and the baseline the other two are measured against.
+    //
+    //   1  THE DISPLAY'S RATE. That wait is skipped and a frame is drawn for every frame the
+    //      display shows: in VR, one per view set the presenter publishes; in flat mode, one
+    //      per refresh, which is `swapInterval = 1` doing the blocking. Vsync, in other words.
+    //
+    //   2  UNLOCKED. The wait is skipped and nothing else paces the loop, so the rate is
+    //      1000 / the cost of one frame. Vsync off.
+    //
+    // 1 and 2 are the SAME MECHANISM -- FlatFrames skips the loop's tick wait -- differing only
+    // in what is allowed to gate a frame afterwards. THE SIMULATION RATE IS UNTOUCHED by both:
+    // every frame between two ticks redraws the last latched tick with the blend advanced, and
+    // reads no simulation state.
+    //
+    // 1 on a 36 Hz exe is what a 144 Hz exe achieves by accident -- its ticks arrive faster
+    // than frames can be drawn, so the loop's wait never blocks. That is the whole of the
+    // difference between the two binaries, and the whole of why the 36 Hz one felt like 36.
+    //
+    // 1 and 2 both TURN `interpolate` ON, because a frame drawn between two ticks without the
+    // blend is a duplicate of the one before it: more frames, identical picture.
+    int frameRate = 1;
 
     // How long before the presenter's latch a paced frame aims to be published, in
     // milliseconds, on top of the measured latch-to-publish cost. 0 to 10.
@@ -455,13 +470,16 @@ struct Options {
 
     // Interpolate the world to the frame's display time. Every car and the view -- the cockpit,
     // the own car, the mirror and trackside cameras -- are drawn blended between the two newest
-    // latched sim ticks, so the world moves evenly at any display rate, and render pacing also
-    // engages when the display period is not a whole number of ticks. Adds one sim tick of
-    // latency (6.94 ms at 144 Hz). VR only. Interpolation.h.
-    bool vrInterpolate = true;
+    // latched sim ticks, so the world moves evenly at any display rate. Adds one sim tick of
+    // latency (6.94 ms at 144 Hz). Both modes; Interpolation.h.
+    //
+    // This is a separate lever from `frameRate` on purpose -- one says how often a frame is
+    // drawn, the other says whether the world in it has moved -- but `frameRate` 1 and 2 turn
+    // it on, because without it the frames they add are duplicates.
+    bool interpolate = true;
 
-    // Toggle vrInterpolate while the game runs, for an A/B in one race. '7' by default; 0
-    // disables. VR only.
+    // Toggle `interpolate` while the game runs, for an A/B in one race. '7' by default; 0
+    // disables. Both modes.
     int interpolateKey = '7';
 
     // Centre the world walk on the CAR rather than on the eye.
@@ -486,25 +504,6 @@ struct Options {
     // its lock bracket are still GPL's in both, so neither reclaims the wait yet -- that is
     // stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
     int simRing = 0;
-
-    // FLAT MODE: draw this many extra frames between two simulation ticks (FlatFrames.h).
-    //
-    // gpl_fgEventLoop opens every frame with a poll that sleeps until the simulation has
-    // produced a new tick, so stock flat GPL draws exactly one frame per tick -- 36 a second on
-    // a stock install, whatever the monitor can do. With this set, a frame whose tick has not
-    // arrived yet is drawn anyway from the last latched tick, with the blend advanced to that
-    // instant, so the world moves at the display rate while the simulation goes on ticking at
-    // its own. 3 gives 144 frames a second on a 36 Hz sim; 7 is the ceiling.
-    //
-    // The simulation rate is NOT changed, so nothing the AI or the physics depend on moves. The
-    // cost is the sim tick of latency interpolation has always cost, and the GPU time for the
-    // extra frames. 0 leaves the loop exactly as GPL wrote it.
-    int flatExtraFrames = 0;
-
-    // Blend the world on those extra frames. With 0 they redraw the last tick unchanged, which
-    // is the control that says how much of the smoothness is the blend and how much is merely
-    // presenting more often.
-    bool flatInterpolate = true;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //
@@ -556,6 +555,24 @@ struct Options {
     // textures to Direct3D and on NVIDIA waits for the GL work on them to complete. If 0 shows
     // torn, half-drawn or stale frames in the headset, the unlock does not synchronise here.
     bool vrTransferFinish = true;
+
+    // Render the frame straight into the shared texture the presenter reads, instead of
+    // rendering into our own and copying it across at publish. Report 80.
+    //
+    // The copy is a glBlitFramebuffer of the whole frame -- 80.5 MB read and written at
+    // 6344x3172, measured at 1.0 to 1.9 ms of an 11.11 ms budget. Nothing needs it: the
+    // shared texture is already a complete GL render target, so the off-screen framebuffer
+    // can take it as colour attachment 0 and the game draws into it directly.
+    //
+    // What changes for the presenter is how long a slot is held: the interop lock now spans
+    // the whole frame rather than the moment of the copy, and there are two slots. What
+    // changes for the game is that a frame no longer starts from the previous one's pixels
+    // -- the texture is registered WRITE_DISCARD and the two slots alternate -- so anything
+    // GPL draws once and expects to survive would show every other frame.
+    //
+    // Requires vrOffscreen. A lock or an attachment that fails drops back to the copy for
+    // the rest of the session and says so.
+    bool vrDirectToShared = false;
 
     // Drop GPL's stamped text (stampDraw) that cannot reach the headset. VR only.
     //

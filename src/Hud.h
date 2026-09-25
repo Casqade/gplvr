@@ -57,7 +57,7 @@ void hudEndFrame();
 // Re-issue this frame's HUD. Called after each EXTRA render, which re-enters
 // gpl_sceneRender underneath a HUD that has already been drawn and paints the world over
 // it -- so without this the HUD survives only on frames with no extra render, which at
-// `vrExtraRenders = 2` is one frame in three.
+// `frameRate = 2` into a 90 Hz headset is one frame in three.
 void hudReplay();
 
 // True while the bitmapDraw global holds the thunk, which is the only place the mirror

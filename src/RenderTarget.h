@@ -64,6 +64,19 @@ bool renderTargetActive();
 GLuint renderTargetFramebuffer();
 bool   renderTargetSize(int& width, int& height);
 
+// Draw into a texture we do not own, as colour attachment 0 in place of the target's own.
+//
+// This is what lets the frame be rendered straight into the presenter's shared texture
+// (vrDirectToShared, report 80). `name` 0 puts the target's own texture back, which is also
+// what a rebuild does -- so the caller has to ask again after a resolution change rather
+// than assume the attachment survived. False means the attachment was refused or the
+// framebuffer is incomplete with it, and the target's own texture is attached instead.
+//
+// The texture must be lockable by whoever owns it for as long as it is attached, and it
+// must be detached before it is handed back.
+bool   renderTargetAttachColour(const GlFunctions& gl, GLuint name);
+GLuint renderTargetAttachedColour();
+
 // Resize the surface a camera is about to render into, to match the off-screen target.
 //
 // Changing the back buffer's own width and height is NOT enough, and the first run

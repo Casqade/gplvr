@@ -107,6 +107,15 @@ bool presenterMonitorHudTaken();
 // each rendered frame correspond to one display frame.
 int32_t presenterViewSequence();
 
+// The view set the LAST RENDER actually took its eye cameras from, which is what an extra
+// frame has to be newer than.
+//
+// Not the same question as "has the counter moved since I got here": by the time a frame has
+// been drawn and presented, the presenter has usually published one or two sets already, and
+// waiting for yet another spends a display period of the tick's idle tail on nothing. The
+// first extra frame of a tick almost always has a fresh pose waiting for it.
+int32_t presenterAcquiredViewSequence();
+
 // The presenter's display clock from the newest published view set, in QPC ticks. False
 // when it is not publishing, has no valid views, or has not published timing.
 struct PresenterClock {

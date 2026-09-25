@@ -1,5 +1,6 @@
 #include "Stereo.h"
 
+#include "FlatFrames.h"
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Hud.h"
@@ -1276,12 +1277,32 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
 
 }  // namespace
 
+// The mirror on one frame in stereoMirrorEvery, counting from the frame that latched the tick.
+//
+// A frame drawn between two sim ticks is one of GPL's own and redraws everything, the mirror
+// included -- measured at frameRate = 2, 231 mirror-only renders a second against a 36 Hz
+// simulation, which doubles the cost of every frame and so halves the rate. What a rear-view
+// mirror shows changes with the tick and with the head, and neither needs every frame.
+//
+// ONLY WITH stereoMirror = 1, and that is not a simplification. At 2 each eye's pass renders
+// the panes from its own eye into the SAME mirror texture, so the image in it at the end of a
+// frame is the right eye's. A frame that skips the render leaves both eyes sampling that one --
+// and the left eye then alternates between its own reflection and the right's, which is a
+// visible flicker and was reported as one. Per-eye skipping needs a mirror texture per eye;
+// until there is one, 2 renders every frame. loadOptions says so rather than ignoring it here.
+bool stereoMirrorDueThisFrame() {
+    if (g_options.stereoMirrorEvery <= 1 || g_options.stereoMirror != 1) return true;
+    return (flatFramesTickFrameIndex() % g_options.stereoMirrorEvery) == 0;
+}
+
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     if (!stereoAvailable() || !params || !params->camera) return false;
     if (!ensureEyes(params->camera)) return false;
 
     void* const savedCamera = params->camera;
     void* const savedMirror = params->mirrorCamera;
+
+    void* const mirrorWanted = stereoMirrorDueThisFrame() ? savedMirror : nullptr;
     // The params block is the GAME'S live memory, not a copy of it -- gpl_simFrameRender
     // reuses it and zeroes p[43] the moment sceneRender returns. So anything we adjust in
     // it has to be put back before we hand control away. The mirror aim is the frame
@@ -1572,8 +1593,8 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         // on the left eye's pass only, from the head centre, and the right eye samples what
         // it left; 2 does it on both passes, each from its own eye. Without panes the same
         // passes render GPL's single stock image.
-        bool mirrorThisPass = savedMirror && (g_options.stereoMirror == 2 ||
-                                              (g_options.stereoMirror == 1 && pass == 0));
+        bool mirrorThisPass = mirrorWanted && (g_options.stereoMirror == 2 ||
+                                               (g_options.stereoMirror == 1 && pass == 0));
         params->mirrorCamera = mirrorThisPass ? savedMirror : nullptr;
         if (mirrorThisPass && panes) {
             float eye[3] = {params->eyeX, params->eyeY, params->eyeZ};

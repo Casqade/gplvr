@@ -23,7 +23,7 @@ namespace gplvr {
 // Redirect gpl_simFrameSetup's three gpl_carLatchRenderRecord calls and its view, mirror and pit
 // board record latches, and the fgEnableBG call after the latch. Every site is checked against its
 // stock bytes first; nothing is patched unless all match. Installs in VR, and in flat mode when
-// flatExtraFrames asks for frames between the ticks. Call after renderPacingInstall, which
+// frameRate asks for frames between the ticks. Call after renderPacingInstall, which
 // locates the tick wait in VR.
 void interpolationInstall();
 

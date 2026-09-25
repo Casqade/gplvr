@@ -120,6 +120,11 @@ bool stereoAvailable();
 // should render normally -- a failed stereo setup must never cost you the game.
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*));
 
+// Whether this frame renders the mirror (`stereoMirrorEvery`). Always true unless that is above
+// 1 AND `stereoMirror` is 1 -- at 2 the two eyes share one mirror texture, so a skipped frame
+// leaves one eye looking at the other's reflection.
+bool stereoMirrorDueThisFrame();
+
 // Drops the eye surfaces and cameras. Called when the render target changes size and
 // on shutdown; the next frame rebuilds them.
 void stereoRelease();

@@ -83,6 +83,9 @@ struct Target {
     GLuint framebuffer = 0;
     GLuint colour = 0;
     GLuint depth = 0;
+    // A texture belonging to somebody else, attached in place of `colour` for a frame that
+    // renders straight into it. 0 means the target's own.
+    GLuint borrowed = 0;
     int    width = 0;
     int    height = 0;
 
@@ -530,6 +533,7 @@ void destroyFramebuffer(const GlFunctions& gl) {
     g_target.framebuffer = 0;
     g_target.depth = 0;
     g_target.colour = 0;
+    g_target.borrowed = 0;
     g_target.width = 0;
     g_target.height = 0;
     g_target.bound = false;
@@ -876,6 +880,43 @@ bool renderTargetSize(int& width, int& height) {
     height = g_target.height;
     return true;
 }
+
+bool renderTargetAttachColour(const GlFunctions& gl, GLuint name) {
+    if (!g_target.framebuffer || !gl.bindFramebuffer || !gl.framebufferTexture2D)
+        return false;
+
+    GLuint wanted = name ? name : g_target.colour;
+    if (!wanted) return false;
+
+    // The binding is saved and put back rather than left at the target's own: this runs
+    // both between frames, where nothing is bound, and in the middle of the extra-render
+    // tail, where the target is bound and the frame after this one keeps drawing into it.
+    GLint previous = 0;
+    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previous);
+    gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, wanted, 0);
+
+    GLenum status = gl.checkFramebufferStatus ? gl.checkFramebufferStatus(kGlFramebuffer)
+                                              : kGlFramebufferComplete;
+    if (status != kGlFramebufferComplete) {
+        // Put our own back before returning, so a refusal leaves a target that still
+        // renders rather than one that is incomplete for the rest of the session.
+        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                                g_target.colour, 0);
+        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+        g_target.borrowed = 0;
+        logf("target: texture %u will not serve as colour attachment 0 of the %dx%d "
+             "off-screen framebuffer (0x%04X) -- the target's own is attached again",
+             name, g_target.width, g_target.height, status);
+        return false;
+    }
+
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+    g_target.borrowed = name;
+    return true;
+}
+
+GLuint renderTargetAttachedColour() { return g_target.borrowed; }
 
 void renderTargetOverrideSurface(void* surfaceHandle) {
     if (!renderTargetActive()) return;

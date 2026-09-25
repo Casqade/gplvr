@@ -320,6 +320,88 @@ bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
     return ok;
 }
 
+namespace {
+
+bool panelUsable(const GlFunctions& gl, const GlPanelCopy* panel) {
+    return panel && panel->shared && panel->shared->interopObject &&
+           panel->shared->framebuffer && panel->sourceFramebuffer && panel->width > 0 &&
+           panel->height > 0 && gl.blitFramebuffer && gl.bindFramebuffer &&
+           gl.framebufferTexture2D;
+}
+
+// The panel's blit into its shared texture, under a lock the caller has already taken.
+// Returns the name of the call that failed, or null.
+//
+// Both transfer paths use it, and they lock differently: the copy takes the frame and the
+// panel in one wglDXLockObjectsNV, while the direct path locks the panel on its own because
+// the frame's lock was taken before its first draw call.
+const char* copyPanelLocked(const GlFunctions& gl, const GlPanelCopy& panel,
+                            GLint previousDraw, GLenum& failedWith) {
+    const char* failedAt = nullptr;
+    auto        step = [&](const char* what) {
+        if (failedAt) return;
+        const GLenum error = gl.getError();
+        if (error != GL_NO_ERROR) {
+            failedAt = what;
+            failedWith = error;
+        }
+    };
+
+    // The same attach, blit, detach order as the frame's, for the same reasons: an
+    // incomplete destination makes the blit a silent no-op, and a texture still attached at
+    // the unlock makes the unlock fail.
+    frameBudgetSwitch(kSpanTransferPanel);
+    const GlSharedTexture& target = *panel.shared;
+    gl.bindFramebuffer(kGlDrawFramebuffer, target.framebuffer);
+    gl.framebufferTexture2D(kGlDrawFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                            target.name, 0);
+    step("glFramebufferTexture2D(panel shared texture)");
+    if (gl.checkFramebufferStatus) {
+        const GLenum status = gl.checkFramebufferStatus(kGlDrawFramebuffer);
+        if (status != kGlFramebufferComplete && !failedAt) {
+            failedAt = "the panel's shared framebuffer is incomplete";
+            failedWith = status;
+        }
+    }
+    gl.bindFramebuffer(kGlReadFramebuffer, panel.sourceFramebuffer);
+    gl.readBuffer(kGlColorAttachment0);
+    step("glReadBuffer(COLOR_ATTACHMENT0) on the panel framebuffer");
+    if (!failedAt) {
+        gl.blitFramebuffer(0, 0, panel.width, panel.height, 0, 0, panel.width, panel.height,
+                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        step("glBlitFramebuffer(panel)");
+    }
+    gl.framebufferTexture2D(kGlDrawFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
+    step("glFramebufferTexture2D(panel detach)");
+    gl.bindFramebuffer(kGlReadFramebuffer, 0);
+    gl.bindFramebuffer(kGlDrawFramebuffer, static_cast<GLuint>(previousDraw));
+    gl.readBuffer(GL_BACK);
+    step("restoring the bindings after the panel");
+    frameBudgetSwitch(kSpanTransfer);
+    return failedAt;
+}
+
+// Report on CHANGE, with a cap, shared by both paths so the budget is one budget.
+void reportPanel(const GlPanelCopy* panel, const char* failedAt, GLenum failedWith,
+                 const char* how) {
+    static const char* reported = nullptr;
+    static int         reportsLeft = 8;
+    if (!panel || !panel->shared) return;
+    if (failedAt == reported || reportsLeft <= 0) return;
+    --reportsLeft;
+    reported = failedAt;
+    if (failedAt)
+        logf("gl: the HUD panel copy failed at %s with 0x%04X -- %dx%d, source framebuffer "
+             "%u, shared texture %u; the headset keeps the last panel it had",
+             failedAt, failedWith, panel->width, panel->height, panel->sourceFramebuffer,
+             panel->shared->name);
+    else
+        logf("gl: the HUD panel reaches the headset -- %dx%d, copied %s", panel->width,
+             panel->height, how);
+}
+
+}  // namespace
+
 bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
                              const GlSharedTexture& shared, int width, int height,
                              GLuint sourceFramebuffer, bool finish, GlPanelCopy* panel) {
@@ -364,23 +446,10 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
     // The panel goes under the same lock as the frame when there is one to copy. If the pair
     // is refused the frame is locked alone, so a panel problem never costs the headset its
     // picture.
-    static const char* panelReported = nullptr;
-    static int         panelReportsLeft = 8;
-    const char*        panelFailedAt = nullptr;
-    GLenum             panelFailedWith = GL_NO_ERROR;
-    auto panelStep = [&](const char* what) {
-        if (panelFailedAt) return;
-        const GLenum error = gl.getError();
-        if (error != GL_NO_ERROR) {
-            panelFailedAt = what;
-            panelFailedWith = error;
-        }
-    };
+    const char* panelFailedAt = nullptr;
+    GLenum      panelFailedWith = GL_NO_ERROR;
 
-    bool panelWanted = panel && panel->shared && panel->shared->interopObject &&
-                       panel->shared->framebuffer && panel->sourceFramebuffer &&
-                       panel->width > 0 && panel->height > 0 && gl.blitFramebuffer &&
-                       gl.bindFramebuffer && gl.framebufferTexture2D;
+    bool panelWanted = panelUsable(gl, panel);
 
     HANDLE objects[2] = {shared.interopObject,
                          panelWanted ? panel->shared->interopObject : nullptr};
@@ -399,39 +468,8 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
     GLint previousDraw = 0;
     if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previousDraw);
 
-    if (panelWanted) {
-        // The same blit, attach-and-detach order as the frame's below, for the same reasons:
-        // an incomplete destination makes the blit a silent no-op, and a texture still
-        // attached at the unlock makes the unlock fail.
-        frameBudgetSwitch(kSpanTransferPanel);
-        const GlSharedTexture& target = *panel->shared;
-        gl.bindFramebuffer(kGlDrawFramebuffer, target.framebuffer);
-        gl.framebufferTexture2D(kGlDrawFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
-                                target.name, 0);
-        panelStep("glFramebufferTexture2D(panel shared texture)");
-        if (gl.checkFramebufferStatus) {
-            GLenum status = gl.checkFramebufferStatus(kGlDrawFramebuffer);
-            if (status != kGlFramebufferComplete && !panelFailedAt) {
-                panelFailedAt = "the panel's shared framebuffer is incomplete";
-                panelFailedWith = status;
-            }
-        }
-        gl.bindFramebuffer(kGlReadFramebuffer, panel->sourceFramebuffer);
-        gl.readBuffer(kGlColorAttachment0);
-        panelStep("glReadBuffer(COLOR_ATTACHMENT0) on the panel framebuffer");
-        if (!panelFailedAt) {
-            gl.blitFramebuffer(0, 0, panel->width, panel->height, 0, 0, panel->width,
-                               panel->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            panelStep("glBlitFramebuffer(panel)");
-        }
-        gl.framebufferTexture2D(kGlDrawFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, 0, 0);
-        panelStep("glFramebufferTexture2D(panel detach)");
-        gl.bindFramebuffer(kGlReadFramebuffer, 0);
-        gl.bindFramebuffer(kGlDrawFramebuffer, static_cast<GLuint>(previousDraw));
-        gl.readBuffer(GL_BACK);
-        panelStep("restoring the bindings after the panel");
-        frameBudgetSwitch(kSpanTransfer);
-    }
+    if (panelWanted)
+        panelFailedAt = copyPanelLocked(gl, *panel, previousDraw, panelFailedWith);
 
     const bool blitPath = sourceFramebuffer != 0 && shared.framebuffer != 0 &&
                           gl.blitFramebuffer && gl.bindFramebuffer &&
@@ -514,19 +552,9 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
             panelFailedAt = "the frame's own transfer failed under the shared lock";
         panel->copied = !panelFailedAt;
     }
-    if (panel && panel->shared && panelFailedAt != panelReported && panelReportsLeft > 0) {
-        --panelReportsLeft;
-        panelReported = panelFailedAt;
-        if (panelFailedAt)
-            logf("gl: the HUD panel copy failed at %s with 0x%04X -- %dx%d, source framebuffer "
-                 "%u, shared texture %u; the headset keeps the last panel it had",
-                 panelFailedAt, panelFailedWith, panel->width, panel->height,
-                 panel->sourceFramebuffer, panel->shared->name);
-        else
-            logf("gl: the HUD panel is copied under the frame transfer's lock -- %dx%d, one "
-                 "wglDXLockObjectsNV/wglDXUnlockObjectsNV pair for both textures",
-                 panel->width, panel->height);
-    }
+    reportPanel(panel, panelFailedAt, panelFailedWith,
+                "under the frame transfer's own lock -- one "
+                "wglDXLockObjectsNV/wglDXUnlockObjectsNV pair for both textures");
 
     // Report on CHANGE, with a cap. Every frame would be a flood and one frame would be
     // a startup sample; what is wanted is a line each time the answer becomes different.
@@ -581,6 +609,104 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
         return false;
     }
     return true;
+}
+
+bool glInteropLockDirect(const GlFunctions& gl, HANDLE interopDevice,
+                         const GlSharedTexture& shared) {
+    if (!shared.interopObject || !shared.name || !gl.dxLockObjects) return false;
+
+    // Drained first, for the reason the copy gives at length: a pending error is sticky,
+    // and one raised by the game would otherwise be read here and blamed on the lock.
+    for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
+
+    HANDLE object = shared.interopObject;
+    if (!gl.dxLockObjects(interopDevice, 1, &object)) {
+        logf("gl: wglDXLockObjectsNV refused the frame's shared texture %u (GL error "
+             "0x%04X)",
+             shared.name, gl.getError());
+        return false;
+    }
+    GLenum error = gl.getError();
+    if (error)
+        logf("gl: wglDXLockObjectsNV took the frame's shared texture %u but left GL error "
+             "0x%04X",
+             shared.name, error);
+    return true;
+}
+
+bool glInteropPublishDirect(const GlFunctions& gl, HANDLE interopDevice,
+                            const GlSharedTexture& shared, bool finish,
+                            GlPanelCopy* panel) {
+    if (!shared.interopObject || !gl.dxUnlockObjects) return false;
+    if (panel) panel->copied = false;
+
+    for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
+
+    const char* panelFailedAt = nullptr;
+    GLenum      panelFailedWith = GL_NO_ERROR;
+
+    // The frame's object has been locked since before its first draw call, so only the
+    // panel's is taken here -- and both are handed back in one unlock, which keeps the
+    // frame's cost at the one interop synchronisation it has always been.
+    HANDLE objects[2] = {shared.interopObject, nullptr};
+    int    lockedCount = 1;
+    if (panelUsable(gl, panel)) {
+        HANDLE panelObject = panel->shared->interopObject;
+        if (gl.dxLockObjects(interopDevice, 1, &panelObject)) {
+            objects[1] = panelObject;
+            lockedCount = 2;
+            GLint previousDraw = 0;
+            if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previousDraw);
+            panelFailedAt = copyPanelLocked(gl, *panel, previousDraw, panelFailedWith);
+        } else {
+            for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
+            panelFailedAt = "wglDXLockObjectsNV on the panel texture";
+        }
+    }
+
+    // Where the CPU waits for the GPU on NVIDIA, as it does for the copy -- with the
+    // difference that the work it waits for is the frame itself rather than a blit of it.
+    int  unlocking = frameBudgetEnter(kSpanWaitUnlock);
+    BOOL unlocked = gl.dxUnlockObjects(interopDevice, lockedCount, objects);
+    frameBudgetLeave(unlocking);
+
+    const char* failedAt = nullptr;
+    GLenum      failedWith = gl.getError();
+    if (!unlocked)
+        failedAt = "wglDXUnlockObjectsNV returned FALSE";
+    else if (failedWith != GL_NO_ERROR)
+        failedAt = "wglDXUnlockObjectsNV";
+
+    if (lockedCount == 2) {
+        if (!panelFailedAt && failedAt) panelFailedAt = "the frame's own unlock failed";
+        panel->copied = !panelFailedAt;
+    }
+    reportPanel(panel, panelFailedAt, panelFailedWith,
+                "under its own lock, handed back with the frame's");
+
+    static const char* reported = nullptr;
+    static int         reportsLeft = 8;
+    if (failedAt != reported && reportsLeft > 0) {
+        --reportsLeft;
+        reported = failedAt;
+        if (failedAt)
+            logf("gl: publishing the directly rendered frame failed at %s with 0x%04X -- "
+                 "shared texture %u. The most likely cause is the texture still being "
+                 "attached to a framebuffer: GL may not hold a shared object at the unlock.",
+                 failedAt, failedWith, shared.name);
+        else
+            logf("gl: the frame is rendered straight into shared texture %u, and the unlock "
+                 "hands it over with no copy",
+                 shared.name);
+    }
+
+    if (finish) {
+        int waiting = frameBudgetEnter(kSpanWaitTransfer);
+        gl.finish();
+        frameBudgetLeave(waiting);
+    }
+
+    return failedAt == nullptr;
 }
 
 }  // namespace gplvr

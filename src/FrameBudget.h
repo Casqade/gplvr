@@ -31,7 +31,7 @@ enum BudgetSpan {
     kSpanRebindBind,       // renderTargetBeginFrame: glBindFramebuffer and its check
     kSpanRebindViewport,   // renderTargetBeginFrame: glViewport and the two matrices
     kSpanRebindMenu,       // menuScaleBeginFrame
-    kSpanExtra,            // vrExtraRenders, whole, less their waits
+    kSpanExtra,            // frameRate = 2's extra frames, whole, less their waits
     kSpanTailGame,       // hook return -> post-frame callbacks: the rest of the redraw
     kSpanTailCallbacks,  // gpl_fgRunPostFrameCallbacks
     kSpanTailSnapshot,   // gpl_fgFrameSnapshotEnd

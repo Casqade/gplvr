@@ -4,6 +4,7 @@
 #include "Interpolation.h"
 #include "Log.h"
 #include "RenderProfile.h"
+#include "presenter/Producer.h"
 
 #include <windows.h>
 
@@ -60,6 +61,13 @@ struct State {
     FlagFn  bgRequested = nullptr;
 
     long long frequency = 0;
+    // The presenter's view counter as it stood when this loop last let a frame through.
+    //
+    // Ours, not `presenterAcquiredViewSequence` -- that is updated by the eye cameras, which
+    // only run on a tracked stereo frame, so menus and replays left it frozen and the gate
+    // never closed: frameRate = 1 free-ran at 286 fps, which is what "despite frameRate = 1 it
+    // renders >90 fps" was.
+    int32_t   lastViewSequence = 0;
     long long tickStart = 0;   // when the tick now being drawn was latched
     double    tickPeriod = 0.0;
     bool      haveTick = false;
@@ -70,7 +78,7 @@ struct State {
     unsigned windowExtra = 0;
     unsigned windowBlended = 0;   // extra frames that actually moved the world
     unsigned windowWaited = 0;    // extra frames that had to wait for their slice
-    unsigned windowPreempted = 0; // of those, the ones a real tick landed on first
+    unsigned windowPreempted = 0; // of those, the ones that gave up to keep a tick latched
     unsigned windowExhausted = 0; // refused because the tick's allowance was spent
     unsigned windowTickless = 0;  // refused because no tick has been latched yet
     unsigned windowMaxExtra = 0;  // the most drawn against any one tick in the window
@@ -106,22 +114,24 @@ bool redirect(uintptr_t site, uintptr_t to) {
     return true;
 }
 
-int extraLimit() {
-    int limit = g_options.flatExtraFrames;
-    if (limit > kMaxExtra) limit = kMaxExtra;
-    return limit;
-}
+// frameRate 1 and 2 both skip the loop's wait for the next tick; the ceiling is the same and
+// only the gate in front of each extra frame differs. 0 never draws one.
+int extraLimit() { return g_options.frameRate > 0 ? kMaxExtra : 0; }
 
-// Extra frame k of a tick belongs at tickStart + k * period / (limit + 1).
+// Is this frame allowed to be drawn yet?
 //
-// Spacing them is the whole point. Drawing the allowance back to back leaves the rest of the
-// tick in the Sleep(1), which shows the same stepping the extra frames exist to remove -- the
-// frames arrive evenly only if they are started evenly. A frame that is merely LATE is drawn at
-// once; there is no catching up to do and no time to spare.
-bool sliceHasCome(const State& s, long long at, int limit) {
-    if (s.tickPeriod <= 0.0) return true;
-    double slice = s.tickPeriod / (limit + 1);
-    return static_cast<double>(at - s.tickStart) >= (s.extras + 1) * slice;
+//   2  unlocked -- always. The next frame starts when the last one finished, which is what
+//      unlocked means.
+//   1  the display's rate -- in VR, when the presenter has published a view set newer than the
+//      one the last render used, so exactly one frame is drawn per display frame. In flat mode
+//      there is no such clock: SwapBuffers is the gate, and `swapInterval` decides whether it
+//      blocks, so the answer here is always yes and the driver does the pacing.
+bool displayIsReady(const State& s) {
+    if (g_options.frameRate != 1) return true;
+    if (!g_options.vr) return true;
+    int32_t published = presenterViewSequence();
+    if (!published) return true;  // not publishing yet; do not stall on a clock that is absent
+    return published != s.lastViewSequence;
 }
 
 bool tickWaiting(const State& s) {
@@ -144,6 +154,8 @@ void takeStockFrame(State& s) {
     s.tickStart = at;
     s.haveTick = true;
     s.extras = 0;
+    // A tick frame is a frame for the display too, so the gate counts from here as well.
+    s.lastViewSequence = presenterViewSequence();
 }
 
 void __cdecl snapshotBeginHook() {
@@ -151,12 +163,48 @@ void __cdecl snapshotBeginHook() {
     int    limit = extraLimit();
     ++s.windowFrames;
 
-    if (!limit || !s.getBGCount || tickWaiting(s)) {
+    if (!limit || !s.getBGCount) {
         takeStockFrame(s);
         return;
     }
-    if (!s.haveTick) {
-        ++s.windowTickless;
+
+    // EVERY ITERATION WAITS FOR THE DISPLAY, INCLUDING THE ONE THAT LATCHES.
+    //
+    // This is the whole of the decoupling, and having it the other way round is what kept the
+    // rate above the display's through three attempts to patch around it. Asking "has a tick
+    // arrived?" FIRST makes the latching frame ungated, so a 36 Hz simulation puts 36 frames a
+    // second on top of the display's 90 and the counter reads 126.
+    //
+    // There is no reason for it. One loop iteration is one drawn frame whether or not it
+    // latches, so the loop runs at the rate frames are wanted and the latch rides on whichever
+    // iteration finds a tick waiting. Rendering was decoupled from the simulation precisely so
+    // that the simulation's rate would stop appearing in the frame rate.
+    //
+    // Delaying a latch by up to one display period is free while the display is the faster of
+    // the two -- 11.1 ms against 27.8 -- because the latch still takes the newest tick and none
+    // can pass unseen. The guard inside the wait is for the case where it is not.
+    if (!displayIsReady(s)) {
+        long long waitUntil =
+            s.tickPeriod > 0.0 ? now() + static_cast<long long>(s.tickPeriod) : 0;
+        ++s.windowWaited;
+        for (;;) {
+            if (displayIsReady(s)) break;
+            // A display SLOWER than the simulation would let a tick pass unlatched, and a tick
+            // that is never latched is one the blend has no pair for.
+            if (waitUntil && now() >= waitUntil) {
+                ++s.windowPreempted;
+                break;
+            }
+            Sleep(1);
+        }
+    }
+    s.lastViewSequence = presenterViewSequence();
+
+    // A tick is waiting, so this is the frame that latches it. gpl_fgFrameSnapshotBegin's own
+    // poll returns immediately -- what it waits for has already arrived -- so this costs the
+    // latch and nothing else.
+    if (tickWaiting(s) || !s.haveTick) {
+        if (!s.haveTick) ++s.windowTickless;
         takeStockFrame(s);
         return;
     }
@@ -167,25 +215,10 @@ void __cdecl snapshotBeginHook() {
         return;
     }
 
-    // Before its slice. Wait for it rather than letting the stock path sleep away the whole
-    // remainder of the tick, which would drop this frame instead of merely delaying it. A tick
-    // landing meanwhile ends the wait: the real frame always wins.
-    if (!sliceHasCome(s, now(), limit)) {
-        ++s.windowWaited;
-        for (;;) {
-            if (tickWaiting(s)) {
-                ++s.windowPreempted;
-                takeStockFrame(s);
-                return;
-            }
-            if (sliceHasCome(s, now(), limit)) break;
-            Sleep(1);
-        }
-    }
-
-    // The extra frame. gpl_fgFrameSnapshotBegin is skipped whole, so dword_94D714 stays clear
-    // and gpl_fgFrameSnapshotEnd at the bottom of the loop finds nothing to release -- the latch
-    // and its release stay paired. Nothing below takes the BG lock or reads sim state.
+    // The frame between two ticks. gpl_fgFrameSnapshotBegin is skipped whole, so dword_94D714
+    // stays clear and gpl_fgFrameSnapshotEnd at the bottom of the loop finds nothing to release
+    // -- the latch and its release stay paired. Nothing here takes the BG lock or reads sim
+    // state.
     ++s.extras;
     ++s.windowExtra;
     if (interpolationExtraFrame()) ++s.windowBlended;
@@ -219,12 +252,12 @@ void __cdecl snapshotEndHook() {
 void flatFramesInstall() {
     State& s = g_state;
     if (s.installed) return;
-    if (g_options.vr || g_options.flatExtraFrames <= 0) return;
+    if (g_options.frameRate <= 0) return;
 
     if (!interpolationActive()) {
-        logf("flat: the blend is not running, so frames between the ticks would be duplicates "
-             "-- flatExtraFrames is ignored (flatInterpolate=%d)",
-             g_options.flatInterpolate ? 1 : 0);
+        logf("frames: the blend is not running, so frames between the ticks would be "
+             "duplicates -- frameRate = %d is ignored (interpolate=%d)",
+             g_options.frameRate, g_options.interpolate ? 1 : 0);
         return;
     }
 
@@ -232,7 +265,7 @@ void flatFramesInstall() {
     s.getBGCount = exe ? reinterpret_cast<CountFn>(GetProcAddress(exe, "?getBGCount@@YAHXZ"))
                        : nullptr;
     if (!s.getBGCount) {
-        logf("flat: the exe does not export getBGCount -- no frames between the ticks");
+        logf("frames: the exe does not export getBGCount -- no frames between the ticks");
         return;
     }
 
@@ -244,7 +277,7 @@ void flatFramesInstall() {
                               GetProcAddress(exe, "?bgHasRequestedFGAction@@YA_NXZ"))
                         : nullptr;
     if (!s.bgRequested) {
-        logf("flat: the exe does not export bgHasRequestedFGAction, so a held frame could not be "
+        logf("frames: the exe does not export bgHasRequestedFGAction, so a held frame could not be "
              "released before the game services a BG request -- no frames between the ticks");
         return;
     }
@@ -262,7 +295,7 @@ void flatFramesInstall() {
     if (marked) {
         if (*beginSlot != reinterpret_cast<void*>(kSnapshotBegin) ||
             *endSlot != reinterpret_cast<void*>(kSnapshotEnd)) {
-            logf("flat: the profiler's snapshot slots hold %08X/%08X, not "
+            logf("frames: the profiler's snapshot slots hold %08X/%08X, not "
                  "gpl_fgFrameSnapshotBegin/End %08X/%08X -- no frames between the ticks",
                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(*beginSlot)),
                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(*endSlot)),
@@ -274,12 +307,12 @@ void flatFramesInstall() {
         *beginSlot = reinterpret_cast<void*>(&snapshotBeginHook);
         *endSlot = reinterpret_cast<void*>(&snapshotEndHook);
         s.installed = true;
-        logf("flat: installed behind the profiler's snapshot markers (they keep call sites "
+        logf("frames: installed behind the profiler's snapshot markers (they keep call sites "
              "%08X/%08X; gplvr reaches gpl_fgFrameSnapshotBegin/End %08X/%08X from there)",
              static_cast<unsigned>(kSnapshotBeginCall), static_cast<unsigned>(kSnapshotEndCall),
              static_cast<unsigned>(kSnapshotBegin), static_cast<unsigned>(kSnapshotEnd));
     } else if (beginSlot || endSlot) {
-        logf("flat: the profiler marks the snapshot %s but not the %s, and gplvr needs both -- "
+        logf("frames: the profiler marks the snapshot %s but not the %s, and gplvr needs both -- "
              "no frames between the ticks",
              beginSlot ? "begin" : "end", beginSlot ? "end" : "begin");
         return;
@@ -288,7 +321,7 @@ void flatFramesInstall() {
         auto endBytes = reinterpret_cast<const uint8_t*>(kSnapshotEndCall);
         if (std::memcmp(beginBytes, kSnapshotBeginStock, sizeof(kSnapshotBeginStock)) != 0 ||
             std::memcmp(endBytes, kSnapshotEndStock, sizeof(kSnapshotEndStock)) != 0) {
-            logf("flat: %08X/%08X do not hold the stock calls to gpl_fgFrameSnapshotBegin/End "
+            logf("frames: %08X/%08X do not hold the stock calls to gpl_fgFrameSnapshotBegin/End "
                  "(%02X %02X %02X %02X %02X / %02X %02X %02X %02X %02X) -- no frames between the "
                  "ticks",
                  static_cast<unsigned>(kSnapshotBeginCall),
@@ -300,14 +333,14 @@ void flatFramesInstall() {
         s.begin = reinterpret_cast<BeginFn>(callTarget(kSnapshotBeginCall));
         s.end = reinterpret_cast<EndFn>(callTarget(kSnapshotEndCall));
         if (!redirect(kSnapshotBeginCall, reinterpret_cast<uintptr_t>(&snapshotBeginHook))) {
-            logf("flat: could not redirect the frame loop's snapshot begin at %08X -- no frames "
+            logf("frames: could not redirect the frame loop's snapshot begin at %08X -- no frames "
                  "between the ticks",
                  static_cast<unsigned>(kSnapshotBeginCall));
             return;
         }
         if (!redirect(kSnapshotEndCall, reinterpret_cast<uintptr_t>(&snapshotEndHook))) {
             redirect(kSnapshotBeginCall, reinterpret_cast<uintptr_t>(s.begin));
-            logf("flat: could not redirect the frame loop's snapshot end at %08X -- no frames "
+            logf("frames: could not redirect the frame loop's snapshot end at %08X -- no frames "
                  "between the ticks",
                  static_cast<unsigned>(kSnapshotEndCall));
             return;
@@ -315,11 +348,22 @@ void flatFramesInstall() {
         s.installed = true;
     }
 
-    logf("flat: frames between the ticks ON -- up to %d extra per sim tick, spaced evenly across "
-         "it, each one redrawing the last latched tick with the blend advanced to that instant. "
-         "The simulation rate is untouched; only the drawn world moves faster. flatInterpolate=%d",
-         extraLimit(), g_options.flatInterpolate ? 1 : 0);
+    logf("frames: the frame loop's wait for the next sim tick is ours (frameRate = %d, %s). "
+         "Up to %d frames between any two ticks, each redrawing the last latched tick with the "
+         "blend advanced to that instant. THE SIMULATION RATE IS UNTOUCHED -- an extra frame "
+         "reads no simulation state.",
+         g_options.frameRate,
+         g_options.frameRate == 1
+             ? (g_options.vr ? "one frame per view set the presenter publishes"
+                             : "one frame per refresh, which swapInterval does by blocking in "
+                               "SwapBuffers")
+             : "unlocked: as fast as frames can be drawn",
+         kMaxExtra);
 }
+
+bool flatFramesActive() { return g_state.installed; }
+
+int flatFramesTickFrameIndex() { return g_state.installed ? g_state.extras : 0; }
 
 bool flatFramesFormat(char* out, size_t size, double seconds) {
     State& s = g_state;
@@ -329,15 +373,15 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
                         ? 1000.0 * s.tickPeriod / static_cast<double>(s.frequency)
                         : 0.0;
     std::snprintf(out, size,
-                  "flat: %u frames in %.1f s (%.1f/s), %u of them between ticks (%u moved the "
+                  "frames: %u frames in %.1f s (%.1f/s), %u of them between ticks (%u moved the "
                   "world, %u drew a repeat) | up to %u per tick against a %.1f ms tick | %u "
-                  "waited for their slice, %u of those lost it to a real tick | %u past the "
-                  "allowance, %u before the first tick | frame held open %u times, released "
-                  "early for a BG request %u",
+                  "waited for the display, %u of those gave up so a tick would not pass "
+                  "unlatched | %u past the allowance, %u before the first tick | frame held "
+                  "open %u times, released early for a BG request %u",
                   s.windowFrames, seconds, seconds > 0.0 ? s.windowFrames / seconds : 0.0,
                   s.windowExtra, s.windowBlended, s.windowExtra - s.windowBlended,
-                  s.windowMaxExtra, period, s.windowWaited, s.windowPreempted, s.windowExhausted,
-                  s.windowTickless, s.windowHeld, s.windowReleased);
+                  s.windowMaxExtra, period, s.windowWaited, s.windowPreempted,
+                  s.windowExhausted, s.windowTickless, s.windowHeld, s.windowReleased);
 
     s.windowFrames = 0;
     s.windowExtra = 0;

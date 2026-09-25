@@ -1,5 +1,6 @@
 #include "RenderPacing.h"
 
+#include "FlatFrames.h"
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Interpolation.h"
@@ -28,11 +29,11 @@ enum Unpaced { kUnpacedOff, kUnpacedMenu, kUnpacedClock, kUnpacedStale, kUnpaced
 const char* const kUnpacedName[kUnpacedCount] = {"off", "menu", "no clock", "stale", "ratio"};
 
 const char* const kUnpacedWhy[kUnpacedCount] = {
-    "vrLockToHeadset = 0",
+    "frameRate is not 1, or the frame loop's own wait is drawing the display's rate already",
     "the previous frame was not a tracked stereo world frame",
     "the presenter is not publishing its display clock",
     "the presenter's newest latch is more than 3 display periods old",
-    "the display period is not a whole number of sim ticks and vrInterpolate is off"};
+    "the display period is not a whole number of sim ticks and interpolate is off"};
 
 // Where the presenter's display period came from, named on the pace: change lines.
 const char* const kSourceQuery = "refresh rate query";
@@ -115,8 +116,9 @@ struct State {
     bool      coarseSleep = false;
 
     // The sim tick clock interpolation reads: tick `count` arrived at tickBase + count * T.
-    // Every getBGCount reading bounds the base -- tick `count` has arrived, tick count+1 has
-    // not -- and the base moves only as far as a reading proves it wrong.
+    // Each getBGCount reading places the base one latch delay late, and the base is the smoothed
+    // average of those rather than a bound on them -- see noteTickCount. What the blend needs
+    // from this grid is that it holds still, not that it is exact.
     double    tickBase = 0.0;
     bool      haveTickBase = false;
     int       tickBaseHz = 0;
@@ -187,10 +189,24 @@ void noteTickCount(State& s, long long qpc, int count) {
         s.tickLastCount = count;
         s.tickLastChange = qpc;
     }
-    if (s.tickBase > latest) s.tickBase = latest;
-    double earliest = latest - period;
-    if (static_cast<double>(qpc - s.tickLastChange) < 2.0 * period && s.tickBase < earliest)
-        s.tickBase = earliest;
+
+    // FITTED, NOT BOUNDED. This was a bound -- pull the base down to the earliest reading, then
+    // clamp it back to within a period of the newest -- which is the right shape for a
+    // scheduler that must never claim a tick arrived before it did, and the wrong one for
+    // interpolation.
+    //
+    // The blend divides by this grid. Every millisecond the base MOVES is a millisecond of world
+    // motion applied to every car and to the view at once, and it moves once per tick, so a
+    // wandering base is a step at the simulation's rate laid over otherwise smooth motion --
+    // which is exactly "not 36 and not 90, somewhere in between". A bound tracks the extremes of
+    // the latch delay; an average tracks its middle and then stays there. A constant offset in
+    // this grid is invisible, because it shifts every object equally and the blend only ever
+    // uses differences.
+    //
+    // The readings got noisier when the frame loop began waiting for the display before
+    // latching: the delay from a tick arriving to its latch running is now up to a display
+    // period rather than a Sleep(1) granule.
+    s.tickBase += 0.02 * (latest - s.tickBase);
 }
 
 Published* findPublished(State& s, int32_t sequence) {
@@ -299,7 +315,10 @@ void __stdcall paceBeforeLatch() {
     bool           integral = true;
     const char*    source = nullptr;
     int            why = -1;
-    if (!g_options.vrLockToHeadset) {
+    // frameRate = 1 is the display's rate, and when the frame loop's wait is ours that is done
+    // by drawing one frame per published view set -- there is nothing left for a per-tick pace
+    // to hold back. This stays as the fallback for when those call sites could not be taken.
+    if (g_options.frameRate != 1 || flatFramesActive()) {
         why = kUnpacedOff;
     } else if (!s.previousTracked) {
         why = kUnpacedMenu;
@@ -323,7 +342,7 @@ void __stdcall paceBeforeLatch() {
                     s.loggedRatio = true;
                     logf("pace: a %.2f Hz display (period from the %s) against a %d Hz sim is "
                          "%.3f ticks per display, not a whole number -- frames stay unpaced "
-                         "while vrInterpolate is off (logged once)",
+                         "while interpolate is off (logged once)",
                          static_cast<double>(s.frequency) / static_cast<double>(clock.period),
                          source, simHz, ratio);
                 }
@@ -563,9 +582,10 @@ void renderPacingInstall() {
     logf("pace: the tick wait's fgDisableBG call at %08X goes through gplvr, then %s. %s",
          static_cast<unsigned>(s.site),
          current == s.fgDisableBG ? "straight to fgDisableBG" : "to the profiler's tick marker",
-         g_options.vrLockToHeadset
+         g_options.frameRate == 1
              ? "Frames are paced whenever the conditions on the pace: lines hold."
-             : "vrLockToHeadset = 0: frames run unpaced and the pace: line is the baseline.");
+             : "frameRate is not 1: frames run unpaced, and the pace: line is the baseline "
+               "or, at 2, the cadence the extra frames set instead.");
 }
 
 void renderPacingNotePublished() {
@@ -629,10 +649,31 @@ bool renderPacingTickArrival(int count, double& qpc) {
     return true;
 }
 
-bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter) {
+bool renderPacingNextTickDue(double& qpc) {
+    State& s = g_state;
+    if (!s.haveTickBase || s.tickBaseHz <= 0 || s.tickBaseHz != taskRateSimHz()) return false;
+    if (!s.tickLastChange) return false;
+
+    // From the LAST TICK'S OWN ARRIVAL, not from `tickBase`.
+    //
+    // tickBase is a lower bound -- it moves only as far as a reading proves it wrong, and the
+    // clamp below it allows the whole base to sit a full period early. Interpolation wants that
+    // (a target that never runs ahead of the state it blends); a deadline does not. Asked
+    // through tickBase, "when is the next tick due" answered with the CURRENT tick's arrival,
+    // which is already fifteen milliseconds in the past by the time a frame has been drawn and
+    // presented -- so the extra frames read "no room" on every single frame and were short by
+    // an amount that never even got recorded, because they failed the deadline-in-the-past test
+    // instead of the budget one.
+    qpc = static_cast<double>(s.tickLastChange) +
+          static_cast<double>(s.frequency) / s.tickBaseHz;
+    return true;
+}
+
+bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& display,
+                               bool& fromPresenter) {
     State& s = g_state;
     if (!s.installed) return false;
-    long long latch = s.latchQpc ? s.latchQpc : now;
+    long long latch = anchorQpc ? anchorQpc : now;
     long long cost = s.haveCost ? static_cast<long long>(s.costMean) : 0;
 
     PresenterClock clock;
@@ -640,7 +681,10 @@ bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresen
         // A presenter latch at latchTime + k * period is displayed this long after it.
         long long toDisplay =
             clock.displayTime - clock.viewLead * clock.period - clock.latchTime;
-        long long presenterLatch = s.engaged ? s.targetLatch : 0;
+        // The paced target belongs to the frame whose LATCH this is, not to a frame being
+        // drawn between two ticks, which has a latch of its own to be timed against.
+        long long presenterLatch =
+            (s.engaged && anchorQpc == s.latchQpc) ? s.targetLatch : 0;
         if (!presenterLatch) {
             long long k = (latch + cost - clock.latchTime + clock.period - 1) / clock.period;
             if (k < 1) k = 1;
@@ -653,6 +697,10 @@ bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresen
     display = latch + cost;
     fromPresenter = false;
     return true;
+}
+
+bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter) {
+    return renderPacingDisplayTimeAt(g_state.latchQpc, now, display, fromPresenter);
 }
 
 bool renderPacingFormat(char* out, size_t size) {

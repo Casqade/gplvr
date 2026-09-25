@@ -198,10 +198,10 @@ DWORD WINAPI installThread(LPVOID) {
              "front-end scaling, roglv2's glFinish drop and swap interval, mouselook, the fast "
              "text path%s. Stereo, the HUD split, billboards and the headset profilers need "
              "vr = 1.",
-             g_options.flatExtraFrames > 0
+             g_options.frameRate > 0
                  ? ", and frames drawn between the simulation's ticks with the world "
                    "interpolated onto them"
-                 : " (flatExtraFrames = 0: one frame per simulation tick, as GPL ships)");
+                 : " (frameRate = 0: one frame per simulation tick, as GPL ships)");
     return 0;
 }
 

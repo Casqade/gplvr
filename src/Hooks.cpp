@@ -165,12 +165,31 @@ bool      g_loggedMirrorPath = false;
 // then FREES the instance and zeroes p[43] before returning. Our extra renders run after
 // that, through a pointer into the same live params block -- so p[43] is already null and
 // they skip the mirror entirely. Predicted consequence: mirror refreshes track the GAME
-// frame rate while the headset sees 1 + vrExtraRenders frames, so the ratio is set by how
+// frame rate while the headset sees the extra frames too, so the ratio is set by how
 // much idle time the current scene leaves. If `mirror N/s` tracks worldFrames and not fps,
 // that is confirmed; if it is far below worldFrames, something else is throttling it and
 // the extra renders are not the story.
 unsigned  g_mirrorRefreshes = 0;
 LONGLONG  g_extraRenderCost = 0;
+
+// Why the extra frames of frameRate = 2 did not happen, counted for one report window.
+//
+// Every gate in renderExtraFrames is a silent `return`, and four of them can fire for reasons
+// that look identical from outside: the frame rate simply stays at the sim's. Two rounds were
+// spent guessing which, so each now has a counter and the `extra:` line names it.
+struct ExtraFrameCounts {
+    unsigned ticks = 0;        // frames that reached the budget
+    unsigned rendered = 0;     // extra frames actually drawn and published
+    unsigned notStereo = 0;    // no tracked stereo world frame to repeat
+    unsigned slow = 0;         // the game is slower than 25 fps
+    unsigned late = 0;         // this frame already overran the sim tick
+    unsigned noDeadline = 0;   // the tick clock had no reading, so the old estimate was used
+    unsigned noPose = 0;       // the presenter published no newer view set before the deadline
+    unsigned noRoom = 0;       // a render would not have finished before the next tick
+    LONGLONG roomShort = 0;    // how much it was short by, summed, for the worst case below
+    LONGLONG roomWorst = 0;
+};
+ExtraFrameCounts g_extraFrames;
 
 std::vector<uintptr_t> g_pendingCallSites;
 volatile bool          g_sceneHookPending = false;
@@ -249,9 +268,18 @@ void reportOncePerSecond() {
         _snprintf_s(paneRenders, sizeof(paneRenders), _TRUNCATE, " + %.1f/s mirror-only",
                     g_sceneMirrorOnlyCalls / seconds);
 
-    logf("fps %.1f | worldFrames %.1f/s, renders %.1f/s (x%.2f)%s, %.2f ms each, "
+    // What the HEADSET is given, next to what the game runs at, because they are not the same
+    // number and "fps" alone has been read as the headset's more than once. `fps` counts game
+    // frames -- one per sim tick, whatever else happens -- while every published frame,
+    // including the extra ones, takes a transfer.
+    char headsetRate[48] = {};
+    if (g_options.vr && haveTransfer)
+        _snprintf_s(headsetRate, sizeof(headsetRate), _TRUNCATE, " (headset %.1f/s)",
+                    transfers / seconds);
+
+    logf("fps %.1f%s | worldFrames %.1f/s, renders %.1f/s (x%.2f)%s, %.2f ms each, "
          "%.2f ms worst | transfer %.2f ms x%.1f/frame | %s%s%smode %s",
-         g_frames / seconds, g_sceneHookCalls / seconds, g_sceneOrigCalls / seconds,
+         g_frames / seconds, headsetRate, g_sceneHookCalls / seconds, g_sceneOrigCalls / seconds,
          g_sceneHookCalls ? static_cast<double>(g_sceneOrigCalls) / g_sceneHookCalls : 0.0,
          paneRenders, msPerRender, worstMs,
          haveTransfer && transfers ? transferMs / transfers : 0.0,
@@ -339,17 +367,38 @@ void reportOncePerSecond() {
     if (renderProfileFormatHeadroom(headroom, sizeof(headroom), seconds, g_frames))
         logf("%s", headroom);
 
-    // Render pacing, once a second while tracked frames were rendered: with vrLockToHeadset = 0
-    // it is the unpaced baseline for the same counters.
+    // Render pacing, once a second while tracked frames were rendered: at any frameRate other
+    // than 1 it is the unpaced baseline for the same counters.
     char pacing[640] = {};
     if (renderPacingFormat(pacing, sizeof(pacing))) logf("%s", pacing);
+
+    // The fallback path's extra frames, and -- when there are none -- which gate stopped them.
+    // Every one of those gates is a silent return, and they all look the same from outside: the
+    // rate stays at the sim's. Suppressed when the loop's own wait is ours, where the `frames:`
+    // line below is the account and this one would print a row of zeroes that reads as failure.
+    if (g_options.vr && g_options.frameRate > 0 && !flatFramesActive()) {
+        ExtraFrameCounts& e = g_extraFrames;
+        LARGE_INTEGER     frequency;
+        QueryPerformanceFrequency(&frequency);
+        double toMsShort = e.noRoom ? 1000.0 / static_cast<double>(frequency.QuadPart) : 0.0;
+        logf("extra: %u drawn from %u game frames%s | refused: no room %u (short by %.1f ms "
+             "mean, %.1f worst), no newer pose %u, frame already late %u, game under 25 fps "
+             "%u, no tracked stereo frame %u, no tick clock %u | one costs %.2f ms",
+             e.rendered, e.ticks, e.ticks ? "" : " -- NONE REACHED THE BUDGET", e.noRoom,
+             e.noRoom ? toMsShort * static_cast<double>(e.roomShort) / e.noRoom : 0.0,
+             toMsShort * static_cast<double>(e.roomWorst), e.noPose, e.late, e.slow,
+             e.notStereo, e.noDeadline,
+             1000.0 * static_cast<double>(g_extraRenderCost) /
+                 static_cast<double>(frequency.QuadPart));
+        g_extraFrames = ExtraFrameCounts{};
+    }
 
     // World interpolation, once a second while world frames were latched.
     char interp[1280] = {};
     if (interpolationFormat(interp, sizeof(interp))) logf("%s", interp);
 
-    // Frames drawn between the simulation's ticks (flat mode). After the interp line, which says
-    // what the blend did with them.
+    // Frames drawn between the simulation's ticks, in either mode. After the interp line, which
+    // says what the blend did with them.
     char flat[384] = {};
     if (flatFramesFormat(flat, sizeof(flat), seconds)) logf("%s", flat);
 
@@ -609,18 +658,12 @@ void pollToggle() {
     if (g_options.interpolateKey) {
         bool down = (GetAsyncKeyState(g_options.interpolateKey) & 0x8000) != 0;
         if (down && !g_interpolateKeyLast) {
-            bool on = false;
-            if (g_options.vr) {
-                g_options.vrInterpolate = !g_options.vrInterpolate;
-                on = g_options.vrInterpolate;
-            } else {
-                g_options.flatInterpolate = !g_options.flatInterpolate;
-                on = g_options.flatInterpolate;
-            }
-            logf("interp: %s now %d -- %s", g_options.vr ? "vrInterpolate" : "flatInterpolate",
-                 on ? 1 : 0,
-                 on ? "the world is drawn blended between the two newest ticks"
-                    : "the world is drawn at the newest latched tick");
+            g_options.interpolate = !g_options.interpolate;
+            logf("interp: interpolate now %d -- %s", g_options.interpolate ? 1 : 0,
+                 g_options.interpolate
+                     ? "the world is drawn blended between the two newest ticks"
+                     : "the world is drawn at the newest latched tick, so the frames between "
+                       "them are duplicates");
         }
         g_interpolateKeyLast = down;
     }
@@ -693,20 +736,17 @@ void __cdecl callOriginalSceneRender(void* params);  // defined below
 // measured frame interval before drawing, so the poses it picks up from the presenter
 // are genuinely newer.
 void renderExtraFrames() {
-    if (!g_options.vr || g_options.vrExtraRenders <= 0 || !g_options.stereo) return;
-    // An extra render publishes a frame between two paced ones.
-    if (renderPacingEngaged()) {
-        static bool loggedPaced = false;
-        if (!loggedPaced) {
-            loggedPaced = true;
-            logf("vr: extra renders held at 0 while render pacing is engaged (vrExtraRenders = "
-                 "%d applies to unpaced frames only)",
-                 g_options.vrExtraRenders);
-        }
+    if (!g_options.vr || g_options.frameRate <= 0 || !g_options.stereo) return;
+    // THE FALLBACK ONLY. When the frame loop's wait is ours every frame is a whole frame of
+    // GPL's own, drawn through its loop with the mirror pass and the HUD, and there is nothing
+    // for a partial repeat after the present to add. This path exists for the case where those
+    // call sites could not be taken.
+    if (flatFramesActive()) return;
+    if (!g_lastSceneParams || !stereoAvailable()) return;
+    if (!g_lastFrameWasStereo || !vrFrustumInjected()) {
+        ++g_extraFrames.notStereo;
         return;
     }
-    if (!g_lastSceneParams || !stereoAvailable()) return;
-    if (!g_lastFrameWasStereo || !vrFrustumInjected()) return;
 
     LARGE_INTEGER frequency, now;
     QueryPerformanceFrequency(&frequency);
@@ -735,6 +775,7 @@ void renderExtraFrames() {
     // slower than 25 fps is not a tick with idle time to spend, so spend none.
     const LONGLONG slowest = frequency.QuadPart / 25;
     if (interval > slowest) {
+        ++g_extraFrames.slow;
         if (!g_warnedSlowTick) {
             g_warnedSlowTick = true;
             logf("vr: extra renders paused -- the game frame is %.1f ms, which leaves no "
@@ -776,6 +817,7 @@ void renderExtraFrames() {
     // transition only -- once per frame would be a flood at exactly the moment the log
     // is least readable.
     if (measured > budget + budget / 10) {
+        ++g_extraFrames.late;
         // On CHANGE, and CAPPED. A latch alone is not enough when the condition itself
         // alternates: holding back on a late frame makes the next one early, so the
         // transition fires again, and the first version of this line appeared 2650 times
@@ -801,18 +843,20 @@ void renderExtraFrames() {
     // next frame if the game is legitimately slower (a replay, a menu).
     const LONGLONG pace = interval < budget ? interval : budget;
 
-    int extra = g_options.vrExtraRenders;
-    if (extra > 3) extra = 3;
+    // A ceiling, not a setting: the deadline is what actually stops this, and no sim tick has
+    // room for more whole frames than this even in principle.
+    int extra = 7;
 
     if (!g_loggedExtraRenders) {
         g_loggedExtraRenders = true;
         // The wording said "spread over a tick" long after the spreading was replaced
         // by locking to the presenter's cadence. A stale log line is a lie told once a
         // session.
-        logf("vr: extra renders ON -- up to %d per game frame, each waiting for the "
-             "presenter to publish a new pose rather than for a slice of the %.1f ms "
-             "tick. The world still animates at the sim rate; only head tracking gets "
-             "faster. Watch that 'fps' below does not fall.",
+        logf("vr: frameRate = 2 -- up to %d extra frames per game frame, each waiting for "
+             "the presenter to publish a new pose rather than for a slice of the %.1f ms "
+             "tick. With interpolate = 1 the world is re-blended to each one's own display "
+             "time, so both the head and the world move at the headset's rate; with it off "
+             "only the head does. Watch that 'fps' below does not fall.",
              extra, 1000.0 * static_cast<double>(interval) /
                         static_cast<double>(frequency.QuadPart));
     }
@@ -826,14 +870,38 @@ void renderExtraFrames() {
     // Waiting for the view counter to move means one rendered frame per display frame,
     // whatever the two rates happen to be.
     //
-    // The deadline is the point where the game's own next frame is due. Stop before it
-    // rather than counting renders: if the presenter is slow we do fewer, if it is fast
-    // we do more, and neither case runs into the game.
-    const LONGLONG deadline = now.QuadPart + pace - pace / 8;
+    // The deadline is the point where the game's own next frame is due -- WHEN THE NEXT SIM
+    // TICK ARRIVES, not a tick from now.
+    //
+    // Those are not the same instant, and the difference is most of the budget. This runs
+    // after the present, by which point the latch, the two eye renders, the HUD and the
+    // transfer have already spent 14 of the tick's 27.8 ms. Measuring from `now` claimed 24 ms
+    // of room where 13 existed, so a render that could not possibly finish was started anyway,
+    // the game's frame went out 37 ms after the last one, and the late-tick guard below then
+    // held the NEXT frame back -- which is why the log showed the holdback several times a
+    // second and the interp: line counted four extra frames in a second instead of thirty.
+    //
+    // The sim tick clock knows when the next one is due. Without it, fall back to the old
+    // estimate rather than to no extra frames at all.
+    double         nextTick = 0.0;
+    bool           haveDue = renderPacingNextTickDue(nextTick);
+    const LONGLONG deadline =
+        haveDue ? static_cast<LONGLONG>(nextTick) : now.QuadPart + pace - pace / 8;
+    if (!haveDue) ++g_extraFrames.noDeadline;
+    ++g_extraFrames.ticks;
+    if (deadline <= now.QuadPart) {
+        ++g_extraFrames.noRoom;
+        return;
+    }
 
     for (int done = 0; done < extra; ++done) {
-        const int32_t before = presenterViewSequence();
-        if (!before) return;
+        // What the LAST RENDER used, not what is current now. The game's own frame took its
+        // pose at its latch, and the presenter has published one or two sets in the time since
+        // -- so the first extra frame of a tick has a newer pose already waiting and should
+        // not spend a display period discovering that. After it renders, this moves on with
+        // it, and the ones after it wait properly.
+        const int32_t before = presenterAcquiredViewSequence();
+        if (!presenterViewSequence()) return;
 
         // Wait for the presenter to publish a NEW view set. Without this the extra
         // render would draw from the same pose as the frame before it and cost time for
@@ -852,17 +920,32 @@ void renderExtraFrames() {
             SwitchToThread();
         }
         frameBudgetLeave(waiting);
-        if (!advanced) return;
+        if (!advanced) {
+            ++g_extraFrames.noPose;
+            return;
+        }
 
         // Do not START a render that cannot finish before the game's next frame.
         //
         // The deadline was only checked while waiting, so a render begun just under it
         // ran straight into the game's own frame -- which is a hitch, and hitches are
-        // what these renders exist to remove. Budget on what the last one actually
-        // cost, doubled for headroom.
+        // what these renders exist to remove. Budget on what the last one actually cost,
+        // plus a quarter for headroom.
+        //
+        // It used to double it, which was survivable only because the deadline was an
+        // overestimate by about the same factor; against the real one it refuses every
+        // frame whose render takes more than half the idle tail, and at 10 ms of render in
+        // 13 ms of tail that is all of them.
         LARGE_INTEGER before2;
         QueryPerformanceCounter(&before2);
-        if (before2.QuadPart + g_extraRenderCost * 2 > deadline) return;
+        LONGLONG needed = g_extraRenderCost + g_extraRenderCost / 4;
+        if (before2.QuadPart + needed > deadline) {
+            ++g_extraFrames.noRoom;
+            LONGLONG shortBy = before2.QuadPart + needed - deadline;
+            g_extraFrames.roomShort += shortBy;
+            if (shortBy > g_extraFrames.roomWorst) g_extraFrames.roomWorst = shortBy;
+            return;
+        }
 
         // NO MIRROR IN THE EXTRA RENDERS, on either path, deliberately.
         //
@@ -881,6 +964,15 @@ void renderExtraFrames() {
         // Forcing it null here makes the two paths behave and cost identically, which is
         // the whole point: the mirror should not depend on whether this machine's driver
         // still exposes pbuffer render targets.
+        // Move the WORLD to this frame's display time, not just the head.
+        //
+        // Without it an extra render redraws the same sim instant from a newer pose: head
+        // tracking gets smooth and everything outside the cockpit still steps at 36 Hz, which
+        // is the whole picture for anyone not turning their head. The records are rewritten
+        // from the same two latched ticks the frame's own blend used, at a target one display
+        // period further on, exactly as the loop-level path does between the ticks.
+        interpolationExtraFrame();
+
         auto* const extraParams = static_cast<SceneParams*>(g_lastSceneParams);
         void* const extraMirror = extraParams->mirrorCamera;
         extraParams->mirrorCamera = nullptr;
@@ -889,6 +981,7 @@ void renderExtraFrames() {
         // entry to gpl_simFrameRender -- it branches on finding it already set.
         extraParams->mirrorCamera = extraMirror;
         if (rendered) {
+            ++g_extraFrames.rendered;
             // Same reasoning as the cursor below, and the HUD needs it more: the extra
             // render has just painted the world over a HUD that was drawn once, in
             // gpl_simFrameRender, before this loop was reached. Without the replay the
@@ -1276,7 +1369,11 @@ void __cdecl sceneRenderHook(void* params) {
     // targets the texture directly, nothing is copied, the bit is never set -- and a
     // counter that tested it would read zero while the mirror worked perfectly.
     if (scene->mirrorCamera) {
-        ++g_mirrorRefreshes;
+        // What is actually rendered, not what GPL asked for: with stereoMirrorEvery above 1 the
+        // request comes every frame and `stereoRender` drops most of them, and a counter that
+        // read the request would have reported the mirror at the full frame rate while it was
+        // being drawn half as often.
+        if (stereoMirrorDueThisFrame()) ++g_mirrorRefreshes;
         if (!g_loggedMirrorPath) {
             g_loggedMirrorPath = true;
             logf("mirror: rendering by the %s. %s",
@@ -1954,6 +2051,18 @@ void loadOptions(const char* fileName) {
     g_options.stereo = GetPrivateProfileIntA("gplvr", "stereo", 0, path) != 0;
     g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 2, path);
     if (g_options.stereoMirror < 0 || g_options.stereoMirror > 2) g_options.stereoMirror = 2;
+    g_options.stereoMirrorEvery = GetPrivateProfileIntA("gplvr", "stereoMirrorEvery", 1, path);
+    if (g_options.stereoMirrorEvery < 1) g_options.stereoMirrorEvery = 1;
+    if (g_options.stereoMirrorEvery > 16) g_options.stereoMirrorEvery = 16;
+    if (g_options.stereoMirrorEvery > 1 && g_options.stereoMirror == 2) {
+        logf("options: stereoMirrorEvery = %d is IGNORED while stereoMirror = 2. At 2 each eye "
+             "renders the panes from its own eye into the same mirror texture, so a frame that "
+             "skips the render leaves both eyes sampling the last one written -- the right "
+             "eye's -- and the left eye flickers between its own reflection and the right's. "
+             "Use stereoMirror = 1, which renders one shared image from the head centre and is "
+             "half the cost before this option does anything.",
+             g_options.stereoMirrorEvery);
+    }
     GetPrivateProfileStringA("gplvr", "vrMirrorFovScale", "1.0", text, sizeof(text), path);
     g_options.vrMirrorFovScale = static_cast<float>(atof(text));
     if (!(g_options.vrMirrorFovScale >= 0.25f)) g_options.vrMirrorFovScale = 0.25f;
@@ -2018,7 +2127,6 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "vrMouseLookKey", '6', path);
     GetPrivateProfileStringA("gplvr", "vrHorizonLock", "0.0", text, sizeof(text), path);
     g_options.vrHorizonLock = static_cast<float>(atof(text));
-    g_options.vrExtraRenders = GetPrivateProfileIntA("gplvr", "vrExtraRenders", 0, path);
     GetPrivateProfileStringA("gplvr", "vrWorldScale", "1.0", text, sizeof(text), path);
     g_options.vrWorldScale = static_cast<float>(atof(text));
     g_options.windowWidth = GetPrivateProfileIntA("gplvr", "windowWidth", 0, path);
@@ -2090,24 +2198,24 @@ void loadOptions(const char* fileName) {
     if (g_options.vrHudEye < 0 || g_options.vrHudEye > 2) g_options.vrHudEye = 0;
     g_options.vrPredictPosition =
         GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
-    g_options.vrLockToHeadset = GetPrivateProfileIntA("gplvr", "vrLockToHeadset", 1, path) != 0;
+    g_options.frameRate = GetPrivateProfileIntA("gplvr", "frameRate", 1, path);
+    if (g_options.frameRate < 0 || g_options.frameRate > 2) g_options.frameRate = 1;
     GetPrivateProfileStringA("gplvr", "vrPaceMarginMs", "2.0", text, sizeof(text), path);
     g_options.vrPaceMarginMs = static_cast<float>(atof(text));
     if (!(g_options.vrPaceMarginMs >= 0.0f)) g_options.vrPaceMarginMs = 0.0f;
     if (g_options.vrPaceMarginMs > 10.0f) g_options.vrPaceMarginMs = 10.0f;
-    g_options.vrInterpolate = GetPrivateProfileIntA("gplvr", "vrInterpolate", 1, path) != 0;
-    if (g_options.vrLockToHeadset && !g_options.vrInterpolate) {
-        g_options.vrInterpolate = true;
-        logf("options: vrLockToHeadset = 1 turns vrInterpolate on -- the lock declines every "
-             "frame without it whenever the display period is not a whole number of sim ticks "
-             "(144 Hz into 90 Hz is 1.6), and the game would free-run instead. It costs one sim "
-             "tick of latency. Set vrLockToHeadset = 0 to race unlocked without it.");
+    g_options.interpolate = GetPrivateProfileIntA("gplvr", "interpolate", 1, path) != 0;
+    if (g_options.frameRate > 0 && !g_options.interpolate) {
+        g_options.interpolate = true;
+        logf("options: frameRate = %d turns interpolate on -- a frame drawn between two sim "
+             "ticks without the blend is a duplicate of the one before it, so the rate would "
+             "rise and the picture would not. It costs one sim tick of latency; frameRate = 0 "
+             "races without it.",
+             g_options.frameRate);
     }
     g_options.interpolateKey = GetPrivateProfileIntA("gplvr", "interpolateKey", '7', path);
     g_options.fixEyeSegment = GetPrivateProfileIntA("gplvr", "fixEyeSegment", 1, path) != 0;
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
-    g_options.flatExtraFrames = GetPrivateProfileIntA("gplvr", "flatExtraFrames", 0, path);
-    g_options.flatInterpolate = GetPrivateProfileIntA("gplvr", "flatInterpolate", 1, path) != 0;
     if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
@@ -2128,18 +2236,22 @@ void loadOptions(const char* fileName) {
         // read the same frame in both modes, and it owns no GPU marks, so it does not
         // collide with profilePost.
         g_options.profileStages = false;
-        g_options.vrLockToHeadset = false;
-        g_options.vrInterpolate = false;
-        // interpolateKey SURVIVES: flat mode blends too, once flatExtraFrames draws frames
-        // between the ticks, and the key toggles flatInterpolate there. It is the A/B for the
-        // whole feature, so switching it off in the mode that gained it would be backwards.
+        // frameRate, interpolate and interpolateKey SURVIVE. Neither feature is about the
+        // headset: one decides how often a frame is drawn and the other whether the world in it
+        // has moved, and flat GPL wants both -- 144 fps on a 36 Hz simulation is the same
+        // mechanism doing the same thing. Switching them off here is what used to make them
+        // read as VR features.
     }
 
-    logf("options: stereo=%d mirror=%d vrMirrorFovScale=%.2f vrMirrorYaw=%.1f "
-         "vrMirrorPitch=%.1f vrMirrorOffscreen=%d stereoKey=0x%02X",
-         g_options.stereo, g_options.stereoMirror, g_options.vrMirrorFovScale,
-         g_options.vrMirrorYaw, g_options.vrMirrorPitch, g_options.vrMirrorOffscreen ? 1 : 0,
-         g_options.stereoKey);
+    logf("options: stereo=%d mirror=%d stereoMirrorEvery=%d vrMirrorFovScale=%.2f "
+         "vrMirrorYaw=%.1f vrMirrorPitch=%.1f vrMirrorOffscreen=%d stereoKey=0x%02X (%s)",
+         g_options.stereo, g_options.stereoMirror, g_options.stereoMirrorEvery,
+         g_options.vrMirrorFovScale, g_options.vrMirrorYaw, g_options.vrMirrorPitch,
+         g_options.vrMirrorOffscreen ? 1 : 0, g_options.stereoKey,
+         g_options.stereoMirrorEvery > 1
+             ? "the mirror is rendered on one frame in stereoMirrorEvery, counting from the "
+               "frame that latched the tick; the rest keep the last image"
+             : "the mirror is rendered on every frame");
     logf("options: vrMirrorTweakKey=0x%02X vrMirrorTweakAngleSpeed=%.2f "
          "vrMirrorTweakFovSpeed=%.2f vrMirrorModeKey=0x%02X",
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
@@ -2152,6 +2264,13 @@ void loadOptions(const char* fileName) {
         g_options.vrMonitorEye = 1;
     g_options.vrTransferFinish =
         GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
+    g_options.vrDirectToShared =
+        GetPrivateProfileIntA("gplvr", "vrDirectToShared", 0, path) != 0;
+    logf("options: vrDirectToShared=%d (%s)", g_options.vrDirectToShared ? 1 : 0,
+         g_options.vrDirectToShared
+             ? "the frame is rendered straight into the shared texture, with no copy at "
+               "publish"
+             : "the frame is rendered into our own target and copied across at publish");
     g_options.vrHudPanelRate = GetPrivateProfileIntA("gplvr", "vrHudPanelRate", 72, path);
     if (g_options.vrHudPanelRate < 0) g_options.vrHudPanelRate = 0;
     if (g_options.vrHudPanelRate > 0 && g_options.vrHudPanelRate < 10)
@@ -2184,18 +2303,25 @@ void loadOptions(const char* fileName) {
          g_options.vrRenderScale,
          g_options.vrRecentreKey,
          g_options.vrOffscreen, g_options.vrMonitorEye);
-    logf("options: vrExtraRenders=%d vrHorizonLock=%.2f vrWorldScale=%.2f",
-         g_options.vrExtraRenders, g_options.vrHorizonLock, g_options.vrWorldScale);
+    logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f", g_options.vrHorizonLock,
+         g_options.vrWorldScale);
     logf("options: vrHudLayer=%d vrHudTextScale=%.2f vrHudBackdropOpacity=%.2f vrHudEye=%d "
          "vrPredictPosition=%d",
          g_options.vrHudLayer, g_options.vrHudTextScale, g_options.vrHudBackdropOpacity,
          g_options.vrHudEye, g_options.vrPredictPosition ? 1 : 0);
-    logf("options: vrLockToHeadset=%d vrPaceMarginMs=%.1f (%s)", g_options.vrLockToHeadset ? 1 : 0,
+    logf("options: frameRate=%d vrPaceMarginMs=%.1f (%s)", g_options.frameRate,
          g_options.vrPaceMarginMs,
-         g_options.vrLockToHeadset
-             ? "in a tracked race each latch waits to publish this many ms before the "
-               "presenter's latch, and the views are located for the display the frame reaches"
-             : "frames start as soon as a sim tick arrives, as stock");
+         g_options.frameRate == 0
+             ? "THE SIM'S RATE: one frame per sim tick, as GPL ships"
+         : g_options.frameRate == 1
+             ? (g_options.vr ? "THE DISPLAY'S RATE: the loop's wait for the next sim tick is "
+                               "skipped and one frame is drawn per view set the presenter "
+                               "publishes"
+                             : "THE DISPLAY'S RATE: the loop's wait for the next sim tick is "
+                               "skipped; swapInterval decides whether SwapBuffers then blocks "
+                               "for the refresh")
+             : "UNLOCKED: the loop's wait for the next sim tick is skipped and nothing else "
+               "paces it, so the rate is 1000 / the cost of one frame");
     logf("options: fixEyeSegment=%d (%s)", g_options.fixEyeSegment ? 1 : 0,
          g_options.fixEyeSegment
              ? "the world walk's lookup asks about the VIEWED CAR's position instead of the "
@@ -2203,16 +2329,13 @@ void loadOptions(const char* fileName) {
                "GPL's own containment test before the walk is centred on it"
              : "the world walk's lookup asks about the eye's own position and its answer is "
                "taken as the game gives it");
-    logf("options: vrInterpolate=%d interpolateKey=0x%02X (%s; the key toggles whichever of "
-         "vrInterpolate and flatInterpolate belongs to this mode)",
-         g_options.vrInterpolate ? 1 : 0, g_options.interpolateKey,
-         g_options.vrInterpolate
+    logf("options: interpolate=%d interpolateKey=0x%02X (%s)", g_options.interpolate ? 1 : 0,
+         g_options.interpolateKey,
+         g_options.interpolate
              ? "every car and the view are drawn blended between the two newest latched sim "
                "ticks at the frame's display time, which adds one sim tick of latency (6.94 ms "
-               "at 144 Hz); render pacing also engages when the display period is not a whole "
-               "number of ticks"
-         : g_options.vr ? "the world is drawn at the newest latched sim tick, as stock"
-                        : "VR only; flat mode blends under flatExtraFrames/flatInterpolate");
+               "at 144 Hz)"
+             : "the world is drawn at the newest latched sim tick, as stock");
     logf("options: simRing=%d (%s)", g_options.simRing,
          g_options.simRing >= 2
              ? "the sim thread publishes each tick and the car render records are written from "
@@ -2221,13 +2344,6 @@ void loadOptions(const char* fileName) {
              ? "the sim thread publishes each tick and the ring is verified against GPL's own "
                "latch; nothing drawn changes"
              : "off: the sim and the render thread exchange state through GPL's latch alone");
-    logf("options: flatExtraFrames=%d flatInterpolate=%d (%s)", g_options.flatExtraFrames,
-         g_options.flatInterpolate ? 1 : 0,
-         g_options.vr ? "VR: ignored, the presenter sets the cadence"
-         : g_options.flatExtraFrames > 0
-             ? "flat: frames are drawn between the simulation's ticks, so the world moves at the "
-               "display rate while the sim keeps its own"
-             : "off: flat GPL draws one frame per simulation tick");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
