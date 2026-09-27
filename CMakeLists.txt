@@ -39,6 +39,7 @@ function(gplvr_add_survey target output)
         src/Log.cpp
         src/openxr/Xr.cpp
         src/openxr/GplvrXr.cpp
+        src/openxr/XrInput.cpp
         src/presenter/Consumer.cpp
     )
     set_target_properties(${target} PROPERTIES OUTPUT_NAME "${output}")
@@ -90,6 +91,7 @@ else()
         src/Letterbox.cpp
         src/Log.cpp
         src/MenuScale.cpp
+        src/MirrorCache.cpp
         src/MirrorConfig.cpp
         src/MirrorTarget.cpp
         src/MouseLook.cpp
@@ -103,7 +105,11 @@ else()
         src/Stereo.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
+        src/TweakApi.cpp
         src/VrCamera.cpp
+        src/VrInput.cpp
+        src/VrMenu.cpp
+        src/VrText.cpp
         src/Window.cpp
         src/presenter/Producer.cpp
         # The fast text path (fastText = 1): GPL's stamped glyphs drawn from a GPU atlas

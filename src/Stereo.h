@@ -120,8 +120,8 @@ bool stereoAvailable();
 // should render normally -- a failed stereo setup must never cost you the game.
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*));
 
-// Whether this frame renders the mirror (`stereoMirrorEvery`). Always true unless that is above
-// 1 AND `stereoMirror` is 1 -- at 2 the two eyes share one mirror texture, so a skipped frame
+// Whether this frame renders the mirror (`mirrorUpdateRate`). Always true unless that is above
+// 1 AND `perEyeMirror` is off -- with it on the two eyes share one mirror texture, so a skipped frame
 // leaves one eye looking at the other's reflection.
 bool stereoMirrorDueThisFrame();
 
@@ -190,9 +190,13 @@ bool stereoDroppingPolygons();
 // corrected, and by how much. False when no stereo pass ran in the window. See report 84.
 bool stereoWalkFormat(char* out, size_t size);
 
-// The x at which gpl_sceneRender's mirror copy-out writes into mirror.mip. `readSurface` is
-// the bitmap the copy reads from (bitmapDraw's fourth argument). The +Y pane's copy moves to
-// the right half of the texture, where the +Y glass samples; everything else keeps `x`.
-int stereoMirrorCopyX(int readSurface, int x);
+// gpl_sceneRender's mirror copy-out, on its way through bitmapDraw. `writeBitmap` is where the
+// pixels land (the first argument) and `readSurface` is what they come from (the fourth), which
+// is the reverse of what those argument positions are named after everywhere else.
+//
+// Returns the x to write at: the +Y pane's copy moves to the right half of the texture, where
+// the +Y glass samples, and everything else keeps `x`. It also notes mirror.mip's bitmap for
+// MirrorCache, because this is the one place in the process that names it.
+int stereoMirrorCopy(int writeBitmap, int readSurface, int x);
 
 }  // namespace gplvr

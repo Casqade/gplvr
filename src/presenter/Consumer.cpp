@@ -550,6 +550,132 @@ void Consumer::releaseHud() {
     hudHeight_ = 0;
 }
 
+void Consumer::releaseMenu() {
+    for (Slot& slot : menuSlots_) {
+        if (slot.view) slot.view->Release();
+        if (slot.texture) slot.texture->Release();
+        slot.view = nullptr;
+        slot.texture = nullptr;
+    }
+    menuWidth_ = 0;
+    menuHeight_ = 0;
+}
+
+bool Consumer::menuPanel(MenuPanel& out) {
+    if (!block_ || !device_) return false;
+    if (!block_->menuVisible) return false;
+
+    int32_t generation = block_->menuGeneration;
+    if (!generation) return false;
+
+    // Opened once per generation, whether or not it works -- the HUD's reasoning exactly:
+    // a handle that cannot be opened now will not open on the next frame either, and
+    // trying ninety times a second would only repeat the log line.
+    if (generation != menuGeneration_) {
+        releaseMenu();
+        menuGeneration_ = generation;
+        for (uint32_t index = 0; index < kFrameSlots; ++index) {
+            HANDLE  handle = loadSharedHandle(block_->menuTextures[index]);
+            HRESULT opened =
+                handle ? device_->OpenSharedResource(handle, __uuidof(ID3D11Texture2D),
+                                                     (void**)&menuSlots_[index].texture)
+                       : E_HANDLE;
+            if (FAILED(opened) || !menuSlots_[index].texture) {
+                logf("present: the VR menu's slot %u could not be opened (hr=0x%08lX)",
+                     index, (unsigned long)opened);
+                menuSlots_[index].texture = nullptr;
+                releaseMenu();
+                return false;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc = {};
+            viewDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            viewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            viewDesc.Texture2D.MipLevels = 1;
+            if (FAILED(device_->CreateShaderResourceView(
+                    menuSlots_[index].texture, &viewDesc, &menuSlots_[index].view))) {
+                logf("present: CreateShaderResourceView failed for VR menu slot %u", index);
+                releaseMenu();
+                return false;
+            }
+        }
+        menuWidth_ = block_->menuTextureWidth;
+        menuHeight_ = block_->menuTextureHeight;
+        logf("present: opened the VR menu textures at %ux%u, generation %d", menuWidth_,
+             menuHeight_, generation);
+    }
+    if (!menuSlots_[0].view || !menuWidth_ || !menuHeight_) return false;
+
+    // The sequence is read FIRST and the pose after it, which is the opposite order to
+    // the way they are written -- so a pose read here belongs to this image or to a
+    // newer one, never to an older one.
+    out.sequence = block_->menuSequence;
+    if (!out.sequence) return false;
+    out.pose = block_->menuPose;
+    out.space = block_->menuSpace;
+    out.widthMetres = block_->menuWidthMetres;
+    out.heightMetres = block_->menuHeightMetres;
+    out.textureWidth = menuWidth_;
+    out.textureHeight = menuHeight_;
+    return out.widthMetres > 0.0f && out.heightMetres > 0.0f;
+}
+
+bool Consumer::drawMenu(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                        int32_t sequence, bool decodeSrgb) {
+    if (!target || !context_ || !constants_) return false;
+    ID3D11ShaderResourceView* source =
+        menuSlots_[static_cast<uint32_t>(sequence) % kFrameSlots].view;
+    if (!source) return false;
+
+    // The whole texture, flipped because GL drew it bottom-up, alpha kept -- the HUD
+    // panel's constants exactly, because it is the same kind of image.
+    BlitConstants constants = {};
+    constants.fit[0] = 1.0f;
+    constants.fit[1] = 1.0f;
+    constants.fit[2] = 1.0f;
+    constants.fit[3] = 1.0f;
+    constants.rect[2] = 1.0f;
+    constants.rect[3] = 1.0f;
+    constants.colour[0] = decodeSrgb ? 1.0f : 0.0f;
+    constants.colour[1] = block_ ? block_->gamma : 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context_->Map(constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        return false;
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_->Unmap(constants_, 0);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(width);
+    viewport.Height = static_cast<float>(height);
+    viewport.MaxDepth = 1.0f;
+
+    const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context_->OMSetRenderTargets(1, &target, nullptr);
+    context_->OMSetBlendState(blend_, blendFactor, 0xFFFFFFFF);
+    context_->RSSetState(rasterizer_);
+    context_->RSSetViewports(1, &viewport);
+    context_->IASetInputLayout(nullptr);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(vertexShader_, nullptr, 0);
+    context_->PSSetShader(pixelShader_, nullptr, 0);
+    context_->PSSetShaderResources(0, 1, &source);
+    context_->PSSetSamplers(0, 1, &sampler_);
+    context_->PSSetConstantBuffers(0, 1, &constants_);
+    context_->Draw(3, 0);
+
+    ID3D11ShaderResourceView* none = nullptr;
+    context_->PSSetShaderResources(0, 1, &none);
+    return true;
+}
+
+void Consumer::publishInputNames(const SharedInputNames& names) {
+    if (!block_) return;
+    block_->inputNames = names;
+    MemoryBarrier();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->inputNamesGeneration),
+                        ++inputNamesGeneration_);
+}
+
 bool Consumer::hudPanel(HudPanel& out) {
     if (!block_ || !device_) return false;
     out.layer = block_->hudLayer;
@@ -690,6 +816,18 @@ void Consumer::publishViews(const SharedView views[2], const SharedPose& head,
                         ++viewSequence_);
 }
 
+void Consumer::publishInput(const SharedInput& input) {
+    if (!block_) return;
+
+    block_->input = input;
+
+    // Payload first, counter second -- the views' protocol, for the same reason. The
+    // counter starts at 1 so 0 keeps meaning "nothing has ever been published", which is
+    // what a session with no controllers leaves behind.
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->inputSequence),
+                        ++inputSequence_);
+}
+
 int32_t Consumer::viewLeadDisplays() const {
     if (!block_) return 0;
     int32_t lead = block_->viewLeadDisplays;
@@ -715,6 +853,7 @@ bool Consumer::producerAlive() const {
 void Consumer::close() {
     releaseTextures();
     releaseHud();
+    releaseMenu();
 
     if (rasterizer_) rasterizer_->Release();
     if (blend_) blend_->Release();

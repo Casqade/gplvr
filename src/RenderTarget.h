@@ -77,6 +77,19 @@ bool   renderTargetSize(int& width, int& height);
 bool   renderTargetAttachColour(const GlFunctions& gl, GLuint name);
 GLuint renderTargetAttachedColour();
 
+// The GL texture a rasterizer bitmap handle draws from, or 0 if the handle does not reach one.
+//
+// It lives here because this is where roglv2's handle table is discovered -- by decoding the
+// exported bitmapWidth and asserting exactly one candidate reaches the back buffer's real size
+// -- and every step of the walk goes through the same readability check, so a handle that names
+// nothing returns 0 rather than faulting.
+//
+// **The answer is not self-verifying.** A handle whose root is not a textured bitmap has
+// something else at that offset: the display's holds a heap tag. Ask GL what size the texture
+// is and compare it with the size the rasterizer reports for the handle before writing through
+// it.
+GLuint rasterBitmapGlTexture(int handle);
+
 // Resize the surface a camera is about to render into, to match the off-screen target.
 //
 // Changing the back buffer's own width and height is NOT enough, and the first run

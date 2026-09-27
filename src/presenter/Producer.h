@@ -32,7 +32,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill);
 //   presenterBlitToWindow show the off-screen frame in the game window
 //   presenterBeginFrame   start drawing off-screen again, after the present
 //
-// All three are inert unless vr and vrOffscreen are on and the target actually built.
+// All three are inert unless vr is on and the off-screen target actually built.
 void presenterEndFrame();
 
 // The frame transfer's cost. Noted per transfer, taken and reset by the reporter, so the
@@ -54,6 +54,43 @@ void presenterBeginFrame();
 // It also saves the pixels it covers; presenterRestoreUnderCursor puts them back.
 void presenterDrawCursor(bool sideBySide);
 
+// Build the VR menu's layer image and publish it. Here for the same reason
+// presenterDrawCursor is: this side owns the resolved GL entry points. It draws nothing
+// into the frame -- the menu is a composition layer of its own -- and is inert unless the
+// menu is open and its content has changed.
+void presenterUpdateVrMenu();
+
+// Draw the controller's aiming ray into the off-screen frame, for the headset only.
+//
+// Call it AFTER presenterEndFrame and BEFORE presenterFrame: it takes the window's
+// picture first if that has not happened yet, so the ray is in the image the headset
+// gets and not in the one the monitor shows. Inert unless a mode is open and the owning
+// hand is tracked, and it moves nothing about the frame's ordering when it is inert.
+void presenterDrawVrRay(bool takeWindowPicture);
+
+// The names the runtime gives the controls each action is bound to, for the menu's help
+// lines. False until the presenter has asked at least once.
+bool presenterLatestInputNames(SharedInputNames& names, int32_t& generation);
+
+// The VR menu's own quad layer.
+//
+// Begin makes the menu's texture the GL draw target, cleared transparent, creating it at
+// this size if it is not already; the size chosen comes back in actualWidth/actualHeight.
+// End must follow every successful Begin in the same frame and restores the previous
+// draw target. Publish then copies the finished image into a shared slot under a lock of
+// its own -- NOT the frame transfer's batched one, which carries exactly one panel
+// already -- and publishes the pose, the extent and the sequence. Hide takes the layer
+// away without touching the texture.
+//
+// `pose` is in the SEAT's space, which is the space the presenter builds from the
+// published seat pose for the seat-locked HUD panel. False from any of them means no
+// layer this frame, and the reason has been logged.
+bool presenterMenuBegin(int width, int height, int& actualWidth, int& actualHeight);
+void presenterMenuEnd();
+bool presenterMenuPublish(const SharedPose& pose, int32_t space, float widthMetres,
+                          float heightMetres);
+void presenterMenuHide();
+
 // Put back the pixels the cursor was drawn over, before the game presents.
 //
 // Exactly one of these per presenterDrawCursor, in the same frame, AFTER the frame has
@@ -74,6 +111,16 @@ void presenterStop();
 // `motion`, when given, receives the head velocity and display clock published with them.
 bool presenterLatestViews(SharedView views[2], SharedPose& head,
                           SharedMotion* motion = nullptr);
+
+// The newest motion-controller sample the presenter published, and the counter it came
+// under. False when the channel is not running, nothing has been published yet, or the
+// copy caught a write in progress three times running -- in every case the caller must
+// keep whatever state it had rather than treating the hands as released.
+//
+// The counter is what tells a fresh sample from a repeat: the presenter publishes at the
+// display rate and the game reads at its own, so the same sample is read several times
+// over and an edge detector keyed on the values alone would see each press once per read.
+bool presenterLatestInput(SharedInput& input, int32_t& sequence);
 
 // Publish the seat -- the recentred head pose, heading only, in the presenter's LOCAL
 // space -- so a layer can be placed relative to it. Called on every recentre.

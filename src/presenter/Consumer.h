@@ -78,6 +78,27 @@ public:
     };
     bool hudPanel(HudPanel& out);
 
+    // The VR menu's panel. Unlike the HUD's, its pose is published outright -- the menu
+    // hangs where the driver was looking when it opened, which is not something this side
+    // can derive -- and it is always in the SEAT's space. False when the layer is off or
+    // no image has been shared yet.
+    struct MenuPanel {
+        SharedPose pose;
+        // kMenuSpaceSeat or kMenuSpaceView: which space `pose` is stated in.
+        int32_t    space = kMenuSpaceSeat;
+        float      widthMetres = 0.0f;
+        float      heightMetres = 0.0f;
+        uint32_t   textureWidth = 0;
+        uint32_t   textureHeight = 0;
+        int32_t    sequence = 0;
+    };
+    bool menuPanel(MenuPanel& out);
+
+    // Draw menu image `sequence` into a render target at full size, alpha kept. Only
+    // after menuPanel returned true.
+    bool drawMenu(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                  int32_t sequence, bool decodeSrgb);
+
     // Draw HUD image `sequence` into a render target at full size, alpha kept. Only after
     // hudPanel returned true. `decodeSrgb` as for drawEye.
     bool drawHud(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
@@ -89,6 +110,14 @@ public:
 
     void publishViews(const SharedView views[2], const SharedPose& head, bool valid,
                       const SharedMotion& motion);
+
+    // The motion controllers, as XrInput sampled them for this frame's display time. Same
+    // protocol as the views: payload first, counter second.
+    void publishInput(const SharedInput& input);
+
+    // What the runtime calls each bound control. Published on an interaction-profile
+    // change, not per frame.
+    void publishInputNames(const SharedInputNames& names);
 
     // Tell the game whether the runtime allows a modified fov. False means a submitted
     // fov is ignored rather than honoured, so the eye cameras must render exactly what
@@ -110,6 +139,7 @@ private:
     bool openTextures();
     void releaseTextures();
     void releaseHud();
+    void releaseMenu();
 
     HANDLE        mapping_ = nullptr;
     ControlBlock* block_ = nullptr;
@@ -149,12 +179,18 @@ private:
     int32_t  hudGeneration_ = 0;
     uint32_t hudWidth_ = 0;
     uint32_t hudHeight_ = 0;
+    Slot     menuSlots_[kFrameSlots] = {};
+    int32_t  menuGeneration_ = 0;
+    uint32_t menuWidth_ = 0;
+    uint32_t menuHeight_ = 0;
     Frame    current_;
     int32_t  openedGeneration_ = 0;
     uint32_t sourceWidth_ = 0;
     uint32_t sourceHeight_ = 0;
     bool     bottomUp_ = true;
     bool     loggedFirstFrame_ = false;
+    int32_t  inputSequence_ = 0;
+    int32_t  inputNamesGeneration_ = 0;
 
     // What the last logged layer description said, so it can be repeated when it
     // changes rather than only once at startup.

@@ -4,6 +4,7 @@
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "VrMenu.h"
 #include "presenter/Producer.h"
 
 #include <windows.h>
@@ -111,6 +112,12 @@ constexpr int kPanelCount = sizeof(kPanels) / sizeof(kPanels[0]);
 constexpr const char* kLayoutFile = "gplvr_pribluda.ini";
 constexpr int         kUnset = INT_MIN;
 
+// Text on the panel, RELATIVE to pribluda's own size: 1.0 would keep the share of the panel
+// the text has of the monitor, which is too small to read at a panel's distance. Not a
+// setting -- the panel's own width already scales everything on it together, which is the
+// control someone actually wants, and two overlapping size controls is one too many.
+constexpr float kPribludaTextScale = 2.0f;
+
 // Written next to the game when it is missing. Positions are fractions of the panel, and
 // the defaults are PRIBLUDA.INI's own monitor layout in those terms -- the three boards at
 // width-900/-600/-300, the tyre grid at 1180 and 100 up from the bottom, the fps counter
@@ -133,7 +140,7 @@ constexpr const char* kDefaultLayout =
     "; out as a copy of your monitor HUD; pull things together to make it more compact.\r\n"
     ";\r\n"
     "; Where the panel hangs and how big it is lives in gplvr.ini: vrHudLayer, and\r\n"
-    "; vrHudHead*/vrHudSeat* for each mode. Text size is vrHudTextScale.\r\n"
+    "; vrHudHead*/vrHudSeat* for each mode; the panel's own width sets how big text is.\r\n"
     ";\r\n"
     "; Same section and key names as PRIBLUDA.INI. Only positions and `show` are read;\r\n"
     "; colours, driver counts and key bindings still come from PRIBLUDA.INI. `show` here\r\n"
@@ -215,8 +222,8 @@ bool    g_reportedNoGl = false;
 SampleFpsFn g_sampleFps = nullptr;
 bool        g_monitorRedirected = false;
 
-// vrHudPanelRate: when the next panel redraw is due, as a QPC value; 0 before the first.
-LONGLONG g_panelDue = 0;
+// pribludaUpdateRate counts frames, so this is the frame number the modulo is taken of.
+unsigned g_panelFrame = 0;
 bool     g_reportedPanelRate = false;
 
 // Stands in for prib_rasterHook_drawsHud's call of prib_hudDraw -- the monitor HUD -- inside
@@ -282,32 +289,26 @@ BOOL WINAPI pribludaGetClientRect(HWND window, LPRECT rect) {
 }
 
 typedef void(WINAPI* BlendFuncFn)(GLenum, GLenum);
-typedef void(WINAPI* Color3dFn)(GLdouble, GLdouble, GLdouble);
 typedef void(WINAPI* Color4dFn)(GLdouble, GLdouble, GLdouble, GLdouble);
 BlendFuncFn g_blendFunc = nullptr;
-Color3dFn   g_color3d = nullptr;
 Color4dFn   g_color4d = nullptr;
-double      g_quadShade = 1.0;
 
-// pribluda's glColor3d import. Its only caller is prib_drawQuad, which sets the shade of a
-// backdrop box with it just before choosing the blend.
-void WINAPI pribludaColor3d(GLdouble red, GLdouble green, GLdouble blue) {
-    g_quadShade = (red + green + blue) / 3.0;
-    g_color3d(red, green, blue);
-}
-
-// pribluda's glBlendFunc import, again called only by prib_drawQuad. The backdrop boxes
-// multiply what is under them by their shade: glBlendFunc(GL_DST_COLOR,
-// GL_ONE_MINUS_SRC_ALPHA) with an opaque grey. On the monitor that darkens the game; on the
-// panel, cleared to transparent black, it multiplies zero and leaves alpha zero, so the box
-// vanishes. For the panel draw the same darkening is written as premultiplied alpha
-// instead -- black at some coverage, blended "over" -- which the compositor then applies to
-// the game image behind the quad. The translucent boxes (pribluda's shade 0.7) take their
-// coverage from vrHudBackdropOpacity; the solid ones (shade 0, the dash) stay solid.
+// pribluda's glBlendFunc import, called only by prib_drawQuad. The backdrop boxes multiply
+// what is under them by their shade: glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA) with
+// an opaque grey. On the monitor that darkens the game; on the panel, cleared to transparent
+// black, it multiplies zero and leaves alpha zero, so the box vanishes. For the panel draw
+// the same darkening is written as premultiplied alpha instead -- black at some coverage,
+// blended "over" -- which the compositor then applies to the game image behind the quad.
+//
+// EVERY BOX TAKES ITS COVERAGE FROM vrHudBackdropOpacity, the dash included. It used to
+// branch on the shade pribluda chose -- grey boxes translucent, the dash's black box left
+// solid -- which faithfully reproduced what pribluda's monitor HUD looks like. In a headset
+// that faithfulness is the wrong goal: an opaque black slab is a hole in the world where a
+// translucent one is a readout laid over it, and there was no way to ask for the latter.
 void WINAPI pribludaBlendFunc(GLenum source, GLenum destination) {
     if (g_drawingHud && g_color4d && source == GL_DST_COLOR &&
         destination == GL_ONE_MINUS_SRC_ALPHA) {
-        double coverage = g_quadShade > 0.0 ? g_options.vrHudBackdropOpacity : 1.0;
+        double coverage = g_options.vrHudBackdropOpacity;
         g_color4d(0.0, 0.0, 0.0, coverage);
         g_blendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         return;
@@ -497,19 +498,17 @@ bool bind() {
     HMODULE opengl = GetModuleHandleA("opengl32.dll");
     g_color4d = opengl ? reinterpret_cast<Color4dFn>(GetProcAddress(opengl, "glColor4d"))
                        : nullptr;
-    void* color3d = nullptr;
+    // glColor3d was hooked too, to remember the shade pribluda gave each box so the dash's
+    // black one could be left opaque. Every box takes the same coverage now, so there is
+    // nothing to remember and the hook went with the branch that used it.
     void* blendFunc = nullptr;
-    bool  colourHooked = g_color4d &&
-                        patchModuleImport(module, "glColor3d",
-                                          reinterpret_cast<void*>(&pribludaColor3d), &color3d);
-    if (colourHooked && color3d) g_color3d = reinterpret_cast<Color3dFn>(color3d);
-    bool blendHooked = colourHooked && g_color3d &&
-                       patchModuleImport(module, "glBlendFunc",
-                                         reinterpret_cast<void*>(&pribludaBlendFunc), &blendFunc);
+    bool  blendHooked =
+        g_color4d && patchModuleImport(module, "glBlendFunc",
+                                       reinterpret_cast<void*>(&pribludaBlendFunc), &blendFunc);
     if (blendHooked && blendFunc) g_blendFunc = reinterpret_cast<BlendFuncFn>(blendFunc);
     if (!g_blendFunc) {
-        logf("pribluda: its glColor3d/glBlendFunc imports could not be redirected (glColor4d "
-             "%s) -- the backdrop boxes stay invisible on the HUD panel",
+        logf("pribluda: its glBlendFunc import could not be redirected (glColor4d %s) -- the "
+             "backdrop boxes stay invisible on the HUD panel",
              g_color4d ? "found" : "missing");
     }
 
@@ -685,12 +684,25 @@ bool elementPosition(int element, Fraction*& x, Fraction*& y) {
 
 // Shown in the copies last drawn from, and placed by the layout file. The rest are skipped:
 // a hidden element has nothing to look at, and one without a position has nothing to write.
+bool elementShown(int element) {
+    int panel = kElements[element].panel;
+    return panel < 0 ? g_dash[kOffDashShow] != 0 : g_panels[kPanels[panel].show] != 0;
+}
+
+// A HIDDEN ELEMENT IS STILL SELECTABLE, and that is the whole point.
+//
+// This used to require `shown`, so a hidden element could not be reached -- which meant the
+// one thing that could not be done to a hidden element was turn it back on. Hiding one was a
+// one-way door, and the only way out was editing gplvr_pribluda.ini by hand.
+//
+// What it needs is a POSITION, because that is what the outline is drawn round and what the
+// stick moves. An element never drawn has no measured size either, so its box falls back to
+// kOutlineMinSize -- small, but the tweak mode crosses hidden ones out, which is what makes
+// it findable.
 bool elementSelectable(int element) {
-    int  panel = kElements[element].panel;
-    bool shown = panel < 0 ? g_dash[kOffDashShow] != 0 : g_panels[kPanels[panel].show] != 0;
     Fraction* x = nullptr;
     Fraction* y = nullptr;
-    return shown && elementPosition(element, x, y);
+    return elementPosition(element, x, y);
 }
 
 // The element on the panel, in texels from its top-left corner: where it is placed, at the
@@ -789,6 +801,13 @@ void saveLayout() {
 }
 
 void enterTweak() {
+    // The headset's own HUD mode moves the same fractions through TweakApi. One owner at
+    // a time, and the one that got there first keeps it.
+    if (vrMenuActive()) {
+        logf("pribluda: HUD tweak mode not entered -- the VR menu has the panel; close it "
+             "first");
+        return;
+    }
     if (!elementSelectable(g_tweak.selected)) selectNext(1);
     if (!elementSelectable(g_tweak.selected)) {
         logf("pribluda: HUD tweak mode not entered -- no element on the panel is both shown "
@@ -869,14 +888,20 @@ void pribludaDrawHud() {
     int monitorHeight = *g_prib.screenHeight;
     if (monitorWidth <= 0 || monitorHeight <= 0) return;
 
-    // vrHudPanelRate. Redraws fall due on a fixed schedule, with a quarter period of slack so
-    // a frame landing just before its due time is not pushed a whole frame later. A skipped
-    // frame returns before any GL call and before pribluda is touched, so the headset and the
-    // monitor keep the last image and none of the protections below come into play.
-    LONGLONG now = qpcNow();
-    LONGLONG period =
-        g_options.vrHudPanelRate > 0 ? g_tweak.frequency / g_options.vrHudPanelRate : 0;
-    if (period > 0 && g_panelDue && now + period / 4 < g_panelDue) return;
+    // pribludaUpdateRate: ONE FRAME IN N, counted in frames rather than in hertz.
+    //
+    // It was a rate in redraws per second, which meant the panel's cadence and the frame's
+    // drifted against each other and a redraw could land on any frame. Counting frames says
+    // the same thing in the units the driver actually has -- 1, 1/2, 1/3 -- reads the same
+    // way as the mirror's setting next to it in the menu, and is one modulo instead of a
+    // period and a slack window. A skipped frame returns before any GL call and before
+    // pribluda is touched, so the headset and the monitor keep the last image and none of
+    // the protections below come into play.
+    ++g_panelFrame;
+    unsigned every = g_options.pribludaUpdateRate > 1
+                         ? static_cast<unsigned>(g_options.pribludaUpdateRate)
+                         : 1u;
+    if (every > 1 && (g_panelFrame % every) != 0) return;
 
     GlFunctions gl;
     if (!glResolve(gl) || !gl.viewport || !gl.pushAttrib || !gl.popAttrib ||
@@ -941,8 +966,8 @@ void pribludaDrawHud() {
         // of the monitor. With the layout file the panel's texels ARE the coordinate space,
         // and the glyphs are scaled by texels per monitor pixel; without it pribluda's own
         // monitor-sized space is mapped onto the panel, which scales them already.
-        // vrHudTextScale multiplies on top of either.
-        font = savedFont * g_options.vrHudTextScale;
+        // kPribludaTextScale multiplies on top of either.
+        font = savedFont * kPribludaTextScale;
         if (g_layout.present) font *= static_cast<float>(width) / monitorWidth;
         *g_prib.fontSize = font;
 
@@ -974,19 +999,15 @@ void pribludaDrawHud() {
 
         presenterHudEnd();
 
-        // A draw more than a period late starts the schedule again from now rather than
-        // catching up with a burst.
-        if (period > 0)
-            g_panelDue = g_panelDue && now - g_panelDue < period ? g_panelDue + period
-                                                                  : now + period;
         if (!g_reportedPanelRate) {
             g_reportedPanelRate = true;
-            if (period > 0)
-                logf("pribluda: the HUD panel is redrawn at most %d times a second "
-                     "(vrHudPanelRate); between redraws the last image stays up",
-                     g_options.vrHudPanelRate);
+            if (every > 1)
+                logf("pribluda: the HUD panel is redrawn on one frame in %u "
+                     "(pribludaUpdateRate); between redraws the last image stays up",
+                     every);
             else
-                logf("pribluda: the HUD panel is redrawn every frame (vrHudPanelRate = 0)");
+                logf("pribluda: the HUD panel is redrawn on every frame "
+                     "(pribludaUpdateRate = 1)");
         }
     }
 
@@ -1069,6 +1090,185 @@ void pribludaPollTweak() {
     double step = g_options.vrHudTweakSpeed * seconds;
     if (dx) moveAxis(*x, dx * step, box.width, g_tweak.panelWidth);
     if (dy) moveAxis(*y, dy * step, box.height, g_tweak.panelHeight);
+}
+
+// -- the layout, for TweakApi -------------------------------------------------------------
+//
+// Thin by design: every one of these is a couple of lines over the internals above, so the
+// semantic tweak API gets at the layout without a second copy of the element table, the
+// clamps or the fraction arithmetic. Pribluda.h says what each one means.
+
+int pribludaElementCount() { return kElementCount; }
+
+const char* pribludaElementName(int element) {
+    if (element < 0 || element >= kElementCount) return "";
+    return kElements[element].name;
+}
+
+bool pribludaElementUsable(int element) {
+    if (element < 0 || element >= kElementCount) return false;
+    return elementSelectable(element);
+}
+
+bool pribludaElementShown(int element) {
+    if (element < 0 || element >= kElementCount) return false;
+    return elementShown(element);
+}
+
+bool pribludaResetLayout() {
+    if (!g_layoutPath[0]) return false;
+    // Deleted rather than overwritten, so loadLayout takes its own CREATE_NEW path and the
+    // file that comes back is exactly the one a fresh install writes -- header, comments and
+    // all -- rather than something this function keeps a second copy of.
+    if (!DeleteFileA(g_layoutPath) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        logf("pribluda: %s could not be deleted (error %lu) -- the layout is unchanged",
+             g_layoutPath, GetLastError());
+        return false;
+    }
+    loadLayout();
+    logf("pribluda: the layout is back to the shipped one; %s has been rewritten",
+         g_layoutPath);
+    return true;
+}
+
+int pribludaElementSelected() { return g_tweak.selected; }
+
+void pribludaElementSelect(int element) {
+    if (element < 0 || element >= kElementCount) return;
+    g_tweak.selected = element;
+}
+
+int pribludaElementCycle(int step) {
+    selectNext(step);
+    return g_tweak.selected;
+}
+
+bool pribludaElementPosition(int element, float& x, float& y) {
+    if (element < 0 || element >= kElementCount) return false;
+    Fraction* fx = nullptr;
+    Fraction* fy = nullptr;
+    if (!elementPosition(element, fx, fy)) return false;
+    x = static_cast<float>(fx->value);
+    y = static_cast<float>(fy->value);
+    return true;
+}
+
+bool pribludaElementMove(int element, float dx, float dy) {
+    if (element < 0 || element >= kElementCount) return false;
+    Fraction* fx = nullptr;
+    Fraction* fy = nullptr;
+    Box       box;
+    if (!elementPosition(element, fx, fy)) return false;
+    if (!elementBox(element, g_tweak.panelWidth, g_tweak.panelHeight, box)) return false;
+
+    // moveAxis raises g_tweak.moved when it changes something, which is what saveLayout
+    // keys off. Read either side of the pair rather than trusting a return value moveAxis
+    // does not have.
+    bool wasMoved = g_tweak.moved;
+    g_tweak.moved = false;
+    if (dx != 0.0f) moveAxis(*fx, dx, box.width, g_tweak.panelWidth);
+    if (dy != 0.0f) moveAxis(*fy, dy, box.height, g_tweak.panelHeight);
+    bool changed = g_tweak.moved;
+    g_tweak.moved = wasMoved || changed;
+    return changed;
+}
+
+bool pribludaElementSetPosition(int element, float x, float y) {
+    if (element < 0 || element >= kElementCount) return false;
+    Fraction* fx = nullptr;
+    Fraction* fy = nullptr;
+    if (!elementPosition(element, fx, fy)) return false;
+    double clampedX = x < 0.0f ? 0.0 : (x > 1.0f ? 1.0 : static_cast<double>(x));
+    double clampedY = y < 0.0f ? 0.0 : (y > 1.0f ? 1.0 : static_cast<double>(y));
+    if (clampedX == fx->value && clampedY == fy->value) return false;
+    fx->value = clampedX;
+    fy->value = clampedY;
+    g_tweak.moved = true;
+    return true;
+}
+
+bool pribludaElementFilePosition(int element, float& x, float& y) {
+    if (element < 0 || element >= kElementCount || !g_layout.present) return false;
+    int      panel = kElements[element].panel;
+    Fraction fileX;
+    Fraction fileY;
+    if (panel < 0) {
+        fileX = readFraction("dash", "X");
+        fileY = readFraction("dash", "Y");
+    } else {
+        fileX = readFraction(kPanels[panel].section, kPanels[panel].xKey);
+        fileY = readFraction(kPanels[panel].section, kPanels[panel].yKey);
+    }
+    if (!fileX.set || !fileY.set) return false;
+    x = static_cast<float>(fileX.value);
+    y = static_cast<float>(fileY.value);
+    return true;
+}
+
+bool pribludaElementResetPosition(int element) {
+    float x = 0.0f;
+    float y = 0.0f;
+    if (!pribludaElementFilePosition(element, x, y)) return false;
+    return pribludaElementSetPosition(element, x, y);
+}
+
+int pribludaElementShow(int element) {
+    if (element < 0 || element >= kElementCount) return -1;
+    int panel = kElements[element].panel;
+    int show = panel < 0 ? g_layout.dash.show : g_layout.panel[panel].show;
+    return show == kUnset ? -1 : (show ? 1 : 0);
+}
+
+bool pribludaElementSetShow(int element, int show) {
+    if (element < 0 || element >= kElementCount) return false;
+    int  panel = kElements[element].panel;
+    int  value = show ? 1 : 0;
+    int& slot = panel < 0 ? g_layout.dash.show : g_layout.panel[panel].show;
+    if (slot == value) return false;
+    slot = value;
+    return true;
+}
+
+float pribludaDashWidth() {
+    return g_layout.dashWidth.set ? static_cast<float>(g_layout.dashWidth.value) : -1.0f;
+}
+
+bool pribludaSetDashWidth(float fraction) {
+    double value = fraction < 0.05f ? 0.05 : (fraction > 1.0f ? 1.0 : fraction);
+    if (g_layout.dashWidth.set && g_layout.dashWidth.value == value) return false;
+    g_layout.dashWidth.set = true;
+    g_layout.dashWidth.value = value;
+    return true;
+}
+
+void pribludaLayoutSave() { saveLayout(); }
+
+bool pribludaTweakActive() { return g_tweak.active; }
+
+bool pribludaPanelLive() {
+    LONGLONG now = qpcNow();
+    return g_tweak.drawnAt != 0 &&
+           now - g_tweak.drawnAt <
+               static_cast<LONGLONG>(g_tweak.frequency * kPanelLiveSeconds);
+}
+
+bool pribludaPanelSize(int& width, int& height) {
+    if (g_tweak.panelWidth <= 0 || g_tweak.panelHeight <= 0) return false;
+    width = g_tweak.panelWidth;
+    height = g_tweak.panelHeight;
+    return true;
+}
+
+bool pribludaElementBox(int element, float& x, float& y, float& width, float& height) {
+    if (element < 0 || element >= kElementCount) return false;
+    if (g_tweak.panelWidth <= 0 || g_tweak.panelHeight <= 0) return false;
+    Box box;
+    if (!elementBox(element, g_tweak.panelWidth, g_tweak.panelHeight, box)) return false;
+    x = static_cast<float>(box.x) / static_cast<float>(g_tweak.panelWidth);
+    y = static_cast<float>(box.y) / static_cast<float>(g_tweak.panelHeight);
+    width = static_cast<float>(box.width) / static_cast<float>(g_tweak.panelWidth);
+    height = static_cast<float>(box.height) / static_cast<float>(g_tweak.panelHeight);
+    return true;
 }
 
 bool pribludaTweakSwallowsKey(unsigned virtualKey) {

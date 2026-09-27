@@ -11,6 +11,7 @@
 #include "RenderPacing.h"
 #include "Stereo.h"
 #include "VrCamera.h"
+#include "VrMenu.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -76,6 +77,22 @@ struct State {
     LONGLONG         hudPublishedQpc = 0;  // when the last panel image was published
     LONGLONG         hudDrawnQpc = 0;      // when pribluda last drew into hudTexture
     LONGLONG         qpcFrequency = 0;
+
+    // The VR menu's panel: the same shape as the HUD's above, with one difference that
+    // matters. Its image is published under a LOCK OF ITS OWN
+    // (glInteropPublishPanel) rather than riding in the frame transfer's batched lock,
+    // because that batch carries exactly one panel and widening it means editing the two
+    // most delicate functions in the project. The menu is open for seconds at a time, so
+    // one extra interop synchronisation on those frames is the cheap side of the trade.
+    ID3D11Texture2D* menuTextures[kFrameSlots] = {};
+    GlSharedTexture  menuShared[kFrameSlots] = {};
+    int              menuWidth = 0;
+    int              menuHeight = 0;
+    GLuint           menuTexture = 0;
+    GLuint           menuFramebuffer = 0;
+    GLint            menuPreviousFramebuffer = 0;
+    bool             menuBound = false;
+    bool             menuReportedFailure = false;
 
     // The panel on the monitor. The views this frame's eyes were rendered from, kept for the monitor draw
     // that follows the transfer; whether that draw took over pribluda's monitor HUD this
@@ -298,6 +315,25 @@ void releaseHudTextures(State& state) {
     state.hudPending = false;
 }
 
+void releaseMenuTextures(State& state) {
+    for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
+        glInteropUnregister(state.gl, state.interopDevice, state.menuShared[slot]);
+        if (state.menuTextures[slot]) state.menuTextures[slot]->Release();
+        state.menuTextures[slot] = nullptr;
+    }
+    if (state.menuFramebuffer && state.gl.deleteFramebuffers)
+        state.gl.deleteFramebuffers(1, &state.menuFramebuffer);
+    if (state.menuTexture && state.gl.deleteTextures)
+        state.gl.deleteTextures(1, &state.menuTexture);
+    state.menuFramebuffer = 0;
+    state.menuTexture = 0;
+    state.menuWidth = 0;
+    state.menuHeight = 0;
+    state.menuBound = false;
+    if (state.block) InterlockedExchange(
+        reinterpret_cast<volatile LONG*>(&state.block->menuVisible), 0);
+}
+
 // Hand back a slot that is being rendered into without publishing it. The frame in it is
 // lost, which is the right outcome everywhere this is called from: the textures are about
 // to be unregistered, and unregistering one that GL still holds is the same fault as
@@ -318,6 +354,7 @@ void releaseTextures(State& state) {
         state.textures[slot] = nullptr;
     }
     releaseHudTextures(state);
+    releaseMenuTextures(state);
 }
 
 bool createTextures(State& state, int width, int height) {
@@ -413,8 +450,9 @@ void acquireDirect(State& state) {
     int width = 0;
     int height = 0;
     if (!renderTargetSize(width, height)) {
-        directNotYet(state, "there is no off-screen render target to attach it to (vrOffscreen "
-                            "is off, or the target did not build)");
+        directNotYet(state,
+                     "there is no off-screen render target to attach it to -- it did not "
+                     "build, and the target: lines say why");
         return;
     }
     if (width != state.width || height != state.height) return;
@@ -529,6 +567,79 @@ bool createHudTextures(State& state, int width, int height) {
     return true;
 }
 
+// The VR menu's panel, built the same way pribluda's is: two shared D3D11 slots for the
+// presenter to read, one plain GL texture the menu draws into with no interop lock, and a
+// framebuffer over it. The only difference is where the image is published from.
+bool createMenuTextures(State& state, int width, int height) {
+    releaseMenuTextures(state);
+
+    for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = static_cast<UINT>(width);
+        desc.Height = static_cast<UINT>(height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+        if (FAILED(state.device->CreateTexture2D(&desc, nullptr,
+                                                 &state.menuTextures[slot]))) {
+            logf("vr: CreateTexture2D %dx%d failed for VR menu slot %u", width, height,
+                 slot);
+            state.menuTextures[slot] = nullptr;
+            releaseMenuTextures(state);
+            return false;
+        }
+        if (!glInteropRegister(state.gl, state.interopDevice, state.menuTextures[slot],
+                               state.menuShared[slot])) {
+            releaseMenuTextures(state);
+            return false;
+        }
+        storeSharedHandle(state.block->menuTextures[slot],
+                          state.menuShared[slot].shareHandle);
+    }
+
+    GlFunctions& gl = state.gl;
+    GLint        previousTexture = 0;
+    GLint        previousFramebuffer = 0;
+    gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    gl.getIntegerv(kGlFramebufferBinding, &previousFramebuffer);
+    gl.genTextures(1, &state.menuTexture);
+    gl.bindTexture(GL_TEXTURE_2D, state.menuTexture);
+    gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                  nullptr);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kGlClampToEdge);
+    gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kGlClampToEdge);
+    gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+    gl.genFramebuffers(1, &state.menuFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, state.menuFramebuffer);
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                            state.menuTexture, 0);
+    GLenum status = gl.checkFramebufferStatus(kGlFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previousFramebuffer));
+    if (status != kGlFramebufferComplete) {
+        logf("vr: the VR menu's %dx%d framebuffer is incomplete (0x%04X) -- no menu layer",
+             width, height, status);
+        releaseMenuTextures(state);
+        return false;
+    }
+
+    state.menuWidth = width;
+    state.menuHeight = height;
+    state.block->menuTextureWidth = static_cast<uint32_t>(width);
+    state.block->menuTextureHeight = static_cast<uint32_t>(height);
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&state.block->menuGeneration));
+    logf("vr: VR menu textures %dx%d shared, generation %d; the menu draws into GL "
+         "texture %u and publishes under a lock of its own",
+         width, height, state.block->menuGeneration, state.menuTexture);
+    return true;
+}
+
 // --- the one-shot field-of-view probe -------------------------------------------
 
 // 32-bit BGRA, bottom-up -- which is the order glReadPixels already returns, so the
@@ -601,6 +712,31 @@ void panelCorners(const HudPlacement& placement, float aspect, float corners[4][
         corners[i][0] = right + turned[0];
         corners[i][1] = up + turned[1];
         corners[i][2] = -ahead + turned[2];
+    }
+}
+
+// The VR menu's four corners, from the pose and extent the game published rather than
+// from a placement's three scalars. Same output, same space (the seat's), so
+// drawPanelInEye takes it unchanged -- which is the point: the monitor's copy of the menu
+// uses the projection that already works for the HUD panel rather than a second one.
+void panelPoseCorners(const SharedPose& pose, float widthMetres, float heightMetres,
+                      float corners[4][3]) {
+    const float halfW = widthMetres * 0.5f;
+    const float halfH = heightMetres * 0.5f;
+    // THE SAME ORDER panelCorners uses, because drawPanelInEye pairs a fixed texture
+    // coordinate with each index. A different winding here would draw the menu upside
+    // down on the monitor and nowhere else, which is the kind of fault that gets blamed
+    // on the headset.
+    static const float kSigns[4][2] = {
+        {-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
+    for (int i = 0; i < 4; ++i) {
+        const float local[3] = {kSigns[i][0] * halfW, kSigns[i][1] * halfH, 0.0f};
+        float       turned[3];
+        quatRotate(pose.orientationX, pose.orientationY, pose.orientationZ,
+                   pose.orientationW, local, turned);
+        corners[i][0] = pose.positionX + turned[0];
+        corners[i][1] = pose.positionY + turned[1];
+        corners[i][2] = pose.positionZ + turned[2];
     }
 }
 
@@ -723,34 +859,58 @@ void drawMonitorHud(State& state, int monitorEye) {
                     static_cast<LONGLONG>(state.qpcFrequency * kHudGraceSeconds);
     int  layer = g_options.vrHudLayer;
 
-    const char* reason = nullptr;
+    // WHY THIS FUNCTION EXISTS AT ALL, and why the VR menu now rides it too.
+    //
+    // A quad composition layer is composited by the RUNTIME, into the headset, and never
+    // reaches GPL's own window. The HUD panel appears on the monitor only because this
+    // draws it a second time, projecting its corners through each eye's rendered pose and
+    // fov -- we are the compositor in the window. The menu became a quad layer for the
+    // headset and would otherwise have vanished from the monitor the same day.
+    //
+    // The two have DIFFERENT gates and one shared setup. The HUD's gates are about
+    // pribluda: its own monitor overlay is suppressed on the frames this one draws, so
+    // this must not draw unless that redirect is in place. None of that is true of the
+    // menu, which replaces nothing and is drawn whenever it is up.
+    const char* common = nullptr;
     if (monitorEye == 0)
-        reason = "vrMonitorEye = 0 puts no picture in the window";
-    else if (!pribludaMonitorDrawRedirected())
-        reason = "pribluda's monitor draw is not redirected (see the pribluda: lines)";
-    else if (!live)
-        reason = "no HUD panel drawn in the last 0.25 s (not in a race, or vrHudLayer 0)";
+        common = "vrMonitorEye = 0 puts no picture in the window";
     else if (!renderTargetWindowPicture(picture))
-        reason = "the window shows no off-screen picture this frame";
+        common = "the window shows no off-screen picture this frame";
     else if (!state.monitorViewsValid)
-        reason = "this frame has no tracked stereo views to place the panel with";
-    else if (layer != 1 && layer != 2)
-        reason = "vrHudLayer is not 1 or 2";
-    else if (layer == 2 && !state.block->seatGeneration)
-        reason = "no seat has been published yet";
+        common = "this frame has no tracked stereo views to place the panel with";
     else if (!gl.pushAttrib || !gl.popAttrib || !gl.pushMatrix || !gl.popMatrix ||
              !gl.matrixMode || !gl.loadIdentity || !gl.ortho || !gl.viewport || !gl.enable ||
              !gl.disable || !gl.scissor || !gl.bindTexture || !gl.texEnvi || !gl.blendFunc ||
              !gl.color4f || !gl.begin || !gl.end || !gl.texCoord2f || !gl.vertex4f ||
              !gl.polygonMode || !gl.colorMask || !gl.getIntegerv || !gl.bindFramebuffer)
-        reason = "GL entry points for a textured quad are missing";
+        common = "GL entry points for a textured quad are missing";
+
+    const char* reason = common;
+    if (!reason) {
+        if (!pribludaMonitorDrawRedirected())
+            reason = "pribluda's monitor draw is not redirected (see the pribluda: lines)";
+        else if (!live)
+            reason = "no HUD panel drawn in the last 0.25 s (not in a race, or vrHudLayer 0)";
+        else if (layer != 1 && layer != 2)
+            reason = "vrHudLayer is not 1 or 2";
+        else if (layer == 2 && !state.block->seatGeneration)
+            reason = "no seat has been published yet";
+    }
+    // The line keeps saying what it always said: why the HUD PANEL is not over the
+    // monitor. The menu's own absence is the VR menu's counters, not this one's.
     noteMonitorHud(state, reason, monitorEye);
-    if (reason) return;
+
+    const bool drawHudPanel = reason == nullptr;
+    const bool drawMenuPanel = common == nullptr && state.menuTexture &&
+                               state.block->menuVisible && state.block->menuWidthMetres > 0.0f;
+    if (!drawHudPanel && !drawMenuPanel) return;
 
     float corners[4][3];
-    panelCorners(layer == 1 ? g_options.vrHudHead : g_options.vrHudSeat,
-                 static_cast<float>(state.hudHeight) / static_cast<float>(state.hudWidth),
-                 corners);
+    if (drawHudPanel)
+        panelCorners(layer == 1 ? g_options.vrHudHead : g_options.vrHudSeat,
+                     static_cast<float>(state.hudHeight) /
+                         static_cast<float>(state.hudWidth),
+                     corners);
 
     GLint previousDraw = 0;
     GLint savedMode = GL_PROJECTION;
@@ -786,16 +946,40 @@ void drawMonitorHud(State& state, int monitorEye) {
     gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     gl.enable(GL_SCISSOR_TEST);
     gl.enable(GL_TEXTURE_2D);
-    gl.bindTexture(GL_TEXTURE_2D, state.hudTexture);
     gl.texEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     gl.color4f(1.0f, 1.0f, 1.0f, 1.0f);
     // The panel is premultiplied: text opaque, pribluda's backdrops black at their coverage.
     gl.enable(GL_BLEND);
     gl.blendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
-    bool seat = layer == 2;
-    if (monitorEye == 1 || monitorEye == 2) drawPanelInEye(state, picture, 0, seat, corners);
-    if (monitorEye == 1 || monitorEye == 3) drawPanelInEye(state, picture, 1, seat, corners);
+    if (drawHudPanel) {
+        gl.bindTexture(GL_TEXTURE_2D, state.hudTexture);
+        bool seat = layer == 2;
+        if (monitorEye == 1 || monitorEye == 2)
+            drawPanelInEye(state, picture, 0, seat, corners);
+        if (monitorEye == 1 || monitorEye == 3)
+            drawPanelInEye(state, picture, 1, seat, corners);
+    }
+
+    // The menu, SECOND and therefore on top -- the same order the composition layers are
+    // submitted in, so the monitor and the headset agree about what covers what. It goes
+    // through the same drawPanelInEye: its quad is corners plus a texture like the HUD's,
+    // and the only difference is that its corners come from a published pose rather than
+    // from three placement scalars.
+    if (drawMenuPanel) {
+        float menuCorners[4][3];
+        panelPoseCorners(state.block->menuPose, state.block->menuWidthMetres,
+                         state.block->menuHeightMetres, menuCorners);
+        gl.bindTexture(GL_TEXTURE_2D, state.menuTexture);
+        // The space the game stated the pose in, not an assumption: HUD tweak over a
+        // head-locked panel publishes in the view's space, and drawing that as if it were
+        // seat-relative would put the menu somewhere the headset does not have it.
+        const bool menuSeat = state.block->menuSpace == kMenuSpaceSeat;
+        if (monitorEye == 1 || monitorEye == 2)
+            drawPanelInEye(state, picture, 0, menuSeat, menuCorners);
+        if (monitorEye == 1 || monitorEye == 3)
+            drawPanelInEye(state, picture, 1, menuSeat, menuCorners);
+    }
 
     gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(savedTexture));
     gl.matrixMode(GL_MODELVIEW);
@@ -808,8 +992,11 @@ void drawMonitorHud(State& state, int monitorEye) {
         gl.bindFramebuffer(kGlDrawFramebuffer, static_cast<GLuint>(previousDraw));
 
     // A quad entirely off the picture still counts: pribluda's monitor HUD must not pop in
-    // whenever the panel is out of view.
-    state.monitorHudTaken = true;
+    // whenever the panel is out of view. Only the HUD sets this -- it is "gplvr drew
+    // pribluda's overlay, so pribluda must not draw it again", and the menu is not
+    // pribluda's overlay. A frame where only the menu was drawn leaves pribluda's own
+    // monitor call alone, which is exactly right.
+    if (drawHudPanel) state.monitorHudTaken = true;
 
     if (gl.getError) {
         GLenum error = gl.getError();
@@ -916,8 +1103,10 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
             logf("vr: the GL context has gone away; releasing until one comes back");
             releaseTextures(state);
             // The cursor texture belongs to that context too, and it is not in
-            // releaseTextures because it is not one of the shared frame textures.
+            // releaseTextures because it is not one of the shared frame textures. The
+            // menu's font lists are display lists, which belong to it just as much.
             cursorOverlayReleaseGl();
+            vrMenuReleaseGl(state.gl, false);
             state.glContext = nullptr;
             state.width = 0;
             state.height = 0;
@@ -932,6 +1121,9 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         state.glContext = currentContext;
         releaseTextures(state);
         cursorOverlayReleaseGl();
+        // The old context is gone, so the lists are forgotten rather than deleted; the
+        // next draw builds them again in the new one.
+        vrMenuReleaseGl(state.gl, false);
         glInteropCloseDevice(state.gl, state.interopDevice);
         state.interopDevice = glInteropOpenDevice(state.gl, state.device);
         if (!state.interopDevice) {
@@ -946,7 +1138,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     // presenter publishes the size it actually created its swapchains at -- scaled by
     // vrRenderScale and clamped to the runtime's maximum -- so there is one number and
     // not two that have to agree.
-    if (g_options.vrOffscreen && block->targetEyeWidth && block->targetEyeHeight) {
+    if (g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
         renderTargetRequestSize(static_cast<int>(block->targetEyeWidth) * 2,
                                 static_cast<int>(block->targetEyeHeight));
     } else {
@@ -1212,6 +1404,98 @@ void presenterBlitToWindow(int eye) {
     drawMonitorHud(state, eye);
 }
 
+bool presenterLatestInput(SharedInput& input, int32_t& sequence) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return false;
+
+    ControlBlock* block = state.block;
+
+    // Three tries, as presenterLatestViews takes for the same race: the presenter writes
+    // at the display rate, we read at the game's, and a copy caught mid-write would hand
+    // the edge detector a button that is down in one field and up in another.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int32_t published = block->inputSequence;
+        if (!published) return false;
+
+        input = block->input;
+
+        if (block->inputSequence == published) {
+            sequence = published;
+            return true;
+        }
+    }
+    return false;
+}
+
+void presenterUpdateVrMenu() {
+    State& state = g_state;
+    // Off or Failed means there is no headset and no layer to publish into. Unlike the
+    // cursor this is not about the monitor: the monitor's copy is drawn from the same
+    // texture later, by drawMonitorHud, and it has nothing to show until this has run.
+    if (state.stage != Stage::Publishing || !state.gl.module) return;
+    vrMenuUpdate(state.gl);
+}
+
+void presenterDrawVrRay(bool takeWindowPicture) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.gl.module) return;
+    if (!vrMenuRayWanted()) return;
+
+    // THE RAY GOES IN AFTER THE WINDOW'S PICTURE HAS BEEN TAKEN. That ordering is the
+    // whole reason this is a function of its own rather than a line beside the cursor.
+    //
+    // The monitor shows the off-screen frame, so anything drawn into it before the blit
+    // is on the monitor too -- which is right for the cursor and wrong for the ray: the
+    // ray is a pointing aid for the person in the headset and means nothing to somebody
+    // watching the flat window. Taking the blit first costs nothing (the frame is
+    // finished either way) and windowBlitDone already exists to stop it happening twice.
+    //
+    // Nothing moves unless the menu is open, so a session that never opens it sees
+    // exactly the ordering it always had.
+    //
+    // An EXTRA render does not take it: that path publishes a frame of its own and never
+    // blits to the window, and the main frame that follows redraws the whole target
+    // before taking its own picture -- so the extra frame's ray cannot reach the monitor
+    // through it, and forcing a blit here would put an intermediate frame on the screen.
+    if (takeWindowPicture && !state.windowBlitDone && renderTargetActive()) {
+        frameBudgetSwitch(kSpanWindowBlit);
+        renderTargetBlitToWindow(state.gl, g_options.vrMonitorEye);
+        state.windowBlitDone = true;
+    }
+
+    // Into the off-screen target, which is the frame the headset gets. Without it the
+    // frame IS the window's back buffer and there is nowhere to put the ray that the
+    // monitor would not also show.
+    const GLuint framebuffer = renderTargetFramebuffer();
+    if (!renderTargetActive() || !framebuffer) {
+        vrMenuNoteRayNeedsOffscreen();
+        return;
+    }
+
+    GLint previous = 0;
+    state.gl.getIntegerv(kGlFramebufferBinding, &previous);
+    state.gl.bindFramebuffer(kGlFramebuffer, framebuffer);
+    vrMenuDrawRay(state.gl);
+    state.gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+}
+
+bool presenterLatestInputNames(SharedInputNames& names, int32_t& generation) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block) return false;
+
+    ControlBlock* block = state.block;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int32_t published = block->inputNamesGeneration;
+        if (!published) return false;
+        names = block->inputNames;
+        if (block->inputNamesGeneration == published) {
+            generation = published;
+            return true;
+        }
+    }
+    return false;
+}
+
 void presenterDrawCursor(bool sideBySide) {
     State& state = g_state;
     // Off or Failed means there is no headset to be blind in, and the flat window
@@ -1237,7 +1521,11 @@ void presenterRestoreUnderCursor() {
 void presenterBeginFrame() {
     State& state = g_state;
     if (state.stage == Stage::Off) return;
-    if (!g_options.vr || !g_options.vrOffscreen) {
+    // Rendering off-screen is what VR IS here -- the eyes need a target of the runtime's own
+    // size, the ray needs somewhere the monitor cannot see, and the window is a view of that
+    // frame rather than the frame itself. It was an option until 2026-09-27 and turning it off
+    // broke each of those in a different way.
+    if (!g_options.vr) {
         // Not merely "do not bind": the engine's back buffer size has to go back to what
         // roglv2 believes, or the next frame is laid out for a surface that is no longer
         // the render target. A slot still held goes back first -- the framebuffer it is
@@ -1429,6 +1717,93 @@ void presenterHudEnd() {
     QueryPerformanceCounter(&now);
     state.hudDrawnQpc = now.QuadPart;
     state.hudPending = true;
+}
+
+bool presenterMenuBegin(int width, int height, int& actualWidth, int& actualHeight) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block || !state.device ||
+        !state.interopDevice || !state.glContext || state.menuBound)
+        return false;
+    if (width <= 0 || height <= 0) return false;
+
+    GlFunctions& gl = state.gl;
+    if (!gl.bindFramebuffer) glResolveFramebuffer(gl);
+    if (!gl.bindFramebuffer || !gl.framebufferTexture2D || !gl.checkFramebufferStatus ||
+        !gl.genFramebuffers || !gl.deleteFramebuffers || !gl.blitFramebuffer || !gl.clear ||
+        !gl.clearColor || !gl.viewport || !gl.getIntegerv || !gl.texImage2D ||
+        !gl.texParameteri || !gl.dxLockObjects || !gl.dxUnlockObjects) {
+        if (!state.menuReportedFailure) {
+            state.menuReportedFailure = true;
+            logf("vr: the VR menu's layer needs framebuffer objects, framebuffer blits and "
+                 "interop locking, and GL did not provide them -- no menu layer");
+        }
+        return false;
+    }
+
+    if ((state.menuWidth != width || state.menuHeight != height || !state.menuFramebuffer) &&
+        !createMenuTextures(state, width, height))
+        return false;
+
+    gl.getIntegerv(kGlFramebufferBinding, &state.menuPreviousFramebuffer);
+    gl.bindFramebuffer(kGlFramebuffer, state.menuFramebuffer);
+    gl.viewport(0, 0, state.menuWidth, state.menuHeight);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+
+    state.menuBound = true;
+    actualWidth = state.menuWidth;
+    actualHeight = state.menuHeight;
+    return true;
+}
+
+void presenterMenuEnd() {
+    State& state = g_state;
+    if (!state.menuBound) return;
+    state.menuBound = false;
+    state.gl.bindFramebuffer(kGlFramebuffer,
+                             static_cast<GLuint>(state.menuPreviousFramebuffer));
+}
+
+bool presenterMenuPublish(const SharedPose& pose, int32_t space, float widthMetres,
+                          float heightMetres) {
+    State& state = g_state;
+    if (state.stage != Stage::Publishing || !state.block || !state.menuFramebuffer)
+        return false;
+    if (state.menuBound) return false;  // the draw target is still bound; nothing to copy
+
+    ControlBlock* block = state.block;
+    // The slot after the one last published, exactly as the HUD picks its own: advancing
+    // the sequence below names the slot the presenter will then read.
+    const uint32_t slot = static_cast<uint32_t>(block->menuSequence + 1) % kFrameSlots;
+    if (!state.menuShared[slot].interopObject) return false;
+
+    GlPanelCopy copy;
+    copy.shared = &state.menuShared[slot];
+    copy.sourceFramebuffer = state.menuFramebuffer;
+    copy.width = state.menuWidth;
+    copy.height = state.menuHeight;
+    if (!glInteropPublishPanel(state.gl, state.interopDevice, copy)) return false;
+
+    // The placement goes out BEFORE the sequence that advertises the image, so the
+    // presenter can never place this frame's picture at the last frame's pose.
+    block->menuPose = pose;
+    block->menuSpace = space;
+    block->menuWidthMetres = widthMetres;
+    block->menuHeightMetres = heightMetres;
+    MemoryBarrier();
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->menuSequence),
+                        block->menuSequence + 1);
+    // Visible last of all: a layer switched on before its first image would show one
+    // display frame of whatever the texture happened to contain.
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->menuVisible), 1);
+    return true;
+}
+
+void presenterMenuHide() {
+    State& state = g_state;
+    if (!state.block) return;
+    if (!state.block->menuVisible) return;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->menuVisible), 0);
 }
 
 bool presenterMonitorHudTaken() { return g_state.monitorHudTaken; }

@@ -8,6 +8,7 @@
 #include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "MirrorCache.h"
 #include "MirrorConfig.h"
 #include "MirrorTarget.h"
 #include "MouseLook.h"
@@ -21,7 +22,10 @@
 #include "Stereo.h"
 #include "SwapControl.h"
 #include "TaskRate.h"
+#include "TweakApi.h"
 #include "VrCamera.h"
+#include "VrInput.h"
+#include "VrMenu.h"
 #include "Window.h"
 #include "presenter/Producer.h"
 
@@ -101,12 +105,10 @@ unsigned  g_sceneHookCalls = 0;  // times our thunk ran (frames that render the 
 unsigned  g_sceneOrigCalls = 0;  // times we called the engine's sceneRender
 long long g_sceneTicks = 0;      // total time inside the original, all invocations
 long long g_sceneTicksWorst = 0;
-bool      g_stereoKeyLast = false;
 bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
 bool      g_vrMirrorModeKeyLast = false;
-bool      g_interpolateKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
 bool      g_dumpEyesLate = false;
@@ -208,6 +210,24 @@ constexpr uintptr_t     kWorldWalk = 0x00485960;
 bool g_mainWalkPending = false;
 bool g_mainWalkRedirected = false;
 
+// gpl_mirrorDistanceScale. gpl_sceneRender scales the two draw-distance globals by this around
+// the mirror walk and restores them after (0x487A12 and 0x487A62), so it sets how far back the
+// mirror sees. At the stock 0.25 the mirror reaches about 78 m ahead and 29 m behind, where the
+// eye reaches 312 and 117.
+//
+// A modded track builds its horizon as ordinary finite scenery instead of the background
+// primitive vanilla uses, and that mesh lies outside the mirror's quartered reach -- which is
+// the white sky above about 13 degrees of glass pitch. 1.0 gives the mirror the eye's own reach
+// and was confirmed to fix it on spa67.
+//
+// Back at GPL's own 0.25 for now, because the cost has never been measured: the mirror passes
+// were only 0.25 ms each BECAUSE the window was quartered, and the session that proved the fix
+// ran with profileStages off. This is where an ini key belongs -- read it into
+// kMirrorDistanceScaleWanted and the rest of this works unchanged.
+constexpr uintptr_t kMirrorDistanceScale = 0x0076E768;
+constexpr float     kMirrorDistanceScaleWanted = 0.25f;
+bool                g_mirrorDistanceScaleSaid = false;
+
 // A mirror-only render (Stereo.cpp) fills one mirror pane and must leave the eye untouched,
 // so the main walk is skipped. Everything else in the call runs: the per-pass resets after
 // it (gpl_renderClearDrawnMarks, gpl_renderClearObjectRegistrations) keep the object lists
@@ -256,8 +276,17 @@ void reportOncePerSecond() {
     // Only when there is a mirror at all -- in the menus and the non-cockpit camera
     // modes gpl_camModeHasMirror says no, and a permanent "mirror 0.0/s" would be noise
     // rather than information.
-    char mirror[40] = {};
-    if (g_mirrorRefreshes)
+    //
+    // `+N restored` is the frames that got their reflection from the per-eye copy instead of
+    // rendering it. It is the pair of counters that says whether mirrorUpdateRate is doing
+    // anything: a restore count of zero with the option above 1 means the copies never built,
+    // and the `mirror:` line above will say why.
+    char     mirror[72] = {};
+    unsigned restored = mirrorCacheTakeRestores();
+    if (g_mirrorRefreshes && restored)
+        _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s +%.1f restored | ",
+                    g_mirrorRefreshes / seconds, restored / seconds);
+    else if (g_mirrorRefreshes)
         _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s | ",
                     g_mirrorRefreshes / seconds);
 
@@ -285,7 +314,7 @@ void reportOncePerSecond() {
          haveTransfer && transfers ? transferMs / transfers : 0.0,
          haveTransfer && g_frames ? static_cast<double>(transfers) / g_frames : 0.0,
          mirror, haveTick ? tick : "", haveTick ? " | " : "",
-         g_options.stereo ? "stereo" : "single");
+         g_options.vr ? "stereo" : "single");
 
     // The frame budget, broken up. Per FRAME, not per render, so the four parts and the
     // remainder add up to the period on the same line and can be read across.
@@ -412,8 +441,17 @@ void reportOncePerSecond() {
 
     // Which part of the track each eye pass selected to walk. A jump here is the world being
     // drawn from somewhere else while the view transform stays put.
-    char walk[768] = {};
+    char walk[1024] = {};
     if (stereoWalkFormat(walk, sizeof(walk))) logf("%s", walk);
+
+    // The controllers and the menu. Both print only when something happened, so a session
+    // with no headset adds nothing to the log -- and both print their REFUSALS, because a
+    // controller that is not reaching the game and a controller nobody is touching look
+    // exactly alike from the inside.
+    char input[320] = {};
+    if (vrInputFormatStatus(input, sizeof(input))) logf("%s", input);
+    char menu[320] = {};
+    if (vrMenuFormatStatus(menu, sizeof(menu))) logf("%s", menu);
 
     // After every line that reads them, and on every path -- a window that printed nothing
     // must still be drained, or its counts land in the next one.
@@ -439,7 +477,7 @@ void reportOncePerSecond() {
 
 // Mirror tweak mode: aiming the glasses from the headset. It changes g_mirrorAim, which aimPane
 // reads every frame, so each step shows at once. Leaving saves the aim to the viewed car's
-// section of gplvr_cars.ini (MirrorConfig); gplvr.ini is never written. It shares the arrows
+// section of gplvr_mirrors.ini (MirrorConfig); gplvr.ini is never written. It shares the arrows
 // and Page Up/Down with HUD tweak mode, so entering either leaves the other.
 constexpr unsigned kMirrorTweakKeys[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
 constexpr double   kMirrorTweakMaxStepSeconds = 0.1;  // the most one poll turns after a stall
@@ -458,10 +496,6 @@ MirrorTweak g_mirrorTweak;
 
 bool mirrorTweakKeyHeld(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
 
-float mirrorTweakClamp(float value, float low, float high) {
-    return value < low ? low : (value > high ? high : value);
-}
-
 void mirrorTweakLogProgress(LONGLONG now) {
     g_mirrorTweak.unlogged = false;
     g_mirrorTweak.loggedAt = now;
@@ -470,6 +504,12 @@ void mirrorTweakLogProgress(LONGLONG now) {
 }
 
 void mirrorTweakEnter() {
+    // The headset's own mirror mode edits the same three numbers through the same API.
+    // Two owners of one aim is how a value ends up somewhere neither of them put it.
+    if (vrMenuActive()) {
+        logf("mirror: tweak mode not entered -- the VR menu has the mirror; close it first");
+        return;
+    }
     pribludaTweakExit(" -- mirror tweak mode entered");
     g_mirrorTweak.active = true;
     g_mirrorTweak.unlogged = false;
@@ -525,26 +565,32 @@ void mirrorTweakPoll() {
         return;
     }
 
-    float yaw = g_mirrorAim.yaw;
-    float pitch = g_mirrorAim.pitch;
-    float fovScale = g_mirrorAim.fovScale;
-    float angleStep = static_cast<float>(g_options.vrMirrorTweakAngleSpeed * seconds);
+    // Through the SAME semantic commands the controller produces. An arrow key held down
+    // is a rate axis at full deflection, which is exactly what the keys always were --
+    // the clamps, the step sizes and the multiplicative field are TweakApi's now, so
+    // there is one copy of them and the two input paths cannot drift apart.
+    TweakCommand command;
+    command.target = TweakTarget::Mirror;
+    command.mode = TweakMode::Rate;
+    command.seconds = static_cast<float>(seconds);
+
+    bool changed = false;
     if (turn) {
-        g_mirrorAim.yaw = mirrorTweakClamp(yaw + turn * angleStep, -45.0f, 45.0f);
+        command.axis = TweakAxis::Yaw;
+        command.value = static_cast<float>(turn);
+        changed = tweakApply(command) || changed;
     }
     if (tilt) {
-        g_mirrorAim.pitch = mirrorTweakClamp(pitch + tilt * angleStep, -45.0f, 45.0f);
+        command.axis = TweakAxis::Pitch;
+        command.value = static_cast<float>(tilt);
+        changed = tweakApply(command) || changed;
     }
     if (widen) {
-        float factor = static_cast<float>(
-            std::pow(2.0, widen * g_options.vrMirrorTweakFovSpeed * seconds));
-        g_mirrorAim.fovScale = mirrorTweakClamp(fovScale * factor, 0.25f, 6.0f);
+        command.axis = TweakAxis::Fov;
+        command.value = static_cast<float>(widen);
+        changed = tweakApply(command) || changed;
     }
-    if (g_mirrorAim.yaw != yaw || g_mirrorAim.pitch != pitch ||
-        g_mirrorAim.fovScale != fovScale) {
-        g_mirrorTweak.unlogged = true;
-        mirrorConfigMarkEdited();
-    }
+    if (changed) g_mirrorTweak.unlogged = true;
 
     if (g_mirrorTweak.unlogged &&
         now - g_mirrorTweak.loggedAt >=
@@ -567,6 +613,8 @@ bool mirrorTweakSwallowsKey(unsigned virtualKey) {
 
 }  // namespace
 
+bool mirrorTweakActive() { return g_mirrorTweak.active; }
+
 void mirrorTweakExit(const char* why) {
     if (!g_mirrorTweak.active) return;
     g_mirrorTweak.active = false;
@@ -579,21 +627,6 @@ void mirrorTweakExit(const char* why) {
 namespace {
 
 void pollToggle() {
-    if (g_options.stereoKey) {
-        const bool down = (GetAsyncKeyState(g_options.stereoKey) & 0x8000) != 0;
-        if (down && !g_stereoKeyLast) {
-            g_options.stereo = !g_options.stereo;
-            logf("stereo toggled %s%s", g_options.stereo ? "ON" : "off",
-                 (g_options.stereo && !stereoAvailable()) ? " (but unavailable -- see the "
-                                                            "discovery lines above)"
-                                                          : "");
-            // Hand the eye surfaces back while stereo is off rather than holding two
-            // rasterizer allocations the game is not using.
-            if (!g_options.stereo) stereoRelease();
-        }
-        g_stereoKeyLast = down;
-    }
-
     // Armed here, taken at publish time -- the key is polled on the game thread and the
     // read has to happen where the frame is complete and still bound.
     if (g_options.dumpEyesKey) {
@@ -634,38 +667,34 @@ void pollToggle() {
         g_vrHudLayerKeyLast = down;
     }
 
+    // The controllers, before anything that reacts to them. One read of the shared block
+    // a frame, and everything below sees the same sample -- a second reader would get a
+    // newer one halfway through the poll and the two would disagree about which buttons
+    // were pressed this frame.
+    vrInputPoll();
+
     pribludaPollTweak();
     mirrorTweakPoll();
 
-    // Per-eye mirrors on and off. The pass loop reads stereoMirror every frame and the main
-    // world walk redirect is installed whenever it started non-zero, so 1 and 2 swap freely.
-    if (g_options.vr && g_options.vrMirrorModeKey && g_options.stereoMirror != 0) {
+    // After the keyboard modes, so a mode entered by key this frame already holds its
+    // target and the menu's own entry refuses rather than taking it away.
+    vrMenuPoll();
+
+    // Per-eye mirrors on and off. The pass loop reads perEyeMirror every frame and the main
+    // world walk redirect is installed whichever way it started, so the two swap freely.
+    if (g_options.vr && g_options.vrMirrorModeKey) {
         bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
         if (down && !g_vrMirrorModeKeyLast) {
-            g_options.stereoMirror = g_options.stereoMirror == 2 ? 1 : 2;
-            logf("mirror: stereoMirror now %d -- %s", g_options.stereoMirror,
-                 g_options.stereoMirror == 2 ? "each eye renders both glasses (4 mirror renders)"
-                                             : "both glasses once from the head centre (2 "
-                                               "mirror renders)");
+            g_options.perEyeMirror = !g_options.perEyeMirror;
+            logf("mirror: per-eye mirrors %s -- %s",
+                 g_options.perEyeMirror ? "ON" : "off",
+                 g_options.perEyeMirror
+                     ? "each eye renders both glasses from its own viewpoint (4 mirror "
+                       "renders a frame)"
+                     : "both glasses once from the head centre, shared by the eyes (2 mirror "
+                       "renders a frame)");
         }
         g_vrMirrorModeKeyLast = down;
-    }
-
-    // World interpolation on and off, for an A/B in one race. The records keep being copied
-    // while it is off, so the blend resumes on the next frame. Each mode toggles its own key,
-    // because the two are separate settings and flat mode's is what decides whether the frames
-    // between the ticks move the world or repeat it.
-    if (g_options.interpolateKey) {
-        bool down = (GetAsyncKeyState(g_options.interpolateKey) & 0x8000) != 0;
-        if (down && !g_interpolateKeyLast) {
-            g_options.interpolate = !g_options.interpolate;
-            logf("interp: interpolate now %d -- %s", g_options.interpolate ? 1 : 0,
-                 g_options.interpolate
-                     ? "the world is drawn blended between the two newest ticks"
-                     : "the world is drawn at the newest latched tick, so the frames between "
-                       "them are duplicates");
-        }
-        g_interpolateKeyLast = down;
     }
 
 
@@ -736,7 +765,7 @@ void __cdecl callOriginalSceneRender(void* params);  // defined below
 // measured frame interval before drawing, so the poses it picks up from the presenter
 // are genuinely newer.
 void renderExtraFrames() {
-    if (!g_options.vr || g_options.frameRate <= 0 || !g_options.stereo) return;
+    if (!g_options.vr || g_options.frameRate <= 0) return;
     // THE FALLBACK ONLY. When the frame loop's wait is ours every frame is a whole frame of
     // GPL's own, drawn through its loop with the mirror pass and the HUD, and there is nothing
     // for a partial repeat after the present to add. This path exists for the case where those
@@ -854,9 +883,9 @@ void renderExtraFrames() {
         // session.
         logf("vr: frameRate = 2 -- up to %d extra frames per game frame, each waiting for "
              "the presenter to publish a new pose rather than for a slice of the %.1f ms "
-             "tick. With interpolate = 1 the world is re-blended to each one's own display "
-             "time, so both the head and the world move at the headset's rate; with it off "
-             "only the head does. Watch that 'fps' below does not fall.",
+             "tick. The world is re-blended to each one's own display time, so the head and "
+             "the world both move at the headset's rate. Watch that 'fps' below does not "
+             "fall.",
              extra, 1000.0 * static_cast<double>(interval) /
                         static_cast<double>(frequency.QuadPart));
     }
@@ -991,8 +1020,13 @@ void renderExtraFrames() {
             // An extra render redraws the world over the frame the cursor was already
             // put into, so it has to go back in before this one is published. Without
             // this the pointer would appear only on the game's own frames and blink at
-            // whatever rate the extra renders happen to be running at.
+            // whatever rate the extra renders happen to be running at. The VR menu needs
+            // no such repeat: it is a composition layer, not part of this picture, and
+            // the runtime draws it on every display frame regardless.
             presenterDrawCursor(true);
+            // The extra render painted the world over the ray as well, and an extra
+            // frame is published straight from here with no window blit of its own.
+            presenterDrawVrRay(false);
             presenterFrame(true, vrFrustumInjected());
             // Same pairing as the main frame, and for the same reason: a save must be
             // put back in the block that made it, immediately after the transfer that
@@ -1066,10 +1100,22 @@ int __cdecl screenDisplayHook(void* surface) {
     // -- belongs to pribluda, which draws raw OpenGL inside roglv2's present for the
     // monitor. A second copy goes into the panel texture the headset shows as a quad
     // layer; it needs the game's GL context, which is current here.
+    //
+    // The menu's "Hide pribluda HUD" row skips the whole pass rather than drawing something
+    // invisible: the monitor's overlay goes with it, and so does the headset's quad, because
+    // the presenter drops that layer when the game stops drawing the panel.
     frameBudgetSwitch(kSpanPanel);
-    pribludaDrawHud();
+    if (!vrMenuPribludaHidden()) pribludaDrawHud();
 
+    // The VR menu's layer is built here, with the GL context current and before the frame
+    // transfer: it publishes under a lock of its own, and its texture is what the
+    // monitor's copy of the panel is drawn from later in this same present.
+    //
+    // It is NOT drawn into the frame, so it needs no repeat after an extra render the way
+    // the cursor and the HUD do -- the runtime composites the layer on every display
+    // frame whatever the game's own frames are doing.
     frameBudgetSwitch(kSpanCursor);
+    presenterUpdateVrMenu();
     presenterDrawCursor(g_stereoRenderedFrame);
 
     // The off-screen frame has to stop being the draw target before the presenter
@@ -1077,6 +1123,12 @@ int __cdecl screenDisplayHook(void* surface) {
     // framebuffer, and SwapBuffers only ever shows the window's own.
     frameBudgetSwitch(kSpanUnbind);
     presenterEndFrame();
+
+    // The aiming ray goes in HERE, between the window's picture and the transfer: it
+    // belongs in the headset's image and not in the monitor's. presenterEndFrame has
+    // taken the picture on the direct path; presenterDrawVrRay takes it on the other one
+    // before it draws, and does nothing at all while the menu is closed.
+    presenterDrawVrRay(true);
 
     frameBudgetSwitch(kSpanPublish);
     if (g_options.vr) {
@@ -1369,7 +1421,7 @@ void __cdecl sceneRenderHook(void* params) {
     // targets the texture directly, nothing is copied, the bit is never set -- and a
     // counter that tested it would read zero while the mirror worked perfectly.
     if (scene->mirrorCamera) {
-        // What is actually rendered, not what GPL asked for: with stereoMirrorEvery above 1 the
+        // What is actually rendered, not what GPL asked for: with mirrorUpdateRate above 1 the
         // request comes every frame and `stereoRender` drops most of them, and a counter that
         // read the request would have reported the mirror at the full frame rate while it was
         // being drawn half as often.
@@ -1398,12 +1450,12 @@ void __cdecl sceneRenderHook(void* params) {
     }
 
     // The engine creates the mirror camera lazily, and leaves p[43] null when mirrors are
-    // off. Say so the first time one appears, because otherwise stereoMirror looks broken
+    // off. Say so the first time one appears, because otherwise perEyeMirror looks broken
     // when in fact there is simply no mirror pass to place.
     if (scene->mirrorCamera && !g_loggedMirror) {
         g_loggedMirror = true;
-        logf("mirror camera appeared: %p -- stereoMirror=%d now has something to place",
-             scene->mirrorCamera, g_options.stereoMirror);
+        logf("mirror camera appeared: %p -- the mirror pass now has something to place",
+             scene->mirrorCamera);
     }
 
     // If stereo is on and its targets are up it owns the whole frame: two renders, one
@@ -1444,10 +1496,9 @@ void __cdecl sceneRenderHook(void* params) {
     // sceneRender stamps p[40] onto whatever camera sits in p[2] on the line before
     // cameraBind, which is why writing it here reaches the projection at all.
     float savedFov = scene->mainFov;
-    bool  fovCorrected = !g_options.vr && !g_options.stereo &&
-                        windowCorrectMainFov(savedFov, scene->mainFov);
+    bool  fovCorrected = !g_options.vr && windowCorrectMainFov(savedFov, scene->mainFov);
 
-    if (g_options.stereo && stereoRender(scene, &callOriginalSceneRender))
+    if (g_options.vr && stereoRender(scene, &callOriginalSceneRender))
         g_stereoRenderedFrame = true;
     else
         callOriginalSceneRender(params);
@@ -1604,6 +1655,27 @@ void applyPendingSceneRenderHook() {
                  "during a mirror-only render",
                  static_cast<unsigned>(kMainWalkSite),
                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(&mainWorldWalkThunk)));
+        }
+    }
+
+    // Written on every rebind, not once: GPL takes this from the graphics options and a mode
+    // change puts the stock value back.
+    auto* mirrorScale = reinterpret_cast<float*>(kMirrorDistanceScale);
+    if (*mirrorScale != kMirrorDistanceScaleWanted) {
+        float stock = *mirrorScale;
+        bool  wrote = patchBytes(mirrorScale, &kMirrorDistanceScaleWanted, sizeof(float));
+        if (!g_mirrorDistanceScaleSaid) {
+            g_mirrorDistanceScaleSaid = true;
+            if (wrote)
+                logf("mirror: gpl_mirrorDistanceScale at %08X set %.2f -> %.2f, which is the "
+                     "fraction of the eye's draw distance the mirror walks. At 1.00 a modded "
+                     "track's horizon is in reach and the sky is right; below that it is not.",
+                     static_cast<unsigned>(kMirrorDistanceScale), stock,
+                     kMirrorDistanceScaleWanted);
+            else
+                logf("mirror: could not write gpl_mirrorDistanceScale at %08X -- it stays at "
+                     "%.2f and the mirror keeps its shorter reach",
+                     static_cast<unsigned>(kMirrorDistanceScale), stock);
         }
     }
 }
@@ -2048,36 +2120,19 @@ void loadOptions(const char* fileName) {
     // the end -- the debug rotation ones sit with the keys they belong to.
     char text[64] = {};
 
-    g_options.stereo = GetPrivateProfileIntA("gplvr", "stereo", 0, path) != 0;
-    g_options.stereoMirror = GetPrivateProfileIntA("gplvr", "stereoMirror", 2, path);
-    if (g_options.stereoMirror < 0 || g_options.stereoMirror > 2) g_options.stereoMirror = 2;
-    g_options.stereoMirrorEvery = GetPrivateProfileIntA("gplvr", "stereoMirrorEvery", 1, path);
-    if (g_options.stereoMirrorEvery < 1) g_options.stereoMirrorEvery = 1;
-    if (g_options.stereoMirrorEvery > 16) g_options.stereoMirrorEvery = 16;
-    if (g_options.stereoMirrorEvery > 1 && g_options.stereoMirror == 2) {
-        logf("options: stereoMirrorEvery = %d is IGNORED while stereoMirror = 2. At 2 each eye "
-             "renders the panes from its own eye into the same mirror texture, so a frame that "
-             "skips the render leaves both eyes sampling the last one written -- the right "
-             "eye's -- and the left eye flickers between its own reflection and the right's. "
-             "Use stereoMirror = 1, which renders one shared image from the head centre and is "
-             "half the cost before this option does anything.",
-             g_options.stereoMirrorEvery);
+    g_options.perEyeMirror = GetPrivateProfileIntA("gplvr", "perEyeMirror", 1, path) != 0;
+    g_options.mirrorUpdateRate = GetPrivateProfileIntA("gplvr", "mirrorUpdateRate", 1, path);
+    if (g_options.mirrorUpdateRate < 0) g_options.mirrorUpdateRate = 0;
+    if (g_options.mirrorUpdateRate > 16) g_options.mirrorUpdateRate = 16;
+    if (g_options.mirrorUpdateRate > 1 && g_options.perEyeMirror) {
+        logf("options: mirrorUpdateRate = %d with perEyeMirror on needs a copy of mirror.mip "
+             "per eye, because the two eyes render their panes into the same texture and a "
+             "skipped frame would leave the left eye looking at the right eye's reflection. "
+             "The copies are built on the first frame that renders the mirror; watch for the "
+             "`mirror: each eye keeps its own copy` line, and for a `no per-eye copy` line "
+             "naming what refused. Until they exist every frame renders, as before.",
+             g_options.mirrorUpdateRate);
     }
-    GetPrivateProfileStringA("gplvr", "vrMirrorFovScale", "1.0", text, sizeof(text), path);
-    g_options.vrMirrorFovScale = static_cast<float>(atof(text));
-    if (!(g_options.vrMirrorFovScale >= 0.25f)) g_options.vrMirrorFovScale = 0.25f;
-    if (g_options.vrMirrorFovScale > 6.0f) g_options.vrMirrorFovScale = 6.0f;
-    auto readMirrorAngle = [&](const char* key) {
-        GetPrivateProfileStringA("gplvr", key, "0.0", text, sizeof(text), path);
-        float degrees = static_cast<float>(atof(text));
-        if (!(degrees >= -45.0f)) degrees = -45.0f;
-        if (degrees > 45.0f) degrees = 45.0f;
-        return degrees;
-    };
-    g_options.vrMirrorYaw = readMirrorAngle("vrMirrorYaw");
-    g_options.vrMirrorPitch = readMirrorAngle("vrMirrorPitch");
-    g_options.vrMirrorOffscreen =
-        GetPrivateProfileIntA("gplvr", "vrMirrorOffscreen", 1, path) != 0;
     g_options.vrMirrorTweakKey = GetPrivateProfileIntA("gplvr", "vrMirrorTweakKey", 'M', path);
     g_options.vrMirrorModeKey = GetPrivateProfileIntA("gplvr", "vrMirrorModeKey", 'N', path);
     GetPrivateProfileStringA("gplvr", "vrMirrorTweakAngleSpeed", "10.0", text, sizeof(text),
@@ -2089,7 +2144,6 @@ void loadOptions(const char* fileName) {
     g_options.vrMirrorTweakFovSpeed = static_cast<float>(atof(text));
     if (!(g_options.vrMirrorTweakFovSpeed >= 0.05f)) g_options.vrMirrorTweakFovSpeed = 0.05f;
     if (g_options.vrMirrorTweakFovSpeed > 4.0f) g_options.vrMirrorTweakFovSpeed = 4.0f;
-    g_options.stereoKey = GetPrivateProfileIntA("gplvr", "stereoKey", '1', path);
     g_options.profileFrame =
         GetPrivateProfileIntA("gplvr", "profileFrame", 1, path) != 0;
     g_options.profileGpuWait =
@@ -2108,12 +2162,7 @@ void loadOptions(const char* fileName) {
     g_options.profileTargetHz = GetPrivateProfileIntA("gplvr", "profileTargetHz", 90, path);
     if (g_options.profileTargetHz < 30) g_options.profileTargetHz = 30;
     if (g_options.profileTargetHz > 240) g_options.profileTargetHz = 240;
-    g_options.fastText = GetPrivateProfileIntA("gplvr", "fastText", 1, path) != 0;
-    g_options.fastTextKey = GetPrivateProfileIntA("gplvr", "fastTextKey", '9', path);
     g_options.dumpEyesKey = GetPrivateProfileIntA("gplvr", "dumpEyesKey", '0', path);
-    g_options.swapInterval = GetPrivateProfileIntA("gplvr", "swapInterval", 0, path);
-    if (g_options.swapInterval < -1) g_options.swapInterval = -1;
-    if (g_options.swapInterval > 4) g_options.swapInterval = 4;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
@@ -2184,37 +2233,69 @@ void loadOptions(const char* fileName) {
     readFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
     if (g_options.vrHudBackdropOpacity < 0.0f) g_options.vrHudBackdropOpacity = 0.0f;
     if (g_options.vrHudBackdropOpacity > 1.0f) g_options.vrHudBackdropOpacity = 1.0f;
-    GetPrivateProfileStringA("gplvr", "vrHudTextScale", "1.0", text, sizeof(text), path);
-    g_options.vrHudTextScale = static_cast<float>(atof(text));
-    if (g_options.vrHudTextScale < 0.25f) g_options.vrHudTextScale = 0.25f;
-    if (g_options.vrHudTextScale > 4.0f) g_options.vrHudTextScale = 4.0f;
     g_options.vrHudLayerKey = GetPrivateProfileIntA("gplvr", "vrHudLayerKey", VK_HOME, path);
     g_options.vrHudTweakKey = GetPrivateProfileIntA("gplvr", "vrHudTweakKey", VK_END, path);
     GetPrivateProfileStringA("gplvr", "vrHudTweakSpeed", "0.10", text, sizeof(text), path);
     g_options.vrHudTweakSpeed = static_cast<float>(atof(text));
     if (g_options.vrHudTweakSpeed < 0.005f) g_options.vrHudTweakSpeed = 0.005f;
     if (g_options.vrHudTweakSpeed > 2.0f) g_options.vrHudTweakSpeed = 2.0f;
-    g_options.vrHudEye = GetPrivateProfileIntA("gplvr", "vrHudEye", 0, path);
-    if (g_options.vrHudEye < 0 || g_options.vrHudEye > 2) g_options.vrHudEye = 0;
     g_options.vrPredictPosition =
         GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
     g_options.frameRate = GetPrivateProfileIntA("gplvr", "frameRate", 1, path);
     if (g_options.frameRate < 0 || g_options.frameRate > 2) g_options.frameRate = 1;
-    GetPrivateProfileStringA("gplvr", "vrPaceMarginMs", "2.0", text, sizeof(text), path);
-    g_options.vrPaceMarginMs = static_cast<float>(atof(text));
-    if (!(g_options.vrPaceMarginMs >= 0.0f)) g_options.vrPaceMarginMs = 0.0f;
-    if (g_options.vrPaceMarginMs > 10.0f) g_options.vrPaceMarginMs = 10.0f;
-    g_options.interpolate = GetPrivateProfileIntA("gplvr", "interpolate", 1, path) != 0;
-    if (g_options.frameRate > 0 && !g_options.interpolate) {
-        g_options.interpolate = true;
-        logf("options: frameRate = %d turns interpolate on -- a frame drawn between two sim "
-             "ticks without the blend is a duplicate of the one before it, so the rate would "
-             "rise and the picture would not. It costs one sim tick of latency; frameRate = 0 "
-             "races without it.",
-             g_options.frameRate);
+
+    // FRAME RATE IS ONE LEVER, AND VSYNC FALLS OUT OF IT.
+    //
+    // They used to be two settings with one subtle relationship, and the combination in the
+    // shipped file was a lie: `frameRate = 1` in flat mode means "one frame per refresh", and
+    // it achieves that by letting SwapBuffers block -- so with vsync off it silently ran to
+    // the 7-frames-per-tick ceiling instead. No wording fixes a setting whose meaning depends
+    // on another setting three hundred lines away.
+    //
+    //   0  vanilla    NO CALL AT ALL, because that is what vanilla is. GPL never touches the
+    //                 swap interval, so the specified initial value of 1 stands and vanilla
+    //                 GPL therefore runs with vsync ON. Forcing 0 here would make "vanilla"
+    //                 less vanilla than leaving it alone.
+    //   1  display    vsync on in flat mode, where the swap IS the pace.
+    //   2  unlimited  vsync off, or nothing is unlimited.
+    //
+    // VR takes the question away: the rate comes from the presenter, each frame waiting for a
+    // newly published view set. SwapBuffers still runs, because the game still presents to the
+    // monitor window, so an interval above 0 would block the frame loop on the MONITOR'S
+    // refresh and cap the headset with it -- a 60 Hz monitor holding a 90 Hz headset at 60,
+    // which reads as a performance fault rather than as a setting.
+    //
+    // TWO SPACES MEET HERE AND ONLY ONE IS THE DRIVER'S. What the ini offers is -1 follow,
+    // 0 force off, 1..4 force on; what g_options.swapInterval carries afterwards is the
+    // resolved interval, where -1 is "make no call". They share the number -1 and do not
+    // share its meaning, which is why the ini's value stays in a local and never reaches the
+    // option field unresolved.
+    int wanted = GetPrivateProfileIntA("gplvr", "swapInterval", -1, path);
+    if (wanted < -1) wanted = -1;
+    if (wanted > 4) wanted = 4;
+
+    int derived = 0;
+    if (!g_options.vr) {
+        if (g_options.frameRate == 0)
+            derived = -1;
+        else if (g_options.frameRate == 1)
+            derived = 1;
     }
-    g_options.interpolateKey = GetPrivateProfileIntA("gplvr", "interpolateKey", '7', path);
-    g_options.fixEyeSegment = GetPrivateProfileIntA("gplvr", "fixEyeSegment", 1, path) != 0;
+
+    g_options.swapInterval = derived;
+    if (wanted >= 0) {
+        if (g_options.vr && wanted != 0) {
+            logf("options: swapInterval = %d refused -- vsync in VR blocks the frame loop on "
+                 "the monitor's refresh and caps the headset with it",
+                 wanted);
+        } else {
+            g_options.swapInterval = wanted;
+            if (wanted != derived)
+                logf("options: swapInterval = %d overrides the %d that frameRate = %d would "
+                     "have chosen. -1 follows it again.",
+                     wanted, derived, g_options.frameRate);
+        }
+    }
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
     if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
@@ -2222,12 +2303,11 @@ void loadOptions(const char* fileName) {
 
     // Flat mode is the vanilla game in a borderless window: the window itself, the
     // letterbox and widescreen fixes, front-end scaling, roglv2's glFinish drop and swap
-    // interval, and mouselook. Stereo and the tools built to develop and measure the
-    // headset path -- the eye dumps, the stage and polygon profilers -- are for vr only. Switching them off here keeps every installer
-    // and key that reads them inert, without a second check at each one.
+    // interval, and mouselook. The tools built to develop and measure the headset path --
+    // the eye dumps, the stage and polygon profilers -- are for vr only. Switching them off
+    // here keeps every installer and key that reads them inert, without a second check at
+    // each one. Stereo itself needs no entry: it IS vr now, not a setting of its own.
     if (!g_options.vr) {
-        g_options.stereo = false;
-        g_options.stereoKey = 0;
         g_options.dumpEyesKey = 0;
         g_options.vrMirrorTweakKey = 0;
         g_options.vrMirrorModeKey = 0;
@@ -2236,29 +2316,25 @@ void loadOptions(const char* fileName) {
         // read the same frame in both modes, and it owns no GPU marks, so it does not
         // collide with profilePost.
         g_options.profileStages = false;
-        // frameRate, interpolate and interpolateKey SURVIVE. Neither feature is about the
-        // headset: one decides how often a frame is drawn and the other whether the world in it
-        // has moved, and flat GPL wants both -- 144 fps on a 36 Hz simulation is the same
-        // mechanism doing the same thing. Switching them off here is what used to make them
-        // read as VR features.
+        // frameRate SURVIVES. It is not about the headset: 144 fps on a 36 Hz simulation is
+        // the same mechanism doing the same thing in flat GPL, and switching it off here is
+        // what used to make it read as a VR feature.
     }
 
-    logf("options: stereo=%d mirror=%d stereoMirrorEvery=%d vrMirrorFovScale=%.2f "
-         "vrMirrorYaw=%.1f vrMirrorPitch=%.1f vrMirrorOffscreen=%d stereoKey=0x%02X (%s)",
-         g_options.stereo, g_options.stereoMirror, g_options.stereoMirrorEvery,
-         g_options.vrMirrorFovScale, g_options.vrMirrorYaw, g_options.vrMirrorPitch,
-         g_options.vrMirrorOffscreen ? 1 : 0, g_options.stereoKey,
-         g_options.stereoMirrorEvery > 1
-             ? "the mirror is rendered on one frame in stereoMirrorEvery, counting from the "
+    logf("options: perEyeMirror=%d mirrorUpdateRate=%d (%s) -- the aim of the glasses is per "
+         "car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
+         g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
+         g_options.mirrorUpdateRate <= 0
+             ? "the mirror is OFF and its texture is filled with black"
+         : g_options.mirrorUpdateRate > 1
+             ? "the mirror is rendered on one frame in mirrorUpdateRate, counting from the "
                "frame that latched the tick; the rest keep the last image"
              : "the mirror is rendered on every frame");
     logf("options: vrMirrorTweakKey=0x%02X vrMirrorTweakAngleSpeed=%.2f "
          "vrMirrorTweakFovSpeed=%.2f vrMirrorModeKey=0x%02X",
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
          g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
-    // The vrMirror* values above are the defaults for any car without a gplvr_cars.ini section.
     mirrorConfigReset();
-    g_options.vrOffscreen =GetPrivateProfileIntA("gplvr", "vrOffscreen", 0, path) != 0;
     g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 1, path);
     if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 3)
         g_options.vrMonitorEye = 1;
@@ -2271,20 +2347,14 @@ void loadOptions(const char* fileName) {
              ? "the frame is rendered straight into the shared texture, with no copy at "
                "publish"
              : "the frame is rendered into our own target and copied across at publish");
-    g_options.vrHudPanelRate = GetPrivateProfileIntA("gplvr", "vrHudPanelRate", 72, path);
-    if (g_options.vrHudPanelRate < 0) g_options.vrHudPanelRate = 0;
-    if (g_options.vrHudPanelRate > 0 && g_options.vrHudPanelRate < 10)
-        g_options.vrHudPanelRate = 10;
-    logf("options: vrTransferFinish=%d vrHudPanelRate=%d%s", g_options.vrTransferFinish ? 1 : 0,
-         g_options.vrHudPanelRate, g_options.vrHudPanelRate == 0 ? " (every frame)" : "/s");
-    g_options.vrSkipStampText =
-        g_options.vr && GetPrivateProfileIntA("gplvr", "vrSkipStampText", 0, path) != 0;
-    logf("options: vrSkipStampText=%d (%s)", g_options.vrSkipStampText ? 1 : 0,
-         g_options.vrSkipStampText
-             ? "GPL's stamped text on screen-space surfaces the headset cannot see is "
-               "dropped"
-             : "every stamp is drawn, and the stamped strings are logged");
-
+    g_options.pribludaUpdateRate =
+        GetPrivateProfileIntA("gplvr", "pribludaUpdateRate", 2, path);
+    if (g_options.pribludaUpdateRate < 1) g_options.pribludaUpdateRate = 1;
+    if (g_options.pribludaUpdateRate > 8) g_options.pribludaUpdateRate = 8;
+    logf("options: vrTransferFinish=%d pribludaUpdateRate=%d (the HUD panel is redrawn on one "
+         "frame in %d)",
+         g_options.vrTransferFinish ? 1 : 0, g_options.pribludaUpdateRate,
+         g_options.pribludaUpdateRate);
     // 0 by default, so an ini written before this existed does not silently gain a
     // cursor. The ini shipped with the mod turns it on, which is where the feature is
     // meant to be exercised from.
@@ -2298,44 +2368,32 @@ void loadOptions(const char* fileName) {
                                         : "drawn whatever Windows says"));
 
     logf("options: vrMenuScale=%.2f vrGamma=%.2f vrHudDepth=%.2f vrRenderScale=%.2f "
-         "vrRecentreKey=0x%02X vrOffscreen=%d vrMonitorEye=%d",
+         "vrRecentreKey=0x%02X vrMonitorEye=%d",
          g_options.vrMenuScale, g_options.vrGamma, g_options.vrHudDepth,
-         g_options.vrRenderScale,
-         g_options.vrRecentreKey,
-         g_options.vrOffscreen, g_options.vrMonitorEye);
+         g_options.vrRenderScale, g_options.vrRecentreKey, g_options.vrMonitorEye);
     logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f", g_options.vrHorizonLock,
          g_options.vrWorldScale);
-    logf("options: vrHudLayer=%d vrHudTextScale=%.2f vrHudBackdropOpacity=%.2f vrHudEye=%d "
-         "vrPredictPosition=%d",
-         g_options.vrHudLayer, g_options.vrHudTextScale, g_options.vrHudBackdropOpacity,
-         g_options.vrHudEye, g_options.vrPredictPosition ? 1 : 0);
-    logf("options: frameRate=%d vrPaceMarginMs=%.1f (%s)", g_options.frameRate,
-         g_options.vrPaceMarginMs,
+    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f vrPredictPosition=%d",
+         g_options.vrHudLayer, g_options.vrHudBackdropOpacity,
+         g_options.vrPredictPosition ? 1 : 0);
+    logf("options: frameRate=%d (%s)", g_options.frameRate,
          g_options.frameRate == 0
-             ? "THE SIM'S RATE: one frame per sim tick, as GPL ships"
+             ? "THE SIM'S RATE: one frame per sim tick, unblended, as GPL ships"
          : g_options.frameRate == 1
-             ? (g_options.vr ? "THE DISPLAY'S RATE: the loop's wait for the next sim tick is "
+             ? (g_options.vr ? "THE PRESENT RATE: the loop's wait for the next sim tick is "
                                "skipped and one frame is drawn per view set the presenter "
-                               "publishes"
+                               "publishes -- the HEADSET's rate, whatever the monitor is doing"
                              : "THE DISPLAY'S RATE: the loop's wait for the next sim tick is "
                                "skipped; swapInterval decides whether SwapBuffers then blocks "
                                "for the refresh")
              : "UNLOCKED: the loop's wait for the next sim tick is skipped and nothing else "
                "paces it, so the rate is 1000 / the cost of one frame");
-    logf("options: fixEyeSegment=%d (%s)", g_options.fixEyeSegment ? 1 : 0,
-         g_options.fixEyeSegment
-             ? "the world walk's lookup asks about the VIEWED CAR's position instead of the "
-               "eye's, which is the point flat GPL asks about, and its answer is checked against "
-               "GPL's own containment test before the walk is centred on it"
-             : "the world walk's lookup asks about the eye's own position and its answer is "
-               "taken as the game gives it");
-    logf("options: interpolate=%d interpolateKey=0x%02X (%s)", g_options.interpolate ? 1 : 0,
-         g_options.interpolateKey,
-         g_options.interpolate
-             ? "every car and the view are drawn blended between the two newest latched sim "
-               "ticks at the frame's display time, which adds one sim tick of latency (6.94 ms "
-               "at 144 Hz)"
-             : "the world is drawn at the newest latched sim tick, as stock");
+    if (g_options.frameRate > 0)
+        logf("options: the world is therefore BLENDED -- every car and the view are drawn "
+             "between the two newest latched sim ticks at the frame's own display time, which "
+             "is what makes a frame between two ticks a new picture rather than a copy. It "
+             "costs one sim tick of latency (6.94 ms at 144 Hz); frameRate = 0 does not pay "
+             "it and does not get the rate.");
     logf("options: simRing=%d (%s)", g_options.simRing,
          g_options.simRing >= 2
              ? "the sim thread publishes each tick and the car render records are written from "
@@ -2352,12 +2410,6 @@ void loadOptions(const char* fileName) {
          g_options.profileWorkWait
              ? "every millisecond of the frame is reported as CPU WORK or CPU WAIT"
              : "no work/wait split -- pre and present stay single numbers");
-    logf("options: fastText=%d fastTextKey=0x%02X (%s)", g_options.fastText ? 1 : 0,
-         g_options.fastTextKey,
-         g_options.fastText
-             ? "GPL's stamped glyphs come from our GPU atlas, a run of them in one draw, "
-               "instead of one glDrawPixels a glyph"
-             : "every glyph is roglv2's glDrawPixels, ~103 us each");
     logf("options: HUD head ahead=%.2f down=%.2f right=%.2f width=%.2f | seat ahead=%.2f "
          "down=%.2f right=%.2f width=%.2f",
          g_options.vrHudHead.ahead, g_options.vrHudHead.down, g_options.vrHudHead.right,
@@ -2449,8 +2501,9 @@ void requestSceneRenderHook(const Binding& binding) {
 
     // Per-pane mirrors (VR) need this call redirected so a mirror-only render can skip it. The
     // sceneRender found by discovery must be the one the fixed call site lives in.
-    g_mainWalkPending =
-        g_options.vr && g_options.stereoMirror > 0 && binding.sceneRender == 0x00487620;
+    // Not conditional on the mirror being ON: mirrorUpdateRate can go to 0 and back from the
+    // menu at any time, and the redirect is installed once at bind.
+    g_mainWalkPending = g_options.vr && binding.sceneRender == 0x00487620;
 
     g_sceneHookPending = true;
     logf("requestSceneRenderHook: queued %zu sceneRender and %zu cameraBind call site(s); "

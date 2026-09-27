@@ -42,7 +42,9 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
-inline constexpr uint32_t kControlVersion = 13;  // 13: eyeSubImageScale removed (rebuild both)
+// 15: the VR menu's own quad layer and the runtime's input-source names;
+// 14: controller input added; 13: eyeSubImageScale removed (rebuild both)
+inline constexpr uint32_t kControlVersion = 15;
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -126,6 +128,121 @@ struct SharedMotion {
 inline constexpr int32_t kMotionLinear = 1;
 inline constexpr int32_t kMotionAngular = 2;
 inline constexpr int32_t kMotionTiming = 4;
+
+// -- motion controllers ---------------------------------------------------------------
+//
+// OpenXR lives only in the presenter, so this is the only way controller state reaches the
+// game at all. The presenter samples one action set once per frame, at the same predicted
+// display time it locates the views for, and publishes the result here; the game reads it
+// from its own frame hook whenever it gets round to it.
+//
+// Poses are in the presenter's LOCAL space and OpenXR's axes, exactly like SharedPose
+// everywhere else in this block, so the game converts a hand through the same seat
+// transform it already converts the eyes through (VrCamera::vrSeatRelative). Nothing here
+// is pre-converted: a second conversion living in the presenter is a second place for the
+// sign errors this project has already paid for.
+//
+// An aim pose is OpenXR's "aim": its -Z is the direction the controller points, aligned
+// with the device's own pointing ray rather than with the grip. A grip pose is the hand's
+// hold. Both are located, so both carry their own validity bits.
+
+inline constexpr int32_t kHandLeft = 0;
+inline constexpr int32_t kHandRight = 1;
+inline constexpr int32_t kHands = 2;
+
+// SharedHand::flags. Aim and grip carry VALID and TRACKED separately because the two mean
+// different things: valid says the pose field holds a number, tracked says the runtime is
+// actually following the device rather than extrapolating from its last known place.
+inline constexpr int32_t kHandAimActive = 0x0001;
+inline constexpr int32_t kHandAimPositionValid = 0x0002;
+inline constexpr int32_t kHandAimOrientationValid = 0x0004;
+inline constexpr int32_t kHandAimPositionTracked = 0x0008;
+inline constexpr int32_t kHandAimOrientationTracked = 0x0010;
+inline constexpr int32_t kHandGripActive = 0x0020;
+inline constexpr int32_t kHandGripPositionValid = 0x0040;
+inline constexpr int32_t kHandGripOrientationValid = 0x0080;
+inline constexpr int32_t kHandGripPositionTracked = 0x0100;
+inline constexpr int32_t kHandGripOrientationTracked = 0x0200;
+inline constexpr int32_t kHandTriggerActive = 0x0400;
+inline constexpr int32_t kHandSqueezeActive = 0x0800;
+inline constexpr int32_t kHandStickActive = 0x1000;
+// The runtime has bound an interaction profile to this hand. Zero means the controller is
+// off, asleep or unknown to the runtime, and every other bit is then meaningless.
+inline constexpr int32_t kHandProfileBound = 0x2000;
+
+// SharedHand::buttons. Two face buttons, because that is what every profile has: A/B on a
+// right Touch or an Index, X/Y on a left Touch, and the trackpad or menu click standing in
+// where a controller has neither.
+inline constexpr int32_t kButtonStick = 0x1;      // thumbstick or trackpad click
+inline constexpr int32_t kButtonPrimary = 0x2;    // A / X / select
+inline constexpr int32_t kButtonSecondary = 0x4;  // B / Y
+inline constexpr int32_t kButtonMenu = 0x8;       // the system-adjacent menu click
+
+struct SharedHand {
+    int32_t    flags = 0;
+    int32_t    buttons = 0;
+    SharedPose aimPose;
+    SharedPose gripPose;
+    float      trigger = 0.0f;  // 0 to 1
+    float      squeeze = 0.0f;  // 0 to 1
+    float      stickX = 0.0f;   // -1 to 1, right positive
+    float      stickY = 0.0f;   // -1 to 1, forward positive
+};
+
+// SharedInput::flags.
+// The session had input focus when this was sampled. Without it OpenXR reports every
+// action inactive, so a sample taken then is all zeroes and must not be read as "the
+// driver let go of everything".
+inline constexpr int32_t kInputFocused = 1;
+
+// ControlBlock::menuSpace: which of the presenter's spaces the menu quad's pose is in.
+inline constexpr int32_t kMenuSpaceSeat = 1;
+inline constexpr int32_t kMenuSpaceView = 2;
+
+// WHAT THE RUNTIME CALLS EACH CONTROL, for the menu's help lines.
+//
+// OpenXR has no glyph or icon API -- nothing in the headers returns a picture of a button
+// -- but xrGetInputSourceLocalizedName is core, and it names what an action is ACTUALLY
+// bound to on the hardware attached right now. That matters more than a picture would:
+// our own binding table names controls in our words, and we do not know which interaction
+// profile a given headset will bind, so a hardcoded "trigger" can simply be wrong. The
+// runtime's own name is right by construction and follows a rebinding.
+//
+// Fixed-size and truncated rather than a second variable-length mechanism across the
+// bitness boundary. One entry per action per hand, indexed the way XrInput's action enum
+// is; kInputActions is asserted against that enum on the presenter side.
+inline constexpr uint32_t kInputActions = 9;
+inline constexpr uint32_t kInputNameCapacity = 48;
+
+// The order SharedInputNames is indexed in. HERE rather than beside the action set,
+// because the 32-bit side needs it and cannot see the OpenXR headers at all; XrInput's
+// own enum is asserted against it so the two can never drift.
+enum SharedInputAction {
+    kInputAimPose = 0,
+    kInputGripPose,
+    kInputTrigger,
+    kInputSqueeze,
+    kInputStick,
+    kInputStickClick,
+    kInputPrimary,
+    kInputSecondary,
+    kInputMenu,
+};
+
+struct SharedInputNames {
+    char text[kHands][kInputActions][kInputNameCapacity] = {};
+};
+
+struct SharedInput {
+    int32_t   flags = 0;
+    // Written zero, read by nothing. It exists so the struct's size is stated rather than
+    // left to whatever each compiler does after an odd number of 4-byte members.
+    int32_t   reserved0 = 0;
+    // When the presenter published this, in QPC ticks. One clock for the whole machine, so
+    // the game can age the sample without the two processes agreeing on anything else.
+    SharedQpc sampleTime;
+    SharedHand hands[kHands];
+};
 
 // A legacy D3D11 shared handle -- IDXGIResource::GetSharedHandle, not an NT handle. It
 // is valid in any process on the same adapter, which is what makes this work across the
@@ -326,6 +443,60 @@ struct ControlBlock {
     volatile int32_t seatGeneration = 0;
     SharedPose       seatPose;
 
+    // -- motion controllers, presenter to producer -----------------------------------
+    //
+    // Published AFTER `input` is complete, so a reader that checks the counter either side
+    // of its copy can tell whether it caught a write in progress -- the same protocol the
+    // views use, and for the same reason: the presenter writes at the display rate and the
+    // game reads at the sim rate, so the overlap is rare and never zero.
+    //
+    // 0 means the presenter has never published a sample, which is what a runtime with no
+    // controllers, or one whose action set could not be attached, leaves behind.
+    volatile int32_t inputSequence = 0;
+    SharedInput      input;
+
+    // What the runtime calls each bound control, re-queried when a hand's interaction
+    // profile changes and published before the generation is bumped. 0 means it has never
+    // been asked, and the menu falls back to its own binding table's words.
+    volatile int32_t inputNamesGeneration = 0;
+    SharedInputNames inputNames;
+
+    // -- the VR menu's own quad layer, producer to presenter -------------------------
+    //
+    // The same shape as the HUD panel above, and for the same reason: a quad layer is
+    // composited by the runtime at the display's rate, from the layer's own texture, so
+    // the menu is sharp, reprojected at display time, and -- the fault that drove this --
+    // it ROTATES AS A WHOLE. Drawn into the eye buffers instead, its background was a
+    // projected quad while its text was glBitmap, which is screen-axis-aligned and cannot
+    // be turned; the two disagreed the moment the head rolled.
+    //
+    // Unlike the HUD's, the pose is published outright rather than built from three
+    // scalars: the menu is put wherever the driver was looking when it opened, which is
+    // not something the presenter can derive.
+    SharedTextureHandle menuTextures[kFrameSlots] = {};
+    uint32_t            menuTextureWidth = 0;
+    uint32_t            menuTextureHeight = 0;
+    volatile int32_t    menuGeneration = 0;
+    volatile int32_t    menuSequence = 0;
+
+    // Non-zero while the layer is to be shown. Written last, so a menu coming back is
+    // never shown for a display frame carrying the image from before it closed.
+    volatile int32_t menuVisible = 0;
+
+    // Where the quad hangs, and in which of the presenter's spaces.
+    //
+    // Usually the seat's -- the same space the seat-locked HUD panel uses, which the
+    // presenter already builds from the published seat pose, and the frame the game
+    // places its panel in. The exception is HUD tweak mode with a HEAD-LOCKED HUD panel
+    // (vrHudLayer 1): the menu's quad is put exactly over that panel to annotate it, and
+    // a panel the runtime re-places against the head every display frame cannot be
+    // followed by a layer nailed to the seat from a pose computed a frame earlier. It
+    // has to be in the same space as the thing it is drawn on.
+    volatile int32_t menuSpace = kMenuSpaceSeat;
+    SharedPose       menuPose;
+    float            menuWidthMetres = 0.0f;
+    float            menuHeightMetres = 0.0f;
+
     // -- counters, for the log and nothing else --------------------------------------
     volatile int32_t producedFrames = 0;
     volatile int32_t presentedFrames = 0;
@@ -337,6 +508,10 @@ static_assert(std::is_standard_layout_v<ControlBlock>,
 static_assert(sizeof(SharedPose) == 28, "SharedPose must not gain padding");
 static_assert(sizeof(SharedView) == 44, "SharedView must not gain padding");
 static_assert(sizeof(SharedMotion) == 60, "SharedMotion must not gain padding");
+static_assert(sizeof(SharedHand) == 80, "SharedHand must not gain padding");
+static_assert(sizeof(SharedInput) == 176, "SharedInput must not gain padding");
+static_assert(sizeof(SharedInputNames) == 2 * 9 * 48,
+              "SharedInputNames is plain chars and must not gain padding");
 static_assert(sizeof(ControlBlock) < 4096, "one page is plenty and keeps mapping simple");
 
 // The mapping name is derived from an instance string -- the game's process id -- so two

@@ -29,12 +29,13 @@ constexpr uintptr_t kModDataEnd = 0x00A10000;
 constexpr int       kTeamFolderBytes = 9;
 constexpr int       kTeamModels = 7;
 
-constexpr const char kFileName[] = "gplvr_cars.ini";
+constexpr const char kFileName[] = "gplvr_mirrors.ini";
 constexpr const char kFileHeader[] =
-    "; gplvr_cars.ini -- per-car mirror aim, written by gplvr's mirror tweak mode.\r\n"
+    "; gplvr_mirrors.ini -- per-car mirror aim, written by gplvr's mirror tweak mode.\r\n"
     "; One section per car: [<car-set folder>/<team folder>], lower case, e.g. [cars67/lotus].\r\n"
-    "; Each of vrMirrorYaw, vrMirrorPitch and vrMirrorFovScale missing from a section is taken\r\n"
-    "; from gplvr.ini. Delete a section to go back to gplvr.ini's values for that car.\r\n"
+    "; A car with no section, or a value missing from one, gets the glasses where GPL points\r\n"
+    "; them: 0 yaw, 0 pitch, 1.0 scale. gplvr.ini has no mirror-aim keys. Delete a section to\r\n"
+    "; put that car back to neutral and aim it again.\r\n"
     "\r\n";
 
 constexpr int kKeyBytes = 40;
@@ -100,11 +101,18 @@ const char* ensurePath() {
     return c.path;
 }
 
+// THE AIM A CAR WITH NO SECTION GETS: neutral, and not configurable.
+//
+// It was three gplvr.ini options until 2026-09-27, which put the same quantity in two files --
+// the per-car values here, the fallback there -- with only the per-car one reachable from the
+// headset. There is no fallback to configure now: a car nobody has aimed gets the glasses
+// where GPL points them, and aiming it takes ten seconds in the headset and is then saved
+// against that car.
 MirrorAim globalAim() {
     MirrorAim aim;
-    aim.yaw = g_options.vrMirrorYaw;
-    aim.pitch = g_options.vrMirrorPitch;
-    aim.fovScale = g_options.vrMirrorFovScale;
+    aim.yaw = 0.0f;
+    aim.pitch = 0.0f;
+    aim.fovScale = 1.0f;
     return aim;
 }
 
@@ -134,7 +142,7 @@ bool buildKey(int slot, char* key, size_t size) {
     return true;
 }
 
-// The one read of gplvr_cars.ini for this slot in this car set.
+// The one read of gplvr_mirrors.ini for this slot in this car set.
 bool loadEntry(int slot, CarEntry& entry) {
     if (!buildKey(slot, entry.key, sizeof(entry.key))) return false;
     entry.aim = globalAim();
@@ -164,7 +172,7 @@ void logResolution(const char* reason) {
          g_mirrorAim.pitch, g_mirrorAim.fovScale, reason ? " -- " : "", reason ? reason : "");
 }
 
-// Creates gplvr_cars.ini with its comment header when it is not there; an existing file is
+// Creates gplvr_mirrors.ini with its comment header when it is not there; an existing file is
 // left alone. WritePrivateProfileString would create it too, without the header.
 void ensureFile(const char* path) {
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
@@ -187,6 +195,22 @@ void mirrorConfigReset() {
     c.edited = false;
     c.carsetKnown = false;
     g_mirrorAim = globalAim();
+}
+
+bool mirrorConfigClearAll() {
+    const char* path = ensurePath();
+    if (!DeleteFileA(path) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        logf("mirror config: %s could not be deleted (error %lu) -- the presets are unchanged",
+             path, GetLastError());
+        return false;
+    }
+    // The cache holds a copy of every car's aim that was read before the file went, so it
+    // has to go too or the cars already seen this session would keep theirs.
+    mirrorConfigReset();
+    logf("mirror config: every per-car preset has been cleared and %s deleted -- every car "
+         "is back to the glasses where GPL points them",
+         path);
+    return true;
 }
 
 bool mirrorConfigCarSetChanged() {
@@ -264,9 +288,9 @@ void mirrorConfigSave() {
     }
     c.edited = false;
     if (!c.key[0]) {
-        logf("mirror config: not saved -- no car identified yet (the mirror panes have not run); "
-             "to keep these for every car, set vrMirrorYaw = %.2f, vrMirrorPitch = %.2f and "
-             "vrMirrorFovScale = %.3f in gplvr.ini",
+        logf("mirror config: not saved -- no car has been identified yet, which means the "
+             "mirror panes have not run. The aim (yaw %.2f pitch %.2f fov %.3f) stays for "
+             "this session; drive a lap and save again.",
              g_mirrorAim.yaw, g_mirrorAim.pitch, g_mirrorAim.fovScale);
         return;
     }

@@ -46,6 +46,7 @@ bool glResolve(GlFunctions& gl) {
     resolveExport(gl.module, "glDeleteTextures", gl.deleteTextures);
     resolveExport(gl.module, "glBindTexture", gl.bindTexture);
     resolveExport(gl.module, "glCopyTexSubImage2D", gl.copyTexSubImage2D);
+    resolveExport(gl.module, "glGetTexLevelParameteriv", gl.getTexLevelParameteriv);
     resolveExport(gl.module, "glPixelStorei", gl.pixelStorei);
     resolveExport(gl.module, "glTexImage2D", gl.texImage2D);
     resolveExport(gl.module, "glTexParameteri", gl.texParameteri);
@@ -400,7 +401,63 @@ void reportPanel(const GlPanelCopy* panel, const char* failedAt, GLenum failedWi
              panel->height, how);
 }
 
+// The menu panel's own report, with a budget of its own. Sharing reportPanel's statics
+// would let a HUD failure spend the menu's eight lines and leave the menu silent, which
+// is the one thing a panel that does not appear must not be.
+void reportMenuPanel(const GlPanelCopy& panel, const char* failedAt, GLenum failedWith) {
+    static const char* reported = nullptr;
+    static int         reportsLeft = 8;
+    if (failedAt == reported || reportsLeft <= 0) return;
+    --reportsLeft;
+    reported = failedAt;
+    if (failedAt)
+        logf("gl: the VR menu panel copy failed at %s with 0x%04X -- %dx%d, source "
+             "framebuffer %u, shared texture %u; the headset keeps the last image it had",
+             failedAt, failedWith, panel.width, panel.height, panel.sourceFramebuffer,
+             panel.shared->name);
+    else
+        logf("gl: the VR menu panel reaches the headset -- %dx%d, under a lock of its own",
+             panel.width, panel.height);
+}
+
 }  // namespace
+
+bool glInteropPublishPanel(const GlFunctions& gl, HANDLE interopDevice,
+                           GlPanelCopy& panel) {
+    panel.copied = false;
+    if (!gl.dxLockObjects || !gl.dxUnlockObjects || !gl.getError) return false;
+    if (!panelUsable(gl, &panel)) return false;
+
+    // Drain first, for the same reason the frame paths do: a sticky error from somebody
+    // else's call would be read as this one's and send the next round chasing it.
+    for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {
+    }
+
+    HANDLE object = panel.shared->interopObject;
+    if (!gl.dxLockObjects(interopDevice, 1, &object)) {
+        for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {
+        }
+        reportMenuPanel(panel, "wglDXLockObjectsNV on the menu panel texture", GL_NO_ERROR);
+        return false;
+    }
+
+    GLint previousDraw = 0;
+    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previousDraw);
+    GLenum      failedWith = GL_NO_ERROR;
+    const char* failedAt = copyPanelLocked(gl, panel, previousDraw, failedWith);
+
+    int  unlocking = frameBudgetEnter(kSpanWaitUnlock);
+    BOOL unlocked = gl.dxUnlockObjects(interopDevice, 1, &object);
+    frameBudgetLeave(unlocking);
+    if (!unlocked && !failedAt) {
+        failedAt = "wglDXUnlockObjectsNV returned FALSE";
+        failedWith = GL_NO_ERROR;
+    }
+
+    panel.copied = !failedAt;
+    reportMenuPanel(panel, failedAt, failedWith);
+    return panel.copied;
+}
 
 bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
                              const GlSharedTexture& shared, int width, int height,

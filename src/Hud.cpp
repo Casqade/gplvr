@@ -204,8 +204,7 @@ void emit(const Call& call) {
     }
 
     int x = remapAnchor(call.x, fullWidth);
-    // One eye has nothing to fuse, so it gets no disparity.
-    int disparity = g_options.vrHudEye ? 0 : disparityPixels(rect[0][2]);
+    int disparity = disparityPixels(rect[0][2]);
     if (disparity != g_lastDisparity && g_reports > 0) {
         --g_reports;
         g_lastDisparity = disparity;
@@ -217,10 +216,8 @@ void emit(const Call& call) {
 
     // y needs no remap: each eye is the full height of the buffer, and a sub-rect
     // instance already offsets into the root by its own origin.
-    if (g_options.vrHudEye != 2)
-        g_original(left, call.colour, x + disparity / 2, call.y, call.text, call.background);
-    if (g_options.vrHudEye != 1)
-        g_original(right, call.colour, x - disparity / 2, call.y, call.text, call.background);
+    g_original(left, call.colour, x + disparity / 2, call.y, call.text, call.background);
+    g_original(right, call.colour, x - disparity / 2, call.y, call.text, call.background);
 }
 
 // -- THE 2D CENSUS ---------------------------------------------------------------------
@@ -363,44 +360,12 @@ int         g_stampHighWater = 0;
 // their ASCII codes. Text is printed as characters, and any code outside printable ASCII
 // is escaped with its raw value.
 
-// Surfaces a bitmapDraw has touched since the last mode change, as either argument. Pixels
-// are copied out of those, so a stamp on one can reach the frame another way.
-constexpr int kMaxComposited = 32;
-int  g_composited[kMaxComposited] = {};
-int  g_compositedCount = 0;
-bool g_compositedOverflow = false;
-
-void noteComposited(int handle) {
-    for (int i = 0; i < g_compositedCount; ++i)
-        if (g_composited[i] == handle) return;
-    if (g_compositedCount < kMaxComposited)
-        g_composited[g_compositedCount++] = handle;
-    else
-        g_compositedOverflow = true;
-}
-
-// A full table can no longer vouch for any surface, so every surface counts as touched.
-bool wasComposited(int handle) {
-    if (g_compositedOverflow) return true;
-    for (int i = 0; i < g_compositedCount; ++i)
-        if (g_composited[i] == handle) return true;
-    return false;
-}
-
-// Whether a stamp that did not qualify for the per-eye split can be dropped: the rule
-// documented at vrSkipStampText in Hooks.h. A destination no wider than the display and
-// at least 7/8 as wide is a screen-space layer of it; the off-screen frame is wider.
-bool stampUnseen(int handle, void* dest, int width, int height, void* left, void* right,
-                 void* source) {
-    if (!renderTargetActive() || !left || !right || !source) return false;
-    if (dest == left || dest == right || dest == source) return false;
-    int nativeW = 0;
-    int nativeH = 0;
-    if (!renderTargetNativeSize(nativeW, nativeH)) return false;
-    if (width * 8 < nativeW * 7 || width > nativeW) return false;
-    if (height <= 0 || height > nativeH) return false;
-    return !wasComposited(handle);
-}
+// The table of surfaces a bitmapDraw had touched went with `vrSkipStampText` on 2026-09-27.
+// It existed for one question -- can this stamp be dropped without anyone seeing it -- and
+// nothing drops a stamp any more. If a future change wants to know again, the rule was: a
+// destination no wider than the display and at least 7/8 as wide is a screen-space layer of
+// it, the off-screen frame is wider, and a surface a bitmapDraw has touched may have been
+// copied into the frame by another route.
 
 // One frame's stamps, grouped into strings in call order: a glyph joins the string before
 // it when it has the same destination, set and y, and sits a little to the right.
@@ -425,7 +390,6 @@ StampString g_frameStrings[kMaxFrameStrings];
 int         g_frameStringCount = 0;
 int         g_frameStampCalls = 0;
 int         g_frameUngrouped = 0;
-int         g_frameDropped = 0;
 
 void recordStamp(int dest, int width, int height, int x, int y, int set, int glyph) {
     unsigned short code =
@@ -486,14 +450,12 @@ struct StampWindow {
     int       frames = 0;
     long long calls = 0;
     int       maxCalls = 0;
-    long long dropped = 0;
     int       lines = 0;
     int       untracked = 0;
     int       ungrouped = 0;
 };
 
 StampWindow g_stampWindow;
-bool        g_loggedStampDrop = false;
 
 unsigned hashStampString(const StampString& s) {
     unsigned hash = 2166136261u;
@@ -603,11 +565,8 @@ void flushStampStrings(DWORD now) {
 }
 
 void resetStampTracking() {
-    g_compositedCount = 0;
-    g_compositedOverflow = false;
     g_knownCount = 0;
     g_knownHint = 0;
-    g_loggedStampDrop = false;
 }
 
 // THE IN-RACE HUD, ONCE PER EYE.
@@ -687,23 +646,10 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
 
     // One record per call GPL makes, before any re-issue; flushed by hudEndFrame.
     ++g_frameStampCalls;
-    if (!g_options.vrSkipStampText) recordStamp(a1, fullWidth, fullHeight, a2, a3, a4, a5);
+    recordStamp(a1, fullWidth, fullHeight, a2, a3, a4, a5);
 
     if (!left || !right || !spansTheBuffer || !stereoEyeRect(0, rect[0]) ||
         !stereoEyeRect(1, rect[1])) {
-        if (g_options.vrSkipStampText &&
-            stampUnseen(a1, dest, fullWidth, fullHeight, left, right, source)) {
-            ++g_frameDropped;
-            if (!g_loggedStampDrop) {
-                g_loggedStampDrop = true;
-                logf("hud: vrSkipStampText -- stampDraw to surface %d (%dx%d) is being "
-                     "dropped, with every stamp like it: not an eye, not the whole "
-                     "side-by-side buffer, a screen-wide layer of the display, and never "
-                     "touched by a bitmapDraw this phase. Counted once a second.",
-                     a1, fullWidth, fullHeight);
-            }
-            return;
-        }
         // Once per distinct destination, so a pass-through that should have been a split
         // says so instead of being silent. Five rounds of this were lost to a branch that
         // declined without comment.
@@ -732,7 +678,7 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
         y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * kHudInset);
     }
 
-    int disparity = g_options.vrHudEye ? 0 : disparityPixels(eyeWidth);
+    int disparity = disparityPixels(eyeWidth);
 
     // A LEFT-ANCHORED ITEM MINUS HALF THE DISPARITY IS OFF THE EDGE.
     //
@@ -762,18 +708,14 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
                  : "not yet taken, so these pixels are in it");
     }
 
-    if (g_options.vrHudEye != 2)
-        g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)), x + half, y,
-                            a4, a5);
-    if (g_options.vrHudEye != 1)
-        g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(right)), x - half, y,
-                            a4, a5);
+    g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)), x + half, y, a4,
+                        a5);
+    g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(right)), x - half, y, a4,
+                        a5);
 }
 
 int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     ++g_bitmapDrawCount;
-    noteComposited(source);
-    noteComposited(dest);
 
     if (g_bitmapDrawReports > 0) {
         bool known = false;
@@ -796,7 +738,7 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     // pixels, the reverse of the names above. The +Y mirror pane's image belongs in the right
     // half of the texture, so its copy is moved there; roglv2 copies the read surface's own
     // width, so exactly that half is written.
-    x = stereoMirrorCopyX(dest, x);
+    x = stereoMirrorCopy(source, dest, x);
 
     return g_bitmapDrawOriginal ? g_bitmapDrawOriginal(source, x, y, dest) : 0;
 }
@@ -1056,14 +998,12 @@ void hudEndFrame() {
     ++g_stampWindow.frames;
     g_stampWindow.calls += g_frameStampCalls;
     if (g_frameStampCalls > g_stampWindow.maxCalls) g_stampWindow.maxCalls = g_frameStampCalls;
-    g_stampWindow.dropped += g_frameDropped;
     g_stampWindow.ungrouped += g_frameUngrouped;
 
-    if (!g_options.vrSkipStampText) flushStampStrings(now);
+    flushStampStrings(now);
 
     g_frameStringCount = 0;
     g_frameStampCalls = 0;
-    g_frameDropped = 0;
     g_frameUngrouped = 0;
 
     DWORD elapsed = now - g_stampWindow.start;
@@ -1073,14 +1013,7 @@ void hudEndFrame() {
     // end: the thunk counts only world-mode calls.
     if (g_stampWindow.calls > 0) {
         double perFrame = static_cast<double>(g_stampWindow.calls) / g_stampWindow.frames;
-        if (g_options.vrSkipStampText) {
-            logf("hud: stamps, last %lu ms: %lld calls over %d frames (%.0f a frame, max %d), "
-                 "%lld dropped (%.0f a frame)",
-                 static_cast<unsigned long>(elapsed), g_stampWindow.calls,
-                 g_stampWindow.frames, perFrame, g_stampWindow.maxCalls,
-                 g_stampWindow.dropped,
-                 static_cast<double>(g_stampWindow.dropped) / g_stampWindow.frames);
-        } else {
+        {
             int distinct = 0;
             int waiting = 0;
             int surfaces[16];

@@ -112,7 +112,7 @@ void mirrorTargetAfterBind(void* camera, const SceneParams* params) {
         if (!isMirror) restore();
         return;
     }
-    if (!isMirror || !g_options.vrMirrorOffscreen || s.gaveUp) return;
+    if (!isMirror || !g_options.vr || s.gaveUp) return;
 
     // Only the copy-out path renders into the frame. The direct path renders into the mip.
     if (!(params->mirrorFlags & 1u)) {

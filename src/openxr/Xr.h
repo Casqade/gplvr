@@ -70,7 +70,24 @@ inline constexpr XrVersion kRequestedApiVersion = XR_MAKE_VERSION(1, 0, 0);
     X(xrWaitFrame)                       \
     X(xrBeginFrame)                      \
     X(xrEndFrame)                        \
-    X(xrLocateViews)
+    X(xrLocateViews)                     \
+    X(xrStringToPath)                    \
+    X(xrPathToString)                    \
+    X(xrCreateActionSet)                 \
+    X(xrDestroyActionSet)                \
+    X(xrCreateAction)                    \
+    X(xrDestroyAction)                   \
+    X(xrSuggestInteractionProfileBindings) \
+    X(xrAttachSessionActionSets)         \
+    X(xrGetCurrentInteractionProfile)    \
+    X(xrCreateActionSpace)               \
+    X(xrGetActionStateBoolean)           \
+    X(xrGetActionStateFloat)             \
+    X(xrGetActionStateVector2f)          \
+    X(xrGetActionStatePose)              \
+    X(xrSyncActions)                     \
+    X(xrEnumerateBoundSourcesForAction)  \
+    X(xrGetInputSourceLocalizedName)
 
 // Resolved only when the matching extension was enabled, so it may stay null.
 #define GPLVR_XR_D3D11_FUNCTIONS(X) X(xrGetD3D11GraphicsRequirementsKHR)

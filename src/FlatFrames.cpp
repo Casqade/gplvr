@@ -254,10 +254,14 @@ void flatFramesInstall() {
     if (s.installed) return;
     if (g_options.frameRate <= 0) return;
 
+    // frameRate above 0 asks for the blend by itself, so reaching this means the blend's own
+    // hooks did not install -- not that anything was configured to turn it off. Without them
+    // the frames between the ticks would be duplicates, so the rate is refused with them.
     if (!interpolationActive()) {
-        logf("frames: the blend is not running, so frames between the ticks would be "
-             "duplicates -- frameRate = %d is ignored (interpolate=%d)",
-             g_options.frameRate, g_options.interpolate ? 1 : 0);
+        logf("frames: the blend did not install, so frames between the ticks would be "
+             "duplicates of the one before -- frameRate = %d is ignored. The interp: line "
+             "above says why the hooks refused.",
+             g_options.frameRate);
         return;
     }
 

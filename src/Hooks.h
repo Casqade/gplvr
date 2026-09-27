@@ -21,19 +21,27 @@ struct HudPlacement {
 };
 
 struct Options {
-    // Render each eye into one half of the back buffer: two cameras aimed at
-    // bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the head.
-    bool stereo = false;
+    // STEREO IS WHAT `vr` MEANS. Each eye is rendered into one half of the frame -- two
+    // cameras aimed at bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the
+    // head. It was a `stereo` key with a runtime toggle until 2026-09-27, documented as "VR
+    // only, and required for it", which is a setting whose only legal value was the one vr
+    // already implied.
 
     // The mirror pass, p[43]. The car's two mirror glasses sample opposite halves of
     // mirror.mip, and each half is rendered by a camera aimed as that glass's reflection.
-    //   0 = no mirror
-    //   1 = both panes rendered once a frame, on the left eye's pass, from the head centre;
-    //       the right eye samples the same texture (2 mirror renders a frame)
-    //   2 = both panes rendered on each eye's pass from that eye, so each glass has stereo
-    //       depth (4 mirror renders a frame, default)
+    //
+    // ON: both panes are rendered on EACH eye's pass, from that eye, so the reflection has
+    // stereo depth like everything else in the frame -- 4 mirror renders a frame.
+    // OFF: both panes are rendered once, on the left eye's pass, from the head centre, and
+    // the right eye samples the same texture -- 2 renders, and a reflection that is subtly
+    // wrong for both eyes instead of right for each.
+    //
     // Each pane after the first in a pass costs a sceneRender whose main pass is skipped.
-    int stereoMirror = 2;
+    //
+    // It was 0/1/2 with 0 meaning "no mirror" until 2026-09-27. Turning the mirror off now
+    // lives in `mirrorUpdateRate = 0`, where it belongs -- off is the far end of how often,
+    // not a third mode of how -- and this went down to the one question it is really about.
+    bool perEyeMirror = true;
 
     // Render the mirror on one frame in N, counting from the frame that latched the sim tick.
     //
@@ -46,54 +54,49 @@ struct Options {
     // What the mirror shows changes with the sim tick and with your head. The tick is 36 Hz, and
     // a reflection in a rear-view mirror is the last place a few milliseconds of head lag is
     // noticed -- so skipping it on most of the frames between ticks costs little and buys a lot.
-    // 1 renders it on every frame, as before. The `mirror N/s` figure on the fps line says what
+    // ONE FRAME IN N. 1 renders it on every frame, 2 on one in two, and so on -- which is why
+    // the menu shows it as 1, 1/2, 1/3. 0 is off: nothing renders it and mirror.mip is filled
+    // with black, because the car goes on sampling that texture and a frozen reflection reads
+    // as a fault rather than an off switch. `mirror N/s +M restored` on the fps line says what
     // the setting actually produced.
-    int stereoMirrorEvery = 1;
-
-    // vrMirrorFovScale, vrMirrorYaw and vrMirrorPitch are the defaults for every car; a car's
-    // section in gplvr_cars.ini overrides each one it holds (MirrorConfig.h).
     //
-    // Field of view of each mirror pane as a multiple of the angle its glass subtends from
-    // the eye. 1.0 is life-size; above 1 shows more of the world, smaller. 0.25 to 6.
-    float vrMirrorFovScale = 1.0f;
+    // With `perEyeMirror = 2` the frames that skip get their reflection from a copy of
+    // mirror.mip kept per eye (MirrorCache.h). There is one mirror texture for the whole
+    // carset, so without the copies a skipped frame would leave the left eye sampling the
+    // right eye's reflection and flickering between the two. The copies are built on the first
+    // frame that renders the mirror; if anything refuses them the log says what, and every
+    // frame renders as it did before.
+    int mirrorUpdateRate = 1;
 
-    // Turn each mirror glass on its mount, in degrees, the way a driver adjusts a real one.
-    // Yaw positive turns the glass face inboard, toward the driver; pitch positive tilts it
-    // up. Mirrored between the two glasses, applied yaw first, and the view swings by twice
-    // the angle, as reflection does. -45 to 45.
-    float vrMirrorYaw = 0.0f;
-    float vrMirrorPitch = 0.0f;
-
-    // Render the mirror pass into a framebuffer of its own instead of the top-left corner
-    // of the frame, where a second mirror pass leaves a square in the left eye.
-    bool vrMirrorOffscreen = true;
+    // THE MIRROR AIM LIVES IN gplvr_mirrors.ini AND NOWHERE ELSE. vrMirrorYaw, vrMirrorPitch and
+    // vrMirrorFovScale were options here until 2026-09-27, holding a fallback for cars with no
+    // section of their own -- the same quantity in two files, with only the per-car copy
+    // reachable from the headset. A car nobody has aimed now gets the glasses where GPL points
+    // them, and aiming it in VR saves against that car (MirrorConfig.h).
+    //
+    // The mirror pass always renders into a framebuffer of its own rather than the top-left
+    // corner of the frame, where a second pass leaves a square in the left eye. That was
+    // vrMirrorOffscreen and there was never a reason to turn it off.
 
     // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
-    // VR only. While on, Left/Right change vrMirrorYaw, Up/Down vrMirrorPitch and Page Up/Down
-    // vrMirrorFovScale, live in both glasses, and those keys do not reach the game; the key
-    // again leaves and, if anything changed, writes the three values to the viewed car's
-    // section of gplvr_cars.ini. gplvr.ini is never written. Entering it leaves HUD tweak
-    // mode, and entering HUD tweak mode leaves it (saving the same way).
+    // VR only. While on, Left/Right turn the glasses, Up/Down tilt them and Page Up/Down
+    // widen them, live in both, and those keys do not reach the game; the key again leaves
+    // and, if anything changed, writes the three values to the viewed car's section of
+    // gplvr_mirrors.ini. Entering it leaves HUD tweak mode, and entering HUD tweak mode leaves
+    // it (saving the same way).
     int vrMirrorTweakKey = 'M';
 
     // How fast mirror tweak mode turns the glasses, in degrees per second.
     float vrMirrorTweakAngleSpeed = 10.0f;
 
-    // How fast mirror tweak mode changes vrMirrorFovScale, in doublings per second: 0.5
+    // How fast mirror tweak mode widens the glasses, in doublings per second: 0.5
     // doubles or halves it every two seconds, the same share of the field at any scale.
     float vrMirrorTweakFovSpeed = 0.5f;
 
-    // Switch stereoMirror between 1 (head centre) and 2 (per eye) while the game runs. 'N' by
-    // default; 0 disables. Does nothing when stereoMirror is 0. VR only.
+    // Toggle perEyeMirror while the game runs, for an A/B from the seat. 'N' by default;
+    // 0 disables. VR only. (It read 1/2 with a 0 that did nothing until perEyeMirror
+    // became a plain on/off on 2026-09-27.)
     int vrMirrorModeKey = 'N';
-
-
-    // Toggle stereo at runtime. '1' by default; 0 disables.
-    //
-    // The number row rather than a function key: pribluda and the in-game cameras have
-    // F1-F12 between them, and there is no VK_ constant for a digit -- the virtual-key
-    // code for '1' is simply 0x31.
-    int stereoKey = '1';
 
     // KEEP DRAWING AND PRESENTING WHILE ANOTHER APPLICATION HAS THE FOREGROUND.
     //
@@ -234,11 +237,10 @@ struct Options {
     // rasterizer's own context under its own 2D transform, with the palette it would have built.
     // Stamps into anything that is not the GL framebuffer stay the rasterizer's and are counted.
     // Flat mode only: in VR the same entry points belong to Hud.cpp.
-    bool fastText = true;
-
-    // Switch it off and on in a race, to compare the picture and the frame time. 0 disables.
-    // '9': '6' is the mouse-look toggle and '8' the memo mark.
-    int fastTextKey = '9';
+    //
+    // NO SETTING, as of 2026-09-27. It was `fastText` with a toggle key for the A/B, and the
+    // A/B has been run: it is faster and the picture is the same. The implementation stays
+    // exactly as it was; only the two ways of turning it off are gone.
 
     // Write each EYE's own rectangle to a .tga next to the game, at the moment the frame
     // is handed to the headset. Not the combined side-by-side the monitor shows -- the
@@ -247,15 +249,21 @@ struct Options {
     int dumpEyesKey = 0;
 
 
-    // The OpenGL swap interval. 0 disables vsync, 1 enables it, -1 leaves the driver
-    // default alone.
+    // THE RESOLVED OpenGL swap interval: 0 and up is the value to pass to
+    // wglSwapIntervalEXT, and -1 means make no call at all.
     //
-    // 0 by default, because the driver default is 1 and NOTHING IN GPL EVER CHANGES IT
-    // -- roglv2 resolves wglSwapIntervalEXT and never calls it, and its `[RasterV2]
-    // VSync` key does not exist. With a 144 Hz display that turns the 6.944 ms frame
-    // budget into a cliff: overrun it and the frame costs 13.889 ms, so the rate steps
-    // straight from 144 to 72 with nothing in between. See SwapControl.h.
-    int swapInterval = 0;
+    // NOT WHAT THE INI SAID. There, -1 means "let frameRate decide" and 0 and up are a
+    // direct override; loadOptions resolves that before this field is written, so nothing
+    // downstream has to know a frameRate exists. The two spellings of -1 are different
+    // questions -- "who decides" against "what did they decide" -- and the resolved one is
+    // the only one that survives.
+    //
+    // -1 resolved is reached by `frameRate = 0` in flat mode, which is vanilla, and vanilla
+    // makes no call: GPL never touches the swap interval, so WGL's specified initial value
+    // of 1 stands and stock GPL runs with vsync ON. With a 144 Hz display that turns the
+    // 6.944 ms frame budget into a cliff -- overrun it and the frame costs 13.889 ms, so the
+    // rate steps straight from 144 to 72 with nothing between. See SwapControl.h.
+    int swapInterval = -1;
 
     // Present in a headset. Launches gplvr-xr.exe, hands it the back buffer through a
     // shared D3D11 texture, and lets it own the OpenXR session.
@@ -393,9 +401,10 @@ struct Options {
     // boxes, solid black in pribluda, stay solid.
     float vrHudBackdropOpacity = 0.30f;
 
-    // Text size on the panel, RELATIVE to pribluda's own: 1.0 keeps the share of the panel
-    // the text has of the monitor. Raise it if it is too small at this size and distance.
-    float vrHudTextScale = 1.0f;
+    // Text on the panel is drawn at kPribludaTextScale times pribluda's own size, a constant
+    // in Pribluda.cpp. It was `vrHudTextScale` until 2026-09-27, and it is not a setting
+    // because the panel's own size already decides how big the text looks: making the panel
+    // wider makes everything on it bigger together, which is the control a driver wants.
 
     // Switch the panel between following the head (vrHudLayer 1) and fixed to the seat (2)
     // while the game runs. Home by default; 0 disables. With the panel off it turns it on,
@@ -411,22 +420,18 @@ struct Options {
     // How fast the arrows move an element in tweak mode, in fractions of the panel per second.
     float vrHudTweakSpeed = 0.10f;
 
-    // The most times a second pribluda redraws the HUD panel. 0 redraws it every frame. Between
-    // redraws the headset and the monitor keep showing the last image. pribluda's text changes a
-    // few times a second at most, so 72 loses nothing at 144 fps and halves the panel's cost.
-    // Values from 1 to 9 are raised to 10, so a panel still counts as drawn within the 0.25 s
-    // the lobby hide and tweak mode wait for.
-    int vrHudPanelRate = 72;
-
-    // Which eye GPL's OWN in-race text is drawn into: 0 both, 1 the left only, 2 the right
-    // only.
+    // ONE FRAME IN N, exactly as mirrorUpdateRate above, and shown the same way in the menu:
+    // 1, 1/2, 1/3. Between redraws the headset and the monitor keep the last image, so a
+    // lower rate costs nothing but the age of the numbers -- and pribluda's text changes a
+    // few times a second at most, so 1/2 loses nothing at 90 fps and halves the panel's cost.
     //
-    // Both is only comfortable when the two copies fuse, and that depends on vrHudDepth
-    // putting them at a distance the eyes are already converged near. One eye cannot be
-    // fused wrongly because there is nothing to fuse; the brain overlays it the way it
-    // does a monocle. Turns the disparity off, since a single copy has none. Pribluda's
-    // overlay is on the panel instead; see vrHudLayer.
-    int vrHudEye = 0;
+    // No 0 here, unlike the mirror: turning the HUD off is its own thing, and it is the
+    // menu's "Pribluda HUD" row, which skips the whole pass rather than freezing it.
+    int pribludaUpdateRate = 2;
+
+    // GPL's OWN in-race text goes into BOTH eyes, at the disparity vrHudDepth asks for. It
+    // was `vrHudEye`, which could put it in one eye only; that is not something to configure
+    // once the depth is right, and the text is being rerouted onto a layer of its own anyway.
 
     // Move each eye to where it will be when its frame is actually displayed.
     //
@@ -437,19 +442,26 @@ struct Options {
     // display clock, and each eye is moved by its velocity over the displays in between.
     bool vrPredictPosition = true;
 
-    // WHAT SETS THE FRAME RATE. The vsync question, and nothing about it is VR-specific: `vr`
-    // already says which mode the game is in, so this does not repeat it.
+    // HOW OFTEN THE GAME DRAWS A PICTURE, and THE ONLY FRAME-RATE SETTING THERE IS: vsync is
+    // derived from it in loadOptions, in both modes, so the two cannot disagree. `vr` already
+    // says which mode the game is in, so this does not repeat it.
     //
-    //   0  THE SIM'S RATE. One frame per sim tick -- 36 on a stock exe, 144 on a patched one --
-    //      because GPL's frame loop opens by sleeping until the tick lands. Stock behaviour,
-    //      and the baseline the other two are measured against.
+    // THREE RATES MEET HERE, which is one more than most games have and the reason this used
+    // to take two settings. The sim ticks at 36 or 144 depending on which exe was patched; the
+    // display refreshes at its own rate; the game draws somewhere between. GPL's frame loop
+    // opens by sleeping until the tick lands, which welds the third rate to the first. This is
+    // what unwelds it, and the display side then has nothing left to ask.
     //
-    //   1  THE DISPLAY'S RATE. That wait is skipped and a frame is drawn for every frame the
-    //      display shows: in VR, one per view set the presenter publishes; in flat mode, one
-    //      per refresh, which is `swapInterval = 1` doing the blocking. Vsync, in other words.
+    //   0  VANILLA. One frame per sim tick, because the loop's wait stands. Stock behaviour,
+    //      and the baseline the other two are measured against -- including in the swap
+    //      interval, which is left uncalled because that is also what GPL does.
     //
-    //   2  UNLOCKED. The wait is skipped and nothing else paces the loop, so the rate is
-    //      1000 / the cost of one frame. Vsync off.
+    //   1  DISPLAY. That wait is skipped and a frame is drawn for every frame the display
+    //      shows: in VR, one per view set the presenter publishes; in flat mode, one per
+    //      refresh, which the swap interval does by blocking in SwapBuffers.
+    //
+    //   2  UNLIMITED. The wait is skipped and nothing else paces the loop, so the rate is
+    //      1000 / the cost of one frame, to a ceiling of 7 extra frames per tick. Vsync off.
     //
     // 1 and 2 are the SAME MECHANISM -- FlatFrames skips the loop's tick wait -- differing only
     // in what is allowed to gate a frame afterwards. THE SIMULATION RATE IS UNTOUCHED by both:
@@ -460,41 +472,19 @@ struct Options {
     // than frames can be drawn, so the loop's wait never blocks. That is the whole of the
     // difference between the two binaries, and the whole of why the 36 Hz one felt like 36.
     //
-    // 1 and 2 both TURN `interpolate` ON, because a frame drawn between two ticks without the
-    // blend is a duplicate of the one before it: more frames, identical picture.
+    // 1 and 2 BOTH INTERPOLATE, and that is not a second setting.
+    //
+    // A frame drawn between two ticks without the blend is a duplicate of the one before it:
+    // more frames, identical picture -- and in a headset, a doubled one. The blend is what
+    // makes a rate above the sim's mean anything, so it is not separable from asking for one.
+    // It was a second option until 2026-09-27, and every path that could reach the pair
+    // separately had to carry a rule saying they could not be; the state is simply gone now.
+    // `blendingEnabled()` in Interpolation.cpp is the one place that reads this as "is the
+    // world blended", and everything else asks it.
+    //
+    // THE COST is one sim tick of latency (6.94 ms at 144 Hz), which is what buys the two
+    // ticks a frame can be drawn between. 0 does not pay it.
     int frameRate = 1;
-
-    // How long before the presenter's latch a paced frame aims to be published, in
-    // milliseconds, on top of the measured latch-to-publish cost. 0 to 10.
-    float vrPaceMarginMs = 2.0f;
-
-    // Interpolate the world to the frame's display time. Every car and the view -- the cockpit,
-    // the own car, the mirror and trackside cameras -- are drawn blended between the two newest
-    // latched sim ticks, so the world moves evenly at any display rate. Adds one sim tick of
-    // latency (6.94 ms at 144 Hz). Both modes; Interpolation.h.
-    //
-    // This is a separate lever from `frameRate` on purpose -- one says how often a frame is
-    // drawn, the other says whether the world in it has moved -- but `frameRate` 1 and 2 turn
-    // it on, because without it the frames they add are duplicates.
-    bool interpolate = true;
-
-    // Toggle `interpolate` while the game runs, for an A/B in one race. '7' by default; 0
-    // disables. Both modes.
-    int interpolateKey = '7';
-
-    // Centre the world walk on the CAR rather than on the eye.
-    //
-    // gpl_sceneRender asks sub_460B40 where the camera is on the track (0x487D73 for the eye
-    // pass, 0x4877D9 for the mirror pass) and uses the answer to pick the segment range to walk
-    // and to set gpl_selectorCameraDlong/Dlat/Height. That search steps one segment at a time
-    // from a hint and stops when it stops getting a consistent answer, so a point it cannot place
-    // sends it several segments away: measured at the bottom of Eau Rouge returning segment 17
-    // against a hint of 12, for one frame, with the eye 0.46 m from where it had just been. The
-    // frame then walks another part of the track -- terrain over everything, no road, the ground
-    // plane showing through. In flat GPL the camera sits in the cockpit and the point is the
-    // car's; in VR the head pose moves it off. This asks about the car's position instead, which
-    // is what flat GPL asks, and keeps all four of the lookup's outputs consistent. 0 to compare.
-    bool fixEyeSegment = true;
 
     // The sim/render state ring (SimRing.h, docs/audit-2026-09-18/72-work-vs-wait.md section 6).
     // The sim thread publishes each finished tick's car sources into one of four slots.
@@ -520,21 +510,15 @@ struct Options {
     // resolution rises.
     float vrRenderScale = 1.0f;
 
-    // Render the whole frame into an off-screen buffer sized by vrRenderScale instead of
-    // by the game window.
+    // IN VR THE FRAME IS ALWAYS RENDERED OFF-SCREEN, at the size vrRenderScale asks for
+    // rather than the size of a Windows display mode.
     //
-    // This is what makes vrRenderScale mean anything above 1.0. With it off the eyes are
-    // halves of roglv2's back buffer, so their size is a Windows display mode and every
-    // pixel above 1280x1440 is invented by the presenter's upscale. With it on the game
-    // rasterizes at the headset's own resolution and the flat window becomes a scaled
-    // monitor of the result.
-    //
-    // OFF by default for its first release, and it should not stay an option: the two
-    // things to look at first are whether the menus, which are laid out in surface
-    // pixels, still place their cursor correctly, and whether GPL's own HUD follows the
-    // larger surface. Both are visible in one session. Once they are answered this
-    // becomes the behaviour and the switch goes -- see AGENTS.md on options.
-    bool vrOffscreen = false;
+    // It was `vrOffscreen`, off by default for its first release with two questions to
+    // answer -- whether the menus still place their cursor and whether GPL's HUD follows
+    // the larger surface. Both were answered in the affirmative and it has been on ever
+    // since; the switch went on 2026-09-27. Three things now depend on it that did not
+    // then: vrRenderScale means nothing without it, the aiming ray needs somewhere the
+    // monitor cannot see, and the flat window is a view OF the frame rather than the frame.
 
     // What the flat window shows while VR is on:
     //
@@ -574,22 +558,11 @@ struct Options {
     // the rest of the session and says so.
     bool vrDirectToShared = false;
 
-    // Drop GPL's stamped text (stampDraw) that cannot reach the headset. VR only.
-    //
-    // In a race GPL stamps up to a few thousand glyphs a frame into the display's own
-    // 2560x1440 back-buffer surface (handle 1) and screen-wide strips of it. With the
-    // off-screen target active that surface is not the frame the headset receives, so the
-    // text is drawn and never seen, and it cost 2-3 ms of CPU and GPU a frame when it
-    // appeared. With this on, a stamp is dropped only when ALL of these hold:
-    //   - the off-screen target is active and stereo has eye surfaces this frame;
-    //   - the destination is not an eye, and does not span the side-by-side buffer (those
-    //     are re-issued once per eye, as before);
-    //   - the destination is at least 7/8 as wide as the display's back buffer, i.e. a
-    //     screen-space layer and never a texture;
-    //   - the destination has not appeared as either argument of a bitmapDraw since the
-    //     engine last changed mode, so a surface whose pixels are copied anywhere is kept.
-    // Everything else, the front end included, is drawn exactly as before.
-    bool vrSkipStampText = false;
+    // GPL'S STAMPED TEXT IS NEVER DROPPED. `vrSkipStampText` threw away stamps that could
+    // not reach the headset -- a few thousand glyphs a frame into a surface the eyes never
+    // see, worth 2-3 ms of CPU and GPU. It went on 2026-09-27 because the answer is to put
+    // that text somewhere it IS seen rather than to decide which of it to bin, and the rule
+    // for "unseen" was four conditions deep and had to be kept true by hand.
 
     // Draw the mouse pointer into the VR image.
     //
@@ -628,9 +601,14 @@ void loadOptions(const char* fileName);
 HWND gameWindow();
 
 // Leave mirror tweak mode if it is on, saving a changed aim to the viewed car's section of
-// gplvr_cars.ini. `why` is appended to the log line. HUD tweak mode calls it on entering, since the two share the
+// gplvr_mirrors.ini. `why` is appended to the log line. HUD tweak mode calls it on entering, since the two share the
 // arrows and Page Up/Down.
 void mirrorTweakExit(const char* why);
+
+// True while the KEYBOARD mirror tweak mode holds the aim. The semantic tweak API refuses
+// while it does: the headset's mirror mode edits the same three numbers, and two owners of
+// one aim is how a value ends up somewhere neither of them put it.
+bool mirrorTweakActive();
 
 // Replaces the screenDisplay function pointer. That pointer is a plain writable
 // global, so this is a single store -- no code patching involved.

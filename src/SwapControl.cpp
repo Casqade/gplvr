@@ -44,9 +44,21 @@ bool resolveBase() {
 }  // namespace
 
 void swapControlApply() {
-    // -1 means leave the driver default alone, and is the one setting that costs
-    // nothing at all: not even the module lookup.
-    if (g_options.swapInterval < 0) return;
+    // RESOLVED -1: make no call, which is what vanilla does and the only outcome we cannot
+    // report. Said once, because "no swap: line at all" and "the feature never installed"
+    // look identical in a log while the difference is half the frame rate.
+    if (g_options.swapInterval < 0) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            logf("swap: no call is made, so whatever the driver or its control panel decided "
+                 "stands. WGL specifies the initial value as 1, i.e. vsync ON, and nothing in "
+                 "GPL changes it -- so on a high-refresh display expect the rate to quantise "
+                 "to the refresh. This is vanilla behaviour and frameRate = 0 asks for it; "
+                 "swapInterval 0 or 1 in the ini overrides it and logs what the driver did.");
+        }
+        return;
+    }
     if (!resolveBase()) return;
 
     HGLRC context = g_getCurrentContext();

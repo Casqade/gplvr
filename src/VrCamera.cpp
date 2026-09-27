@@ -267,6 +267,69 @@ void captureOrigin(const SharedPose& head) {
 
 }  // namespace
 
+bool vrSeatRelative(const SharedPose& pose, float position[3], float forward[3]) {
+    if (!g_state.haveOrigin) return false;
+
+    const Quat inverseOrigin = conjugate(g_state.originOrientation);
+
+    if (position) {
+        const float fromOrigin[3] = {pose.positionX - g_state.originPosition[0],
+                                     pose.positionY - g_state.originPosition[1],
+                                     pose.positionZ - g_state.originPosition[2]};
+        float relative[3];
+        rotate(inverseOrigin, fromOrigin, relative);
+        xrToGpl(relative, position);
+
+        // The same world scale the eye offsets get. Scaling a hand differently from an eye
+        // would put the controller somewhere the driver is not reaching.
+        const float scaleWorld =
+            (g_options.vrWorldScale > 0.05f && g_options.vrWorldScale < 20.0f)
+                ? g_options.vrWorldScale
+                : 1.0f;
+        position[0] *= scaleWorld;
+        position[1] *= scaleWorld;
+        position[2] *= scaleWorld;
+    }
+
+    if (forward) {
+        const Quat  poseQuat = {pose.orientationX, pose.orientationY, pose.orientationZ,
+                                pose.orientationW};
+        const float aheadIn[3] = {0.0f, 0.0f, -1.0f};  // OpenXR: -Z is where a pose points
+        float       turned[3];
+        rotate(poseQuat, aheadIn, turned);
+        float relative[3];
+        rotate(inverseOrigin, turned, relative);
+        xrToGpl(relative, forward);
+
+        // Normalised here rather than trusted: the quaternion arrived over shared memory
+        // and a caller dividing by a length of zero is a crash, not a wrong picture.
+        const float length = std::sqrt(forward[0] * forward[0] + forward[1] * forward[1] +
+                                       forward[2] * forward[2]);
+        if (length > 1e-6f) {
+            forward[0] /= length;
+            forward[1] /= length;
+            forward[2] /= length;
+        } else {
+            forward[0] = 1.0f;
+            forward[1] = 0.0f;
+            forward[2] = 0.0f;
+        }
+    }
+    return true;
+}
+
+bool vrSeatPose(SharedPose& out) {
+    if (!g_state.haveOrigin) return false;
+    out.orientationX = g_state.originOrientation.x;
+    out.orientationY = g_state.originOrientation.y;
+    out.orientationZ = g_state.originOrientation.z;
+    out.orientationW = g_state.originOrientation.w;
+    out.positionX = g_state.originPosition[0];
+    out.positionY = g_state.originPosition[1];
+    out.positionZ = g_state.originPosition[2];
+    return true;
+}
+
 void vrRequestRecentre() { g_state.recentreRequested = true; }
 
 bool vrPublishSeat() {

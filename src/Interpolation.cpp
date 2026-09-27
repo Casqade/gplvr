@@ -777,7 +777,12 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
 // option is not named after either of them. With it off the frames `frameRate` adds redraw an
 // unchanged world, which is the control that says how much of the smoothness is the blend and
 // how much is merely presenting more often.
-bool blendingEnabled() { return g_options.interpolate; }
+// THE ONE PLACE that turns "the driver asked for a rate above the sim's" into "the world is
+// blended". They were two options until 2026-09-27 and the pair could be set to a state that
+// draws duplicate frames -- a doubled picture in the headset -- so the second one is gone and
+// this reads the first. Everything that wants to know whether the world moves between ticks
+// asks here or asks interpolationActive().
+bool blendingEnabled() { return g_options.frameRate > 0; }
 
 // When a tick arrived, in QPC. RenderPacing's model is preferred where it exists; its own is
 // fitted to the tick counter over a whole run, while this one is a two-point extrapolation from

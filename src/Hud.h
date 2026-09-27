@@ -51,7 +51,7 @@ void hudBeginFrame();
 
 // The frame's stamped text, flushed. From the present hook, after GPL has issued every
 // stampDraw of the frame: logs new or changed strings under a per-second cap, and once a
-// second a summary of stamp calls, strings and (with vrSkipStampText) dropped calls.
+// second a summary of stamp calls and the strings they formed.
 void hudEndFrame();
 
 // Re-issue this frame's HUD. Called after each EXTRA render, which re-enters

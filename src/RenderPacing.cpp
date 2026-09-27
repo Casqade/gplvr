@@ -1,9 +1,6 @@
 #include "RenderPacing.h"
 
-#include "FlatFrames.h"
-#include "FrameBudget.h"
 #include "Hooks.h"
-#include "Interpolation.h"
 #include "Log.h"
 #include "Pe.h"
 #include "TaskRate.h"
@@ -22,26 +19,6 @@ namespace {
 using BoolFn = bool(__cdecl*)();
 using CountFn = int(__cdecl*)();
 
-// Why a frame was not paced, counted per frame and named on the pacing line.
-enum Unpaced { kUnpacedOff, kUnpacedMenu, kUnpacedClock, kUnpacedStale, kUnpacedRatio,
-               kUnpacedCount };
-
-const char* const kUnpacedName[kUnpacedCount] = {"off", "menu", "no clock", "stale", "ratio"};
-
-const char* const kUnpacedWhy[kUnpacedCount] = {
-    "frameRate is not 1, or the frame loop's own wait is drawing the display's rate already",
-    "the previous frame was not a tracked stereo world frame",
-    "the presenter is not publishing its display clock",
-    "the presenter's newest latch is more than 3 display periods old",
-    "the display period is not a whole number of sim ticks and interpolate is off"};
-
-// Where the presenter's display period came from, named on the pace: change lines.
-const char* const kSourceQuery = "refresh rate query";
-const char* const kSourceRuntime = "runtime frame period";
-
-// How a pacing wait ended.
-enum Exit { kExitTarget, kExitBgRequest, kExitBgStopped, kExitTimeout, kExits };
-
 // A published frame and the sim tick it latched, for the ticks between displayed frames.
 struct Published {
     int32_t sequence = 0;
@@ -50,70 +27,33 @@ struct Published {
 };
 constexpr int kPublishedRing = 8;
 
-// Over budget is left only after this many consecutive frames whose cost estimate and margin
-// fit in this fraction of a display period.
-constexpr int    kBudgetCalmFrames = 10;
-constexpr double kBudgetLeave = 0.9;
-
 // One reporting window.
 struct Window {
     unsigned trackedFrames = 0;
-    unsigned paced = 0;
-    unsigned overBudget = 0;
-    unsigned unpaced[kUnpacedCount] = {};
     unsigned between[3] = {};  // 1, 2, 3+ ticks
-    double   marginSum = 0.0;
-    double   marginMin = 0.0;
-    unsigned margins = 0;
-    unsigned missed = 0;
-    double   phaseSum = 0.0;
-    double   phaseSquares = 0.0;
-    unsigned phases = 0;
-    double   edgeSquares = 0.0;
-    unsigned edges = 0;
-    unsigned slips = 0;
-    unsigned exits[kExits] = {};
 };
 
 struct State {
+    // bgIsRunning is never called. It is how the tick wait is IDENTIFIED: the one function
+    // that calls both it and fgDisableBG.
     BoolFn    bgIsRunning = nullptr;
-    BoolFn    bgHasRequestedFGAction = nullptr;
     CountFn   getBGCount = nullptr;
     uintptr_t fgDisableBG = 0;
     uintptr_t site = 0;
     bool      installed = false;
     long long frequency = 0;
 
-    // This frame, decided at the latch.
-    bool      engaged = false;
-    long long latchQpc = 0;     // when the wait ended and the latch began
-    int       latchTicks = 0;   // getBGCount then
-    long long targetLatch = 0;  // the presenter latch a paced frame aims for
-    long long publishQpc = 0;   // the frame's first publish after its latch
-
-    bool previousTracked = false;
+    // This frame, taken at the latch.
+    long long latchQpc = 0;    // when the tick wait ended and the latch began
+    int       latchTicks = 0;  // getBGCount then
+    long long publishQpc = 0;  // the frame's first publish after its latch
 
     // Latch to publish, tracked frames only, in QPC ticks: a smoothed mean and a smoothed
-    // absolute deviation, the estimate being mean + 2 deviations.
+    // absolute deviation, the estimate being mean + 2 deviations. The display-time model
+    // needs it, and the latch is the only place it can be measured from.
     double costMean = 0.0;
     double costDeviation = 0.0;
     bool   haveCost = false;
-
-    // The cost estimate and the margin fill a display period: the frame cannot make even the
-    // next display, so its latch starts at once. calmFrames counts frames back under
-    // kBudgetLeave of a period.
-    bool overBudget = false;
-    int  calmFrames = 0;
-    int  budgetReports = 24;
-
-    // The sim tick grid: one estimated tick edge, refined by every edge a wait observes, and
-    // how far the target is moved earlier to sit in the middle of a tick.
-    double    tickEdge = 0.0;
-    bool      haveTickEdge = false;
-    double    pull = 0.0;
-    long long lastSlipQpc = 0;
-    double    lastSlipSeconds = 0.0;
-    bool      coarseSleep = false;
 
     // The sim tick clock interpolation reads: tick `count` arrived at tickBase + count * T.
     // Each getBGCount reading places the base one latch delay late, and the base is the smoothed
@@ -130,42 +70,13 @@ struct State {
     int32_t   lastPublished = 0;
     int32_t   lastConsumed = 0;
 
-    int         loggedState = -2;  // -1 engaged, else an Unpaced
-    const char* loggedSource = nullptr;
-    int         stateReports = 24;
-    bool        loggedRatio = false;
-
     Window window;
 };
 
 State g_state;
 
-double ticksFromMs(double ms) { return ms * static_cast<double>(g_state.frequency) / 1000.0; }
-
 double msFromTicks(double ticks) {
     return 1000.0 * ticks / static_cast<double>(g_state.frequency);
-}
-
-// Wrap into [0, period).
-double wrap(double value, double period) {
-    double r = std::fmod(value, period);
-    return r < 0.0 ? r + period : r;
-}
-
-// A tick edge seen between two polls. Only polls close together place it well enough.
-void noteTickEdge(State& s, long long before, long long after, double tickPeriod) {
-    if (after - before > static_cast<long long>(ticksFromMs(2.0))) return;
-    double edge = 0.5 * static_cast<double>(before + after);
-    if (!s.haveTickEdge) {
-        s.tickEdge = edge;
-        s.haveTickEdge = true;
-        return;
-    }
-    double residual = wrap(edge - s.tickEdge, tickPeriod);
-    if (residual > 0.5 * tickPeriod) residual -= tickPeriod;
-    s.tickEdge = edge - 0.95 * residual;
-    s.window.edgeSquares += residual * residual;
-    ++s.window.edges;
 }
 
 // A getBGCount reading for the tick clock. The upper bound (the tick has arrived) always
@@ -228,72 +139,7 @@ void noteConsumed(State& s) {
     s.lastConsumed = consumed;
 }
 
-void logState(State& s, int state, double ticksPerDisplay, bool integral, double displayHz,
-              int simHz, const char* source) {
-    if (state == s.loggedState && source == s.loggedSource) return;
-    s.loggedState = state;
-    s.loggedSource = source;
-    if (s.stateReports <= 0) return;
-    const char* more = --s.stateReports ? "" : " (further changes not logged)";
-    if (state < 0) {
-        logf("pace: engaged -- %.2f sim ticks per display (%.2f Hz display, period from the %s; "
-             "%d Hz sim)%s; each latch waits for the presenter's clock and the views are located "
-             "for the display the frame reaches%s",
-             ticksPerDisplay, displayHz, source ? source : kSourceRuntime, simHz,
-             integral ? "" : ", interpolation carries the fraction of a tick", more);
-    } else if (source) {
-        logf("pace: unpaced -- %s (display period from the %s)%s", kUnpacedWhy[state], source,
-             more);
-    } else {
-        logf("pace: unpaced -- %s%s", kUnpacedWhy[state], more);
-    }
-}
-
-// Enter over budget when the estimate and margin reach a period; leave after kBudgetCalmFrames
-// frames in a row at or under kBudgetLeave of it. Logged on change, capped.
-void updateBudget(State& s, double estimate, double margin, double period) {
-    bool changed = false;
-    if (!s.overBudget) {
-        if (s.haveCost && estimate + margin >= period) {
-            s.overBudget = true;
-            s.calmFrames = 0;
-            changed = true;
-        }
-    } else if (estimate + margin <= kBudgetLeave * period) {
-        if (++s.calmFrames >= kBudgetCalmFrames) {
-            s.overBudget = false;
-            s.calmFrames = 0;
-            changed = true;
-        }
-    } else {
-        s.calmFrames = 0;
-    }
-    if (!changed || s.budgetReports <= 0) return;
-    const char* more = --s.budgetReports ? "" : " (further changes not logged)";
-    if (s.overBudget) {
-        logf("pace: over budget -- cost estimate %.2f ms + margin %.2f ms >= period %.2f ms; "
-             "frames start at once%s",
-             msFromTicks(estimate), msFromTicks(margin), msFromTicks(period), more);
-    } else {
-        logf("pace: back within budget -- cost estimate %.2f ms + margin %.2f ms <= %.2f ms "
-             "(%.1f of the period) for %d frames; frames are paced again%s",
-             msFromTicks(estimate), msFromTicks(margin), msFromTicks(kBudgetLeave * period),
-             kBudgetLeave, kBudgetCalmFrames, more);
-    }
-}
-
-// The time a paced frame's latch should start, for a given pull: the first presenter latch
-// the frame can still make, less the render cost, the margin and the pull.
-long long latchTarget(const PresenterClock& clock, long long now, double lead, double pull,
-                      double tolerance, long long& presenterLatch, int& displays) {
-    double period = static_cast<double>(clock.period);
-    double k = std::ceil((static_cast<double>(now - clock.latchTime) - tolerance + pull + lead) /
-                         period);
-    if (k < 1.0) k = 1.0;
-    presenterLatch = clock.latchTime + static_cast<long long>(k * period);
-    displays = static_cast<int>(k);
-    return presenterLatch - static_cast<long long>(lead + pull);
-}
+// WHERE THE TICK WAIT ENDED, which is the moment this file exists to be told about.
 
 void __stdcall paceBeforeLatch() {
     State& s = g_state;
@@ -301,181 +147,16 @@ void __stdcall paceBeforeLatch() {
     QueryPerformanceCounter(&entry);
     long long now = entry.QuadPart;
 
-    s.engaged = false;
-    s.targetLatch = 0;
     s.publishQpc = 0;
     s.latchQpc = now;
     s.latchTicks = s.getBGCount();
     noteTickCount(s, now, s.latchTicks);
     noteConsumed(s);
 
-    PresenterClock clock;
-    int            simHz = 0;
-    double         ratio = 0.0;
-    bool           integral = true;
-    const char*    source = nullptr;
-    int            why = -1;
-    // frameRate = 1 is the display's rate, and when the frame loop's wait is ours that is done
-    // by drawing one frame per published view set -- there is nothing left for a per-tick pace
-    // to hold back. This stays as the fallback for when those call sites could not be taken.
-    if (g_options.frameRate != 1 || flatFramesActive()) {
-        why = kUnpacedOff;
-    } else if (!s.previousTracked) {
-        why = kUnpacedMenu;
-    } else if (!presenterClock(clock)) {
-        why = kUnpacedClock;
-    } else {
-        source = clock.refreshRate > 0.0f ? kSourceQuery : kSourceRuntime;
-        if (now - clock.latchTime > 3 * clock.period) {
-            why = kUnpacedStale;
-        } else {
-            simHz = taskRateSimHz();
-            ratio = static_cast<double>(simHz) * static_cast<double>(clock.period) /
-                    static_cast<double>(s.frequency);
-            long nearest = std::lround(ratio);
-            integral = nearest >= 1 && std::fabs(ratio - nearest) <= 0.01 * nearest;
-            // A display that is not a whole number of ticks is still paced when interpolation
-            // is on: the frame keeps to the display and the blend covers the fraction.
-            if (simHz <= 0 || !(ratio > 0.0) || (!integral && !interpolationActive())) {
-                why = kUnpacedRatio;
-                if (!s.loggedRatio && simHz > 0) {
-                    s.loggedRatio = true;
-                    logf("pace: a %.2f Hz display (period from the %s) against a %d Hz sim is "
-                         "%.3f ticks per display, not a whole number -- frames stay unpaced "
-                         "while interpolate is off (logged once)",
-                         static_cast<double>(s.frequency) / static_cast<double>(clock.period),
-                         source, simHz, ratio);
-                }
-            }
-        }
-    }
-
-    logState(s, why, ratio, integral,
-             why < 0 ? static_cast<double>(s.frequency) / static_cast<double>(clock.period) : 0.0,
-             simHz, source);
-    if (why >= 0) {
-        ++s.window.unpaced[why];
-        presenterSetViewLead(0);
-        return;
-    }
-
-    double tickPeriod = static_cast<double>(s.frequency) / simHz;
-    double period = static_cast<double>(clock.period);
-    double margin = ticksFromMs(g_options.vrPaceMarginMs);
-    double estimate = s.haveCost ? s.costMean + 2.0 * s.costDeviation : 0.4 * period;
-    updateBudget(s, estimate, margin, period);
-
-    // Over budget the latch starts now: a wait would only push the frame past a later latch.
-    // The frame reaches the display of the first presenter latch after its mean cost, the
-    // display renderPacingDisplayTime gives interpolation, and the views are located for it.
-    // Latch to publish is still measured, so the estimate keeps following the scene.
-    if (s.overBudget) {
-        double k = std::ceil((static_cast<double>(now - clock.latchTime) + s.costMean) / period);
-        if (k < 1.0) k = 1.0;
-        presenterSetViewLead(k > 2.0 ? 2 : static_cast<int>(k));
-        s.engaged = true;
-        ++s.window.overBudget;
-        return;
-    }
-
-    double cost = estimate;
-    if (cost > period) cost = period;
-    double lead = cost + margin;
-    // A target missed by less than half the margin is still made by starting now.
-    double tolerance = 0.5 * margin;
-
-    long long presenterLatch = 0;
-    int       displays = 0;
-    long long target = latchTarget(clock, now, lead, s.pull, tolerance, presenterLatch, displays);
-
-    // Keep the latch in the middle of a sim tick, where the jitter of tick arrival cannot move
-    // it to the neighbouring tick. The display and sim clocks drift, so this re-centres once in
-    // a while: that frame is one tick nearer or further from the last, counted as a slip. A
-    // display that is not a whole number of ticks crosses tick edges every few frames by
-    // construction, so there it is left to interpolation.
-    if (!integral && s.pull != 0.0) {
-        s.pull = 0.0;
-        target = latchTarget(clock, now, lead, s.pull, tolerance, presenterLatch, displays);
-    }
-    if (s.haveTickEdge && integral) {
-        double phase = wrap(static_cast<double>(target) - s.tickEdge, tickPeriod);
-        if (phase < 0.25 * tickPeriod || phase > 0.75 * tickPeriod) {
-            s.pull = wrap(s.pull + phase - 0.5 * tickPeriod, tickPeriod);
-            target = latchTarget(clock, now, lead, s.pull, tolerance, presenterLatch, displays);
-            ++s.window.slips;
-            if (s.lastSlipQpc)
-                s.lastSlipSeconds =
-                    static_cast<double>(now - s.lastSlipQpc) / static_cast<double>(s.frequency);
-            s.lastSlipQpc = now;
-        }
-    }
-
-    // The presenter locates the next views for the display this frame's successor reaches.
-    presenterSetViewLead(displays > 2 ? 2 : displays);
-
-    Exit      exit = kExitTarget;
-    long long exitQpc = now;
-    if (target > now) {
-        frameBudgetSwitch(kSpanWaitPace);
-        int       ticks = s.latchTicks;
-        long long lastPoll = now;
-        long long limit = now + clock.period;
-        long long sleepAbove = static_cast<long long>(ticksFromMs(2.0));
-        long long coarse = static_cast<long long>(ticksFromMs(4.0));
-        for (;;) {
-            LARGE_INTEGER poll;
-            QueryPerformanceCounter(&poll);
-            exitQpc = poll.QuadPart;
-            if (exitQpc >= target) break;
-            if (exitQpc >= limit) {
-                exit = kExitTimeout;
-                break;
-            }
-            if (s.bgHasRequestedFGAction()) {
-                exit = kExitBgRequest;
-                break;
-            }
-            if (!s.bgIsRunning()) {
-                exit = kExitBgStopped;
-                break;
-            }
-            int count = s.getBGCount();
-            noteTickCount(s, exitQpc, count);
-            if (count != ticks) {
-                noteTickEdge(s, lastPoll, exitQpc, tickPeriod);
-                ticks = count;
-            }
-            lastPoll = exitQpc;
-
-            if (!s.coarseSleep && target - exitQpc > sleepAbove) {
-                Sleep(1);
-                LARGE_INTEGER woke;
-                QueryPerformanceCounter(&woke);
-                if (woke.QuadPart - exitQpc > coarse) {
-                    s.coarseSleep = true;
-                    logf("pace: Sleep(1) took %.1f ms -- the timer resolution is coarse, so the "
-                         "pacing wait yields instead of sleeping from now on",
-                         msFromTicks(static_cast<double>(woke.QuadPart - exitQpc)));
-                }
-            } else {
-                SwitchToThread();
-            }
-        }
-        frameBudgetSwitch(kSpanWaitBg);
-        s.latchTicks = s.getBGCount();
-    }
-
-    s.engaged = true;
-    s.latchQpc = exitQpc;
-    s.targetLatch = presenterLatch;
-    ++s.window.paced;
-    ++s.window.exits[exit];
-    if (s.haveTickEdge) {
-        double phase = msFromTicks(wrap(static_cast<double>(exitQpc) - s.tickEdge, tickPeriod));
-        s.window.phaseSum += phase;
-        s.window.phaseSquares += phase * phase;
-        ++s.window.phases;
-    }
+    // The presenter locates its next views for the display the NEXT frame reaches, and with
+    // no pace there is no prediction to make about which one that is: it is told nothing,
+    // which is what it was told on every frame the pace declined to act on.
+    presenterSetViewLead(0);
 }
 
 using PaceFn = void(__stdcall*)();
@@ -502,13 +183,11 @@ void renderPacingDiscover(const Binding& binding) {
     HMODULE exe = GetModuleHandleA(nullptr);
     if (!exe) return;
     s.bgIsRunning = reinterpret_cast<BoolFn>(GetProcAddress(exe, "?bgIsRunning@@YA_NXZ"));
-    s.bgHasRequestedFGAction =
-        reinterpret_cast<BoolFn>(GetProcAddress(exe, "?bgHasRequestedFGAction@@YA_NXZ"));
     s.getBGCount = reinterpret_cast<CountFn>(GetProcAddress(exe, "?getBGCount@@YAHXZ"));
     s.fgDisableBG = reinterpret_cast<uintptr_t>(GetProcAddress(exe, "?fgDisableBG@@YAXXZ"));
-    if (!s.bgIsRunning || !s.bgHasRequestedFGAction || !s.getBGCount || !s.fgDisableBG) {
-        logf("pace: the exe does not export bgIsRunning/bgHasRequestedFGAction/getBGCount/"
-             "fgDisableBG -- no render pacing");
+    if (!s.bgIsRunning || !s.getBGCount || !s.fgDisableBG) {
+        logf("pace: the exe does not export bgIsRunning/getBGCount/fgDisableBG -- no sim tick "
+             "clock, so interpolation falls back to the wall clock");
         return;
     }
 
@@ -546,7 +225,7 @@ void renderPacingDiscover(const Binding& binding) {
     }
     if (matches != 1 || inside != 1) {
         logf("pace: %d functions call both bgIsRunning and fgDisableBG (%zu fgDisableBG calls in "
-             "the last) -- the tick wait is not identifiable, no render pacing",
+             "the last) -- the tick wait is not identifiable, no sim tick clock",
              matches, inside);
         return;
     }
@@ -559,7 +238,7 @@ void renderPacingInstall() {
 
     auto call = reinterpret_cast<const uint8_t*>(s.site);
     if (call[0] != 0xE8) {
-        logf("pace: the tick wait's call at %08X is no longer a near call -- no render pacing",
+        logf("pace: the tick wait's call at %08X is no longer a near call -- no sim tick clock",
              static_cast<unsigned>(s.site));
         return;
     }
@@ -574,18 +253,17 @@ void renderPacingInstall() {
     g_paceNext = reinterpret_cast<void*>(current);
     int32_t mine = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&paceThunk) - (s.site + 5));
     if (!patchBytes(reinterpret_cast<void*>(s.site + 1), &mine, sizeof(mine))) {
-        logf("pace: could not redirect the tick wait's call at %08X -- no render pacing",
+        logf("pace: could not redirect the tick wait's call at %08X -- no sim tick clock",
              static_cast<unsigned>(s.site));
         return;
     }
     s.installed = true;
-    logf("pace: the tick wait's fgDisableBG call at %08X goes through gplvr, then %s. %s",
+    logf("pace: the tick wait's fgDisableBG call at %08X goes through gplvr, then %s. This is "
+         "where the sim tick clock is read and where a frame's latch is timed from; the blend "
+         "divides by that clock, so without this line interpolation is working from the wall "
+         "clock instead.",
          static_cast<unsigned>(s.site),
-         current == s.fgDisableBG ? "straight to fgDisableBG" : "to the profiler's tick marker",
-         g_options.frameRate == 1
-             ? "Frames are paced whenever the conditions on the pace: lines hold."
-             : "frameRate is not 1: frames run unpaced, and the pace: line is the baseline "
-               "or, at 2, the cadence the extra frames set instead.");
+         current == s.fgDisableBG ? "straight to fgDisableBG" : "to the profiler's tick marker");
 }
 
 void renderPacingNotePublished() {
@@ -594,14 +272,6 @@ void renderPacingNotePublished() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     s.publishQpc = now.QuadPart;
-    if (!s.targetLatch) return;
-
-    double margin = msFromTicks(static_cast<double>(s.targetLatch - s.publishQpc));
-    Window& w = s.window;
-    if (!w.margins || margin < w.marginMin) w.marginMin = margin;
-    w.marginSum += margin;
-    ++w.margins;
-    if (margin < 0.0) ++w.missed;
 }
 
 void renderPacingEndFrame(bool trackedStereo) {
@@ -630,11 +300,8 @@ void renderPacingEndFrame(bool trackedStereo) {
         }
     }
     if (trackedStereo) ++s.window.trackedFrames;
-    s.previousTracked = trackedStereo;
     noteConsumed(s);
 }
-
-bool renderPacingEngaged() { return g_state.engaged; }
 
 uintptr_t renderPacingTickWaitSite() { return g_state.installed ? g_state.site : 0; }
 
@@ -681,15 +348,11 @@ bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& di
         // A presenter latch at latchTime + k * period is displayed this long after it.
         long long toDisplay =
             clock.displayTime - clock.viewLead * clock.period - clock.latchTime;
-        // The paced target belongs to the frame whose LATCH this is, not to a frame being
-        // drawn between two ticks, which has a latch of its own to be timed against.
-        long long presenterLatch =
-            (s.engaged && anchorQpc == s.latchQpc) ? s.targetLatch : 0;
-        if (!presenterLatch) {
-            long long k = (latch + cost - clock.latchTime + clock.period - 1) / clock.period;
-            if (k < 1) k = 1;
-            presenterLatch = clock.latchTime + k * clock.period;
-        }
+        // The first presenter latch this frame can make, given how long its latch has
+        // historically taken to reach a publish.
+        long long k = (latch + cost - clock.latchTime + clock.period - 1) / clock.period;
+        if (k < 1) k = 1;
+        long long presenterLatch = clock.latchTime + k * clock.period;
         display = presenterLatch + toDisplay;
         fromPresenter = true;
         return true;
@@ -703,36 +366,24 @@ bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresen
     return renderPacingDisplayTimeAt(g_state.latchQpc, now, display, fromPresenter);
 }
 
+// What is left to say once a second: how far apart in sim ticks the frames the presenter
+// actually showed were, and how long a latch takes to reach a publish.
+//
+// The tick spread is the number that matters. Even ticks between displayed frames is what the
+// pacing wait existed to produce and what FlatFrames produces instead, so a run of 2s and 3s
+// here is the symptom that would send anyone back to the frame loop.
 bool renderPacingFormat(char* out, size_t size) {
     State& s = g_state;
     if (!s.installed) return false;
     Window& w = s.window;
     bool    report = w.trackedFrames > 0;
     if (report) {
-        double phaseMean = w.phases ? w.phaseSum / w.phases : 0.0;
-        double phaseVariance = w.phases ? w.phaseSquares / w.phases - phaseMean * phaseMean : 0.0;
-        int    simHz = taskRateSimHz();
-        char   slip[48] = {};
-        if (w.slips && s.lastSlipSeconds > 0.0)
-            std::snprintf(slip, sizeof(slip), " (last two %.1f s apart)", s.lastSlipSeconds);
-        std::snprintf(
-            out, size,
-            "pace: %u paced, over budget %u, unpaced %s %u / %s %u / %s %u / %s %u / %s %u | "
-            "ticks between displayed frames 1:%u 2:%u 3+:%u | publish margin before latch mean "
-            "%.2f min %.2f ms, %u missed | tick phase at latch mean %.2f sd %.2f of %.2f ms, "
-            "edge residual %.2f ms | slips %u%s | wait exits target %u bgRequest %u bgStopped "
-            "%u timeout %u | cost estimate %.2f ms",
-            w.paced, w.overBudget, kUnpacedName[kUnpacedOff], w.unpaced[kUnpacedOff], kUnpacedName[kUnpacedMenu],
-            w.unpaced[kUnpacedMenu], kUnpacedName[kUnpacedClock], w.unpaced[kUnpacedClock],
-            kUnpacedName[kUnpacedStale], w.unpaced[kUnpacedStale], kUnpacedName[kUnpacedRatio],
-            w.unpaced[kUnpacedRatio], w.between[0], w.between[1], w.between[2],
-            w.margins ? w.marginSum / w.margins : 0.0, w.margins ? w.marginMin : 0.0, w.missed,
-            phaseMean, phaseVariance > 0.0 ? std::sqrt(phaseVariance) : 0.0,
-            simHz > 0 ? 1000.0 / simHz : 0.0,
-            w.edges ? msFromTicks(std::sqrt(w.edgeSquares / w.edges)) : 0.0, w.slips, slip,
-            w.exits[kExitTarget], w.exits[kExitBgRequest], w.exits[kExitBgStopped],
-            w.exits[kExitTimeout],
-            s.haveCost ? msFromTicks(s.costMean + 2.0 * s.costDeviation) : 0.0);
+        std::snprintf(out, size,
+                      "pace: %u tracked frames | ticks between displayed frames 1:%u 2:%u 3+:%u "
+                      "| latch to publish %.2f ms, estimate %.2f ms",
+                      w.trackedFrames, w.between[0], w.between[1], w.between[2],
+                      s.haveCost ? msFromTicks(s.costMean) : 0.0,
+                      s.haveCost ? msFromTicks(s.costMean + 2.0 * s.costDeviation) : 0.0);
     }
     w = Window();
     return report;

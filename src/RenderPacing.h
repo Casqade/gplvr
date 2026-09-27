@@ -1,15 +1,28 @@
 #pragma once
 
-// Render pacing: start each frame's latch so the frame is published just before the
-// presenter's latch, and every displayed frame is the same number of sim ticks newer than
-// the last.
+// THE SIM TICK CLOCK AND THE DISPLAY-TIME MODEL, hooked at the tick wait.
 //
-// GPL's loop polls for a new sim tick and latches the moment one arrives, so at 144 Hz sim
-// against a 72 Hz display the frames the headset shows are 1, 2 or 3 ticks apart
-// irregularly: world judder, and a projection pose whose age changes frame to frame. The
-// wait here sits at the fgDisableBG call inside gpl_fgWaitForTickAndSnapshot, after the new
-// tick has arrived and before the BG lock is taken, so the sim keeps stepping through it and
-// the draw still follows its latch immediately. docs/audit-2026-09-14/43-render-pacing.md.
+// THE PACING IS GONE, 2026-09-27, and the name is a leftover. This file used to hold a wait
+// that delayed each frame's latch so the frame was published just before the presenter's --
+// see docs/audit-2026-09-14/43-render-pacing.md, which remains the record of it. That wait
+// never ran. FlatFrames takes the frame loop's wait over and draws one frame per published
+// view set, which solves the same problem earlier and better, and the pace stood down
+// whenever it was installed: measured over 322 seconds, 304 reporting windows, `0 paced` in
+// every one. The only configuration that would have reached it was FlatFrames failing to
+// patch gpl_fgFrameSnapshotBegin, and an exe where that fails is not one to have a quietly
+// different frame scheduler on -- it is one to stop and look at.
+//
+// What was underneath it is what the file is now, and it is load-bearing. The hook at the
+// fgDisableBG call inside gpl_fgWaitForTickAndSnapshot is where a tick's arrival can be timed
+// accurately, so it feeds:
+//
+//   * the SIM TICK CLOCK -- when tick N arrived, fitted from getBGCount readings. The blend
+//     divides by this grid, so Interpolation asks it for every target it computes.
+//   * the DISPLAY-TIME MODEL -- when the frame whose latch has just run will be SEEN,
+//     quantised to the presenter's latches. This is what interpolation targets, and the
+//     reason it is a display time and not a wall clock.
+//   * the latch-to-publish cost, which the model above needs and which only a hook at the
+//     latch can measure.
 //
 // Everything here runs on the game's fg thread. The presenter's clock is read from the
 // control block under its view-sequence check.
@@ -22,6 +35,9 @@ namespace gplvr {
 // for the same call and has to see the stock bytes. VR only.
 void renderPacingDiscover(const Binding& binding);
 
+// Note for anyone adding to this file: the names still say "pacing" because renaming fourteen
+// functions across six files is a mechanical change worth making on its own, after a build.
+
 // Redirect that site, chaining to whatever it calls now -- fgDisableBG, or the profiler's
 // marker thunk if profileStages installed one. Call after renderProfileDiscover.
 void renderPacingInstall();
@@ -33,12 +49,8 @@ void renderPacingNotePublished();
 // tracked stereo world frame, which is what the next frame's pacing decision reads.
 void renderPacingEndFrame(bool trackedStereo);
 
-// True when this frame's latch was paced, or started at once because the frame is over budget.
-// Extra renders stay off while it is.
-bool renderPacingEngaged();
-
-// The tick wait's fgDisableBG call site, 0 unless pacing installed there. Interpolation finds
-// the fgEnableBG call that closes the latch relative to it.
+// The tick wait's fgDisableBG call site, 0 unless the hook installed there. Interpolation
+// finds the fgEnableBG call that closes the latch relative to it.
 uintptr_t renderPacingTickWaitSite();
 
 // A getBGCount reading taken at `qpc`, for the sim tick clock. The pacing wait feeds it too.
@@ -57,9 +69,8 @@ bool renderPacingTickArrival(int count, double& qpc);
 bool renderPacingNextTickDue(double& qpc);
 
 // When the frame whose latch has just run reaches the display, in QPC ticks. With the
-// presenter's clock: the presenter latch the frame aims for (paced) or the first it can make
-// after its measured cost (unpaced or over budget), mapped to that latch's display;
-// `fromPresenter` true.
+// presenter's clock: the first presenter latch the frame can make after its measured cost,
+// mapped to that latch's display; `fromPresenter` true.
 // Without it: the latch plus the measured latch-to-publish cost.
 bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter);
 
@@ -77,7 +88,7 @@ bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresen
 bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& display,
                                bool& fromPresenter);
 
-// The once-a-second pacing line. False when the window held no tracked stereo frame.
+// The once-a-second latch line. False when the window held no tracked stereo frame.
 bool renderPacingFormat(char* out, size_t size);
 
 }  // namespace gplvr

@@ -35,6 +35,7 @@ typedef void(WINAPI* GlDeleteTexturesFn)(GLsizei, const GLuint*);
 typedef void(WINAPI* GlBindTextureFn)(GLenum, GLuint);
 typedef void(WINAPI* GlCopyTexSubImage2DFn)(GLenum, GLint, GLint, GLint, GLint, GLint,
                                             GLsizei, GLsizei);
+typedef void(WINAPI* GlGetTexLevelParameterivFn)(GLenum, GLint, GLenum, GLint*);
 typedef void(WINAPI* GlPixelStoreiFn)(GLenum, GLint);
 typedef void(WINAPI* GlTexImage2DFn)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint,
                                      GLenum, GLenum, const void*);
@@ -128,6 +129,12 @@ struct GlFunctions {
     GlDeleteTexturesFn    deleteTextures = nullptr;
     GlBindTextureFn       bindTexture = nullptr;
     GlCopyTexSubImage2DFn copyTexSubImage2D = nullptr;
+
+    // Asks a texture GL already owns how big it is and in what format. The mirror cache
+    // uses it to check that a texture name read out of roglv2's own bitmap really is the
+    // mirror's before anything is written through it.
+    GlGetTexLevelParameterivFn getTexLevelParameteriv = nullptr;
+
     GlPixelStoreiFn       pixelStorei = nullptr;
     GlTexImage2DFn        texImage2D = nullptr;
     GlTexParameteriFn     texParameteri = nullptr;
@@ -292,6 +299,21 @@ bool glInteropLockDirect(const GlFunctions& gl, HANDLE interopDevice,
 // the detach inside the copy.
 bool glInteropPublishDirect(const GlFunctions& gl, HANDLE interopDevice,
                             const GlSharedTexture& shared, bool finish, GlPanelCopy* panel);
+
+// Copy ONE panel into its shared texture under a lock of its own, outside the frame
+// transfer entirely.
+//
+// The frame transfer batches the frame and exactly one panel into a single
+// wglDXLockObjectsNV/wglDXUnlockObjectsNV pair (`HANDLE objects[2]` in both copy paths),
+// and that batch is the most delicate code in this project -- the detach-before-unlock bug
+// recorded inside it made every race black while reporting success. A SECOND panel, the VR
+// menu's, takes its own pair rather than widening that one: it costs one extra interop
+// synchronisation on the frames the menu is open, which is a menu and not a race, and the
+// frame path keeps the single synchronisation it has always had.
+//
+// The blit itself is the same debugged routine both frame paths use, detach and all.
+// `panel.copied` says whether the image reached the shared texture.
+bool glInteropPublishPanel(const GlFunctions& gl, HANDLE interopDevice, GlPanelCopy& panel);
 
 // Pull the back buffer into system memory as BGRA, bottom-up, for the one-shot fov
 // probe. This is the slow path the interop transport exists to avoid -- 1.36 ms and a

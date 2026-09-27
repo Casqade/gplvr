@@ -52,10 +52,34 @@ struct VrEye {
 // depends on them.
 bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight);
 
+// A pose the presenter published, in the seat's frame and GPL's axes.
+//
+// The same conversion vrAcquireEyes applies to an eye, exposed so a motion controller goes
+// through it too: `position` is where the pose is relative to the seat, in GPL axes and in
+// GPL units (vrWorldScale applied, exactly as an eye offset is), and `forward` is the unit
+// vector the pose points along -- OpenXR's -Z, which for an aim pose is the controller's
+// own pointing ray -- in the same axes.
+//
+// ONE definition for hands and eyes. A second copy of this arithmetic is a second place
+// for a sign error, and the seat capture's own history (a tilted origin poisoning every
+// later rotation) is what that costs.
+//
+// False before the first recentre, when there is no seat to be relative to. Either output
+// pointer may be null.
+bool vrSeatRelative(const SharedPose& pose, float position[3], float forward[3]);
+
 // Take the current head pose as the new origin. The driver's seat is wherever they were
 // sitting when they asked, which is the only definition that survives someone shifting
 // in their chair.
 void vrRequestRecentre();
+
+// The seat itself, in the presenter's LOCAL space: position and heading, as captureOrigin
+// left it. False before the first recentre.
+//
+// The presenter builds its seat-locked reference space from exactly this pose, so anything
+// on the game side that wants to place something against a seat-locked layer -- the HUD
+// panel, say -- reads it from here rather than keeping a second copy.
+bool vrSeatPose(SharedPose& out);
 
 // Publish the seat now, for a layer that needs one: the recentre pose if there is one,
 // otherwise the newest head pose the presenter published, taken as the recentre is. False

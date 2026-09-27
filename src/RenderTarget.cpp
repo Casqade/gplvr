@@ -918,6 +918,39 @@ bool renderTargetAttachColour(const GlFunctions& gl, GLuint name) {
 
 GLuint renderTargetAttachedColour() { return g_target.borrowed; }
 
+GLuint rasterBitmapGlTexture(int handle) {
+    if (handle <= 0 || !resolveSurface()) return 0;
+
+    // The same walk as sizeFieldAddress, then two more fields, every one of them read
+    // through readable(). A handle mistaken for a pointer is what this function exists to
+    // make impossible, and the mistake it replaces was an access violation on the first
+    // frame (report 37 §1.3 gives the offsets for the OBJECT, which a handle is not).
+    void* manager = nullptr;
+    if (!readAt(g_surface.handleTable, manager) || !manager) return 0;
+
+    void* entries = nullptr;
+    if (!readAt(static_cast<const unsigned char*>(manager) + 8, entries) || !entries)
+        return 0;
+
+    void* object = nullptr;
+    if (!readAt(static_cast<const unsigned char*>(entries) + static_cast<size_t>(handle) * 8,
+                object) ||
+        !object)
+        return 0;
+
+    // +32 is the ROOT bitmap, which for a top-level one is the object itself and for an
+    // instance is the bitmap it is a sub-rect of. The GL name is the root's, at +84, which
+    // is where rogl_blit_GLtoGL_copyTexSubImage reads it from. A root that is not a textured
+    // bitmap has something else at +84 -- the display's is a heap tag -- so the caller has to
+    // check the answer against what it expects rather than trust it.
+    void* root = nullptr;
+    if (!readAt(static_cast<const unsigned char*>(object) + 32, root) || !root) return 0;
+
+    GLuint name = 0;
+    if (!readAt(static_cast<const unsigned char*>(root) + 84, name)) return 0;
+    return name;
+}
+
 void renderTargetOverrideSurface(void* surfaceHandle) {
     if (!renderTargetActive()) return;
     if (!g_surface.resolved) return;

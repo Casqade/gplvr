@@ -6,6 +6,8 @@
 #include "Hud.h"
 #include "Interpolation.h"
 #include "Log.h"
+#include "MenuScale.h"
+#include "MirrorCache.h"
 #include "MirrorConfig.h"
 #include "Pe.h"
 #include "RenderTarget.h"
@@ -194,6 +196,14 @@ struct State {
     // The game's mirror camera for the frame being rendered, so a bind of it can be told apart
     // from the eye cameras when the panes are not in use.
     void* frameMirror = nullptr;
+
+    // That camera's destination, read while the camera is still live and cleared when the
+    // passes are done. gpl_simFrameRender frees the instance and zeroes p[43] on its way out,
+    // so this is a value to compare copy-out arguments against for the length of the frame and
+    // nothing to read through afterwards. Null means no stereo render is in progress, which is
+    // what keeps a freed handle that some later allocation reused from being taken for the
+    // mirror's.
+    void* frameMirrorSurface = nullptr;
     int  paneCopies = 0;
     bool reportedNoCopy = false;
 
@@ -396,6 +406,10 @@ bool ensureEyes(void* mainCamera) {
     stereoRelease();
 
     const float fov = cameraFloat(mainCamera, kCameraFov);
+    // TAKEN ONCE, and that is enough: GPL never moves its near plane. Measured 2026-09-26 over a
+    // whole session with the eye cameras tracking it per frame and reporting every change -- one
+    // line at startup, 0.125, and nothing after it. Re-reading it per frame was built, run and
+    // removed; do not build it again.
     const float nearZ = cameraFloat(mainCamera, kCameraNear);
     const int   halfWidth = width / 2;
 
@@ -547,14 +561,19 @@ using WalkSegmentFn = int(__cdecl*)(int hint, int* out, int x, int y, int z);
 constexpr uintptr_t kWalkSegmentOf = 0x00460B40;
 constexpr double    kDlongUnitsPerMetre = 19685.0;
 
-// THE SUBSTITUTION (fixEyeSegment). gpl_sceneRender asks this function where the camera is on
-// the track, and uses the answer to centre the world walk and to set gpl_selectorCameraDlong /
-// Dlat / Height. In flat GPL the camera sits in the cockpit, so the answer is the car's; in VR
-// the head pose moves the point off it -- measured at 0.03 to 0.32 m in the mirror lines, since
-// recentring puts the origin at the driver's own eye -- and at some places, measured at the
-// bottom of Eau Rouge, the search then returns a segment four to six away and the frame walks
-// another part of the track entirely. Asking about the CAR's position instead restores what flat GPL
-// does, keeps all four outputs consistent with each other, and needs no threshold.
+// THE FALLBACK. gpl_sceneRender asks this function where the camera is on the track, and uses
+// the answer to centre the world walk and to set gpl_selectorCameraDlong / Dlat / Height. In
+// flat GPL the camera sits in the cockpit, so the answer is the car's; in VR the head pose moves
+// the point off it -- measured at 0.03 to 0.32 m in the mirror lines, since recentring puts the
+// origin at the driver's own eye -- and at some places, measured at the bottom of Eau Rouge, the
+// search then returns a segment four to six away and the frame walks another part of the track
+// entirely. Asking about the CAR's position instead restores what flat GPL does, keeps all four
+// outputs consistent with each other, and needs no threshold.
+//
+// ONLY WHEN THE CAMERA'S OWN ANSWER FAILS, and that qualification was paid for. Substituting on
+// every lookup centred the drawn segment range on a point metres from the camera; where a
+// boundary fell between the two the camera's own segment left the range and a distant terrain
+// tile filled the frame below its own horizon. See walkLookupBody.
 //
 // Both call sites are redirected: 0x487D73 for the eye pass, 0x4877D9 for the mirror pass, so the
 // whole frame is centred on the same point.
@@ -636,6 +655,41 @@ unsigned g_walkOverMargin = 0;     // the dlong moved further than the car did
 unsigned g_walkNoDlong = 0;        // rejected, but the car's dlong was unavailable
 float    g_walkWorstExcess = 0.0f; // biggest rejected overshoot, metres
 
+// BOTH EYES ASK ABOUT THE HEAD CENTRE, and this is the fix for the one-frame eye-segment
+// artifact. MEASURED AND CLOSED, 2026-09-27.
+//
+// gpl_sceneRender picks the segment range from the eye POSITION, and each pass handed it its
+// own -- so the question had an answer per eye rather than per frame, and nothing made the two
+// halves of one picture agree. The fix is to ask once, about the point between the eyes: the
+// answer is then the same int by construction, with no threshold and no comparison deciding it.
+//
+// WHAT THE INSTRUMENT FOUND BEFORE IT WAS REMOVED. A shadow lookup asked the search about each
+// eye's own position as well, purely to record what it WOULD have said. Over 510 seconds it
+// caught three frames -- left 12 against right 17, left 224 against right 223, left 225 against
+// right 229 -- and the drawn ranges never once differed. **Four and five segments apart for
+// 65 mm of separation**: that is the search's stopping point flipping, report 84's mechanism,
+// not the eyes being in genuinely different parts of the track. Both answers also passed the
+// containment test, so no check could have caught it -- only asking one question could.
+//
+// That is also why picking either answer is correct rather than merely consistent: the two
+// positions are 65 mm apart, so a segment range right for one is right for the other.
+//
+// Only the eye site is redirected. The mirror site asks about the mirror camera, which is a
+// different place and a different question.
+int  g_walkCentre[3] = {};
+bool g_walkHaveCentre = false;
+int  g_walkPass = -1;  // which eye pass is rendering, -1 outside the loop
+
+void walkSetCentre(float x, float y, float z) {
+    auto toUnits = [](float metres) {
+        return static_cast<int>(static_cast<double>(metres) * kDlongUnitsPerMetre);
+    };
+    g_walkCentre[0] = toUnits(x);
+    g_walkCentre[1] = toUnits(y);
+    g_walkCentre[2] = toUnits(z);
+    g_walkHaveCentre = true;
+}
+
 // TWO DIFFERENT THINGS LOOK THE SAME TO THE CONTRACT, so they are counted apart.
 //
 // A one-frame excursion of tens of metres moves the walk's centre by more than a segment for a
@@ -660,13 +714,36 @@ int dlongDelta(int from, int to) {
     return delta;
 }
 
-int __cdecl walkLookupThunk(int hint, int* out, int x, int y, int z) {
+int walkLookupBody(int hint, int* out, int x, int y, int z) {
     auto original = reinterpret_cast<WalkSegmentFn>(g_walkLookupOriginal);
-    float blended[3] = {}, tick[3] = {};
-    if (!g_options.fixEyeSegment || !interpolationViewedCarPosition(blended, tick)) {
+
+    // THE EYE'S OWN ANSWER FIRST, and kept whenever it is sound.
+    //
+    // Substituting the car unconditionally centred the whole drawn segment range on a point
+    // metres from the camera, and where a segment boundary fell between the two the camera's
+    // own segment dropped out of the range: the road under the camera was not drawn and a
+    // distant terrain tile filled the frame below its own horizon. Measured 2026-09-26 at
+    // dlong 13875-13877, and the size of it tracked the separation -- a notch out of one tyre
+    // at 1.19 m in the cockpit, half the frame at 4.98 m in the chase camera.
+    //
+    // The containment test decides. Report 84 measured 308 corrections in 66,160 passes, so
+    // the eye's answer is sound on better than 99% of them and the car is a fallback, not a
+    // replacement.
+    int segment = original(hint, out, x, y, z);
+    if (placementOf(segment, x, y) == 0) {
         ++g_walkPassedThrough;
         g_walkHaveLast = false;  // the memory is about the substituted point, not this one
-        return original(hint, out, x, y, z);
+        return segment;
+    }
+
+    // The eye's answer is an extrapolation from a segment it is not in -- report 84's defect.
+    // Ask again about the car, whose position the sim maintains and which flat GPL would have
+    // asked about anyway.
+    float blended[3] = {}, tick[3] = {};
+    if (!interpolationViewedCarPosition(blended, tick)) {
+        ++g_walkPassedThrough;
+        g_walkHaveLast = false;
+        return segment;
     }
 
     auto toUnits = [](float metres) {
@@ -678,7 +755,7 @@ int __cdecl walkLookupThunk(int hint, int* out, int x, int y, int z) {
     int uy = toUnits(blended[1]);
     int uz = toUnits(blended[2]);
 
-    int segment = original(hint, out, ux, uy, uz);
+    segment = original(hint, out, ux, uy, uz);
 
     // How far the car moved since the last accepted answer. All four calls in a frame -- two eyes,
     // and the mirror pass with them -- use the same substituted point, so within a frame this is
@@ -740,6 +817,26 @@ int __cdecl walkLookupThunk(int hint, int* out, int x, int y, int z) {
     return segment;
 }
 
+// One thunk per site. The two sites are the two lookups gpl_sceneRender makes -- one for the
+// main camera, one for the mirror's -- and only the main one is the eye's own walk, which is
+// the one the head centre replaces.
+int __cdecl walkLookupMainThunk(int hint, int* out, int x, int y, int z) {
+    if (g_walkHaveCentre && g_walkPass >= 0 && g_walkPass < 2) {
+        x = g_walkCentre[0];
+        y = g_walkCentre[1];
+        z = g_walkCentre[2];
+    }
+    return walkLookupBody(hint, out, x, y, z);
+}
+
+int __cdecl walkLookupMirrorThunk(int hint, int* out, int x, int y, int z) {
+    return walkLookupBody(hint, out, x, y, z);
+}
+
+void walkPassBegin(int pass) { g_walkPass = pass; }
+
+void walkFrameEnd() { g_walkPass = -1; }
+
 // Both sites are checked against their stock bytes before either is written, and neither is
 // written unless both match -- half a substitution would centre the eye pass on the car and the
 // mirror pass on the mirror, which is worse than leaving both alone.
@@ -747,10 +844,13 @@ bool installWalkLookup() {
     struct Site {
         uintptr_t     address;
         unsigned char stock[5];
+        void*         thunk;
     };
-    static constexpr Site kSites[] = {
-        {0x00487D73, {0xE8, 0xC8, 0x8D, 0xFD, 0xFF}},  // the eye pass
-        {0x004877D9, {0xE8, 0x62, 0x93, 0xFD, 0xFF}},  // the mirror pass
+    static const Site kSites[] = {
+        {0x00487D73, {0xE8, 0xC8, 0x8D, 0xFD, 0xFF},
+         reinterpret_cast<void*>(&walkLookupMainThunk)},  // the eye pass
+        {0x004877D9, {0xE8, 0x62, 0x93, 0xFD, 0xFF},
+         reinterpret_cast<void*>(&walkLookupMirrorThunk)},  // the mirror pass
     };
     static bool tried = false;
     if (tried) return g_walkLookupOriginal != nullptr;
@@ -771,7 +871,7 @@ bool installWalkLookup() {
     g_walkLookupOriginal = reinterpret_cast<void*>(kSites[0].address + 5 + rel);
 
     for (const Site& site : kSites) {
-        int32_t offset = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&walkLookupThunk) -
+        int32_t offset = static_cast<int32_t>(reinterpret_cast<uintptr_t>(site.thunk) -
                                               (site.address + 5));
         if (patchBytes(reinterpret_cast<void*>(site.address + 1), &offset, sizeof(offset)))
             continue;
@@ -781,11 +881,12 @@ bool installWalkLookup() {
         return false;
     }
 
-    logf("walk: the camera's segment lookup at 004877D9 and 00487D73 now asks about the VIEWED "
-         "CAR's position, and GPL's answer is checked for containment before the walk is centred "
-         "on it (report 84). In flat mode this matters as soon as frames are drawn between the "
-         "ticks: the defect needs a blended position against the latch's kept seed, which is "
-         "what the blend makes in either mode. Original at %p.",
+    logf("walk: the camera's segment lookup at 004877D9 and 00487D73 goes through gplvr. GPL's "
+         "answer for the camera's own position is checked against its containment test and kept "
+         "whenever the camera is in the segment the search settled on; only when it is not is "
+         "the question asked again about the VIEWED CAR (report 84). No setting: it is on in VR "
+         "and in flat mode with interpolation, which is wherever a blended car position exists "
+         "to fall back to. Original at %p.",
          g_walkLookupOriginal);
     return true;
 }
@@ -964,7 +1065,12 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
 
 void stereoInstallWalkLookup() {
-    if (g_options.fixEyeSegment) installWalkLookup();
+    // NO SETTING. The defect is GPL's own search answering from a segment the camera is not in,
+    // and the fallback is the viewed car's blended position -- so this is wanted wherever such a
+    // position exists, which is VR always and flat mode whenever the blend is on. Anywhere else
+    // the thunk would find no car to ask about and hand every lookup straight back, so
+    // installing it would buy one containment probe per lookup and nothing at all.
+    if (g_options.vr || g_options.frameRate > 0) installWalkLookup();
 }
 
 bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
@@ -975,11 +1081,13 @@ bool stereoWalkFormat(char* out, size_t size) {
     // whatever was added last -- which is always the newest instrument. Say so instead.
     int written = _snprintf_s(
         out, size, _TRUNCATE,
-        "walk: lookup from the car %u, left alone %u | %u OUTSIDE the segment GPL settled on, %u "
-        "impossible for the distance moved, %u CORRECTED from the car's own dlong (%u of them "
-        "10 m or more, the kind that is visible), worst %.1f m over, %u with no car dlong",
-        g_walkSubstituted, g_walkPassedThrough, g_walkOutside, g_walkOverMargin, g_walkCorrected,
-        g_walkCorrectedBig, static_cast<double>(g_walkWorstExcess), g_walkNoDlong);
+        "walk: the camera's own answer stood %u times, asked again about the car %u | of those, "
+        "%u still OUTSIDE the segment GPL settled on, %u impossible for the distance moved, %u "
+        "CORRECTED from the car's own dlong (%u of them 10 m or more, the kind that is visible), "
+        "worst %.1f m over, %u with no car dlong",
+        g_walkPassedThrough,
+        g_walkSubstituted, g_walkOutside, g_walkOverMargin, g_walkCorrected, g_walkCorrectedBig,
+        static_cast<double>(g_walkWorstExcess), g_walkNoDlong);
     if (written < 0) {
         static bool said = false;
         if (!said) {
@@ -1000,16 +1108,38 @@ bool stereoWalkFormat(char* out, size_t size) {
     return true;
 }
 
-int stereoMirrorCopyX(int readSurface, int x) {
-    void* surface = g_state.pane[0].surface;
-    if (!g_state.mirrorOnly || !surface ||
-        readSurface != static_cast<int>(reinterpret_cast<intptr_t>(surface)))
+int stereoMirrorCopy(int writeBitmap, int readSurface, int x) {
+    State& s = g_state;
+    if (!s.frameMirrorSurface) return x;
+
+    // The three surfaces a mirror copy-out can read from: either pane when the glasses render
+    // separately, GPL's own frame-corner instance when they do not. Everything else going
+    // through bitmapDraw in a frame -- and the HUD is most of a hundred of them -- leaves here
+    // on this comparison.
+    auto handleOf = [](void* pointer) {
+        return static_cast<int>(reinterpret_cast<intptr_t>(pointer));
+    };
+    bool fromPane0 = s.pane[0].surface && readSurface == handleOf(s.pane[0].surface);
+    if (!fromPane0 && !(s.pane[1].surface && readSurface == handleOf(s.pane[1].surface)) &&
+        readSurface != handleOf(s.frameMirrorSurface))
         return x;
-    ++g_state.paneCopies;
-    return x + g_state.paneMipWidth / 2;
+
+    // The first argument is where the pixels LAND -- mirror.mip's level-0 bitmap, which is the
+    // one thing in this process that names the texture the two glasses are read out of. It is a
+    // handle, like everything roglv2's C API passes; the accessors here take one, and so does
+    // the cache.
+    void* handle = reinterpret_cast<void*>(static_cast<intptr_t>(writeBitmap));
+    mirrorCacheNoteTexture(writeBitmap, bitmapWidth(handle), bitmapHeight(handle));
+
+    if (!fromPane0 || !s.mirrorOnly) return x;
+    ++s.paneCopies;
+    return x + s.paneMipWidth / 2;
 }
 
 void stereoRelease() {
+    // The mirror's bitmap may not outlive the mode change, so the cache is told to forget it
+    // before anything here can look at it again.
+    mirrorCacheRelease();
     releasePanes();
     releaseHalf(g_state.half[0]);
     releaseHalf(g_state.half[1]);
@@ -1275,24 +1405,41 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
          aim[0].pitch, aim[1].distance, aim[1].fov, aim[1].yaw, aim[1].pitch);
 }
 
+// WHICH GLASS PUTS THE WHITE IN THE SKY. A temporary bisect, not a setting.
+//
+// The two glasses are rendered by different paths, which is worth knowing here: glass 0 (+Y) is
+// a whole extra gpl_sceneRender of its own with mirrorOnly set, and glass 1 (-Y) rides the eye's
+// own gpl_sceneRender as params->mirrorCamera.
+//
+// Both were rendered alone in turn to find where the white mirror sky above ~13 degrees of glass
+// pitch comes from, and both showed it, so it is common to the two paths and not in either.
+
 }  // namespace
 
-// The mirror on one frame in stereoMirrorEvery, counting from the frame that latched the tick.
+// The mirror on one frame in mirrorUpdateRate, counting from the frame that latched the tick.
 //
 // A frame drawn between two sim ticks is one of GPL's own and redraws everything, the mirror
 // included -- measured at frameRate = 2, 231 mirror-only renders a second against a 36 Hz
 // simulation, which doubles the cost of every frame and so halves the rate. What a rear-view
 // mirror shows changes with the tick and with the head, and neither needs every frame.
 //
-// ONLY WITH stereoMirror = 1, and that is not a simplification. At 2 each eye's pass renders
-// the panes from its own eye into the SAME mirror texture, so the image in it at the end of a
-// frame is the right eye's. A frame that skips the render leaves both eyes sampling that one --
-// and the left eye then alternates between its own reflection and the right's, which is a
-// visible flicker and was reported as one. Per-eye skipping needs a mirror texture per eye;
-// until there is one, 2 renders every frame. loadOptions says so rather than ignoring it here.
+// With perEyeMirror on, each eye's pass renders the panes from its own eye into the SAME mirror
+// texture, so the image in it at the end of a frame is the right eye's, and a frame that skipped
+// the render left both eyes sampling that one -- the left eye alternating between its own
+// reflection and the right's, which is a visible flicker and was reported as one. MirrorCache
+// gives each eye a copy and puts it back on the frames that do not render; until both copies
+// exist there is nothing to put back, so the frame renders.
+// Whether the glasses show anything at all. One switch now: mirrorUpdateRate = 0 is off, and
+// it comes out as a dark glass rather than a frozen one. perEyeMirror used to be a second way
+// to say no -- it was 0/1/2 with 0 meaning off -- and having two was the reason to fold it
+// down to what it is actually about, which is whether each eye gets its own reflection.
+bool stereoMirrorOn() { return g_options.mirrorUpdateRate > 0; }
+
 bool stereoMirrorDueThisFrame() {
-    if (g_options.stereoMirrorEvery <= 1 || g_options.stereoMirror != 1) return true;
-    return (flatFramesTickFrameIndex() % g_options.stereoMirrorEvery) == 0;
+    if (!stereoMirrorOn()) return false;
+    if (g_options.mirrorUpdateRate <= 1) return true;
+    if (g_options.perEyeMirror && !mirrorCacheReady()) return true;
+    return (flatFramesTickFrameIndex() % g_options.mirrorUpdateRate) == 0;
 }
 
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
@@ -1302,7 +1449,33 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     void* const savedCamera = params->camera;
     void* const savedMirror = params->mirrorCamera;
 
+    // TURNING THE MIRROR OFF HAS TO WIPE IT. Nothing renders it once it is off, but the car
+    // still samples mirror.mip, so the glasses keep whatever reflection was last written into
+    // them -- a frozen image that reads as a fault rather than an off switch. Done here because
+    // this is a place with the game's GL context current and the setting can change at any time
+    // from the menu.
+    static int lastMirrorOn = -1;
+    int        mirrorOn = stereoMirrorOn() ? 1 : 0;
+    if (mirrorOn != lastMirrorOn) {
+        if (lastMirrorOn == 1)
+            logf("stereo: the car mirror is off -- mirror.mip %s",
+                 mirrorCacheBlackout()
+                     ? "filled with black, so the glasses are dark rather than frozen"
+                     : "could NOT be cleared, so the glasses keep their last reflection");
+        lastMirrorOn = mirrorOn;
+    }
+
     void* const mirrorWanted = stereoMirrorDueThisFrame() ? savedMirror : nullptr;
+
+    // Whether each eye's reflection is worth keeping. Only mode 2 gives the two eyes different
+    // images, and only a mirrorUpdateRate above 1 ever skips a render -- with neither, the
+    // copy would be made every frame and never read.
+    //
+    // Deliberately not conditional on there being a mirror camera this frame. A frame with no
+    // camera is one that will not render the mirror and still draws a car that samples it --
+    // an extra render through the present hook is exactly that -- so it wants the restore for
+    // the same reason a skipped frame does. With nothing saved yet the restore costs a compare.
+    bool cacheEyes = g_options.perEyeMirror && g_options.mirrorUpdateRate > 1;
     // The params block is the GAME'S live memory, not a copy of it -- gpl_simFrameRender
     // reuses it and zeroes p[43] the moment sceneRender returns. So anything we adjust in
     // it has to be put back before we hand control away. The mirror aim is the frame
@@ -1368,7 +1541,7 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     bool                panes = false;
     PaneFrame           paneFrame = {};
     const PaneGeometry* glass = nullptr;
-    if (savedMirror && g_options.stereoMirror > 0) {
+    if (savedMirror && stereoMirrorOn()) {
         if (!(params->mirrorFlags & 1u)) {
             reportPanes("GPL renders the mirror straight into mirror.mip, so there are no "
                         "halves to fill -- one stock image");
@@ -1511,6 +1684,17 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     std::memcpy(savedOrientation, levelled, sizeof(levelled));
 
     g_state.frameMirror = savedMirror;
+    g_state.frameMirrorSurface =
+        savedMirror ? cameraPointer(savedMirror, kCameraSurface) : nullptr;
+
+    // The one point both eye passes ask the segment search about. Built from the same offsets
+    // the passes use and from savedOrientation as the horizon lock has just left it, so it is
+    // the midpoint of the two eye positions written below.
+    float centreX = 0.0f, centreY = 0.0f, centreZ = 0.0f;
+    localToWorld(savedOrientation, (vr[0].offset[0] + vr[1].offset[0]) * 0.5f,
+                 (vr[0].offset[1] + vr[1].offset[1]) * 0.5f,
+                 (vr[0].offset[2] + vr[1].offset[2]) * 0.5f, centreX, centreY, centreZ);
+    walkSetCentre(savedX + centreX, savedY + centreY, savedZ + centreZ);
 
     for (int pass = 0; pass < 2; ++pass) {
         // pass 0 draws the left half of the buffer and is the left eye. Proven in
@@ -1550,9 +1734,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         // right. That is the artifact as the user describes it, so this records the segment
         // each pass is about to walk and reports jumps.
         //
-        // The substitution goes in here too, on the render thread between passes, because the
-        // sites it patches are inside the function this call is about to enter.
-        if (g_options.fixEyeSegment) installWalkLookup();
+        // The redirect goes in here too, on the render thread between passes, because the sites
+        // it patches are inside the function this call is about to enter.
+        installWalkLookup();
+        walkPassBegin(pass);
 
         // Re-aim at the runtime's frustum. Writing fov and aspect and setting the
         // dirty byte is enough -- cameraBind rebuilds the projection from them on
@@ -1593,12 +1778,11 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         // on the left eye's pass only, from the head centre, and the right eye samples what
         // it left; 2 does it on both passes, each from its own eye. Without panes the same
         // passes render GPL's single stock image.
-        bool mirrorThisPass = mirrorWanted && (g_options.stereoMirror == 2 ||
-                                               (g_options.stereoMirror == 1 && pass == 0));
+        bool mirrorThisPass = mirrorWanted && (g_options.perEyeMirror || pass == 0);
         params->mirrorCamera = mirrorThisPass ? savedMirror : nullptr;
         if (mirrorThisPass && panes) {
             float eye[3] = {params->eyeX, params->eyeY, params->eyeZ};
-            if (g_options.stereoMirror == 1) {
+            if (!g_options.perEyeMirror) {
                 // vr[i].offset is each eye's own displacement from the recentre pose, in GPL
                 // local axes, so their midpoint is the head's.
                 float hx = 0.0f, hy = 0.0f, hz = 0.0f;
@@ -1633,7 +1817,7 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
 
             if (pass == 0)
                 reportPaneAim(paneFrame, eye, aim,
-                              g_options.stereoMirror == 1 ? "head centre" : "left eye");
+                              !g_options.perEyeMirror ? "head centre" : "left eye");
         }
 
         // Does GPL's euler round trip preserve what we composed?
@@ -1662,7 +1846,26 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                  worst, yaw * 57.29578f, pitch * 57.29578f, roll * 57.29578f);
         }
 
+        // This pass is not rendering the mirror, so mirror.mip still holds whichever eye wrote
+        // it last. Put this eye's own reflection back before the render that samples it.
+        //
+        // FLUSH FIRST. roglv2 does not rasterise when polyDraw is called -- it appends to the
+        // ZBuffer drawer's bins and issues them at a destination change or a 2D call. The eye
+        // before this one can still have the car queued, and that car samples mirror.mip, so
+        // replacing the texture underneath it hands it the other eye's reflection: the glasses
+        // read as swapped, and intermittently, because it depends on what is still in the bin.
+        // GPL's own copy-out has exactly this hazard and bitmapDraw flushes on its way in,
+        // which is why the stock mirror is never stale. This blit is not a bitmapDraw.
+        if (cacheEyes && !mirrorThisPass) {
+            rasterFlushPending();
+            mirrorCacheRestore(pass);
+        }
+
         original(params);
+
+        // Both halves of mirror.mip are this eye's only now: the +Y glass was copied in before
+        // the render and the -Y glass during it, just ahead of the car that samples them.
+        if (cacheEyes && mirrorThisPass) mirrorCacheSave(pass);
 
         // Did the projection actually get REBUILT?
         //
@@ -1723,6 +1926,9 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                  g_state.pendingAspect[pass], renderedAspect);
         }
     }
+
+    walkFrameEnd();
+    g_state.frameMirrorSurface = nullptr;
 
     params->camera = savedCamera;
     params->mirrorCamera = savedMirror;

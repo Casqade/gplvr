@@ -176,7 +176,9 @@ enum StampOutcome {
 };
 const char* const kOutcomeNames[kOutcomes] = {
     "DRAWN by us",       "clipped away by roglv2's own rule",
-    "fastText is off",   "unreadable",
+    // Unreachable since the fastText option went on 2026-09-27. The slot stays so the rest of
+    // the outcomes keep their numbers, which the probe records carry.
+    "(no longer used)",  "unreadable",
     "destination is not the GL framebuffer",
     "the set carries no palette",
     "the glyph is not an 8-bit colour-index image",
@@ -285,7 +287,6 @@ struct State {
 
     Counters                 window;
     fasttext::DrawStats      drawStats;
-    bool                     keyLast = false;
     bool                     loggedScale = false;
     int                      reportsLeft = 6;
 };
@@ -604,7 +605,7 @@ void flushPending() {
                   viewport[1] == 0)
                      ? ""
                      : " -- THEY DO NOT AGREE: the text will be scaled where roglv2's would "
-                       "not be. Turn fastText off and say so.");
+                       "not be.");
         }
         float screen[16];
         screenMatrix(width, height, readInt(display, kDisplayOriginX),
@@ -765,11 +766,6 @@ bool handleStamp(int handle, int x, int y, int set, int glyph) {
     std::memset(&source, 0, sizeof(source));
     ++s.window.calls;
     if (s.sampling) sampleStamp(handle, x, y, set, glyph);
-    if (!g_options.fastText) {
-        recordProbe(handle, set, glyph, source, kOutcomeOptionOff, 0, 0, 0, 0, 0, 0);
-        flushPending();
-        return false;
-    }
     long long start = now();
 
     if (!readStamp(handle, set, glyph, source)) {
@@ -1093,9 +1089,8 @@ bool tryInstall(bool loud) {
     s.pending = false;
     logf("fast text: installed on all seven 2D globals (stampDraw at %p). GPL's stamped glyphs "
          "are drawn from a GPU atlas as one batched quad list; the other six flush that list "
-         "first, so nothing changes order. fastText = %d, key 0x%02X.",
-         reinterpret_cast<void*>(s.slot[kRasterStampDraw]), g_options.fastText ? 1 : 0,
-         g_options.fastTextKey);
+         "first, so nothing changes order. No setting: it is what this path does.",
+         reinterpret_cast<void*>(s.slot[kRasterStampDraw]));
     return true;
 }
 
@@ -1108,10 +1103,6 @@ void fastTextBind(const Binding& binding) {
     if (g_options.vr) {
         logf("fast text: not installed -- in VR the seven 2D globals belong to Hud.cpp, which "
              "re-issues every stamp once per eye");
-        return;
-    }
-    if (!g_options.fastText && !g_options.fastTextKey) {
-        logf("fast text: fastText = 0 and no key -- GPL's stamped text stays roglv2's");
         return;
     }
     for (int kind = 0; kind < kRasterKinds; ++kind) {
@@ -1161,17 +1152,6 @@ void fastTextPollFrame() {
         }
     }
 
-    if (g_options.fastTextKey) {
-        bool down = (GetAsyncKeyState(g_options.fastTextKey) & 0x8000) != 0;
-        if (down && !s.keyLast) {
-            g_options.fastText = !g_options.fastText;
-            flushPending();
-            logf("fast text: %s", g_options.fastText
-                                      ? "ON -- glyphs come from our atlas, one draw a run"
-                                      : "OFF -- roglv2 draws every glyph with glDrawPixels");
-        }
-        s.keyLast = down;
-    }
 }
 
 void fastTextEndFrame() {
@@ -1197,12 +1177,12 @@ void fastTextReport() {
     double perFrame = 1000.0 / static_cast<double>(frequency.QuadPart) / c.frames;
     unsigned fellBack = c.fellBackDestination + c.fellBackNoPalette + c.fellBackFormat +
                         c.fellBackUnreadable + c.fellBackAtlasFull + c.fellBackNoGl;
-    logf("fast text: %s -- %.1f stampDraw calls a frame, %.1f drawn by us in %.1f draws "
+    logf("fast text: %.1f stampDraw calls a frame, %.1f drawn by us in %.1f draws "
          "(cache %u hit, %u uploaded), %.1f clipped away, %.1f back to roglv2 (destination not "
          "the framebuffer %u, no palette %u, glyph format %u, unreadable %u, atlas full %u, no "
          "GL %u); atlas %dx%d holding %zu glyphs, %u uploads of %u KiB, %u palette uploads; "
          "cpu %.3f ms a frame (%.3f of it in the draw, %.3f in uploads)",
-         g_options.fastText ? "ON" : "OFF", static_cast<double>(c.calls) / c.frames,
+         static_cast<double>(c.calls) / c.frames,
          static_cast<double>(c.drawn) / c.frames,
          static_cast<double>(s.drawStats.draws) / c.frames, c.cacheHits, c.cacheMisses,
          static_cast<double>(c.clippedAway) / c.frames, static_cast<double>(fellBack) / c.frames,

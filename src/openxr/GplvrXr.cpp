@@ -28,6 +28,7 @@
 
 #include "Log.h"
 #include "openxr/Xr.h"
+#include "openxr/XrInput.h"
 #include "presenter/Consumer.h"
 
 #include <d3d11_1.h>
@@ -306,8 +307,12 @@ struct HudLayer {
     bool     loggedNoSeat = false;
 };
 
+// Builds a quad layer's swapchain. Two layers use it -- pribluda's HUD panel and the VR
+// menu -- so `what` names which one in every line it prints. Without it the menu's
+// swapchain announced itself as the HUD's, three times a session, which is the kind of
+// mislabelled diagnostic that costs an hour the next time something here is wrong.
 bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
-                        uint32_t width, uint32_t height, HudLayer& hud) {
+                        uint32_t width, uint32_t height, HudLayer& hud, const char* what) {
     releaseEye(hud.image);
     hud.haveImage = false;
     hud.drawnSequence = 0;
@@ -326,7 +331,7 @@ bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
         hud.image.swapchain = XR_NULL_HANDLE;
         hud.failedWidth = width;
         hud.failedHeight = height;
-        logf("xr: the HUD panel swapchain %ux%u could not be created -- no panel", width,
+        logf("xr: the %s swapchain %ux%u could not be created -- no panel", what, width,
              height);
         return false;
     }
@@ -349,7 +354,7 @@ bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
         desc.Format = viewFormat;
         desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
         if (FAILED(device->CreateRenderTargetView(image.texture, &desc, &target))) {
-            logf("xr: CreateRenderTargetView failed for a HUD panel image -- no panel");
+            logf("xr: CreateRenderTargetView failed for a %s image -- no panel", what);
             releaseEye(hud.image);
             hud.failedWidth = width;
             hud.failedHeight = height;
@@ -360,8 +365,8 @@ bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
 
     hud.failedWidth = 0;
     hud.failedHeight = 0;
-    logf("xr: HUD panel swapchain %ux%u, %u images, %s -- image format %d, drawn through %s%s",
-         width, height, count, dxgiFormatName(format), (int)textureFormat,
+    logf("xr: %s swapchain %ux%u, %u images, %s -- image format %d, drawn through %s%s",
+         what, width, height, count, dxgiFormatName(format), (int)textureFormat,
          dxgiFormatName(viewFormat),
          hud.image.decodeSrgb ? " with an sRGB decode in the blit" : "");
     return true;
@@ -369,6 +374,39 @@ bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
 
 // Copy the game's newest panel image into the swapchain when there is one. True when an
 // image has been released and the quad can be submitted.
+// The VR menu's image, into its own swapchain. The same shape as the HUD's, with
+// Consumer::drawMenu in place of drawHud -- they read different shared slots and nothing
+// else about them differs.
+bool updateMenuImage(Consumer& consumer, ID3D11DeviceContext* context,
+                     const Consumer::MenuPanel& panel, HudLayer& menu) {
+    if (!panel.sequence || panel.sequence == menu.drawnSequence) return menu.haveImage;
+
+    uint32_t                    imageIndex = 0;
+    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!XR_CHECK(g_api.xrAcquireSwapchainImage(menu.image.swapchain, &acquireInfo,
+                                                &imageIndex)))
+        return menu.haveImage;
+
+    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    XR_CHECK(g_api.xrWaitSwapchainImage(menu.image.swapchain, &waitInfo));
+
+    bool drawn = imageIndex < menu.image.targets.size() &&
+                 consumer.drawMenu(menu.image.targets[imageIndex], menu.image.width,
+                                   menu.image.height, panel.sequence,
+                                   menu.image.decodeSrgb);
+    context->Flush();
+
+    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    XR_CHECK(g_api.xrReleaseSwapchainImage(menu.image.swapchain, &releaseInfo));
+
+    if (drawn) {
+        menu.drawnSequence = panel.sequence;
+        menu.haveImage = true;
+    }
+    return menu.haveImage;
+}
+
 bool updateHudImage(Consumer& consumer, ID3D11DeviceContext* context,
                     const Consumer::HudPanel& panel, HudLayer& hud) {
     if (!panel.sequence || panel.sequence == hud.drawnSequence) return hud.haveImage;
@@ -402,7 +440,8 @@ bool updateHudImage(Consumer& consumer, ID3D11DeviceContext* context,
 
 // The seat space follows the game's recentre: rebuilt from the published seat pose
 // whenever its generation moves.
-void updateSeatSpace(XrSession session, const Consumer& consumer, HudLayer& hud) {
+void updateSeatSpace(XrSession session, const Consumer& consumer, HudLayer& hud,
+                     const char* what) {
     SharedPose seat;
     int32_t    generation = 0;
     if (!consumer.seat(seat, generation) || generation == hud.seatGeneration) return;
@@ -418,10 +457,10 @@ void updateSeatSpace(XrSession session, const Consumer& consumer, HudLayer& hud)
     info.poseInReferenceSpace.position = {seat.positionX, seat.positionY, seat.positionZ};
     if (!XR_CHECK(g_api.xrCreateReferenceSpace(session, &info, &hud.seatSpace))) {
         hud.seatSpace = XR_NULL_HANDLE;
-        logf("xr: HUD panel -- the seat space could not be created");
+        logf("xr: %s -- the seat space could not be created", what);
         return;
     }
-    logf("xr: HUD panel -- seat space built from recentre %d at (%.3f, %.3f, %.3f)",
+    logf("xr: %s -- seat space built from recentre %d at (%.3f, %.3f, %.3f)", what,
          generation, seat.positionX, seat.positionY, seat.positionZ);
 }
 
@@ -981,6 +1020,15 @@ int wmain(int argc, wchar_t** argv) {
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     XR_CHECK(g_api.xrCreateReferenceSpace(session, &spaceInfo, &viewSpace));
 
+    // -- motion controllers ------------------------------------------------------
+    //
+    // Here rather than in the frame loop: xrAttachSessionActionSets may be called once per
+    // session and must precede the first xrSyncActions. A refusal is not fatal -- the
+    // headset still works, the hands simply never appear -- and XrInput::create has
+    // already said which step said no.
+    XrInput controllers;
+    controllers.create(g_api, g_instance, session);
+
     // -- swapchains --------------------------------------------------------------
     uint32_t formatCount = 0;
     XR_CHECK(g_api.xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr));
@@ -1089,6 +1137,10 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     HudLayer hud;
+    // The VR menu's layer. Its own swapchain and its own seat space, because the seat
+    // space is rebuilt on a recentre and the two layers must not share one object whose
+    // lifetime either of them can end.
+    HudLayer menu;
 
     // -- frame loop --------------------------------------------------------------
     XrSessionState state = XR_SESSION_STATE_IDLE;
@@ -1232,11 +1284,35 @@ int wmain(int argc, wchar_t** argv) {
             XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
             if (!XR_CHECK(g_api.xrBeginFrame(session, &beginInfo))) break;
 
+            // The controllers, at the same predicted display time the views below are
+            // located for, and in the same appSpace -- so a hand and an eye read out of
+            // one published sample belong to one instant in one frame of reference.
+            //
+            // Published every frame, including the frames the runtime says not to render:
+            // a menu open over the game is exactly such a frame, and it is a frame where
+            // the driver is most likely to be pressing something.
+            if (controllers.attached()) {
+                SharedInput input;
+                controllers.sample(g_api, g_instance, session, appSpace,
+                                   frameState.predictedDisplayTime,
+                                   state == XR_SESSION_STATE_FOCUSED, input);
+                consumer.publishInput(input);
+
+                // What the runtime calls each bound control, asked only when a hand's
+                // interaction profile has changed -- which the sample above detects.
+                SharedInputNames names;
+                if (controllers.takeChangedNames(g_api, g_instance, session, names))
+                    consumer.publishInputNames(names);
+            }
+
             XrCompositionLayerProjectionView projectionViews[2] = {};
             XrCompositionLayerProjection     layer{
                 XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             XrCompositionLayerQuad              hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-            const XrCompositionLayerBaseHeader* layers[2] = {};
+            XrCompositionLayerQuad              menuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+            // Three: the projection, pribluda's panel and the VR menu. Layers are painted
+            // in submission order, so the menu goes last and sits over both.
+            const XrCompositionLayerBaseHeader* layers[3] = {};
             uint32_t layerCount = 0;
 
             if (frameState.shouldRender) {
@@ -1695,13 +1771,14 @@ int wmain(int argc, wchar_t** argv) {
                                         hud.failedHeight == panel.textureHeight;
                     if (failedBefore ||
                         !createHudSwapchain(session, device, chosenFormat,
-                                            panel.textureWidth, panel.textureHeight, hud))
+                                            panel.textureWidth, panel.textureHeight, hud,
+                                            "HUD panel"))
                         hudOn = false;
                 }
 
                 XrSpace hudSpace = XR_NULL_HANDLE;
                 if (hudOn && panel.layer == 2) {
-                    updateSeatSpace(session, consumer, hud);
+                    updateSeatSpace(session, consumer, hud, "HUD panel");
                     hudSpace = hud.seatSpace;
                     if (!hudSpace && !hud.loggedNoSeat) {
                         hud.loggedNoSeat = true;
@@ -1743,6 +1820,77 @@ int wmain(int argc, wchar_t** argv) {
                                                      static_cast<float>(hud.image.width)};
                     layers[layerCount++] =
                         reinterpret_cast<XrCompositionLayerBaseHeader*>(&hudQuad);
+                }
+
+                // -- the VR menu's quad ---------------------------------------------
+                //
+                // Simpler than the HUD's: the game publishes the pose outright, because
+                // the menu hangs where the driver was looking when it opened and nothing
+                // on this side can derive that. Always in the seat's space, which is the
+                // space the game states it in.
+                Consumer::MenuPanel menuPanel;
+                bool menuOn = presenting && consumer.menuPanel(menuPanel);
+                if (menuOn && menu.loggedLayer != 1) {
+                    menu.loggedLayer = 1;
+                    logf("xr: the VR menu layer is on -- %.2f x %.2f m from a %ux%u "
+                         "texture, in the seat's space",
+                         menuPanel.widthMetres, menuPanel.heightMetres,
+                         menuPanel.textureWidth, menuPanel.textureHeight);
+                } else if (!menuOn && menu.loggedLayer != 0) {
+                    menu.loggedLayer = 0;
+                    logf("xr: the VR menu layer is off");
+                }
+                if (menuOn && (menu.image.width != menuPanel.textureWidth ||
+                               menu.image.height != menuPanel.textureHeight)) {
+                    bool failedBefore = menu.failedWidth == menuPanel.textureWidth &&
+                                        menu.failedHeight == menuPanel.textureHeight;
+                    if (failedBefore ||
+                        !createHudSwapchain(session, device, chosenFormat,
+                                            menuPanel.textureWidth,
+                                            menuPanel.textureHeight, menu, "VR menu"))
+                        menuOn = false;
+                }
+
+                // Which space the game stated the pose in. Usually the seat's; the view's
+                // while the menu is annotating a head-locked HUD panel, because a layer
+                // drawn ON that panel has to be re-placed against the head exactly as the
+                // panel itself is.
+                XrSpace menuSpace = XR_NULL_HANDLE;
+                if (menuOn) {
+                    if (menuPanel.space == kMenuSpaceView) {
+                        menuSpace = viewSpace;
+                    } else {
+                        updateSeatSpace(session, consumer, menu, "VR menu");
+                        menuSpace = menu.seatSpace;
+                        if (!menuSpace && !menu.loggedNoSeat) {
+                            menu.loggedNoSeat = true;
+                            logf("xr: the VR menu -- no seat yet; it appears once the game "
+                                 "has recentred");
+                        }
+                    }
+                    if (!menuSpace) menuOn = false;
+                }
+
+                if (menuOn && menu.image.swapchain &&
+                    updateMenuImage(consumer, context, menuPanel, menu)) {
+                    menuQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    menuQuad.space = menuSpace;
+                    menuQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    menuQuad.subImage.swapchain = menu.image.swapchain;
+                    menuQuad.subImage.imageRect.offset = {0, 0};
+                    menuQuad.subImage.imageRect.extent = {
+                        static_cast<int32_t>(menu.image.width),
+                        static_cast<int32_t>(menu.image.height)};
+                    menuQuad.subImage.imageArrayIndex = 0;
+                    menuQuad.pose.orientation = {
+                        menuPanel.pose.orientationX, menuPanel.pose.orientationY,
+                        menuPanel.pose.orientationZ, menuPanel.pose.orientationW};
+                    menuQuad.pose.position = {menuPanel.pose.positionX,
+                                              menuPanel.pose.positionY,
+                                              menuPanel.pose.positionZ};
+                    menuQuad.size = {menuPanel.widthMetres, menuPanel.heightMetres};
+                    layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuQuad);
                 }
 
                 ++framesThisSecond;
@@ -1842,6 +1990,9 @@ int wmain(int argc, wchar_t** argv) {
     consumer.close();
     for (Eye& eye : eyes) releaseEye(eye);
     releaseHud(hud);
+    releaseHud(menu);
+    // Before the session: the action spaces and the action set belong to it.
+    controllers.destroy(g_api);
     if (viewSpace) g_api.xrDestroySpace(viewSpace);
     if (appSpace) g_api.xrDestroySpace(appSpace);
     g_api.xrDestroySession(session);
