@@ -406,7 +406,7 @@ bool ensureEyes(void* mainCamera) {
     stereoRelease();
 
     const float fov = cameraFloat(mainCamera, kCameraFov);
-    // TAKEN ONCE, and that is enough: GPL never moves its near plane. Measured 2026-09-26 over a
+    // TAKEN ONCE, and that is enough: GPL never moves its near plane. Measured over a
     // whole session with the eye cameras tracking it per frame and reporting every change -- one
     // line at startup, 0.125, and nothing after it. Re-reading it per frame was built, run and
     // removed; do not build it again.
@@ -581,7 +581,7 @@ void* g_walkLookupOriginal = nullptr;
 unsigned g_walkSubstituted = 0;   // calls where the car's position was used
 unsigned g_walkPassedThrough = 0; // calls with no viewed car, left alone
 
-// THE DEFECT THIS GUARDS, measured 2026-09-21 (report 84).
+// THE DEFECT THIS GUARDS, as measured in report 84.
 //
 // The walkmark trace caught it directly: for ONE frame -- both eye passes -- the dlong this
 // search writes jumps 32 m and comes straight back, while the eye's and the car's own dlongs in
@@ -609,6 +609,9 @@ unsigned g_walkPassedThrough = 0; // calls with no viewed car, left alone
 // tenth of a metre through the very frames where this search spiked 32 m. Live authoritative
 // data, not a stale value and not a guess about the search.
 constexpr uintptr_t kTrackLengthDlong = 0x006B3884;
+constexpr uintptr_t kSegmentCount = 0x006AFB08;
+constexpr uintptr_t kSegmentTable = 0x006AEA1C;  // float rows: +4 start m, +12 scale, +16 length
+constexpr int       kSegmentRowWords = 360;      // 1440 bytes a row
 
 // GPL'S OWN CONTAINMENT ANSWER, which its search asks for and then throws away.
 //
@@ -655,8 +658,26 @@ unsigned g_walkOverMargin = 0;     // the dlong moved further than the car did
 unsigned g_walkNoDlong = 0;        // rejected, but the car's dlong was unavailable
 float    g_walkWorstExcess = 0.0f; // biggest rejected overshoot, metres
 
+// A HYSTERESIS AND A FRAME-TO-FRAME JUMP COUNTER USED TO BE HERE. Both are gone.
+//
+// The hysteresis held the car-derived answer until GPL's own came back into agreement, to stop the
+// switch between two disagreeing sources being the jump. Measured with an exact-agreement
+// window: 38 re-asks, 26 answers held, ONE release on agreement. The two sources do not reconverge,
+// so it suppressed a steady disagreement rather than smoothing a transient -- and a jump still got
+// through. The table lookup removes the second source instead of filtering it.
+//
+// The counter compared each frame's accepted segment with the last frame's and flagged changes of
+// more than one, which is a flip rather than motion: a car at 300 km/h advances 0.93 m in a 90 Hz
+// frame and segments run to tens of metres. It caught the defect red-handed -- seven segments on a
+// frame where the car moved 22 cm, in five consecutive clean windows -- and it is out because the
+// table lookup makes that structurally impossible, which the driver has confirmed by eye.
+//
+// The one thing still worth saying is a REFUSAL: if the table cannot answer, the answer falls back
+// to GPL's search and the artifact can return. That is a silent failure, so it says so once.
+bool g_walkTableSaidRefused = false;
+
 // BOTH EYES ASK ABOUT THE HEAD CENTRE, and this is the fix for the one-frame eye-segment
-// artifact. MEASURED AND CLOSED, 2026-09-27.
+// artifact. MEASURED AND CLOSED.
 //
 // gpl_sceneRender picks the segment range from the eye POSITION, and each pass handed it its
 // own -- so the question had an answer per eye rather than per frame, and nothing made the two
@@ -705,6 +726,49 @@ void walkSetCentre(float x, float y, float z) {
 constexpr float kBigExcess = 10.0f;
 
 // Signed difference the short way round the lap, in dlong units.
+// THE SEGMENT FOR A DLONG, by table lookup instead of by search.
+//
+// gpl_cameraTrackPositionFromWorld answers the same question by walking from a hint segment, and
+// that walk is not a continuous function of its input: it can settle on a segment the point is not
+// inside (report 84) and which one it settles on moves with the hint and with sub-centimetre
+// changes in the position. The segment sets the origin of the drawn range, so a multi-segment
+// change shifts the whole world for a frame.
+//
+// The table at 0x006AEA1C is an ordered array of 1440-byte rows whose start dlong is at +4 and
+// whose length is +16 / +12, so this is monotone: the answer moves by one segment when the dlong
+// crosses a boundary and cannot move by four unless the DLONG moved by four segments' worth. It
+// therefore still follows a camera cut, a car reset or a lap crossing exactly, because those move
+// the dlong; what it cannot do is invent a jump the dlong did not make.
+//
+// Returns -1 when the table is not readable or the dlong is outside it.
+int segmentForDlong(float metres) {
+    int          count = *reinterpret_cast<const int*>(kSegmentCount);
+    const float* table = *reinterpret_cast<const float* const*>(kSegmentTable);
+    if (count <= 0 || count > 4096 || !table) return -1;
+
+    int low = 0;
+    int high = count - 1;
+    while (low <= high) {
+        int          mid = low + (high - low) / 2;
+        const float* row = table + kSegmentRowWords * mid;
+        float        start = row[1];
+        if (!(row[3] > 0.0f)) return -1;
+        float end = start + row[4] / row[3];
+        if (metres < start) {
+            high = mid - 1;
+        } else if (metres >= end) {
+            low = mid + 1;
+        } else {
+            return mid;
+        }
+    }
+    return -1;
+}
+
+// ANYTHING COMPARING TWO SEGMENT INDICES needs the shortest way round the ring, the way dlongDelta
+// below does for the dlong: the count is at kSegmentCount, and without the wrap a lap crossing reads
+// as a jump of the whole track. A helper for that lived here and went with the jump counter.
+
 int dlongDelta(int from, int to) {
     int length = *reinterpret_cast<const int*>(kTrackLengthDlong);
     int delta = to - from;
@@ -722,15 +786,38 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     // Substituting the car unconditionally centred the whole drawn segment range on a point
     // metres from the camera, and where a segment boundary fell between the two the camera's
     // own segment dropped out of the range: the road under the camera was not drawn and a
-    // distant terrain tile filled the frame below its own horizon. Measured 2026-09-26 at
+    // distant terrain tile filled the frame below its own horizon. Measured at
     // dlong 13875-13877, and the size of it tracked the separation -- a notch out of one tyre
     // at 1.19 m in the cockpit, half the frame at 4.98 m in the chase camera.
     //
     // The containment test decides. Report 84 measured 308 corrections in 66,160 passes, so
     // the eye's answer is sound on better than 99% of them and the car is a fallback, not a
     // replacement.
-    int segment = original(hint, out, x, y, z);
-    if (placementOf(segment, x, y) == 0) {
+    int  segment = original(hint, out, x, y, z);
+    bool sound = placementOf(segment, x, y) == 0;
+
+    // THE DLONG DECIDES THE SEGMENT, when the table can answer.
+    //
+    // The search above stays because out[1], the dlat, is its work and is a level-of-detail input.
+    // What is replaced is the segment index and the dlong, taken together from one smooth source so
+    // the pair cannot disagree with each other.
+    float viewDlong = 0.0f;
+    bool  viewSnapped = false;
+    int   fromTable =
+        interpolationViewDlong(viewDlong, viewSnapped) ? segmentForDlong(viewDlong) : -1;
+    if (fromTable >= 0) {
+        out[0] = static_cast<int>(static_cast<double>(viewDlong) * kDlongUnitsPerMetre);
+        return fromTable;
+    }
+    if (!g_walkTableSaidRefused) {
+        g_walkTableSaidRefused = true;
+        logf("walk: the segment table could not answer for the view's dlong, so the camera's "
+             "segment falls back to GPL's own search for as long as that lasts -- which is the "
+             "unstable answer the table exists to replace. Either the view dlong is unavailable "
+             "or it is outside the table.");
+    }
+
+    if (sound) {
         ++g_walkPassedThrough;
         g_walkHaveLast = false;  // the memory is about the substituted point, not this one
         return segment;
@@ -741,6 +828,7 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     // asked about anyway.
     float blended[3] = {}, tick[3] = {};
     if (!interpolationViewedCarPosition(blended, tick)) {
+        // Nothing to substitute, so GPL's answer goes out as it always did.
         ++g_walkPassedThrough;
         g_walkHaveLast = false;
         return segment;
@@ -820,6 +908,12 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
 // One thunk per site. The two sites are the two lookups gpl_sceneRender makes -- one for the
 // main camera, one for the mirror's -- and only the main one is the eye's own walk, which is
 // the one the head centre replaces.
+//
+// ANYTHING MEASURING THIS ANSWER MUST NOT USE out[0] AS ITS CONTROL. out[0] changes SOURCE between
+// the paths below -- the search writes the dlong for the camera on one and for the car on the other,
+// and the table writes the view's -- so it jumps exactly when the source switches, which is the
+// event such a measurement would be looking for. A jump counter built that way reported 5.47 m of
+// advance on a single 90 Hz frame, or 492 m/s. Use the view's own dlong.
 int __cdecl walkLookupMainThunk(int hint, int* out, int x, int y, int z) {
     if (g_walkHaveCentre && g_walkPass >= 0 && g_walkPass < 2) {
         x = g_walkCentre[0];
@@ -1137,6 +1231,10 @@ int stereoMirrorCopy(int writeBitmap, int readSurface, int x) {
 }
 
 void stereoRelease() {
+    // A track change may legitimately put the dlong outside a table that has not loaded yet, so the
+    // one-shot refusal notice is armed again for the new one.
+    g_walkTableSaidRefused = false;
+
     // The mirror's bitmap may not outlive the mode change, so the cache is told to forget it
     // before anything here can look at it again.
     mirrorCacheRelease();

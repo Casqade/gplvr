@@ -58,6 +58,10 @@ bool interpolationViewedCarPosition(float blended[3], float newestTick[3]);
 // instead of from a search that can answer a segment out. False when there is no viewed car.
 bool interpolationViewedCarDlong(float& metres);
 
+// The view's own blended dlong along the track, and whether the view history snapped this frame.
+// A snap is a camera cut, a car reset or a tick gap: the value legitimately jumps there.
+bool interpolationViewDlong(float& metres, bool& snapped);
+
 // The once-a-second interp: line. False when the window latched no world frame.
 bool interpolationFormat(char* out, size_t size);
 

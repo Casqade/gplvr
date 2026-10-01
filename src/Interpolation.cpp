@@ -65,6 +65,26 @@ enum Blend {
     kQuat,    // quaternion x, y, z, w, slerped; `matrix` is rebuilt from it
 };
 
+// THE RECORD'S OWN VELOCITIES ARE NOT USED, and what is known about them is worth keeping.
+//
+// The view and mirror records carry the sim's published linear velocity at +12 and its angular
+// velocity at +136, both `kKeep`. Measured and decoded:
+//
+//   - gpl_viewRecordSetVelocity 0x4E3A90 copies phys+12..20 in verbatim, no scaling.
+//   - Both are per SECOND, not per tick: the eye's move over one tick is 0.03 of the published
+//     magnitude and 1/36 is 0.028, and gpl_rbIntegrateEuler integrates with dt = 1/36 s.
+//   - gpl_aiPredictOneTickBallistic hands the rigid body's angular velocity into the +136 slot
+//     beside +244's linear one, and gpl_netCarRecordStampLocalSim takes the four as
+//     (position, orientation, linear, angular).
+//   - GPL's own orientation step is h = 0.5 * dt * omega, q' = normalise(q + q (x) h), where the
+//     product is q (x) h -- sub_4E4D10 0x4E4D10 gives result.xyz = q.w * h + q x h.
+//   - Cars carry NEITHER velocity, so nothing of this applies to them.
+//
+// They were used for a tick of extrapolation and it worked -- the linear scaling measured 1.00 and
+// the angular step sat within a quarter of the arc's own reach -- but the arc's reach past a tick
+// is only about 0.2 degrees, so the whole mechanism is sub-degree and could not be the jolt it was
+// reached for. It is out again with the forward targeting that needed it.
+
 struct Field {
     int         offset;  // bytes from the record's base
     int         words;
@@ -187,6 +207,17 @@ constexpr float kMaxBlendMagnitude = 1e6f;
 enum Snap { kSnapFirst, kSnapIdentity, kSnapGap, kSnapJump, kSnapCamera, kSnapNonFinite, kSnaps };
 
 // One record's two newest latched copies. words[0] is the older, words[1] the newest.
+//
+// A THIRD COPY WAS TRIED AND REVERTED. The target rides the presenter's display grid
+// while the copies ride the sim's latch grid, so it lands a few milliseconds before words[0] about
+// one frame in five and is clamped there, freezing the world for that frame. Keeping the tick
+// before words[0] let those frames blend against a pair that brackets them, and it worked --
+// clamped low went to 0 and alpha's mean from 0.33 to 0.51.
+//
+// It is out because the frames it fixed were not the problem. The decision has to be taken once
+// for the WHOLE frame or records drawn from different pairs disagree with each other, which is a
+// worse artifact than the freeze; taken that way it still did not settle the jolt, and the driver
+// preferred the stepping. Anyone rebuilding it needs the frame-level decision from the start.
 struct History {
     uint32_t words[2][kCarWords] = {};
     int      ticks[2] = {};
@@ -212,6 +243,24 @@ struct Window {
     long long extraCostTicks = 0;
     unsigned  clampedLow = 0;
     unsigned  clampedHigh = 0;
+    unsigned  targetHeldBack = 0;    // frames whose target regressed and was held instead
+
+    // How far outside the pair the target was when it clamped, and how often the alpha reported
+    // for the frame was the VIEW's rather than some other record's.
+    //
+    // These two settled a contradiction and are worth their width: the clamp is the
+    // view's own (70 of 70) and the excursion is real (7 to 11 ms of a 27.78 ms window), which is
+    // what ruled out both "the counter is measuring another record" and "it is floating-point dust
+    // at the boundary". Any future claim about the clamp has to survive these.
+    unsigned  sampledView = 0;
+    double    clampedWorstMs = 0.0;
+
+
+    // How evenly the sampled world instant advanced, in ms, on frames that kept the same pair as
+    // the frame before and on frames that changed pair.
+    unsigned  steadySteps = 0;
+    double    steadyMin = 0.0;
+    double    steadyMax = 0.0;
     unsigned  snaps[kSnaps] = {};
     unsigned  gaps[4] = {};  // view pair: 1, 2, 3, 4+ ticks
     unsigned  carsBlended = 0;
@@ -250,6 +299,36 @@ struct State {
     bool blendable = false;  // the last latch produced a pair worth re-blending
     float    lastAlpha = 0.0f;
     int      lastTickGap = 0;
+
+    // THE SAMPLED INSTANT'S OWN SMOOTHNESS, which no alpha figure can show.
+    //
+    // alpha is a position within a pair, so it says nothing about the world time the frame was
+    // drawn for once the pair changes underneath it. What the eye sees is that instant advancing
+    // evenly: at 90 Hz it should step 11.11 ms every frame, whatever alpha or which pair produced
+    // it. An uneven step is judder of the whole picture, because the eye position is itself a
+    // blended field.
+    //
+    // Split by whether the pair changed this frame. The older-pair fallback makes about one frame
+    // in five blend from (T-1, T0) and the rest from (T0, T1), so it switches roughly 36 times a
+    // second, and the two pairs' ends come from tickArrival's MODEL rather than from one clock. If
+    // the model places them inconsistently, every switch is a step -- which would be a judder the
+    // fallback introduced, and the driver reports the whole-frame stutter appearing with it.
+    double   lastTarget = 0.0;
+    bool     haveLastTarget = false;
+
+    // THE TARGET MUST NEVER GO BACKWARDS, and measured it sometimes did.
+    //
+    // The drawn instant stepped -0.24 ms on one frame and 131 ms on another, in six of 37 windows,
+    // about once every six seconds -- the same rate as the hiccups. A negative step draws the world
+    // BEFORE where the last frame drew it, and the frame after jumps two periods to catch up.
+    //
+    // It comes from the quantisation in renderPacingDisplayTime: the display is a presenter latch
+    // plus a whole number of periods, and when the presenter's own latch time updates between two
+    // frames that number can recompute one period lower. Real time does not do that, so the
+    // regression is arithmetic rather than a real event, and holding the previous target is closer
+    // to the truth than following it back.
+    double   guardTarget = 0.0;
+    bool     haveGuardTarget = false;
     bool viewLatched = false;
     bool mirrorLatched = false;
     bool pitBoardLatched = false;
@@ -424,13 +503,14 @@ float blendDlong(float older, float newest, float a, float length) {
 unsigned g_rotationFallbacks = 0;
 
 // Rotation fields: the matrix, or the quaternion and the matrix derived from it.
-void blendRotation(const History& h, uint8_t* record, int base, const Field& field, float a) {
+void blendRotation(const uint32_t* lo, const uint32_t* hi, uint8_t* record, int base,
+                   const Field& field, float a) {
     if (field.blend == kQuat) {
-        Quat older = quatAt(h.words[0], base, field.offset);
-        Quat newest = quatAt(h.words[1], base, field.offset);
+        Quat older = quatAt(lo, base, field.offset);
+        Quat newest = quatAt(hi, base, field.offset);
         float olderMatrix[9], newestMatrix[9];
-        matrixAt(h.words[0], base, field.matrix, olderMatrix);
-        matrixAt(h.words[1], base, field.matrix, newestMatrix);
+        matrixAt(lo, base, field.matrix, olderMatrix);
+        matrixAt(hi, base, field.matrix, newestMatrix);
         // A matrix written apart from its quaternion is blended by itself instead.
         if (!unitQuat(older) || !unitQuat(newest) || !matrixMatchesQuat(olderMatrix, older) ||
             !matrixMatchesQuat(newestMatrix, newest)) {
@@ -454,8 +534,8 @@ void blendRotation(const History& h, uint8_t* record, int base, const Field& fie
         return;
     }
     float olderMatrix[9], newestMatrix[9];
-    matrixAt(h.words[0], base, field.offset, olderMatrix);
-    matrixAt(h.words[1], base, field.offset, newestMatrix);
+    matrixAt(lo, base, field.offset, olderMatrix);
+    matrixAt(hi, base, field.offset, newestMatrix);
     Quat older, newest;
     if (!quatFromMatrix(olderMatrix, older) || !quatFromMatrix(newestMatrix, newest)) return;
     float blended[9];
@@ -466,19 +546,19 @@ void blendRotation(const History& h, uint8_t* record, int base, const Field& fie
 
 // Writes every blended field of `record` from the pair, at `a` from the older copy to the
 // newest. Kept fields are left as the latch wrote them, which is the newest copy.
-void blendFields(const History& h, uint8_t* record, int base, const Field* fields, size_t count,
-                 float a, float length) {
+void blendFields(const uint32_t* lo, const uint32_t* hi, uint8_t* record, int base,
+                 const Field* fields, size_t count, float a, float length) {
     for (size_t i = 0; i < count; ++i) {
         const Field& field = fields[i];
         if (field.blend == kKeep) continue;
         if (field.blend == kMatrix || field.blend == kQuat) {
-            blendRotation(h, record, base, field, a);
+            blendRotation(lo, hi, record, base, field, a);
             continue;
         }
         for (int k = 0; k < field.words; ++k) {
             int   offset = field.offset + 4 * k;
-            float older = floatAt(h.words[0], base, offset);
-            float newest = floatAt(h.words[1], base, offset);
+            float older = floatAt(lo, base, offset);
+            float newest = floatAt(hi, base, offset);
             float d = newest - older;
             float value = newest;
             switch (field.blend) {
@@ -514,6 +594,7 @@ void shift(History& h, const uint8_t* words, int count, int tick) {
     h.ticks[1] = tick;
     if (h.copies < 2) ++h.copies;
 }
+
 
 uint8_t* carRecord(int slot) {
     uintptr_t array = slot < kCarsPerArray ? kLiveCars : kReplayCars;
@@ -646,6 +727,9 @@ void pushView(State& s, History& h, const uint8_t* record, int tick, const int i
 
     int gap = h.ticks[1] - h.ticks[0];
     if (countGap && gap >= 1) ++w.gaps[gap >= 4 ? 3 : gap - 1];
+
+    // DOES THE PUBLISHED VELOCITY MATCH THE MOVE THE PAIR MADE?
+    //
     int reason = -1;
     if (gap < 1 || gap > kMaxBlendTicks) {
         reason = kSnapGap;
@@ -741,14 +825,21 @@ float    g_blendWorstMetres = 0.0f;
 
 void checkBlendedPosition(const History& h, const uint8_t* record, int base, int offset,
                           const char* what) {
-    float worst = 0.0f;
+    // The pair the blend actually used, which is the only one the written value has to lie in.
+    const uint32_t* lo = h.words[0];
+    const uint32_t* hi = h.words[1];
+    int             loTick = h.ticks[0];
+    int             hiTick = h.ticks[1];
+    float           worst = 0.0f;
     for (int k = 0; k < 3; ++k) {
-        float older = floatAt(h.words[0], base, offset + 4 * k);
-        float newest = floatAt(h.words[1], base, offset + 4 * k);
+        float older = floatAt(lo, base, offset + 4 * k);
+        float newest = floatAt(hi, base, offset + 4 * k);
         float wrote = *reinterpret_cast<const float*>(record + offset + 4 * k);
         float low = older < newest ? older : newest;
         float high = older < newest ? newest : older;
         float over = wrote < low ? low - wrote : (wrote > high ? wrote - high : 0.0f);
+        // Past the newest tick the value is SUPPOSED to leave the pair, by (alpha - 1) of the
+        // pair's own span. Only what exceeds that is a fault.
         if (over > worst) worst = over;
     }
     if (worst <= 0.01f) return;
@@ -763,12 +854,12 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
          what, static_cast<double>(*reinterpret_cast<const float*>(record + offset)),
          static_cast<double>(*reinterpret_cast<const float*>(record + offset + 4)),
          static_cast<double>(*reinterpret_cast<const float*>(record + offset + 8)),
-         static_cast<double>(worst), static_cast<double>(floatAt(h.words[0], base, offset)),
-         static_cast<double>(floatAt(h.words[0], base, offset + 4)),
-         static_cast<double>(floatAt(h.words[0], base, offset + 8)),
-         static_cast<double>(floatAt(h.words[1], base, offset)),
-         static_cast<double>(floatAt(h.words[1], base, offset + 4)),
-         static_cast<double>(floatAt(h.words[1], base, offset + 8)), h.ticks[0], h.ticks[1]);
+         static_cast<double>(worst), static_cast<double>(floatAt(lo, base, offset)),
+         static_cast<double>(floatAt(lo, base, offset + 4)),
+         static_cast<double>(floatAt(lo, base, offset + 8)),
+         static_cast<double>(floatAt(hi, base, offset)),
+         static_cast<double>(floatAt(hi, base, offset + 4)),
+         static_cast<double>(floatAt(hi, base, offset + 8)), loTick, hiTick);
 }
 
 // Blend one record to `target`. True when its pair was usable; only the first such record of a
@@ -778,7 +869,7 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
 // unchanged world, which is the control that says how much of the smoothness is the blend and
 // how much is merely presenting more often.
 // THE ONE PLACE that turns "the driver asked for a rate above the sim's" into "the world is
-// blended". They were two options until 2026-09-27 and the pair could be set to a state that
+// blended". They were two options once, and the pair could be set to a state that
 // draws duplicate frames -- a doubled picture in the headset -- so the second one is gone and
 // this reads the first. Everything that wants to know whether the world moves between ticks
 // asks here or asks interpolationActive().
@@ -794,7 +885,56 @@ bool tickArrival(const State& s, int count, double& qpc) {
     return true;
 }
 
-bool blendHistory(State& s, const History& h, uint8_t* record, int base, const Field* fields,
+// ONE DECISION FOR THE WHOLE FRAME, if the third copy is ever rebuilt.
+//
+// Taken per record, the older-pair fallback produced a worse artifact than the freeze it removed:
+// each record has its own history, so one car could clamp to the newest pair while the world around
+// it blended from the older one -- drawn at a different instant from everything else, eighteen times
+// a second. Before the third copy a clamped frame clamped EVERY record together, and the eye reads a
+// brief uniform hold far more forgivingly than one car swimming against the road. The rule is:
+// either every record in the frame uses the older pair or none does.
+
+// Hold the target at the previous frame's when the new one is behind it, and count that. A real
+// discontinuity -- a tick gap, a camera cut, a mode change -- moves the target FORWARD, which is
+// let through; only backwards is refused, because nothing in the world does that.
+//
+// The guard resets when the blend cannot be timed at all, so a session or mode change starts again
+// rather than holding against an instant from before it.
+double holdTargetForward(State& s, double target) {
+    if (s.haveGuardTarget && target < s.guardTarget) {
+        ++s.window.targetHeldBack;
+        return s.guardTarget;
+    }
+    s.guardTarget = target;
+    s.haveGuardTarget = true;
+    return target;
+}
+
+// SUBSTITUTING A SECOND ANCHOR WHEN THE FIRST FALLS OUT OF RANGE WAS TRIED AND REVERTED.
+// Do not rebuild it.
+//
+// The arithmetic behind it still holds and is worth keeping: `display - latency - tick` is the right
+// expression, and with this frame's OWN latch-to-display it reduces to `the frame's instant - tick`,
+// which lies between the two ticks by construction, so alpha could never leave [0, 1]. `latency` is
+// not this frame's own and cannot be -- `display` is quantised to the display grid while the instant
+// it is measured against is not, so the sample sweeps a whole display period and the average it
+// settles on is off by up to half of one on any given frame. Raising kLatencyGain does not help,
+// because the error is the sawtooth's own amplitude rather than tracking lag.
+//
+// So the target really does fall outside the pair, and by a real margin: measured 7 to 11 ms of a
+// 27.78 ms window, on 5 to 24 frames of every 72, always low, with `70 of 70 alphas were the view's`
+// confirming it is the view's own pair and not another record's.
+//
+// What failed was the remedy. Using the frame's own instant on just those frames mixes two anchors
+// within one second -- at 72 Hz it reached 31 of 73 frames -- and the frames either side of a
+// substitution disagree by whatever the two anchors differ by. That is the same fault the display
+// clock was moved to fix, described where blendFrame builds the target: two formulas for one
+// question, and the world steps where they meet. The driver's verdict was that it turned stepping
+// objects into everything stuttering, which is what mixing anchors should do.
+//
+// Whatever replaces it has to answer with ONE anchor on every frame.
+
+bool blendHistory(State& s, History& h, uint8_t* record, int base, const Field* fields,
                   size_t count, double target, float length, bool& sampled, bool rewriteAtOne) {
     if (h.copies < 2 || h.snapped) return false;
     double older = 0.0;
@@ -802,6 +942,9 @@ bool blendHistory(State& s, const History& h, uint8_t* record, int base, const F
     if (!tickArrival(s, h.ticks[0], older) || !tickArrival(s, h.ticks[1], newest) ||
         !(newest > older))
         return false;
+
+    const uint32_t* lo = h.words[0];
+    const uint32_t* hi = h.words[1];
 
     double alpha = (target - older) / (newest - older);
     bool   low = alpha < 0.0;
@@ -819,11 +962,52 @@ bool blendHistory(State& s, const History& h, uint8_t* record, int base, const F
         ++w.alphas;
         if (low) ++w.clampedLow;
         if (high) ++w.clampedHigh;
+        if ((low || high) && s.frequency > 0) {
+            double outside = low ? older - target : target - newest;
+            double ms = outside * 1000.0 / static_cast<double>(s.frequency);
+            if (ms > w.clampedWorstMs) w.clampedWorstMs = ms;
+        }
+
+        // CORRECTING A CONSTANT BIAS WAS TRIED AND REVERTED. Do not rebuild it.
+        //
+        // The reasoning was that with a latency equal to this frame's own latch-to-display the
+        // target reduces to `latch - tick`, so alpha is the latch's phase inside the tick and can
+        // never clamp; therefore any clamp is error, and its direction says which way to move. A
+        // slow integrator drove the target off whichever edge was being hit.
+        //
+        // It moved the mean exactly as intended and fixed nothing: at +2.17 ms of correction the
+        // mean alpha reached 0.40, which is the ideal for 90/36, while `clamped low` stayed at 5
+        // to 10 frames of every 70. It then integrated past the target, because a population that
+        // never stops clamping never supplies the opposing push.
+        //
+        // The mean and the clamps are DIFFERENT POPULATIONS. The clamps are a tail -- measured 4.5
+        // to 7.8 ms outside the pair while `alpha max` was already 0.97 to 0.99 -- so the
+        // distribution was against the top of the window before any correction. Shifting it up
+        // cannot pull a tail off the bottom.
+        //
+        // The arithmetic that would have refused this before it was built: the excursions in the
+        // run it was designed from were 2.5 to 2.9 ms, and the offset inferred from the mean was
+        // 1.9 ms. An offset smaller than the excursions cannot account for them.
+
+        // The instant this frame was actually drawn for, against the one before it. Measured from
+        // the clamped alpha, so it is what the record received rather than what was asked for --
+        // which is how the clamp shows up here as a step of zero.
+        double drawn = older + alpha * (newest - older);
+        if (s.haveLastTarget && s.frequency > 0) {
+            double step = (drawn - s.lastTarget) * 1000.0 / static_cast<double>(s.frequency);
+            if (!w.steadySteps || step < w.steadyMin) w.steadyMin = step;
+            if (!w.steadySteps || step > w.steadyMax) w.steadyMax = step;
+            ++w.steadySteps;
+        }
+        s.lastTarget = drawn;
+        s.haveLastTarget = true;
     }
-    // At the newest tick the record already holds what the latch wrote -- unless an earlier
-    // frame of this same tick blended it somewhere else, which is what an extra frame does.
+    // The record already holds what the latch wrote, so at EXACTLY the newest tick there is nothing
+    // to do -- unless an earlier frame of this same tick blended it somewhere else, which is what an
+    // extra frame does. Past the newest tick the fields have to be written, because extrapolation
+    // moves them; and on the older pair the top end is ticks[0] while the record holds ticks[1].
     if (alpha < 1.0 || rewriteAtOne)
-        blendFields(h, record, base, fields, count, static_cast<float>(alpha), length);
+        blendFields(lo, hi, record, base, fields, count, static_cast<float>(alpha), length);
     return true;
 }
 
@@ -853,6 +1037,9 @@ void applyBlend(State& s, double target, const int* cars, int carCount, bool hav
     bool    sampled = false;
     bool    any = false;
     int     parts = kPartAll;
+
+    // ONE DECISION FOR THE WHOLE FRAME. Every record that will be blended has to be able to honour
+    // it, or the frame keeps the newest pair and the clamp for all of them.
     if ((parts & kPartView) &&
         blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
@@ -862,6 +1049,9 @@ void applyBlend(State& s, double target, const int* cars, int carCount, bool hav
         // The view record's eye position is the first three floats; the car's is at its byte 16.
         checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(kViewRecord), 0, 0, "the eye");
     }
+    // Whether the alpha reported for this frame is the VIEW's. Measured rather than assumed: a
+    // clamp attributed to the wrong record sends the next reader after the wrong history.
+    if (sampled) ++w.sampledView;
     if ((parts & kPartMirror) && haveMirror &&
         blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(kMirrorRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
@@ -908,19 +1098,31 @@ void blendFrame(State& s, long long now, bool frozen) {
     if (!g_options.vr) {
         if (!s.haveTickModel || s.tickPeriod <= 0.0) {
             ++w.untimed;
+            s.haveGuardTarget = false;
             return;
         }
         ++w.costTimed;
-        applyBlend(s, static_cast<double>(now) - s.tickPeriod, s.latched, s.latchedCount,
-                   s.mirrorLatched, s.pitBoardLatched, false);
+        applyBlend(s, holdTargetForward(s, static_cast<double>(now) - s.tickPeriod), s.latched,
+                   s.latchedCount, s.mirrorLatched, s.pitBoardLatched, false);
         return;
     }
 
+    // ANCHORED ON THIS FRAME, exactly as the frames between the ticks are.
+    //
+    // renderPacingDisplayTime anchors on the sim latch instead, and that was the only difference
+    // left between the two paths: 36 frames a second asked one way and 54 the other. Where the two
+    // disagree the target stands still for a frame and then advances two display periods -- measured
+    // as steps of 0.00 ms followed by 22.5 ms, clustered where the render is slowest and the two
+    // anchors are furthest apart. One formula for every frame cannot produce that.
+    //
+    // The comment in interpolationBetweenTicks records why the frame anchor was introduced for the
+    // extra frames; the latched frame simply never followed.
     int       simHz = taskRateSimHz();
     long long display = 0;
     bool      fromPresenter = false;
-    if (simHz <= 0 || !renderPacingDisplayTime(now, display, fromPresenter)) {
+    if (simHz <= 0 || !renderPacingDisplayTimeAt(now, now, display, fromPresenter)) {
         ++w.untimed;
+        s.haveGuardTarget = false;
         return;
     }
     if (fromPresenter)
@@ -929,17 +1131,44 @@ void blendFrame(State& s, long long now, bool frozen) {
         ++w.costTimed;
 
     // The drawn state is the one a tick before the display time, less the frame's own smoothed
-    // latch-to-display time, so it advances with the display clock and always lies between the
-    // two latched ticks.
+    // latch-to-display time, so it advances with the display clock and always lies between the two
+    // latched ticks.
+    //
+    // FORWARD TARGETING WAS TRIED AND REVERTED. Dropping the tick put the target in
+    // [T1, T1 + one tick), where the millisecond of noise in the estimate cannot fall off the edge
+    // of the data, and it removed the clamping that freezes about one frame in five -- all of which
+    // it did, measurably: clamped low went to 0 and alpha's mean to 0.51. It also needed
+    // extrapolation, which brought the published linear and angular velocities in with it.
+    //
+    // None of it fixed the jolt the driver was chasing, and the driver's judgement was that the
+    // frozen-frame stepping it replaced was the lesser problem. Six mechanisms were proposed for
+    // that jolt across this session and every one was measured and disproved; it is not in this
+    // expression, and the measured signal never matched the symptom's distribution.
+    //
+    // THE SMOOTHING HAS TO BE SLOW, and this is the whole reason the drawn instant was jittery.
+    //
+    // `display` is quantised to the presenter's display grid while `now` advances continuously, so
+    // `sample` does not vary a little -- it SAWTOOTHS across a whole display period, 11.11 ms at
+    // 90 Hz. An exponential average of a sawtooth settles on its mean, but it also ripples by
+    // roughly the coefficient times the amplitude every step, and that ripple lands directly in
+    // the target: at 0.05 it is 0.05 * 11.11 = 0.55 ms a frame, which is what the drawn instant
+    // was measured stepping by (10.46 to 11.46 ms against an expected 11.11).
+    //
+    // The target must advance as evenly as `display` does, so what is subtracted from it has to be
+    // effectively constant frame to frame. kLatencyGain is the ripple budget: 0.004 puts it at
+    // 0.04 ms, well under a tenth of a millisecond, with a time constant of about 250 frames --
+    // under three seconds, which is fast enough for anything that is not a mode change. Mode
+    // changes are not left to it: the reset below takes them in one step.
+    constexpr double kLatencyGain = 0.004;
     double tick = static_cast<double>(s.frequency) / simHz;
     double sample = static_cast<double>(display - now);
     if (!s.haveLatency || std::fabs(sample - s.latency) > 3.0 * tick) {
         s.latency = sample;
         s.haveLatency = true;
     } else {
-        s.latency += 0.05 * (sample - s.latency);
+        s.latency += kLatencyGain * (sample - s.latency);
     }
-    double target = static_cast<double>(display) - s.latency - tick;
+    double target = holdTargetForward(s, static_cast<double>(display) - s.latency - tick);
 
     applyBlend(s, target, s.latched, s.latchedCount, s.mirrorLatched, s.pitBoardLatched, false);
 }
@@ -1026,6 +1255,8 @@ void __stdcall afterLatch() {
                 ++w.snaps[kSnapCamera];
                 ++w.viewCarCoupled;
             }
+            // The older pair needs no coupling here: applyBlend decides it once for the frame and
+            // every record honours that decision or none does.
         }
 
         // A board hidden in this latch starts a new history when it shows again.
@@ -1331,8 +1562,11 @@ bool interpolationExtraFrame() {
             return false;
         target = static_cast<double>(display) - s.latency - s.tickPeriod;
     } else {
+        // Flat mode has no display clock, so the wall clock is all there is; SwapBuffers' own
+        // blocking is what keeps the draw-to-display interval steady enough for it.
         target = static_cast<double>(now.QuadPart) - s.tickPeriod;
     }
+    target = holdTargetForward(s, target);
 
     Window& w = s.window;
     ++w.extraFrames;
@@ -1349,6 +1583,23 @@ bool interpolationExtraFrame() {
 // The viewed car's own distance along the track, blended, in metres. Record byte 12, the field
 // the sim maintains and the one the mark ring shows moving smoothly to a tenth of a metre while
 // gpl_cameraTrackPositionFromWorld's answer for the same point was spiking 32 m (report 84).
+// The VIEW's own blended dlong, byte 60 of the view record.
+//
+// This is the camera's position along the track, which is what decides the camera's segment. The
+// car's dlong is a different quantity: a chase or trackside camera sits metres from the car, and
+// substituting one for the other is what put the drawn range around the wrong point (measured at
+// 4.98 m in the chase camera).
+//
+// `snapped` says the view history refused to blend this frame -- a camera cut, a reset, a tick gap
+// -- which is a legitimate discontinuity in this value rather than a defect.
+bool interpolationViewDlong(float& metres, bool& snapped) {
+    State& s = g_state;
+    if (!s.installed || s.view.copies < 1) return false;
+    metres = *reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(kViewRecord) + 60);
+    snapped = s.view.snapped;
+    return true;
+}
+
 bool interpolationViewedCarDlong(float& metres) {
     State& s = g_state;
     if (!s.installed || s.viewedSlot < 0) return false;
@@ -1386,7 +1637,10 @@ bool interpolationFormat(char* out, size_t size) {
         int wanted = std::snprintf(
             out, size,
             "interp: %s | %u world frames: %u blended, %u frozen, %u untimed | alpha mean %.2f "
-            "min %.2f max %.2f, clamped low %u high %u | snaps first %u identity %u tick gap %u "
+            "min %.2f max %.2f, clamped low %u high %u (worst %.3f ms outside, %u of %u alphas "
+            "were the view's), target held back %u "
+            "| the drawn instant stepped %.2f to %.2f ms over %u frames "
+            "| snaps first %u identity %u tick gap %u "
             "jump %u camera %u nonfinite %u (%u of them the view and its car coupled) | view tick "
             "gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
             "| view blended %u, mirror %u, pit board %u (snapped %u) | rotation: %u matrix "
@@ -1395,7 +1649,9 @@ bool interpolationFormat(char* out, size_t size) {
             "ms | cost %.3f ms a frame | between ticks %u frames, %u re-blended, %.3f ms each",
             blendingEnabled() ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
             w.alphas ? w.alphaSum / w.alphas : 0.0, w.alphas ? w.alphaMin : 0.0,
-            w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.snaps[kSnapFirst],
+            w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.clampedWorstMs,
+            w.sampledView, w.alphas, w.targetHeldBack, w.steadyMin, w.steadyMax,
+            w.steadySteps, w.snaps[kSnapFirst],
             w.snaps[kSnapIdentity], w.snaps[kSnapGap], w.snaps[kSnapJump], w.snaps[kSnapCamera],
             w.snaps[kSnapNonFinite], w.viewCarCoupled, w.gaps[0], w.gaps[1], w.gaps[2],
             w.gaps[3],

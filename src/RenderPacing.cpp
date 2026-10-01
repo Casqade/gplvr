@@ -31,7 +31,26 @@ constexpr int kPublishedRing = 8;
 struct Window {
     unsigned trackedFrames = 0;
     unsigned between[3] = {};  // 1, 2, 3+ ticks
+    // Where `now + cost` fell inside the display period, in tenths. THE LOAD INDICATOR: this is
+    // the input the old rounding quantised, so bins 1, 9 and 10 together are "the phase is on a
+    // boundary", which is the condition the integer aim exists to survive. Kept after the fix so
+    // a quiet run can be told from a run that was never stressed.
+    unsigned phase[10] = {};
 };
+
+// THE PUBLISH-SPACING HISTOGRAM IS GONE and the phase distribution beside it came back, because
+// the two were removed together and only one of them was spent.
+//
+// The publish gap was a NEGATIVE, and negatives are the ones that get re-asked: over 42 windows
+// the mean gap was 1.00 with nothing beyond 1.25 periods in 38 of them, so no publish ever waits
+// for the next display, and the presenter's own log agreed at 5 skipped displays in 277 windows,
+// all at startup. Frame delivery is not a source of the jolt.
+//
+// The phase was not spent. It turned out to be the instrument that identified the jolt -- the
+// rounding in renderPacingDisplayTimeAt flips slot exactly when the phase sits on a period
+// boundary, and the phase moves there when render cost rises. What killed the earlier reading of
+// it was the question asked of it: "do publishes fall near an edge" (they did not, 12 of 17
+// windows) is not "does the TARGET's input fall near an edge" (it did, whenever a mirror was on).
 
 struct State {
     // bgIsRunning is never called. It is how the tick wait is IDENTIFIED: the one function
@@ -46,7 +65,7 @@ struct State {
     // This frame, taken at the latch.
     long long latchQpc = 0;    // when the tick wait ended and the latch began
     int       latchTicks = 0;  // getBGCount then
-    long long publishQpc = 0;  // the frame's first publish after its latch
+    long long publishQpc = 0;      // the frame's first publish after its latch
 
     // Latch to publish, tracked frames only, in QPC ticks: a smoothed mean and a smoothed
     // absolute deviation, the estimate being mean + 2 deviations. The display-time model
@@ -69,6 +88,7 @@ struct State {
     int       ringNext = 0;
     int32_t   lastPublished = 0;
     int32_t   lastConsumed = 0;
+
 
     Window window;
 };
@@ -138,6 +158,24 @@ void noteConsumed(State& s) {
     }
     s.lastConsumed = consumed;
 }
+
+// ANSWERING THE DISPLAY TIME FROM AN INTEGER VIEW-SEQUENCE LAG WAS TRIED AND REVERTED.
+// Do not rebuild it.
+//
+// It replaced the rounding below with `the newest published view set's own display time, plus
+// (presenterViewSequence() - presenterAcquiredViewSequence() + 1) periods`, on the reasoning that an
+// integer from two counters cannot sit on a boundary the way a rounded timestamp can.
+//
+// It engaged perfectly -- every frame on the integer path, no fallback -- and it did not help,
+// because the integer sits on a boundary of its own. The lag is a race between the render finishing
+// and the presenter's next publish, so when render cost approaches one display period it becomes a
+// coin flip: measured `aimed past its views 1:86 2:5` at 8.8-11.3 ms of an 11.11 ms period, and each
+// flip moves the target a WHOLE period. `0.07 to 22.34 ms` in the drawn-instant step with no clamp,
+// no hold and no rebase in that window is the flip and nothing else. Below about 8 ms of cost it was
+// a clean single column for 190 seconds -- which is exactly where the rounding was also fine.
+//
+// The phase histogram it brought with it stays, because it is what identified the boundary in the
+// first place and it reads on either arithmetic.
 
 // WHERE THE TICK WAIT ENDED, which is the moment this file exists to be told about.
 
@@ -268,11 +306,13 @@ void renderPacingInstall() {
 
 void renderPacingNotePublished() {
     State& s = g_state;
-    if (!s.installed || s.publishQpc) return;
+    if (!s.installed) return;
+    if (s.publishQpc) return;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     s.publishQpc = now.QuadPart;
 }
+
 
 void renderPacingEndFrame(bool trackedStereo) {
     State& s = g_state;
@@ -344,7 +384,21 @@ bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& di
     long long cost = s.haveCost ? static_cast<long long>(s.costMean) : 0;
 
     PresenterClock clock;
-    if (presenterClock(clock) && now - clock.latchTime <= 3 * clock.period) {
+    bool haveClock = presenterClock(clock) && clock.period > 0 &&
+                     now - clock.latchTime <= 3 * clock.period;
+
+    // The load indicator, noted wherever the clock can be read at all, so it keeps reporting on a
+    // frame the integer path answers. This is the phase the old rounding tripped over.
+    if (haveClock) {
+        long long into = (latch + cost - clock.latchTime) % clock.period;
+        if (into < 0) into += clock.period;
+        int bin = static_cast<int>(into * 10 / clock.period);
+        if (bin < 0) bin = 0;
+        if (bin > 9) bin = 9;
+        ++s.window.phase[bin];
+    }
+
+    if (haveClock) {
         // A presenter latch at latchTime + k * period is displayed this long after it.
         long long toDisplay =
             clock.displayTime - clock.viewLead * clock.period - clock.latchTime;
@@ -362,16 +416,19 @@ bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& di
     return true;
 }
 
-bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter) {
-    return renderPacingDisplayTimeAt(g_state.latchQpc, now, display, fromPresenter);
-}
-
 // What is left to say once a second: how far apart in sim ticks the frames the presenter
-// actually showed were, and how long a latch takes to reach a publish.
+// actually showed were, how long a latch takes to reach a publish, and the two numbers that say
+// whether the target is being built the stable way.
 //
 // The tick spread is the number that matters. Even ticks between displayed frames is what the
 // pacing wait existed to produce and what FlatFrames produces instead, so a run of 2s and 3s
 // here is the symptom that would send anyone back to the frame loop.
+//
+// `phase` is where `now + cost` falls inside the display period, and the display time is rounded up
+// from exactly that, so bins 1, 9 and 10 busy is the rounding sitting on a boundary and flipping
+// slot between consecutive frames. It is driven by render cost: 4-6 ms puts the phase mid-interval
+// and 9 ms or more puts it on the edge, which is why a scene light enough to lower the cost stops
+// the world stepping. This is the load indicator for anything that reads the display time.
 bool renderPacingFormat(char* out, size_t size) {
     State& s = g_state;
     if (!s.installed) return false;
@@ -380,10 +437,13 @@ bool renderPacingFormat(char* out, size_t size) {
     if (report) {
         std::snprintf(out, size,
                       "pace: %u tracked frames | ticks between displayed frames 1:%u 2:%u 3+:%u "
-                      "| latch to publish %.2f ms, estimate %.2f ms",
+                      "| latch to publish %.2f ms, estimate %.2f ms "
+                      "| phase in tenths of the display %u %u %u %u %u %u %u %u %u %u",
                       w.trackedFrames, w.between[0], w.between[1], w.between[2],
                       s.haveCost ? msFromTicks(s.costMean) : 0.0,
-                      s.haveCost ? msFromTicks(s.costMean + 2.0 * s.costDeviation) : 0.0);
+                      s.haveCost ? msFromTicks(s.costMean + 2.0 * s.costDeviation) : 0.0,
+                      w.phase[0], w.phase[1], w.phase[2], w.phase[3], w.phase[4], w.phase[5],
+                      w.phase[6], w.phase[7], w.phase[8], w.phase[9]);
     }
     w = Window();
     return report;

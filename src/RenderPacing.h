@@ -2,7 +2,7 @@
 
 // THE SIM TICK CLOCK AND THE DISPLAY-TIME MODEL, hooked at the tick wait.
 //
-// THE PACING IS GONE, 2026-09-27, and the name is a leftover. This file used to hold a wait
+// THE PACING IS GONE and the name is a leftover. This file used to hold a wait
 // that delayed each frame's latch so the frame was published just before the presenter's --
 // see docs/audit-2026-09-14/43-render-pacing.md, which remains the record of it. That wait
 // never ran. FlatFrames takes the frame loop's wait over and draws one frame per published
@@ -68,23 +68,38 @@ bool renderPacingTickArrival(int count, double& qpc);
 // had 13, started renders that could not finish, and pushed the game's own frame late.
 bool renderPacingNextTickDue(double& qpc);
 
-// When the frame whose latch has just run reaches the display, in QPC ticks. With the
-// presenter's clock: the first presenter latch the frame can make after its measured cost,
-// mapped to that latch's display; `fromPresenter` true.
-// Without it: the latch plus the measured latch-to-publish cost.
-bool renderPacingDisplayTime(long long now, long long& display, bool& fromPresenter);
+// THE LATCH-ANCHORED VARIANT IS GONE -- do not put it back.
+//
+// renderPacingDisplayTime(now, ...) passed the sim latch as the anchor, and the latched frame was
+// its only caller while the frames between the ticks used their own time. Two formulas for the same
+// question meant the target stood still for a frame at every tick boundary where they disagreed and
+// then advanced two display periods: measured as steps of 0.00 ms followed by 22.5 ms,
+// worst where the render is slowest and the two anchors furthest apart. Every frame now asks below,
+// anchored on itself.
 
-// The same, for a frame that is not the one whose latch just ran -- a frame drawn between two
-// sim ticks. `anchorQpc` is when that frame starts, and the answer is the display IT reaches.
+// When a frame reaches the display, in QPC ticks. `anchorQpc` is when that frame starts, and the
+// answer is the display IT reaches.
 //
 // This distinction is the difference between smooth and juddering, and it is not obvious. The
-// answer is quantised to the presenter's latches, so two frames headed for the same display get
-// the same one and two headed for different displays get different ones -- which is exactly
-// right, and is what makes the world's sampled instant depend on when a frame will be SEEN
-// rather than on when it happened to be drawn. Anchoring on the latch instead quantises to the
-// sim tick, so every frame between two ticks blended to one instant; anchoring on nothing and
-// using the wall clock lets the world's instant jitter by however much the draw-to-display
-// interval jitters, which is roadside objects stepping as you pass them.
+// answer has to depend on when a frame will be SEEN rather than on when it happened to be drawn:
+// anchoring on the latch quantises to the sim tick, so every frame between two ticks blended to
+// one instant, and using the wall clock lets the world's instant jitter by however much the
+// draw-to-display interval jitters, which is roadside objects stepping as you pass them.
+//
+// KNOWN DEFECT, measured and not yet fixed. The answer rounds `now + the smoothed
+// latch-to-publish cost` up to the next presenter latch, which is a step function of a jittery
+// continuous input: when render cost walks the phase onto a period boundary the rounding flips slot
+// between consecutive frames, and each flip is a WHOLE display period of world motion. Measured as
+// the drawn instant stepping 0.00 ms and then 22.2 ms, every window, with the phase histogram in
+// bins 9, 10 and 1. Cost 4-6 ms puts the phase mid-interval and it goes quiet, which is why a scene
+// light enough to lower the cost stops the stepping, and why turning the mirrors off "fixes" it --
+// with 90 fps, no repeats and no dropped frames throughout.
+//
+// Answering from an integer view-sequence lag instead was tried and reverted: see the note above
+// noteAim's former site in the .cpp. The integer has a boundary of its own, in the race between the
+// render finishing and the presenter's next publish, and it lands on it at the same render cost.
+// Anything that replaces this has to produce ONE anchor on every frame and not merely move which
+// quantity is being rounded.
 bool renderPacingDisplayTimeAt(long long anchorQpc, long long now, long long& display,
                                bool& fromPresenter);
 
