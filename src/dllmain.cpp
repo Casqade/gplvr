@@ -11,6 +11,7 @@
 
 #include "Billboard.h"
 #include "CrashGuard.h"
+#include "DataRebase.h"
 #include "Discovery.h"
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
@@ -221,6 +222,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // Stamp the build. Two runs have now been discussed without knowing whether
         // the binary contained a given fix, which wastes the test.
         logf("gplvr attached to %s -- built %s %s", exe, __DATE__, __TIME__);
+
+        // Where this image keeps its globals, before anything reads or writes one. Links of
+        // 1.2.0.2 ship identical code with the tail of `.data` 8 or 16 bytes apart, so a guard
+        // that only checks code bytes passes on every one of them and then uses an address that
+        // belongs to another. Everything that goes through rebase() depends on this line.
+        dataRebaseResolve();
 
         loadOptions("gplvr.ini");
 

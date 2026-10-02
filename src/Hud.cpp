@@ -1,5 +1,6 @@
 #include "Hud.h"
 
+#include "DataRebase.h"
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -37,6 +38,11 @@ void**          g_bitmapHeightSlot = nullptr;
 // and the overflow is logged rather than silently dropped.
 constexpr int kMaxCalls = 48;
 constexpr int kMaxText = 96;
+
+// gpl_rasterDrawDebugText's slot in the reference link, used only to check that the slot found
+// by entry-point name is the one the exe actually calls. Reference-link address, so it goes
+// through DataRebase before the comparison.
+constexpr uintptr_t kDebugTextSlot = 0x00866E08;
 
 struct Call {
     void*    surface;
@@ -807,7 +813,7 @@ void hudBind(const Binding& binding) {
     // The GLOBAL'S ADDRESS, because a patch that lands on the wrong slot and a patch
     // that lands on the right one look identical from everywhere else. gplc67 calls
     // `call ds:gpl_rasterDrawDebugText` and gpl_rasterResolveEntryPoints fills that from
-    // GetProcAddress at 0x004E2338, which writes 0x00866E08. Anything else here means we
+    // GetProcAddress at 0x004E2338, which writes kDebugTextSlot. Anything else here means we
     // are holding a slot nothing calls.
     // The 2D census rides alongside. It is a counter, not a behaviour change, and it
     // fails quietly: if the global cannot be found or written, the HUD work above is
@@ -853,12 +859,16 @@ void hudBind(const Binding& binding) {
         }
     }
 
-    logf("hud: drawDebugText thunked at global %p (held %p) -- gplc67's own slot is "
-         "00866E08; if this says otherwise the thunk is on a copy nobody calls. The "
-         "in-race HUD is re-issued once per eye surface, with the anchor class remapped "
-         "to the eye's own width. Items on any other destination, the frame-time readout "
-         "included, are untouched.",
-         reinterpret_cast<void*>(g_slot), reinterpret_cast<void*>(g_original));
+    // The expected slot goes through rebase, because the slot itself was resolved by entry-point
+    // name and will legitimately differ from the reference link's address on an image whose data
+    // moved. Comparing against the raw constant made this line cry wolf on every such image.
+    uintptr_t expected = rebase(kDebugTextSlot);
+    logf("hud: drawDebugText thunked at global %p (held %p) -- this image's own slot is %08X; if "
+         "this says otherwise the thunk is on a copy nobody calls. The in-race HUD is re-issued "
+         "once per eye surface, with the anchor class remapped to the eye's own width. Items on "
+         "any other destination, the frame-time readout included, are untouched.",
+         reinterpret_cast<void*>(g_slot), reinterpret_cast<void*>(g_original),
+         static_cast<unsigned>(expected));
 }
 
 // THE THUNK DOES NOT STAY INSTALLED, AND THAT IS WHY THE HUD WAS NEVER PER-EYE.

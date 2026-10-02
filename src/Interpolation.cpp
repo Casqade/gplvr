@@ -1,5 +1,6 @@
 #include "Interpolation.h"
 
+#include "DataRebase.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "Pe.h"
@@ -38,6 +39,59 @@ constexpr uintptr_t kViewIsLive = 0x00776168;        // byte: 1 live, 0 replay
 constexpr uintptr_t kViewRecord = 0x00776175;        // scene params p[3..42]
 constexpr uintptr_t kMirrorRecord = 0x00776219;      // scene params p[44..83]
 constexpr uintptr_t kPitBoardRecord = 0x0074E990;    // gpl_pitBoardRenderRecord
+
+// The same globals as this image keeps them, resolved once in interpolationInstall and zero
+// until then. Every read and write below goes through these rather than the constants above, so
+// an image whose data sits elsewhere either resolves completely or does not install at all --
+// there is no state in which some of the blend's inputs are this image's and the rest are
+// another's.
+struct ResolvedAt {
+    uintptr_t latchedTickCount = 0;
+    uintptr_t segmentCount = 0;
+    uintptr_t segmentTable = 0;
+    uintptr_t liveCars = 0;
+    uintptr_t replayCars = 0;
+    uintptr_t viewCarDriverIndex = 0;
+    uintptr_t viewCameraMode = 0;
+    uintptr_t viewIsLive = 0;
+    uintptr_t viewRecord = 0;
+    uintptr_t mirrorRecord = 0;
+    uintptr_t pitBoardRecord = 0;
+};
+
+ResolvedAt g_at;
+
+// Fills g_at, or says which global could not be placed. All eleven or none.
+bool resolveAddresses(const char*& missing) {
+    struct Entry {
+        uintptr_t  reference;
+        uintptr_t* out;
+        const char* name;
+    };
+    const Entry entries[] = {
+        {kLatchedTickCount, &g_at.latchedTickCount, "gpl_fgLastLatchedBgCount"},
+        {kSegmentCount, &g_at.segmentCount, "the segment count"},
+        {kSegmentTable, &g_at.segmentTable, "the segment table"},
+        {kLiveCars, &g_at.liveCars, "the live car array"},
+        {kReplayCars, &g_at.replayCars, "the replay car array"},
+        {kViewCarDriverIndex, &g_at.viewCarDriverIndex, "the viewed car's driver index"},
+        {kViewCameraMode, &g_at.viewCameraMode, "the camera mode"},
+        {kViewIsLive, &g_at.viewIsLive, "the live/replay flag"},
+        {kViewRecord, &g_at.viewRecord, "the view record"},
+        {kMirrorRecord, &g_at.mirrorRecord, "the mirror record"},
+        {kPitBoardRecord, &g_at.pitBoardRecord, "the pit board record"},
+    };
+    for (const Entry& entry : entries) {
+        uintptr_t at = rebase(entry.reference);
+        if (!at) {
+            missing = entry.name;
+            g_at = ResolvedAt();
+            return false;
+        }
+        *entry.out = at;
+    }
+    return true;
+}
 
 struct StockCall {
     uintptr_t     site;
@@ -471,8 +525,11 @@ bool matrixMatchesQuat(const float m[9], const Quat& q) {
 // segment search (sub_463C00) measures it. That search never terminates for a dlong past the last
 // segment (report 49). 0 when the table does not hold a plausible length.
 float trackLengthMetres() {
-    int          count = *reinterpret_cast<const int*>(kSegmentCount);
-    const float* table = *reinterpret_cast<const float* const*>(kSegmentTable);
+    // Zero until interpolationInstall has placed them on this image, and this dereferences a
+    // pointer and then indexes off it.
+    if (!g_at.segmentCount || !g_at.segmentTable) return 0.0f;
+    int          count = *reinterpret_cast<const int*>(g_at.segmentCount);
+    const float* table = *reinterpret_cast<const float* const*>(g_at.segmentTable);
     if (count <= 0 || count > 4096 || !table) return 0.0f;
     const float* row = table + kSegmentRowWords * (count - 1);
     if (!(row[3] > 0.0f)) return 0.0f;
@@ -597,16 +654,16 @@ void shift(History& h, const uint8_t* words, int count, int tick) {
 
 
 uint8_t* carRecord(int slot) {
-    uintptr_t array = slot < kCarsPerArray ? kLiveCars : kReplayCars;
+    uintptr_t array = slot < kCarsPerArray ? g_at.liveCars : g_at.replayCars;
     return reinterpret_cast<uint8_t*>(array + (slot % kCarsPerArray) * kCarSize + kCarRecord);
 }
 
 int carSlot(uintptr_t car) {
     uintptr_t span = kCarSize * kCarsPerArray;
-    if (car >= kLiveCars && car < kLiveCars + span && (car - kLiveCars) % kCarSize == 0)
-        return static_cast<int>((car - kLiveCars) / kCarSize);
-    if (car >= kReplayCars && car < kReplayCars + span && (car - kReplayCars) % kCarSize == 0)
-        return kCarsPerArray + static_cast<int>((car - kReplayCars) / kCarSize);
+    if (car >= g_at.liveCars && car < g_at.liveCars + span && (car - g_at.liveCars) % kCarSize == 0)
+        return static_cast<int>((car - g_at.liveCars) / kCarSize);
+    if (car >= g_at.replayCars && car < g_at.replayCars + span && (car - g_at.replayCars) % kCarSize == 0)
+        return kCarsPerArray + static_cast<int>((car - g_at.replayCars) / kCarSize);
     return -1;
 }
 
@@ -1041,19 +1098,19 @@ void applyBlend(State& s, double target, const int* cars, int carCount, bool hav
     // ONE DECISION FOR THE WHOLE FRAME. Every record that will be blended has to be able to honour
     // it, or the frame keeps the newest pair and the clamp for all of them.
     if ((parts & kPartView) &&
-        blendHistory(s, s.view, reinterpret_cast<uint8_t*>(kViewRecord), 0, kViewFields,
+        blendHistory(s, s.view, reinterpret_cast<uint8_t*>(g_at.viewRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
                      rewriteAtOne)) {
         ++w.viewBlended;
         any = true;
         // The view record's eye position is the first three floats; the car's is at its byte 16.
-        checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(kViewRecord), 0, 0, "the eye");
+        checkBlendedPosition(s.view, reinterpret_cast<const uint8_t*>(g_at.viewRecord), 0, 0, "the eye");
     }
     // Whether the alpha reported for this frame is the VIEW's. Measured rather than assumed: a
     // clamp attributed to the wrong record sends the next reader after the wrong history.
     if (sampled) ++w.sampledView;
     if ((parts & kPartMirror) && haveMirror &&
-        blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(kMirrorRecord), 0, kViewFields,
+        blendHistory(s, s.mirror, reinterpret_cast<uint8_t*>(g_at.mirrorRecord), 0, kViewFields,
                      sizeof(kViewFields) / sizeof(kViewFields[0]), target, length, sampled,
                      rewriteAtOne)) {
         ++w.mirrorBlended;
@@ -1073,7 +1130,7 @@ void applyBlend(State& s, double target, const int* cars, int carCount, bool hav
         }
     }
     if ((parts & kPartPitBoard) && havePitBoard &&
-        blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(kPitBoardRecord), 4,
+        blendHistory(s, s.pitBoard, reinterpret_cast<uint8_t*>(g_at.pitBoardRecord), 4,
                      kPitBoardFields, sizeof(kPitBoardFields) / sizeof(kPitBoardFields[0]), target,
                      length, sampled, rewriteAtOne)) {
         ++w.pitBoardBlended;
@@ -1187,7 +1244,7 @@ void __stdcall afterLatch() {
     if (s.viewLatched) {
         Window& w = s.window;
         ++w.frames;
-        int  tick = *reinterpret_cast<const int*>(kLatchedTickCount);
+        int  tick = *reinterpret_cast<const int*>(g_at.latchedTickCount);
         bool frozen = s.haveLastTick && tick == s.lastTick;
 
         // Date this tick, so an extra frame can place a target between it and the one before.
@@ -1220,12 +1277,12 @@ void __stdcall afterLatch() {
         s.lastTick = tick;
         s.haveLastTick = true;
 
-        int identity[3] = {*reinterpret_cast<const int*>(kViewCameraMode),
-                           *reinterpret_cast<const int*>(kViewCarDriverIndex),
-                           *reinterpret_cast<const uint8_t*>(kViewIsLive)};
-        pushView(s, s.view, reinterpret_cast<const uint8_t*>(kViewRecord), tick, identity, true);
+        int identity[3] = {*reinterpret_cast<const int*>(g_at.viewCameraMode),
+                           *reinterpret_cast<const int*>(g_at.viewCarDriverIndex),
+                           *reinterpret_cast<const uint8_t*>(g_at.viewIsLive)};
+        pushView(s, s.view, reinterpret_cast<const uint8_t*>(g_at.viewRecord), tick, identity, true);
         if (s.mirrorLatched)
-            pushView(s, s.mirror, reinterpret_cast<const uint8_t*>(kMirrorRecord), tick, identity,
+            pushView(s, s.mirror, reinterpret_cast<const uint8_t*>(g_at.mirrorRecord), tick, identity,
                      false);
         for (int i = 0; i < s.latchedCount; ++i) {
             int slot = s.latched[i];
@@ -1261,7 +1318,7 @@ void __stdcall afterLatch() {
 
         // A board hidden in this latch starts a new history when it shows again.
         if (s.pitBoardLatched)
-            pushPitBoard(s, s.pitBoard, reinterpret_cast<const uint8_t*>(kPitBoardRecord), tick,
+            pushPitBoard(s, s.pitBoard, reinterpret_cast<const uint8_t*>(g_at.pitBoardRecord), tick,
                          s.view);
         else
             s.pitBoard.copies = 0;
@@ -1309,14 +1366,14 @@ void* __cdecl carLatchHook(void* car) {
 
 int __fastcall viewLatchHook(void* self, void* unused, void* destination) {
     int copied = g_viewLatch(self, unused, destination);
-    if (copied && reinterpret_cast<uintptr_t>(destination) == kViewRecord)
+    if (copied && reinterpret_cast<uintptr_t>(destination) == g_at.viewRecord)
         g_state.viewLatched = true;
     return copied;
 }
 
 int __fastcall mirrorLatchHook(void* self, void* unused, void* destination) {
     int copied = g_mirrorLatch(self, unused, destination);
-    if (copied && reinterpret_cast<uintptr_t>(destination) == kMirrorRecord)
+    if (copied && reinterpret_cast<uintptr_t>(destination) == g_at.mirrorRecord)
         g_state.mirrorLatched = true;
     return copied;
 }
@@ -1324,7 +1381,7 @@ int __fastcall mirrorLatchHook(void* self, void* unused, void* destination) {
 // 0 while the board is hidden; the record otherwise.
 void* __cdecl pitBoardLatchHook() {
     void* record = g_pitBoardLatch();
-    if (reinterpret_cast<uintptr_t>(record) == kPitBoardRecord) g_state.pitBoardLatched = true;
+    if (reinterpret_cast<uintptr_t>(record) == g_at.pitBoardRecord) g_state.pitBoardLatched = true;
     return record;
 }
 
@@ -1418,6 +1475,15 @@ void interpolationInstall() {
         return;
     }
 
+    // Every global the blend reads or writes, placed on this image before the latch check below
+    // can compare against one of them.
+    const char* missing = nullptr;
+    if (!resolveAddresses(missing)) {
+        logf("interp: %s cannot be placed in this image (deltas %s) -- no interpolation", missing,
+             rebaseSummary());
+        return;
+    }
+
     // The latch in gpl_fgWaitForTickAndSnapshot, from its fgDisableBG call at `wait`:
     //   +0x00 call fgDisableBG     +0x05 call getBGCount     +0x0A mov edi, [esp+14h]
     //   +0x0E mov [gpl_fgLastLatchedBgCount], eax   ...the latch callbacks...
@@ -1432,10 +1498,12 @@ void interpolationInstall() {
                          (enableTarget == enable || jumpTarget(enable) == enableTarget ||
                           jumpTarget(enableTarget) == enable);
     if (std::memcmp(code + 0x0A, kLoadCount, sizeof(kLoadCount)) != 0 || code[0x0E] != 0xA3 ||
-        store != kLatchedTickCount || !enableMatches) {
-        logf("interp: the tick wait at %08X is not the expected latch (count store %02X %08X, "
-             "call at +0x44 %02X to %08X, fgEnableBG %08X) -- no interpolation",
-             static_cast<unsigned>(wait), code[0x0E], static_cast<unsigned>(store), code[0x44],
+        store != g_at.latchedTickCount || !enableMatches) {
+        logf("interp: the tick wait at %08X is not the expected latch (count store %02X %08X "
+             "against %08X for this image, call at +0x44 %02X to %08X, fgEnableBG %08X) -- no "
+             "interpolation",
+             static_cast<unsigned>(wait), code[0x0E], static_cast<unsigned>(store),
+             static_cast<unsigned>(g_at.latchedTickCount), code[0x44],
              static_cast<unsigned>(enableTarget), static_cast<unsigned>(enable));
         return;
     }
@@ -1595,7 +1663,7 @@ bool interpolationExtraFrame() {
 bool interpolationViewDlong(float& metres, bool& snapped) {
     State& s = g_state;
     if (!s.installed || s.view.copies < 1) return false;
-    metres = *reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(kViewRecord) + 60);
+    metres = *reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(g_at.viewRecord) + 60);
     snapped = s.view.snapped;
     return true;
 }

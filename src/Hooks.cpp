@@ -1,6 +1,7 @@
 #include "Hooks.h"
 
 #include "fast_text/FastText.h"
+#include "DataRebase.h"
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
 #include "FrameBudget.h"
@@ -224,6 +225,7 @@ bool g_mainWalkRedirected = false;
 // were only 0.25 ms each BECAUSE the window was quartered, and the session that proved the fix
 // ran with profileStages off. This is where an ini key belongs -- read it into
 // kMirrorDistanceScaleWanted and the rest of this works unchanged.
+// A reference-link address, placed on the running image through DataRebase before it is written.
 constexpr uintptr_t kMirrorDistanceScale = 0x0076E768;
 constexpr float     kMirrorDistanceScaleWanted = 0.25f;
 bool                g_mirrorDistanceScaleSaid = false;
@@ -1660,8 +1662,20 @@ void applyPendingSceneRenderHook() {
 
     // Written on every rebind, not once: GPL takes this from the graphics options and a mode
     // change puts the stock value back.
-    auto* mirrorScale = reinterpret_cast<float*>(kMirrorDistanceScale);
-    if (*mirrorScale != kMirrorDistanceScaleWanted) {
+    //
+    // Through rebase because this is a bare 4-byte store to a fixed address, with nothing about
+    // the value that would identify the wrong one: on the plain link the global is 8 lower and
+    // 0.25 went into a gpl_flushSegmentDrawQueue variable instead, which the log reported as a
+    // successful write.
+    auto* mirrorScale = reinterpret_cast<float*>(rebase(kMirrorDistanceScale));
+    if (!mirrorScale) {
+        if (!g_mirrorDistanceScaleSaid) {
+            g_mirrorDistanceScaleSaid = true;
+            logf("mirror: gpl_mirrorDistanceScale %08X cannot be placed in this image (deltas "
+                 "%s), so it is left alone and the mirror keeps whatever reach GPL gave it",
+                 static_cast<unsigned>(kMirrorDistanceScale), rebaseSummary());
+        }
+    } else if (*mirrorScale != kMirrorDistanceScaleWanted) {
         float stock = *mirrorScale;
         bool  wrote = patchBytes(mirrorScale, &kMirrorDistanceScaleWanted, sizeof(float));
         if (!g_mirrorDistanceScaleSaid) {
@@ -1670,12 +1684,12 @@ void applyPendingSceneRenderHook() {
                 logf("mirror: gpl_mirrorDistanceScale at %08X set %.2f -> %.2f, which is the "
                      "fraction of the eye's draw distance the mirror walks. At 1.00 a modded "
                      "track's horizon is in reach and the sky is right; below that it is not.",
-                     static_cast<unsigned>(kMirrorDistanceScale), stock,
+                     static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock,
                      kMirrorDistanceScaleWanted);
             else
                 logf("mirror: could not write gpl_mirrorDistanceScale at %08X -- it stays at "
                      "%.2f and the mirror keeps its shorter reach",
-                     static_cast<unsigned>(kMirrorDistanceScale), stock);
+                     static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock);
         }
     }
 }

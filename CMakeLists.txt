@@ -78,6 +78,7 @@ else()
         src/Billboard.cpp
         src/CrashGuard.cpp
         src/CursorOverlay.cpp
+        src/DataRebase.cpp
         src/Discovery.cpp
         src/DrawnMarks.cpp
         src/FlatFrames.cpp

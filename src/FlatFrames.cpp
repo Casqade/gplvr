@@ -1,5 +1,6 @@
 #include "FlatFrames.h"
 
+#include "DataRebase.h"
 #include "Hooks.h"
 #include "Interpolation.h"
 #include "Log.h"
@@ -43,6 +44,9 @@ constexpr unsigned char kSnapshotEndStock[5] = {0xE8, 0x4C, 0xC0, 0xFF, 0xFF};
 // until getBGCount() differs from it, so the two being equal is exactly "the sim has nothing new
 // and the loop is about to sleep".
 constexpr uintptr_t kLastLatchedBgCount = 0x00582114;
+
+// The same global as this image keeps it, placed in flatFramesInstall. Zero until then.
+uintptr_t g_lastLatchedBgCountAt = 0;
 
 // The hard ceiling on extra frames per tick, whatever the option says. At 36 Hz seven extra
 // frames is 288 Hz.
@@ -135,7 +139,10 @@ bool displayIsReady(const State& s) {
 }
 
 bool tickWaiting(const State& s) {
-    return s.getBGCount() != *reinterpret_cast<volatile const int*>(kLastLatchedBgCount);
+    // Placed on this image in flatFramesInstall; without it there is no tick to compare against,
+    // and "the sim has nothing new" is the answer that decides whether a frame is drawn at all.
+    if (!g_lastLatchedBgCountAt) return false;
+    return s.getBGCount() != *reinterpret_cast<volatile const int*>(g_lastLatchedBgCountAt);
 }
 
 // The stock frame: gpl_fgFrameSnapshotBegin, which waits for the tick if it has not landed,
@@ -262,6 +269,14 @@ void flatFramesInstall() {
              "duplicates of the one before -- frameRate = %d is ignored. The interp: line "
              "above says why the hooks refused.",
              g_options.frameRate);
+        return;
+    }
+
+    g_lastLatchedBgCountAt = rebase(kLastLatchedBgCount);
+    if (!g_lastLatchedBgCountAt) {
+        logf("frames: gpl_fgLastLatchedBgCount %08X cannot be placed in this image (deltas %s) "
+             "-- no frames between the ticks",
+             static_cast<unsigned>(kLastLatchedBgCount), rebaseSummary());
         return;
     }
 

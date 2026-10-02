@@ -14,6 +14,13 @@
 // Both functions go through gplvr: the list moves to a larger gplvr-owned array, and an append
 // that would still overflow it unmarks the node instead of storing it. The count stays GPL's own
 // variable. Installed in flat mode as well as in VR.
+//
+// The two function addresses are code, which every link of 1.2.0.2 keeps in the same place. The
+// count and the list are globals in the band where the plain link sits 8 bytes lower, so
+// DataRebase places them on the running image -- including the copies inside the patched
+// instructions' operands, which the stock-byte comparison is made against. When that image
+// cannot be shown to keep them anywhere, the patch declines and GPL's own 2048 unbounded slots
+// stay in use.
 
 namespace gplvr {
 

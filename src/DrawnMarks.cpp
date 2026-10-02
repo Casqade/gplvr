@@ -1,5 +1,6 @@
 #include "DrawnMarks.h"
 
+#include "DataRebase.h"
 #include "Log.h"
 #include "Pe.h"
 
@@ -12,8 +13,12 @@
 namespace gplvr {
 namespace {
 
-constexpr uintptr_t kCount = 0x00870140;      // gpl_drawnMarkCount
-constexpr uintptr_t kStockList = 0x00870144;  // gpl_drawnMarkList, up to gpl_backgroundTable's block
+// Reference-link addresses, which DataRebase maps onto the running image; g_count and
+// g_stockList below hold the result. Both are in the band above 0x005B1208, where the plain link
+// of 1.2.0.2 keeps them 8 lower. They also appear as imm32 operands inside the two instruction
+// templates, which is why the templates are built rather than compared as written.
+constexpr uintptr_t kRetailCount = 0x00870140;  // gpl_drawnMarkCount
+constexpr uintptr_t kRetailList = 0x00870144;   // gpl_drawnMarkList, up to gpl_backgroundTable's block
 constexpr uint32_t  kStockSlots = 2048;
 
 // A node is listed at most once between clears, because a marked node is skipped, so the count
@@ -34,6 +39,10 @@ constexpr uint32_t kSlots = 32768;
 //
 // The only branch into the function body targets 0x4CABF1, so the first six bytes become
 // jmp rel32 + NOP and the rest is left in place, unreachable.
+//
+// The three site addresses are code and are the same in both links; the imm32s inside the
+// bytes here and in kClearStock are the two globals and are not, so stockBytes() rewrites them
+// for the running image before the comparison.
 constexpr uintptr_t     kAppendSite = 0x004CABD9;
 constexpr uintptr_t     kAppendResume = 0x004CABF1;
 constexpr unsigned char kAppendStock[26] = {
@@ -53,14 +62,20 @@ constexpr unsigned char kClearStock[63] = {
 
 uint32_t g_buffer[kSlots];
 
+// The two globals as the running image keeps them, resolved in drawnMarksInstall(). Zero until
+// then, and the install is what refuses when they cannot be resolved, so nothing below ever
+// sees a half-mapped pair.
+uintptr_t g_count = 0;
+uintptr_t g_stockList = 0;
+
 // The list the thunk appends to and the clear walks. Both start on the stock list, and the clear
 // moves them to g_buffer once the append thunk is in, at a moment the list is empty. Appends and
 // clears both run on fg, so the two never see a half-made move.
-uintptr_t     g_list = kStockList;
+uintptr_t     g_list = 0;
 uint32_t      g_capacity = kStockSlots;
 volatile LONG g_appendInstalled = 0;
 
-uintptr_t g_countSlot = kCount;
+uintptr_t g_countSlot = 0;
 void*     g_appendResume = reinterpret_cast<void*>(kAppendResume);
 
 // Session totals, written on fg. The reporter, also on fg, takes window deltas.
@@ -107,7 +122,7 @@ __declspec(naked) void appendThunk() {
 // Replaces gpl_renderClearDrawnMarks through a jmp at its entry, so it returns to the caller of
 // 0x4CAFD0 directly.
 int __cdecl clearDrawnMarks() {
-    auto count = reinterpret_cast<LONG*>(kCount);
+    auto count = reinterpret_cast<LONG*>(g_count);
     int  result = *count;
     auto held = static_cast<uint32_t>(result);
     // Only stock appends from before the install can have gone past the capacity.
@@ -122,11 +137,27 @@ int __cdecl clearDrawnMarks() {
     if (g_appendsSinceClear > g_windowMaxAppends) g_windowMaxAppends = g_appendsSinceClear;
     g_appendsSinceClear = 0;
 
-    if (g_list == kStockList && g_appendInstalled) {
+    if (g_list == g_stockList && g_appendInstalled) {
         g_list = reinterpret_cast<uintptr_t>(g_buffer);
         g_capacity = kSlots;
     }
     return result;
+}
+
+// One instruction template with its global operands moved onto the running image. Each imm32 is
+// found by VALUE and the substitutions are counted, so a template whose operands do not add up --
+// an edit that dropped one, or an address that appears a different number of times than expected
+// -- is a refusal rather than a pattern that still names the reference link and matches nothing
+// else.
+//
+// Where the running image keeps its globals exactly where src/ names them, every substitution
+// writes what was already there; the tally still has to come out, which is what makes the check
+// worth running on any image.
+bool stockBytes(unsigned char* out, const unsigned char* reference, size_t length,
+                unsigned countOperands, unsigned listOperands) {
+    std::memcpy(out, reference, length);
+    return rebaseOperands(out, length, kRetailCount, g_count) == countOperands &&
+           rebaseOperands(out, length, kRetailList, g_stockList) == listOperands;
 }
 
 bool writeJump(uintptr_t site, void* target, size_t length) {
@@ -139,10 +170,38 @@ bool writeJump(uintptr_t site, void* target, size_t length) {
 }  // namespace
 
 void drawnMarksInstall() {
+    // The two globals first. The count is a read-modify-write and the list an indexed store, so
+    // an address this image cannot be shown to keep them at would scribble over whatever it does
+    // keep there, and the stock-byte check below cannot tell: the code is the same in every link
+    // and matches on all of them.
+    g_count = rebase(kRetailCount);
+    g_stockList = rebase(kRetailList);
+    if (!g_count || !g_stockList) {
+        logf("drawn marks: not patching -- gpl_drawnMarkCount %08X and gpl_drawnMarkList %08X "
+             "cannot be placed in this image (deltas %s); gpl_drawnMarkList stays 2048 unbounded "
+             "slots",
+             static_cast<unsigned>(kRetailCount), static_cast<unsigned>(kRetailList),
+             rebaseSummary());
+        return;
+    }
+    g_countSlot = g_count;
+    g_list = g_stockList;
+
+    unsigned char appendPattern[sizeof(kAppendStock)];
+    unsigned char clearPattern[sizeof(kClearStock)];
+    if (!stockBytes(appendPattern, kAppendStock, sizeof(appendPattern), 3, 1) ||
+        !stockBytes(clearPattern, kClearStock, sizeof(clearPattern), 3, 2)) {
+        logf("drawn marks: not patching -- the stock byte templates do not carry the six "
+             "gpl_drawnMarkCount and three gpl_drawnMarkList operands they are expected to, so "
+             "they cannot be moved onto this image (deltas %s)",
+             rebaseSummary());
+        return;
+    }
+
     auto append = reinterpret_cast<const uint8_t*>(kAppendSite);
     auto clear = reinterpret_cast<const uint8_t*>(kClearSite);
-    bool appendStock = std::memcmp(append, kAppendStock, sizeof(kAppendStock)) == 0;
-    bool clearStock = std::memcmp(clear, kClearStock, sizeof(kClearStock)) == 0;
+    bool appendStock = std::memcmp(append, appendPattern, sizeof(appendPattern)) == 0;
+    bool clearStock = std::memcmp(clear, clearPattern, sizeof(clearPattern)) == 0;
     if (!appendStock || !clearStock) {
         logf("drawn marks: not patching -- %s%s%s no longer hold their stock bytes "
              "(%08X: %02X %02X %02X %02X %02X %02X, %08X: %02X %02X %02X %02X %02X %02X); "
@@ -172,9 +231,11 @@ void drawnMarksInstall() {
     }
     InterlockedExchange(&g_appendInstalled, 1);
     logf("drawn marks: gpl_nodeDrawAndMark's append at %08X and gpl_renderClearDrawnMarks at "
-         "%08X go through gplvr -- the list moves to %u slots at the next clear, and a full "
-         "list unmarks the node instead of overwriting the globals after it",
-         static_cast<unsigned>(kAppendSite), static_cast<unsigned>(kClearSite), kSlots);
+         "%08X go through gplvr, over gpl_drawnMarkCount %08X and gpl_drawnMarkList %08X -- the "
+         "list moves to %u slots at the next clear, and a full list unmarks the node instead of "
+         "overwriting the globals after it",
+         static_cast<unsigned>(kAppendSite), static_cast<unsigned>(kClearSite),
+         static_cast<unsigned>(g_count), static_cast<unsigned>(g_stockList), kSlots);
 }
 
 bool drawnMarksFormat(char* out, size_t size, unsigned frames) {

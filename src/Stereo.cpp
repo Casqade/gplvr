@@ -1,5 +1,6 @@
 #include "Stereo.h"
 
+#include "DataRebase.h"
 #include "FlatFrames.h"
 #include "FrameBudget.h"
 #include "Hooks.h"
@@ -216,6 +217,7 @@ struct State {
     const char* paneTeamFallback = nullptr;
     bool        teamCodeChecked = false;
     bool        teamCodeMatches = false;
+    bool        paneDriverRefusedSaid = false;
     bool        paneGeometryReported = false;
 
     // The aim report, rate-limited while the head moves.
@@ -637,9 +639,17 @@ constexpr uintptr_t kSegmentPlacePoint = 0x004608D0;
 using PlacePointFn = int(__cdecl*)(const void* segment, int x, int y, int* dlong, int* dlat);
 
 // 0 inside, 1 past the end, 2 before the start, -1 when it could not be asked.
+//
+// Both globals go through rebase because this reads a pointer out of one, indexes it, and hands
+// the element to the engine as an object pointer. The non-null and range tests below cannot tell
+// a wrong global from a right one -- a plausible pointer and a count of a few hundred are common
+// shapes -- and the install gate is two code sites that are identical in every link of 1.2.0.2.
 int placementOf(int segment, int x, int y) {
-    auto base = *reinterpret_cast<const void* const* const*>(kSegmentArray);
-    int  count = *reinterpret_cast<const int*>(kSegmentArrayCount);
+    uintptr_t arrayAt = rebase(kSegmentArray);
+    uintptr_t countAt = rebase(kSegmentArrayCount);
+    if (!arrayAt || !countAt) return -1;
+    auto base = *reinterpret_cast<const void* const* const*>(arrayAt);
+    int  count = *reinterpret_cast<const int*>(countAt);
     if (!base || count <= 0 || count > 8192 || segment < 0 || segment >= count) return -1;
     const void* node = base[segment];
     if (!node) return -1;
@@ -740,10 +750,15 @@ constexpr float kBigExcess = 10.0f;
 // therefore still follows a camera cut, a car reset or a lap crossing exactly, because those move
 // the dlong; what it cannot do is invent a jump the dlong did not make.
 //
-// Returns -1 when the table is not readable or the dlong is outside it.
+// Returns -1 when the table cannot be placed or read, or the dlong is outside it.
 int segmentForDlong(float metres) {
-    int          count = *reinterpret_cast<const int*>(kSegmentCount);
-    const float* table = *reinterpret_cast<const float* const*>(kSegmentTable);
+    // Through rebase: the table pointer is dereferenced and then indexed by up to 4096 rows of
+    // 1440 bytes, so a global belonging to another link reads megabytes away from anything.
+    uintptr_t countAt = rebase(kSegmentCount);
+    uintptr_t tableAt = rebase(kSegmentTable);
+    if (!countAt || !tableAt) return -1;
+    int          count = *reinterpret_cast<const int*>(countAt);
+    const float* table = *reinterpret_cast<const float* const*>(tableAt);
     if (count <= 0 || count > 4096 || !table) return -1;
 
     int low = 0;
@@ -770,8 +785,12 @@ int segmentForDlong(float metres) {
 // as a jump of the whole track. A helper for that lived here and went with the jump counter.
 
 int dlongDelta(int from, int to) {
-    int length = *reinterpret_cast<const int*>(kTrackLengthDlong);
-    int delta = to - from;
+    // A zero length means no wrap, which is also what a global this image cannot be shown to
+    // keep should produce: the delta passes through unwrapped rather than being folded around a
+    // track length read from somewhere else.
+    uintptr_t lengthAt = rebase(kTrackLengthDlong);
+    int       length = lengthAt ? *reinterpret_cast<const int*>(lengthAt) : 0;
+    int       delta = to - from;
     if (length <= 0) return delta;
     while (delta > length / 2) delta -= length;
     while (delta < -length / 2) delta += length;
@@ -813,8 +832,10 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
         g_walkTableSaidRefused = true;
         logf("walk: the segment table could not answer for the view's dlong, so the camera's "
              "segment falls back to GPL's own search for as long as that lasts -- which is the "
-             "unstable answer the table exists to replace. Either the view dlong is unavailable "
-             "or it is outside the table.");
+             "unstable answer the table exists to replace. Either the view dlong is unavailable, "
+             "or the dlong is outside the table, or this image's globals could not be placed "
+             "(deltas %s).",
+             rebaseSummary());
     }
 
     if (sound) {
@@ -1019,7 +1040,22 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
     State& s = g_state;
     changed = false;
     if (mirrorConfigCarSetChanged()) s.paneDriver = -1000;
-    int driver = *reinterpret_cast<const int*>(kViewCarDriverIndex);
+
+    // Through rebase: nothing about the value read says whether it is a driver index. On the
+    // plain link this global is 8 lower and the read returned a float -- around 61.8, moving
+    // every frame -- so the team lookup refused for every car and the Lotus glasses stood in,
+    // 7650 times in one session.
+    uintptr_t driverAt = rebase(kViewCarDriverIndex);
+    if (!driverAt) {
+        if (!s.paneDriverRefusedSaid) {
+            s.paneDriverRefusedSaid = true;
+            logf("mirror: the viewed car's driver index %08X cannot be placed in this image "
+                 "(deltas %s), so every car gets the Lotus glasses",
+                 static_cast<unsigned>(kViewCarDriverIndex), rebaseSummary());
+        }
+        return kPaneGeometry[s.paneTeam];
+    }
+    int driver = *reinterpret_cast<const int*>(driverAt);
     if (driver == s.paneDriver) return kPaneGeometry[s.paneTeam];
 
     s.paneDriver = driver;
@@ -1038,8 +1074,10 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
         fallback = "gpl_driverGetTeamIndex (0x985AA6) does not hold the expected code";
     } else if (driver < 0 || driver >= kDriverSlots) {
         fallback = "there is no viewed car";
+    } else if (!rebase(kDriverRecords)) {
+        fallback = "the driver records cannot be placed in this image";
     } else {
-        auto record = reinterpret_cast<const unsigned char*>(kDriverRecords +
+        auto record = reinterpret_cast<const unsigned char*>(rebase(kDriverRecords) +
                                                              kDriverRecordSize * driver);
         if (!record[0] && !record[1]) {
             fallback = "the viewed car's driver record is empty";
