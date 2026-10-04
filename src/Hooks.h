@@ -242,7 +242,7 @@ struct Options {
     // A/B has been run: it is faster and the picture is the same. The implementation stays
     // exactly as it was; only the two ways of turning it off are gone.
 
-    // Write each EYE's own rectangle to a .tga next to the game, at the moment the frame
+    // Write each EYE's own rectangle to a .tga in gplvr's folder, at the moment the frame
     // is handed to the headset. Not the combined side-by-side the monitor shows -- the
     // actual clipped halves, which is the picture that settles whether something is in
     // the frame or only appears to be. 0 = off.
@@ -592,6 +592,12 @@ struct Options {
 extern Options g_options;
 
 void loadOptions(const char* fileName);
+
+// Write the HUD panel's eight placement keys back to gplvr.ini, where the panel tweak mode
+// left them. The panel has no file of its own the way the mirror aim and the HUD layout do,
+// so its own values go back into the one loadOptions read. False when a write failed, which
+// the log line then names.
+bool hudPlacementSave();
 
 // The game's own window, from its exported GetMainWindowHandle, falling back to
 // enumerating this thread's visible windows.

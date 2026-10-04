@@ -107,14 +107,25 @@ def comment_safe(text):
     return text
 
 
-def emit(sites, title, note):
+def emit(image, sites, title, note):
+    """Every site's address goes through image.xml_address() on the way out.
+
+    The sites here are found by reading the donor, so they are REAL addresses. The curve
+    body at 0x55BA8C runs 313 entries into GPLPatchDLL's +8 fixup window, so on a shifted
+    donor an un-translated address makes every write land two entries late -- the same
+    class of defect as the four-entry misalignment in ffb3test1.xml that this file exists
+    to replace, and just as invisible in the emitted XML. gplpatch.Image.xml_address is
+    the inverse; the comment keeps the real address so the two can be compared by eye.
+    """
     out = io.StringIO()
     out.write('<?xml version="1.0"?>\n<GPLPatch>\n\n')
     out.write("<!-- %s\n\n%s\n-->\n\n" % (comment_safe(title), comment_safe(note)))
     for va, blob, comment in sites:
+        xml_va = image.xml_address(va)
+        where = comment if xml_va == va else "%s  [writes %08X]" % (comment, va)
         out.write("   <BinaryPatch>\n")
-        out.write("      <!-- %s -->\n" % comment_safe(comment))
-        out.write("      <VirtualAddress>0x%08X</VirtualAddress>\n" % va)
+        out.write("      <!-- %s -->\n" % comment_safe(where))
+        out.write("      <VirtualAddress>0x%08X</VirtualAddress>\n" % xml_va)
         out.write("      <Data>%s</Data>\n" % blob.hex().upper())
         out.write("   </BinaryPatch>\n\n")
     out.write("</GPLPatch>\n")
@@ -130,7 +141,7 @@ def build_conditions(data, image):
                              "the code this patch was built for." % (va, stock, have))
         sites.append((va, struct.pack("<f", 0.0),
                       "%s, %s -> 0.0" % (what, stock)))
-    return emit(sites,
+    return emit(image, sites,
                 "FFB: disable GPL's two canned DirectInput condition effects.",
                 "GPL installs a centring spring and a damper as DirectInput CONDITION\n"
                 "effects at FFB init. Conditions are computed in the wheel's firmware from\n"
@@ -174,7 +185,7 @@ def build_curve(data, image, depth):
         sites.append((CURVE_BODY_VA + 4 * i, struct.pack("<f", scaled),
                       "y[%d] %+.5f -> %+.5f" % (i, value, scaled)))
     return emit(
-        sites,
+        image, sites,
         "FFB: deepen the force curve's notch from %.2f to %.2f."
         % (CURVE_STOCK_NOTCH, -abs(depth)),
         "This is what GEM's ffb3test1.xml was trying to do. That file writes 315 dwords\n"
@@ -211,6 +222,15 @@ def main():
                                   "the unpatched 36 Hz reference exe", "gplc67_36.exe")
     data = io.open(args.exe, "rb").read()
     image = gplpatch.Image(data)
+
+    # WHICH REVISION THE DONOR IS, said out loud. gplpatch.Image refuses an exe that is
+    # neither, so this is never a guess -- but the curve body sits inside the fixup window,
+    # so which revision was read decides what the addresses had to be translated to. The
+    # output is still revision-agnostic: every site here is pure data, nothing bakes an
+    # address into a payload, so GPLPatchDLL translates it for whichever exe applies it.
+    sys.stderr.write("donor      : %s\n" % args.exe)
+    sys.stderr.write("revision   : %s -- addresses emitted in the plain revision's space, "
+                     "so this XML suits both\n" % image.variant)
 
     if args.out_spring_damper:
         io.open(args.out_spring_damper, "w", encoding="utf-8").write(

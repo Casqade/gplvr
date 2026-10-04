@@ -6,7 +6,7 @@
   Runs the three tools in order with the exact recipe of the working build
   (out/gplc67-144.json), producing:
 
-      tools\78 144fps v34.xml                (gplrategen.py)
+      tools\78 144fps v34 UK.xml             (gplrategen.py)
       out\gpla67-144.ini                     (gplaiscale.py)
       out\gplc67-144-v34.exe                 (gplexegen.ps1 + GPLPatchDLL.dll)
 
@@ -37,7 +37,8 @@
 .PARAMETER Donor
   A copy of a WORKING, UNPATCHED gplc67.exe -- the 1967 mod as GEM+ built it, untouched by
   any frame-rate patch. Every stock value is checked against it before being replaced, and
-  the CD key is carried across from it, which no XML can supply. Default:
+  the 31-byte field at 0054CC24 that GEM+ writes is carried across from it, which no XML
+  can supply -- gplexegen.ps1's CarryBytes documents what that field is, and is not. Default:
   <GplDir>\gplc67_36.exe, which is this project's naming convention rather than anything
   the game ships. Make one by copying gplc67.exe before patching.
 
@@ -120,8 +121,8 @@ $gpl67   = Join-Path $gplDir 'Mods\GEM+\gpl67'
 $source  = Join-Path $gplDir 'gpl.exe'
 # The donor is a copy of a WORKING, UNPATCHED gplc67.exe: the 1967 mod as GEM+ built it,
 # untouched by any frame-rate patch. Every stock value is checked against it before being
-# replaced, and the CD key is carried across from it. The .36 suffix is this project's
-# convention, not something the game ships -- name yours with -Donor if it differs.
+# replaced, and GEM+'s 31-byte field at 0054CC24 is carried across from it. The .36 suffix
+# is this project's convention, not something the game ships -- name yours with -Donor if it differs.
 $donor   = if ($Donor) { $Donor } else { Join-Path $gplDir 'gplc67_36.exe' }
 # Likewise: a copy of gpla67.ini as it was before any rescaling. Read, never written.
 $ini36   = if ($Ini36) { $Ini36 } else { Join-Path $gplDir 'gpla67.ini.36' }
@@ -130,7 +131,7 @@ foreach ($need in @(
     @{ p = $gplDir; f = '-GplDir';  d = $true;  what = 'the GPL install directory' },
     @{ p = $gpl67;  f = '-GplDir';  d = $true;  what = "the gpl67 mod XMLs (Mods\GEM+\gpl67)" },
     @{ p = $source; f = '-GplDir';  d = $false; what = 'stock gpl.exe, the patch source' },
-    @{ p = $donor;  f = '-Donor';   d = $false; what = 'an unpatched gplc67.exe to read stock values and the CD key from' },
+    @{ p = $donor;  f = '-Donor';   d = $false; what = 'an unpatched gplc67.exe to read stock values and GEM+''s 0054CC24 field from' },
     @{ p = $ini36;  f = '-Ini36';   d = $false; what = 'an unpatched 36 Hz gpla67.ini to rescale' }
 )) {
     $ok = if ($need.d) { Test-Path -LiteralPath $need.p -PathType Container }
@@ -141,7 +142,7 @@ foreach ($need in @(
     }
 }
 
-$aiXml   = Join-Path $tools ('78 {0}fps v34.xml' -f $Rate)
+$aiXml   = Join-Path $tools ('78 {0}fps v34 UK.xml' -f $Rate)
 $outExe  = Join-Path $outDir 'gplc67-144-v34.exe'
 $manifest= Join-Path $outDir 'gplc67-144-v34.json'
 $aiIni   = Join-Path $outDir ('gpla67-{0}.ini' -f $Rate)
@@ -151,8 +152,8 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 # The two optional FFB patches. NEITHER IS A RATE FIX -- GPL's FFB averager runs inside the
 # physics substep loop, so it is 288 Hz at every tick rate. They are preferences, off by
 # default, and equally valid on a 36 Hz build.
-$ffbCondXml = Join-Path $tools '81 ffb no spring damper v1.xml'
-$ffbCurveXml = Join-Path $tools '82 ffb deeper notch v1.xml'
+$ffbCondXml = Join-Path $tools '81 ffb no spring damper v2.xml'
+$ffbCurveXml = Join-Path $tools '82 ffb deeper notch v2.xml'
 if ($FfbNoSpringDamper -or $FfbDeeperNotch) {
     Write-Host "`n== 0c/4 gplffb.py: optional force-feedback patches =="
     $ffbArgs = @('--game-dir', $gplDir, '--exe', $donor)

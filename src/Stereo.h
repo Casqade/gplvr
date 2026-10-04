@@ -186,8 +186,11 @@ void stereoInstallWalkLookup();
 // cameraBind). A renderer that takes polygons before they reach polyDraw must drop them too.
 bool stereoDroppingPolygons();
 
-// The once-a-second `walk:` line: how often GPL's own "where am I on the track" lookup had to be
-// corrected, and by how much. False when no stereo pass ran in the window. See report 84.
+// The once-a-second `walk:` line: how often the segment table answered the camera's "where am I on
+// the track", how often it refused and why, and -- when a refusal sent the question to GPL's own
+// search -- how often that answer had to be corrected and by how much. False when no lookup ran in
+// the window. A refusal is one frame drawn from GPL's unstable search, so the refusal count is the
+// rate of the one-frame segment artifact. See report 84.
 bool stereoWalkFormat(char* out, size_t size);
 
 // gpl_sceneRender's mirror copy-out, on its way through bitmapDraw. `writeBitmap` is where the

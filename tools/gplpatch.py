@@ -84,8 +84,10 @@ def game_file(args, name, flag, what, *parts):
 _WHERE_FROM = {
     "donor": "    This is a copy of a WORKING, UNPATCHED gplc67.exe -- the 1967 mod built\n"
              "    by GEM+ and not touched by any frame-rate patch. Every stock value is\n"
-             "    checked against it before being replaced, and the CD key is carried\n"
-             "    across from it. Make one by copying gplc67.exe before patching.\n",
+             "    checked against it before being replaced, and the 31-byte field at\n"
+             "    0054CC24 that GEM+ writes is carried across from it -- gplexegen.ps1's\n"
+             "    CarryBytes documents what that field is, and is not. Make one by\n"
+             "    copying gplc67.exe before patching.\n",
     "ini36": "    This is a copy of the UNPATCHED gpla67.ini, the 36 Hz AI settings. The\n"
              "    rescaler reads it and never writes it. Make one by copying gpla67.ini\n"
              "    before patching.\n",
@@ -172,6 +174,36 @@ class Image:
         if self.va_shift and FIXUP_LOW <= va <= FIXUP_HIGH:
             return va + self.va_shift
         return va
+
+    @property
+    def variant(self):
+        """Which revision this exe is, in words, for anything that reports its donor."""
+        return "shifted (+8 fixup)" if self.va_shift else "plain (no fixup)"
+
+    def xml_address(self, va):
+        """The address an XML must CARRY so that GEM+ writes `va` on this exe.
+
+        The inverse of fixup(), and the thing a tool that located a site by SCANNING has to
+        apply before emitting. Scanning yields the real address; writing that straight into
+        <VirtualAddress> is correct on a plain exe and two floats late on a shifted one.
+
+        The XML address space is therefore the PLAIN revision's, which is what makes a
+        data-only XML revision-agnostic: GPLPatchDLL translates it for whichever exe it is
+        applied to. Payload BYTES are not translated -- an address baked into an instruction
+        inside <Data> is specific to the revision it was read from.
+
+        Refuses rather than return an address that does not round-trip. That is the 8 bytes
+        at the bottom of the window: reachable on a plain exe, unreachable on a shifted one.
+        """
+        if self.fixup(va) == va:
+            return va
+        candidate = va - self.va_shift
+        if self.fixup(candidate) != va:
+            raise ValueError(
+                "%08X cannot be expressed as an XML address on this exe: fixup(%08X) is "
+                "%08X, not %08X. It is within %d bytes of the fixup window's edge."
+                % (va, candidate, self.fixup(candidate), va, self.va_shift))
+        return candidate
 
     def offset(self, va):
         """File offset for a virtual address, or None if it is not in raw data."""

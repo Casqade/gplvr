@@ -1,6 +1,7 @@
 #include "Billboard.h"
 
 #include "Hooks.h"
+#include "DataRebase.h"
 #include "Log.h"
 #include "Pe.h"
 
@@ -24,10 +25,15 @@ const unsigned char kStockCall[5] = {0xE8, 0xB0, 0x0E, 0xFF, 0xFF};
 // vertex is in, which is what makes the subtraction meaningful. The matrix stack
 // maintains it, and sub_4C7880's plane-side test reads it the same way. Its value is
 // still the object's own frame at the call site: sub_4D6490 does not push until 0x4D6994.
-float* const kEyeLocal = reinterpret_cast<float*>(0x008676A0);
+// Reference-link addresses, placed on the running image in billboardInstall. The thunks are
+// only reachable once that install has written them, so neither can be read before it ran.
+constexpr uintptr_t kRetailEyeLocal = 0x008676A0;
 
 // Top of the modelview stack, for the degenerate fallback.
-float** const kModelviewTop = reinterpret_cast<float**>(0x0056FE28);
+constexpr uintptr_t kRetailModelviewTop = 0x0056FE28;
+
+float*  g_eyeLocal = nullptr;
+float** g_modelviewTop = nullptr;
 
 }  // namespace
 
@@ -42,14 +48,14 @@ float** const kModelviewTop = reinterpret_cast<float**>(0x0056FE28);
 extern "C" void __cdecl gplvrBillboardAxis(float* out, const float* anchorRecord) {
     const float* anchor = anchorRecord + 1;
 
-    float dx = anchor[0] - kEyeLocal[0];
-    float dy = anchor[1] - kEyeLocal[1];
+    float dx = anchor[0] - g_eyeLocal[0];
+    float dy = anchor[1] - g_eyeLocal[1];
 
     // The eye directly above or below the sprite leaves the horizontal direction
     // undefined, and cross((0,0,1), v) would collapse to zero. Stock behaviour is a
     // reasonable answer there and the sprite is edge-on anyway.
     if (dx * dx + dy * dy < 1e-8f) {
-        const float* row0 = *kModelviewTop;
+        const float* row0 = *g_modelviewTop;
         out[0] = row0[0];
         out[1] = row0[1];
         out[2] = row0[2];
@@ -82,15 +88,15 @@ const unsigned char kStockUpCall[5] = {0xE8, 0x76, 0x09, 0xFF, 0xFF};
 extern "C" void __cdecl gplvrSpriteAxis(float* out, const float* anchorRecord, int axis) {
     const float* anchor = anchorRecord + 1;
 
-    float fx = anchor[0] - kEyeLocal[0];
-    float fy = anchor[1] - kEyeLocal[1];
-    float fz = anchor[2] - kEyeLocal[2];
+    float fx = anchor[0] - g_eyeLocal[0];
+    float fy = anchor[1] - g_eyeLocal[1];
+    float fz = anchor[2] - g_eyeLocal[2];
     float horizontal = fx * fx + fy * fy;
 
     // Directly above or below, left is undefined; the stock view-plane row is as good an
     // answer as any for a sprite seen edge-on.
     if (horizontal < 1e-8f) {
-        const float* row = *kModelviewTop + axis * 4;
+        const float* row = *g_modelviewTop + axis * 4;
         out[0] = row[0];
         out[1] = row[1];
         out[2] = row[2];
@@ -213,6 +219,22 @@ bool redirectCall(uintptr_t site, const unsigned char stock[5], void (*target)()
 }  // namespace
 
 void billboardInstall(const Binding&) {
+    // The two globals the thunks read, before either thunk can be reached. Both or neither:
+    // the basis is built from the eye position and falls back to the modelview row, so a
+    // half-placed pair would silently mix an address from this image with one from another.
+    g_eyeLocal = reinterpret_cast<float*>(rebase(kRetailEyeLocal));
+    g_modelviewTop = reinterpret_cast<float**>(rebase(kRetailModelviewTop));
+    if (!g_eyeLocal || !g_modelviewTop) {
+        g_eyeLocal = nullptr;
+        g_modelviewTop = nullptr;
+        logf("billboard: the eye position %08X and the modelview top %08X cannot both be "
+             "placed in this image (deltas %s) -- not patching; screen-aligned sprites keep "
+             "GPL's own camera rows",
+             static_cast<unsigned>(kRetailEyeLocal),
+             static_cast<unsigned>(kRetailModelviewTop), rebaseSummary());
+        return;
+    }
+
     // Both rows or neither: a quad spanned by one eye-facing axis and one view-plane axis
     // would shear. The up site is checked before the left one is written.
     if (memcmp(reinterpret_cast<unsigned char*>(kSpriteUpSite), kStockUpCall, 5) == 0 &&

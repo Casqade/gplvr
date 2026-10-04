@@ -1,5 +1,6 @@
 #include "CrashGuard.h"
 
+#include "DataRebase.h"
 #include "Log.h"
 #include "Pe.h"
 
@@ -32,27 +33,35 @@ constexpr unsigned char kStock[8] = {0xD9, 0x44, 0x24, 0x10, 0x8B, 0x54, 0x24, 0
 // The sim's body table, 668-byte rows indexed by car (sub_4A1D30, sub_4A40E0). Row 0 is the body
 // every contact shape pointed to in report 50's dump; its position is at +0x94, the pointer
 // sub_4A40E0 hands gpl_viewRecordSetPosition.
-constexpr uintptr_t kBody = 0x006126DC;
-constexpr uintptr_t kBodyPosition = kBody + 0x94;
+//
+// A reference-link address, so it goes through DataRebase. It feeds the diagnostic line only --
+// the guard's own decision does not read it -- but a position read 8 bytes into the wrong row
+// would be reported as this body's, which is worse than reporting nothing.
+constexpr uintptr_t kRetailBody = 0x006126DC;
 constexpr uintptr_t kBodyRowBytes = 668;
 
 constexpr LONG kLoggedFirings = 16;
 
 volatile LONG g_firings = 0;
 bool          g_bodyReadable = false;
+// Row 0's position on the running image, or 0 when it could not be placed or is not readable.
+uintptr_t g_bodyPosition = 0;
+uintptr_t g_body = 0;
 
 // On the sim thread, from the thunk below.
 void __stdcall noGroundPlane() {
     LONG count = InterlockedIncrement(&g_firings);
     if (count > kLoggedFirings) return;
 
-    char body[160] = "body position not read: 006126DC is not in a writable section of the exe";
+    char body[160] = "body position not read: it could not be placed in this image, or is not "
+                     "in a writable section of the exe";
     if (g_bodyReadable) {
         float p[3];
-        std::memcpy(p, reinterpret_cast<const void*>(kBodyPosition), sizeof(p));
+        std::memcpy(p, reinterpret_cast<const void*>(g_bodyPosition), sizeof(p));
         bool finite = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-        std::snprintf(body, sizeof(body), "body 0 (006126DC) position %g %g %g, %s", p[0], p[1],
-                      p[2], finite ? "finite" : "NON-FINITE");
+        std::snprintf(body, sizeof(body), "body 0 (%08X) position %g %g %g, %s",
+                      static_cast<unsigned>(g_body), p[0], p[1], p[2],
+                      finite ? "finite" : "NON-FINITE");
     }
     logf("crash guard: collision found no ground plane for a sphere (best distance stayed -1e9) "
          "-- returned no contact instead of reading NULL | #%ld this session | %s%s",
@@ -97,9 +106,11 @@ __declspec(naked) void contactFoundThunk() {
 
 void crashGuardInstall() {
     ModuleImage image;
-    g_bodyReadable = getModuleImage(GetModuleHandleA(nullptr), image) &&
-                     isWritable(image, reinterpret_cast<const void*>(kBody)) &&
-                     isWritable(image, reinterpret_cast<const void*>(kBody + kBodyRowBytes - 1));
+    g_body = rebase(kRetailBody);
+    g_bodyReadable = g_body && getModuleImage(GetModuleHandleA(nullptr), image) &&
+                     isWritable(image, reinterpret_cast<const void*>(g_body)) &&
+                     isWritable(image, reinterpret_cast<const void*>(g_body + kBodyRowBytes - 1));
+    g_bodyPosition = g_bodyReadable ? g_body + 0x94 : 0;
 
     auto bytes = reinterpret_cast<const uint8_t*>(kSite);
     if (std::memcmp(bytes, kStock, sizeof(kStock)) != 0) {

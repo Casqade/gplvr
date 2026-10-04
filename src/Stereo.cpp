@@ -686,6 +686,25 @@ float    g_walkWorstExcess = 0.0f; // biggest rejected overshoot, metres
 // to GPL's search and the artifact can return. That is a silent failure, so it says so once.
 bool g_walkTableSaidRefused = false;
 
+// HOW OFTEN THE TABLE ANSWERS, counted per lookup rather than announced once.
+//
+// The notice above fires on the first refusal of a track and then stays quiet, so a refusal on one
+// frame in several hundred reads exactly like no refusal at all -- and one frame of GPL's own
+// search is one frame of the artifact. A one-frame artifact that gets more frequent as the frame
+// rate rises is what a per-lookup fallback looks like: its chance is per draw, so drawing more
+// often multiplies it while nothing about the simulation changes.
+//
+// The two causes are separated because they want different fixes. No view dlong means the blend
+// had nothing to offer for this frame; a dlong outside the table means the table itself did not
+// cover where the camera is. A track change legitimately produces a burst of either while the new
+// table loads, so the session totals are read against the per-window counts: a burst in the window
+// after a mode change is a load, a trickle spread over every window while driving is the defect.
+unsigned g_walkTableAnswered = 0;      // the dlong decided the segment
+unsigned g_walkTableNoViewDlong = 0;   // the blend had no dlong for the view
+unsigned g_walkTableOutside = 0;       // a dlong, but outside the table
+unsigned g_walkTableRefusedTotal = 0;  // both causes, over the session
+unsigned g_walkTableWorstWindow = 0;   // most refusals in any one window
+
 // BOTH EYES ASK ABOUT THE HEAD CENTRE, and this is the fix for the one-frame eye-segment
 // artifact. MEASURED AND CLOSED.
 //
@@ -822,12 +841,20 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     // the pair cannot disagree with each other.
     float viewDlong = 0.0f;
     bool  viewSnapped = false;
-    int   fromTable =
-        interpolationViewDlong(viewDlong, viewSnapped) ? segmentForDlong(viewDlong) : -1;
+    bool  haveViewDlong = interpolationViewDlong(viewDlong, viewSnapped);
+    int   fromTable = haveViewDlong ? segmentForDlong(viewDlong) : -1;
     if (fromTable >= 0) {
+        ++g_walkTableAnswered;
         out[0] = static_cast<int>(static_cast<double>(viewDlong) * kDlongUnitsPerMetre);
         return fromTable;
     }
+
+    if (haveViewDlong)
+        ++g_walkTableOutside;
+    else
+        ++g_walkTableNoViewDlong;
+    ++g_walkTableRefusedTotal;
+
     if (!g_walkTableSaidRefused) {
         g_walkTableSaidRefused = true;
         logf("walk: the segment table could not answer for the view's dlong, so the camera's "
@@ -1208,18 +1235,35 @@ void stereoInstallWalkLookup() {
 bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
 
 bool stereoWalkFormat(char* out, size_t size) {
-    if (!g_walkSubstituted && !g_walkPassedThrough) return false;
+    unsigned refused = g_walkTableNoViewDlong + g_walkTableOutside;
+    if (refused > g_walkTableWorstWindow) g_walkTableWorstWindow = refused;
+    if (!g_walkTableAnswered && !refused && !g_walkSubstituted && !g_walkPassedThrough)
+        return false;
+
+    // The table's record first, and it prints on a window where nothing went wrong: a refusal
+    // rate is only readable against the number of lookups that asked.
     // _TRUNCATE returns -1 rather than failing, so a line that outgrows its buffer silently loses
     // whatever was added last -- which is always the newest instrument. Say so instead.
-    int written = _snprintf_s(
-        out, size, _TRUNCATE,
-        "walk: the camera's own answer stood %u times, asked again about the car %u | of those, "
-        "%u still OUTSIDE the segment GPL settled on, %u impossible for the distance moved, %u "
-        "CORRECTED from the car's own dlong (%u of them 10 m or more, the kind that is visible), "
-        "worst %.1f m over, %u with no car dlong",
-        g_walkPassedThrough,
-        g_walkSubstituted, g_walkOutside, g_walkOverMargin, g_walkCorrected, g_walkCorrectedBig,
-        static_cast<double>(g_walkWorstExcess), g_walkNoDlong);
+    int written = _snprintf_s(out, size, _TRUNCATE,
+                              "walk: the table answered %u of %u, refused %u (%u with no view "
+                              "dlong, %u with a dlong outside it) | session refusals %u, worst "
+                              "window %u",
+                              g_walkTableAnswered, g_walkTableAnswered + refused, refused,
+                              g_walkTableNoViewDlong, g_walkTableOutside,
+                              g_walkTableRefusedTotal, g_walkTableWorstWindow);
+
+    // What a refusal then led to, so the two are read together. Silent while the table is
+    // answering every lookup, which is when GPL's search is never reached.
+    if (written >= 0 && (g_walkSubstituted || g_walkPassedThrough))
+        written = _snprintf_s(
+            out + written, size - static_cast<size_t>(written), _TRUNCATE,
+            " || GPL's search was used: the camera's own answer stood %u times, asked again about "
+            "the car %u | of those, %u still OUTSIDE the segment GPL settled on, %u impossible "
+            "for the distance moved, %u CORRECTED from the car's own dlong (%u of them 10 m or "
+            "more, the kind that is visible), worst %.1f m over, %u with no car dlong",
+            g_walkPassedThrough, g_walkSubstituted, g_walkOutside, g_walkOverMargin,
+            g_walkCorrected, g_walkCorrectedBig, static_cast<double>(g_walkWorstExcess),
+            g_walkNoDlong);
     if (written < 0) {
         static bool said = false;
         if (!said) {
@@ -1237,6 +1281,9 @@ bool stereoWalkFormat(char* out, size_t size) {
     g_walkOverMargin = 0;
     g_walkNoDlong = 0;
     g_walkWorstExcess = 0.0f;
+    g_walkTableAnswered = 0;
+    g_walkTableNoViewDlong = 0;
+    g_walkTableOutside = 0;
     return true;
 }
 

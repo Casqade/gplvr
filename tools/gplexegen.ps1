@@ -37,7 +37,18 @@
   saved. Offsets and lengths accept 0x hex. Every range is reported before/after.
 
   This exists for per-installation data that is in no XML and cannot be derived from the
-  source exe -- the GPL CD key being the known case. It is a plain byte copy at a file
+  source exe. The known case was called "the GPL CD key" here for a long time; that was a
+  guess and it is wrong. What the range at file offset 1358372 actually holds is a 31-byte
+  string buffer at VA 0054CC24 whose stock value is the literal "NOT APPLICABLE", and which
+  GEM+ overwrites with 16 bytes (31 52 01 05 20 01 02 03 04 05 06 07 20 20 00 00) when it
+  builds the exe. Applying all 22 gpl67 XMLs through GPLPatchDLL leaves the stock value, so
+  neither an XML nor the DLL writes it: GEM+ does, after the DLL has saved. Exactly one
+  instruction reads it -- 0041044F, a 31-byte copy into offset +0x28 of the ~0xA8 struct
+  built at 00410410, which also takes a car code at +0x80 and is handed to GEM+ mod code at
+  00985412. The same bytes appear at offset 320 of every saved game, immediately after the
+  player name, so that struct is serialised into saves. What the field MEANS is unestablished;
+  "NOT APPLICABLE" as the stock default suggests GPL itself has no use for it and GEM+
+  repurposed it as a stamp. It is a plain byte copy at a file
   offset, deliberately not GPLPatchDLL's PatchWithData: that takes a virtual address and
   silently adds 8 to it inside 0x0054C5B8..0x00971FFF, which is exactly the class of hidden
   behaviour this project has been burned by. A file offset means what it says.

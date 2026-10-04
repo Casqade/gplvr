@@ -1,7 +1,9 @@
 #include "MirrorConfig.h"
 
 #include "Hooks.h"
+#include "DataRebase.h"
 #include "Log.h"
+#include "Paths.h"
 
 #include <windows.h>
 
@@ -17,7 +19,11 @@ namespace {
 
 // gpl_carsetDirName: gpl_teamModelLoadBindNodes (0x4067E0) strcpy's the loaded car-set
 // directory here ("CARS67" in stock gplc67). 16 bytes are compared for a car-set change.
-constexpr uintptr_t kCarsetDirName = 0x005A1928;
+// A reference-link address, and the ONLY site in this project that needs -16 rather than -8:
+// it sits in the middle band. DataRebase derives that band from this very global, so reading
+// it raw was the one place gplvr knew the delta and did not use it. Unplaced, every car falls
+// back to the glasses GPL points, which is the documented no-preset behaviour.
+constexpr uintptr_t kRetailCarsetDirName = 0x005A1928;
 constexpr int       kCarsetDirBytes = 16;
 
 // mod_teamFolderNamePtrs: pointers into the mod layer's 9-byte folder-name slots at 0xA079C8,
@@ -93,11 +99,7 @@ void lowerCase(char* text) {
 
 const char* ensurePath() {
     Config& c = g_config;
-    if (!c.path[0]) {
-        GetModuleFileNameA(nullptr, c.path, MAX_PATH);
-        if (char* slash = strrchr(c.path, '\\')) slash[1] = '\0';
-        strncat_s(c.path, kFileName, _TRUNCATE);
-    }
+    if (!c.path[0]) pathsOwnFile(c.path, sizeof(c.path), kFileName);
     return c.path;
 }
 
@@ -119,8 +121,10 @@ MirrorAim globalAim() {
 // `<cardir>/<teamfolder>` in lower case, or `<cardir>/team<N>` when the folder name cannot be
 // trusted. False when the car-set directory itself is not a readable name.
 bool buildKey(int slot, char* key, size_t size) {
+    uintptr_t carsetDir = rebase(kRetailCarsetDirName);
+    if (!carsetDir) return false;
     char dir[kCarsetDirBytes + 1] = {};
-    std::memcpy(dir, reinterpret_cast<const void*>(kCarsetDirName), kCarsetDirBytes);
+    std::memcpy(dir, reinterpret_cast<const void*>(carsetDir), kCarsetDirBytes);
     if (!validName(dir, kCarsetDirBytes - 1)) return false;
 
     char      folder[kTeamFolderBytes + 1] = {};
@@ -215,7 +219,9 @@ bool mirrorConfigClearAll() {
 
 bool mirrorConfigCarSetChanged() {
     Config& c = g_config;
-    auto live = reinterpret_cast<const char*>(kCarsetDirName);
+    uintptr_t at = rebase(kRetailCarsetDirName);
+    if (!at) return false;   // nothing to compare against, so nothing has changed
+    auto live = reinterpret_cast<const char*>(at);
     if (c.carsetKnown && std::memcmp(live, c.carsetDir, kCarsetDirBytes) == 0) return false;
 
     bool first = !c.carsetKnown;
@@ -246,7 +252,8 @@ void mirrorConfigViewedTeam(int team, const char* reason) {
         CarEntry& entry = c.car[slot];
         if (!entry.resolved && !loadEntry(slot, entry)) {
             slot = -1;
-            why = "the car-set directory at 0x5A1928 is not a readable name";
+            why = "the car-set directory could not be placed in this image, or is not a "
+                  "readable name";
         }
     } else {
         why = reason ? reason : "the viewed car's team could not be read";

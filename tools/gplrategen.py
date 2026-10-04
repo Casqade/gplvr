@@ -1705,31 +1705,127 @@ PAT = re.compile(
 )
 
 
-def _rebase_xml_addresses(image, sites):
-    """Make every site's XML address one that GEM+ will resolve to its real address.
+# EVERY ADDRESS WRITTEN DOWN IN THIS FILE WAS READ OFF A SHIFTED EXE.
+#
+# That is the convention of the tables below, and it is invisible until a donor of the other
+# revision is used -- at which point the in-window entries are 8 bytes high and the stock-byte
+# checks refuse. The donor's revision is not a property of the tables, so the tables stay as
+# authored and this moves them onto whichever exe is being read.
+AUTHORED_VA_SHIFT = 8
+
+
+class AuthoredImage:
+    """gplpatch.Image seen through this file's address convention.
+
+    offset() takes an AUTHORED address, so the tables below need no per-site translation and
+    work unchanged on either revision. offset_real() takes one that is already the donor's --
+    the reference XML's sites, which build() resolves through fixup() before reading them.
+
+    Everything else passes through to the wrapped Image.
+    """
+
+    def __init__(self, image):
+        self._image = image
+
+    def authored(self, va):
+        """An address as written down here -> the same thing on the donor being read."""
+        if not (gplpatch.FIXUP_LOW <= va <= gplpatch.FIXUP_HIGH):
+            return va
+        return self._image.fixup(va - AUTHORED_VA_SHIFT)
+
+    def offset(self, va):
+        return self._image.offset(self.authored(va))
+
+    def offset_real(self, va):
+        return self._image.offset(va)
+
+    def __getattr__(self, name):
+        return getattr(self._image, name)
+
+
+# THE EXPECTED-BYTE PATTERNS CARRY AUTHORED OPERANDS TOO.
+#
+# Five of the stock patterns in this file are instructions that NAME a global, and that operand
+# moved with everything else between the revisions -- FFB_IIR_BLOCK_STOCK twice over. The
+# tables' addresses are moved by _place_authored_sites; these are bytes, so they need the same
+# thing before any comparison against the donor, or a plain donor refuses on a pattern that is
+# correct apart from its operand.
+#
+# Done once by name rather than at each of the five checks: they have five different shapes,
+# two of them nested inside tables of tuples. On a shifted donor every translation is the
+# identity, so this cannot change that output -- which the UK regression check proves.
+AUTHORED_BYTE_PATTERNS = ("FFB_IIR_BLOCK_STOCK", "MOD_LP_WORLD_REDIRECTS", "PERIOD_MASK_SITES",
+                          "STANDALONE_TASK_SITES", "TYPE4_STOCK", "WHITE_FLAG_STOCK")
+
+# A pattern held as a hex STRING rather than bytes -- MOD_LP_WORLD_REDIRECTS keeps its expected
+# FPU load that way. Matched strictly: an even number of hex digits and nothing else, which no
+# note in these tables is.
+_HEX_STRING = re.compile(r"\A(?:[0-9A-Fa-f]{2})+\Z")
+
+_AUTHORED_ORIGINALS = {}
+
+
+def _move_authored_bytes(image, value):
+    """A copy of `value` with every in-window dword inside a bytes member moved onto the donor.
+
+    Recurses through tables; ints are left alone, because an address written as a number is a
+    site address and goes through image.offset()/authored() instead. Hits are collected before
+    any are written so an overlapping window cannot translate the same operand twice.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        hits = []
+        for i in range(max(0, len(value) - 3)):
+            va = struct.unpack_from("<I", value, i)[0]
+            moved = image.authored(va)
+            if moved != va:
+                hits.append((i, moved))
+        out = bytearray(value)
+        for i, moved in hits:
+            struct.pack_into("<I", out, i, moved)
+        return bytes(out)
+    if isinstance(value, str):
+        if len(value) < 10 or not _HEX_STRING.match(value):
+            return value
+        moved = _move_authored_bytes(image, bytes.fromhex(value))
+        return moved.hex() if moved.hex() != value.lower() else value
+    if isinstance(value, tuple):
+        return tuple(_move_authored_bytes(image, item) for item in value)
+    if isinstance(value, list):
+        return [_move_authored_bytes(image, item) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_authored_bytes(image, item) for key, item in value.items()}
+    return value
+
+
+def _place_authored_patterns(image):
+    """Rebind AUTHORED_BYTE_PATTERNS into the donor's space. Idempotent: the originals are
+    kept, so a second donor in the same process is translated from them and not from a result."""
+    for name in AUTHORED_BYTE_PATTERNS:
+        original = _AUTHORED_ORIGINALS.setdefault(name, globals()[name])
+        globals()[name] = _move_authored_bytes(image, original)
+
+
+def _place_authored_sites(image, sites):
+    """Move each hand-written site onto the donor, and give it the XML address to emit.
 
     GPLPatchDLL adds 8 to any address it reads from a patch XML that falls in
-    [0x0054C5B8, 0x00971FFF] (gplpatch.Image.fixup). Sites parsed from the reference XML
-    already carry an XML address and a fixed-up real address, so they are consistent by
-    construction. The hand-written tables in this file give the REAL address for both,
-    which is only correct below that window -- and every site in them was below it until
-    the parameter-descriptor table (0x554658..0x55595F) arrived.
+    [0x0054C5B8, 0x00971FFF] (gplpatch.Image.fixup), so the XML address space is the PLAIN
+    revision's. Sites parsed from the reference XML already carry one, plus the real address
+    fixup() gave; they are consistent by construction and are skipped. The rest are this
+    file's own, in authored space, and need both.
 
-    Writing 8 high there is silent and destructive: a descriptor record is 24 bytes with
-    its float at base+16, so value+8 is the NEXT record's 0x42 table tag, and clobbering
-    that unregisters the following key.
+    Getting it wrong is silent and destructive: a descriptor record is 24 bytes with its
+    float at base+16, so value+8 is the NEXT record's 0x42 table tag, and clobbering that
+    unregisters the following key.
     """
     for site in sites:
-        if image.fixup(site.xml_va) == site.real_va:
+        if not site.authored:
             continue
-        candidate = site.real_va - image.va_shift
-        if image.fixup(candidate) != site.real_va:
-            raise SystemExit(
-                "REFUSED: %08X cannot be expressed as an XML address -- fixup(%08X) is "
-                "%08X, not %08X. It sits within %d bytes of the rebase window's edge."
-                % (site.real_va, candidate, image.fixup(candidate), site.real_va,
-                   image.va_shift))
-        site.xml_va = candidate
+        site.real_va = image.authored(site.real_va)
+        try:
+            site.xml_va = image.xml_address(site.real_va)
+        except ValueError as exc:
+            raise SystemExit("REFUSED: %s" % exc)
 
 
 def _dedupe_sites(sites):
@@ -1796,6 +1892,10 @@ class Site:
         self.exponent = exponent
         self.note = note
         self.out = None         # bytes we emit
+        # True for the sites this file writes down, whose addresses are in authored space.
+        # build() clears it on the ones it takes from the reference XML, which already carry
+        # an XML address and a resolved real one. See _place_authored_sites.
+        self.authored = True
 
 
 def approx(a, b, tol=3e-3):
@@ -1853,7 +1953,8 @@ DROPPED_SITES = []
 def build(exe_path, ref_xml, rate):
     del DROPPED_SITES[:]
     data = io.open(exe_path, "rb").read()
-    image = gplpatch.Image(data)
+    image = AuthoredImage(gplpatch.Image(data))
+    _place_authored_patterns(image)
     text = io.open(ref_xml, encoding="utf-8-sig", errors="replace").read()
 
     scale = rate / STOCK_RATE
@@ -1862,39 +1963,50 @@ def build(exe_path, ref_xml, rate):
         substeps = 1
     physics_hz = rate * substeps
 
+    # The addresses this loop COMPARES against are authored, while real_va is the donor's,
+    # so move them once rather than at every comparison. Only the three substep entries are
+    # in the window at all; the rest are in .text and come back unchanged.
+    substep_dt_sites = {image.authored(va) for va in SUBSTEP_DT_SITES}
+    substep_hz_site = image.authored(SUBSTEP_HZ_SITE)
+    substep_half_dt_site = image.authored(SUBSTEP_HALF_DT_SITE)
+    ai_accessor_const = image.authored(AI_ACCESSOR_CONST_SITE)
+    ai_accessor_code = {image.authored(va) for va in AI_ACCESSOR_CODE_SITES}
+    reference_mistakes = {image.authored(va): why for va, why in REFERENCE_MISTAKES.items()}
+
     sites = []
     for addr, hexdata in PAT.findall(text):
         xml_va = int(addr, 16)
         real_va = image.fixup(xml_va)
         ref = bytes.fromhex(hexdata)
-        off = image.offset(real_va)
+        # offset_real: real_va is already this donor's address, not an authored one.
+        off = image.offset_real(real_va)
         if off is None:
             raise SystemExit("%08X is not inside any section's raw data" % real_va)
         stock = data[off:off + len(ref)]
 
-        if real_va in REFERENCE_MISTAKES:
+        if real_va in reference_mistakes:
             sys.stderr.write("dropping reference site %08X: %s\n"
-                             % (real_va, REFERENCE_MISTAKES[real_va]))
+                             % (real_va, reference_mistakes[real_va]))
             continue
-        if real_va == AI_ACCESSOR_CONST_SITE:
+        if real_va == ai_accessor_const:
             site = Site(xml_va, real_va, stock, ref, "rate-conversion",
                         note="36/%g, the factor the AI accessors multiply by" % rate)
             site.out = struct.pack("<f", STOCK_RATE / rate)
-        elif real_va in AI_ACCESSOR_CODE_SITES:
+        elif real_va in ai_accessor_code:
             # Verbatim: `fmul dword ptr [00449C6C]; ret`. The fmul names the constant by
             # absolute address, so the instruction itself carries no rate.
             site = Site(xml_va, real_va, stock, ref, "rate-conversion",
-                        note="fmul dword ptr [%08X]; ret" % AI_ACCESSOR_CONST_SITE)
+                        note="fmul dword ptr [%08X]; ret" % ai_accessor_const)
             site.out = ref
-        elif real_va in SUBSTEP_DT_SITES:
+        elif real_va in substep_dt_sites:
             site = Site(xml_va, real_va, stock, ref, "substep",
                         note="substep dt = 1/%g" % physics_hz)
             site.out = struct.pack("<f", 1.0 / physics_hz)
-        elif real_va == SUBSTEP_HZ_SITE:
+        elif real_va == substep_hz_site:
             site = Site(xml_va, real_va, stock, ref, "substep",
                         note="physics Hz = %g (= %g x %d substeps)" % (physics_hz, rate, substeps))
             site.out = struct.pack("<f", physics_hz)
-        elif real_va == SUBSTEP_HALF_DT_SITE:
+        elif real_va == substep_half_dt_site:
             site = Site(xml_va, real_va, stock, ref, "substep",
                         note="half substep dt = 1/%g" % (2 * physics_hz))
             site.out = struct.pack("<f", 1.0 / (2.0 * physics_hz))
@@ -1924,6 +2036,7 @@ def build(exe_path, ref_xml, rate):
             else:
                 site.out = ref
                 site.note = "copied verbatim"
+        site.authored = False   # the reference XML already gave both addresses
         sites.append(site)
 
     # Append the hardcoded tick counts. These are not in the reference patch at all (bar
@@ -2238,7 +2351,7 @@ def build(exe_path, ref_xml, rate):
                 "REFUSED: %08X does not hold `cdq; idiv [esi+4]; mov [esp+4], edx; "
                 "fild [esp+4]; pop esi; pop ecx; retn` -- gpl_lodEvaluateVariable's kind-3 "
                 "arm is not the code this fix was built for." % SCENERY_ANIM_VA)
-        scenery = _scenery_anim_block(shift)
+        scenery = _move_authored_bytes(image, _scenery_anim_block(shift))
         site = Site(SCENERY_ANIM_VA, SCENERY_ANIM_VA, SCENERY_ANIM_STOCK, scenery,
                     "rate-conversion",
                     note="trackside scenery animation clock: getBGCount() >> %d before the "
@@ -2272,7 +2385,9 @@ def build(exe_path, ref_xml, rate):
             raise SystemExit("REFUSED: %08X is not %d bytes of zero raw data." % (va, n))
 
     ffb_alpha = 1.0 - (1.0 - FFB_IIR_ALPHA_STOCK) ** (1.0 / scale)
-    ffb_state = struct.pack("<I", FFB_IIR_STATE_VA)
+    # The cave reads and writes this global, so the EMITTED bytes name it. authored():
+    # the constant was read off a shifted exe like every other address here.
+    ffb_state = struct.pack("<I", image.authored(FFB_IIR_STATE_VA))
     ffb_stub = (b"\xd8\x0d" + struct.pack("<I", FFB_IIR_ALPHA_VA)        # fmul [alpha]
                 + b"\xd9\x05" + ffb_state                                # fld  [state]
                 + b"\xd8\x0d" + struct.pack("<I", FFB_IIR_ONE_MINUS_VA)  # fmul [1-alpha]
@@ -2328,8 +2443,8 @@ def build(exe_path, ref_xml, rate):
         raise SystemExit("REFUSED: the cave at %08X is not zero raw data for %d bytes."
                          % (LP_LEAK_CAVE_VA, LP_LEAK_CAVE_SPAN))
     stub_va = LP_LEAK_CAVE_VA
-    for site_va, stock, resume_va, body, note in _lp_leak_stubs(
-            V13_CAVE_VA + 0x18, V13_CAVE_VA + SPT36_CONST_OFFSET):
+    for site_va, stock, resume_va, body, note in _move_authored_bytes(image, _lp_leak_stubs(
+            V13_CAVE_VA + 0x18, V13_CAVE_VA + SPT36_CONST_OFFSET)):
         off = image.offset(site_va)
         if off is None or data[off:off + len(stock)] != stock:
             raise SystemExit(
@@ -2363,7 +2478,8 @@ def build(exe_path, ref_xml, rate):
         raise SystemExit("REFUSED: the cave at %08X is not zero raw data for %d bytes."
                          % (LP_MUL_CAVE_VA, LP_MUL_CAVE_SPAN))
     stub_va = LP_MUL_CAVE_VA
-    for site_va, stock, kind, stub, note in _lp_mul_stubs(V13_CAVE_VA + SPT36_CONST_OFFSET):
+    for site_va, stock, kind, stub, note in _move_authored_bytes(
+            image, _lp_mul_stubs(V13_CAVE_VA + SPT36_CONST_OFFSET)):
         off = image.offset(site_va)
         if off is None or data[off:off + len(stock)] != stock:
             raise SystemExit(
@@ -2441,7 +2557,10 @@ def build(exe_path, ref_xml, rate):
                 % (site_va, stock.hex().upper(),
                    data[off:off + len(stock)].hex().upper() if off is not None else "?"))
         value = int(round(rate * mult))
-        body = build(value)
+        # The build lambdas embed the displaced instruction as a literal, so their OUTPUT
+        # carries an authored operand -- translating the table above reached its expected
+        # bytes but not this.
+        body = _move_authored_bytes(image, build(value))
         stub = body + b"\xe9" + struct.pack("<i", resume_va - (stub_va + len(body) + 5))
         if stub_va + len(stub) > STANDALONE_CAVE_VA + STANDALONE_CAVE_SPAN:
             raise SystemExit("REFUSED: the task stubs do not fit in %d bytes."
@@ -2532,7 +2651,7 @@ def build(exe_path, ref_xml, rate):
                 "REFUSED: the GUI throttle's state dword at %08X is not zero -- "
                 "something else is using it." % va)
     gate = max(1, int(round(rate / STOCK_RATE)))
-    body = _standalone_gui_cave(STANDALONE_GUI_CAVE_VA, gate)
+    body = _move_authored_bytes(image, _standalone_gui_cave(STANDALONE_GUI_CAVE_VA, gate))
     if len(body) > STANDALONE_GUI_CAVE_SPAN:
         raise SystemExit("REFUSED: the GUI cave needs %d bytes, %d available."
                          % (len(body), STANDALONE_GUI_CAVE_SPAN))
@@ -2622,7 +2741,7 @@ def build(exe_path, ref_xml, rate):
     pad_off = image.offset(TYPE4_SCALE_VA)
     if pad_off is None or data[pad_off:pad_off + 4] != b"\x90\x90\x90\x90":
         raise SystemExit("REFUSED: %08X is not alignment padding." % TYPE4_SCALE_VA)
-    block = _type4_block()
+    block = _move_authored_bytes(image, _type4_block())
     assert len(block) == len(TYPE4_STOCK)
     s = Site(TYPE4_BLOCK_VA, TYPE4_BLOCK_VA, TYPE4_STOCK, block, "rate-conversion",
              note="v23 type-4 puff lifetime: cache the particle pointer in ebx to free "
@@ -2699,8 +2818,10 @@ def build(exe_path, ref_xml, rate):
     place(iir, "rec+72 ground-clearance filter, two-constant form so the DC gain stays 1",
           NET_IIR_VA, NET_IIR_STOCK)
 
+    # Authored -> donor space FIRST, so dedupe compares real addresses that exist on
+    # this exe rather than on the one the tables were written against.
+    _place_authored_sites(image, sites)
     sites = _dedupe_sites(sites)
-    _rebase_xml_addresses(image, sites)
     return image, sites, substeps, physics_hz
 
 
@@ -2846,6 +2967,39 @@ def main():
                      % (args.rate, 2 * args.rate, physics_hz, args.rate, substeps))
     sys.stderr.write("sites      : %d  (%s)\n"
                      % (len(sites), ", ".join("%s %d" % (k, v) for k, v in sorted(kinds.items()))))
+    sys.stderr.write("revision   : the donor is the %s revision\n" % image.variant)
+
+    # WHETHER THIS XML SUITS BOTH REVISIONS, OR ONLY THE DONOR'S.
+    #
+    # Site ADDRESSES are safe either way: _rebase_xml_addresses emits them in the plain
+    # revision's space and GPLPatchDLL translates them for whatever exe applies the XML.
+    # Payload BYTES are not translated. An instruction relocated into the cave carries the
+    # operand it had in the donor, and operands in the fixup window moved by 8 between the
+    # revisions -- so one of those pins the whole XML to the donor's revision, silently,
+    # because nothing downstream can tell a baked address from a constant.
+    #
+    # Reported rather than refused: a dword in the window is a CANDIDATE, not a proven
+    # address, and only disassembling the payload settles it. The count is what matters --
+    # zero means the XML is portable, non-zero means there is a second XML to generate.
+    baked = []
+    for site in sites:
+        if site.out is None or len(site.out) < 4:
+            continue
+        for i in range(len(site.out) - 3):
+            value = struct.unpack_from("<I", site.out, i)[0]
+            if gplpatch.FIXUP_LOW <= value <= gplpatch.FIXUP_HIGH:
+                baked.append((site.real_va, i, value))
+    if baked:
+        sys.stderr.write(
+            "\n%d payload dword(s) across %d site(s) fall inside the +8 fixup window, so\n"
+            "they are data addresses READ FROM THIS DONOR and GPLPatchDLL will NOT translate\n"
+            "them. This XML is valid on the %s revision only. Generate the other one by\n"
+            "re-running against a donor built from the other revision's gpl.exe; the site\n"
+            "addresses will come out identical and only these operands will differ.\n"
+            % (len(baked), len(set(va for va, _, _ in baked)), image.variant))
+        for va, off, value in baked:
+            sys.stderr.write("    site %08X  payload +%-3d names %08X\n" % (va, off, value))
+        sys.stderr.write("\n")
 
     unclassified = [s for s in sites if s.kind == "unclassified"]
     if unclassified:

@@ -250,7 +250,7 @@ void glInteropUnregister(const GlFunctions& gl, HANDLE interopDevice,
 // frames after every texture recreation, so a failure names itself instead of arriving as
 // a black headset.
 // Write one rectangle of the framebuffer bound for READING to an uncompressed 24-bit TGA
-// next to the game -- the caller binds the source; see dumpEyeRect in Hooks.cpp. This is
+// in gplvr's own folder -- the caller binds the source; see dumpEyeRect in Hooks.cpp. This is
 // a diagnostic: it exists so that "the pixels are in the frame" can be
 // looked at rather than argued about. TGA because its default origin is bottom-left,
 // which is GL's, so the rows go out in the order they come back with no flip to get wrong.

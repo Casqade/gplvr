@@ -1,6 +1,7 @@
 #include "SimRing.h"
 
 #include "Hooks.h"
+#include "DataRebase.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -14,8 +15,16 @@ namespace {
 
 // -- game addresses (gplc67.exe; reports 44, 45 and 72) ----------------------------------------
 
-constexpr uintptr_t kLiveCars = 0x006BF080;  // gpl_carLiveGet(0)
-constexpr uintptr_t kReplayCars = 0x00790848;
+// Reference-link addresses, placed in simRingInstall. carWords() turns one into the address
+// of a car's word block and the ring copies THROUGH it, so an unplaced base is not a wrong
+// reading but a write into whatever the other link keeps there -- the install refuses
+// instead. Both or neither: carSlotOf() decides live-or-replay by range, so one base from
+// this image and one from another would classify cars into the wrong array.
+constexpr uintptr_t kRetailLiveCars = 0x006BF080;  // gpl_carLiveGet(0)
+constexpr uintptr_t kRetailReplayCars = 0x00790848;
+
+uintptr_t g_liveCars = 0;
+uintptr_t g_replayCars = 0;
 constexpr uintptr_t kCarSize = 1544;
 constexpr int       kCarsPerArray = 20;
 constexpr int       kCarSlots = 2 * kCarsPerArray;
@@ -41,7 +50,11 @@ constexpr uintptr_t kModelHandleOf = 0x0046F050;
 
 // gpl_taskBgGrantsDeferred: the timer thread increments it whenever a tick grant finds
 // gpl_taskFgBgLock taken, which is the render thread holding the latch bracket.
-constexpr uintptr_t kGrantsDeferred = 0x00581ED0;
+//
+// A reference-link address, so it goes through DataRebase at the read. Nothing depends on
+// the value except one report field, and 0 reads as "none deferred", which is also what an
+// image it cannot be placed on should report.
+constexpr uintptr_t kRetailGrantsDeferred = 0x00581ED0;
 
 // -- the slot ----------------------------------------------------------------------------------
 
@@ -162,16 +175,17 @@ bool redirect(uintptr_t site, uintptr_t to) {
 }
 
 uint32_t* carWords(int slot) {
-    uintptr_t array = slot < kCarsPerArray ? kLiveCars : kReplayCars;
+    uintptr_t array = slot < kCarsPerArray ? g_liveCars : g_replayCars;
     return reinterpret_cast<uint32_t*>(array + (slot % kCarsPerArray) * kCarSize);
 }
 
 int carSlotOf(uintptr_t car) {
     uintptr_t span = kCarSize * kCarsPerArray;
-    if (car >= kLiveCars && car < kLiveCars + span && (car - kLiveCars) % kCarSize == 0)
-        return static_cast<int>((car - kLiveCars) / kCarSize);
-    if (car >= kReplayCars && car < kReplayCars + span && (car - kReplayCars) % kCarSize == 0)
-        return kCarsPerArray + static_cast<int>((car - kReplayCars) / kCarSize);
+    if (car >= g_liveCars && car < g_liveCars + span && (car - g_liveCars) % kCarSize == 0)
+        return static_cast<int>((car - g_liveCars) / kCarSize);
+    if (car >= g_replayCars && car < g_replayCars + span &&
+        (car - g_replayCars) % kCarSize == 0)
+        return kCarsPerArray + static_cast<int>((car - g_replayCars) / kCarSize);
     return -1;
 }
 
@@ -429,8 +443,9 @@ void* __cdecl carLatchHook(void* car) {
 }
 
 int deferredGrants() {
-    if (!readable(reinterpret_cast<const void*>(kGrantsDeferred), sizeof(int))) return 0;
-    return *reinterpret_cast<volatile int*>(kGrantsDeferred);
+    uintptr_t at = rebase(kRetailGrantsDeferred);
+    if (!at || !readable(reinterpret_cast<const void*>(at), sizeof(int))) return 0;
+    return *reinterpret_cast<volatile int*>(at);
 }
 
 }  // namespace
@@ -438,6 +453,18 @@ int deferredGrants() {
 void simRingInstall() {
     State& s = g_state;
     if (s.installed) return;
+
+    g_liveCars = rebase(kRetailLiveCars);
+    g_replayCars = rebase(kRetailReplayCars);
+    if (!g_liveCars || !g_replayCars) {
+        g_liveCars = 0;
+        g_replayCars = 0;
+        logf("ring: the live car array %08X and the replay array %08X cannot both be placed "
+             "in this image (deltas %s) -- no sim ring",
+             static_cast<unsigned>(kRetailLiveCars),
+             static_cast<unsigned>(kRetailReplayCars), rebaseSummary());
+        return;
+    }
 
     HMODULE exe = GetModuleHandleA(nullptr);
     s.getBGCount = exe ? reinterpret_cast<CountFn>(GetProcAddress(exe, "?getBGCount@@YAHXZ"))

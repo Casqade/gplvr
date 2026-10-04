@@ -1,5 +1,7 @@
 #include "Log.h"
 
+#include "Paths.h"
+
 #include <windows.h>
 
 #include <cstdarg>
@@ -21,12 +23,10 @@ void logOpen(const char* fileName) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) return;
 
+    // Beside gplvr, not beside the game: gplc67 sets its working directory to `font`, and the
+    // game's own folder is not where gplvr's files live.
     char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (char* slash = strrchr(path, '\\')) slash[1] = '\0';
-    strncat_s(path, fileName, _TRUNCATE);
-
-    fopen_s(&g_file, path, "w");
+    if (pathsOwnFile(path, sizeof(path), fileName)) fopen_s(&g_file, path, "w");
     g_startTick = GetTickCount();
 }
 

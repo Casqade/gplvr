@@ -37,6 +37,7 @@ endif()
 function(gplvr_add_survey target output)
     add_executable(${target}
         src/Log.cpp
+        src/Paths.cpp
         src/openxr/Xr.cpp
         src/openxr/GplvrXr.cpp
         src/openxr/XrInput.cpp
@@ -96,6 +97,7 @@ else()
         src/MirrorConfig.cpp
         src/MirrorTarget.cpp
         src/MouseLook.cpp
+        src/Paths.cpp
         src/Pe.cpp
         src/PostProfile.cpp
         src/Pribluda.cpp
@@ -137,7 +139,7 @@ else()
     # Its own PDB name: with OUTPUT_NAME "gplvr" the loader's link would write gplvr.pdb over
     # the DLL's.
     set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr" PDB_NAME "gplvr-loader")
-    target_link_libraries(gplvr_loader PRIVATE user32)
+    target_link_libraries(gplvr_loader PRIVATE user32 shell32)
 
     set(GPLVR_TARGETS gplvr gplvr_loader)
 endif()

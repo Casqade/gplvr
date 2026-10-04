@@ -269,9 +269,8 @@ bool applyHudElement(const TweakCommand& command) {
                               "there is nothing to toggle");
             const bool changed = pribludaElementSetShow(element, show ? 0 : 1);
             if (changed) {
-                logf("tweak: HUD element '%s' is now %s -- a RUNTIME change; saveLayout "
-                     "writes positions only, so a restart forgets it",
-                     pribludaElementName(element), show ? "hidden" : "shown");
+                logf("tweak: HUD element '%s' is now %s", pribludaElementName(element),
+                     show ? "hidden" : "shown");
                 clearRefusal();
             }
             return changed;
@@ -405,9 +404,13 @@ bool applyHudPanel(const TweakCommand& command) {
     if (!panelPlacement())
         return refuse("the HUD panel is off (vrHudLayer 0), so there is nowhere to put it");
 
-    if (command.action == TweakAction::Commit)
-        return refuse("the panel's placement is a runtime change -- gplvr.ini is never "
-                      "written, so it goes back to the file's values at the next start");
+    if (command.action == TweakAction::Commit) {
+        if (!hudPlacementSave())
+            return refuse("the panel's placement could not be written -- the pribluda: line "
+                          "above says which keys and why");
+        clearRefusal();
+        return true;
+    }
     if (command.action == TweakAction::Select ||
         command.action == TweakAction::SelectNext ||
         command.action == TweakAction::SelectPrevious)

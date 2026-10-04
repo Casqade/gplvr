@@ -108,9 +108,9 @@ bool pribludaElementFilePosition(int element, float& x, float& y);
 bool pribludaElementResetPosition(int element);
 
 // The element's show flag as the layout override holds it: -1 when the file says nothing
-// about it, otherwise 0 or 1. Setting it reaches the next frame's copies. NOT SAVED --
-// saveLayout writes positions only, and the show keys in the file are read and not
-// written, so this is a runtime change that a restart forgets.
+// about it, otherwise 0 or 1. Setting it reaches the next frame's copies, and saveLayout
+// writes it back. An element the file says nothing about keeps saying nothing, so it goes
+// on following pribluda's own hotkeys.
 int  pribludaElementShow(int element);
 bool pribludaElementSetShow(int element, int show);
 
@@ -118,7 +118,8 @@ bool pribludaElementSetShow(int element, int show);
 float pribludaDashWidth();
 bool  pribludaSetDashWidth(float fraction);
 
-// Write the positions to gplvr_pribluda.ini, as leaving the keyboard mode does.
+// Write the layout to gplvr_pribluda.ini, as leaving the keyboard mode does: every
+// position, the dash's width and every show flag the file sets.
 void pribludaLayoutSave();
 
 // True while the KEYBOARD tweak mode holds the panel. The tweak API refuses while it does.

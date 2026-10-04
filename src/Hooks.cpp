@@ -14,6 +14,7 @@
 #include "MirrorTarget.h"
 #include "MouseLook.h"
 #include "Log.h"
+#include "Paths.h"
 #include "PostProfile.h"
 #include "Pribluda.h"
 #include "RenderPacing.h"
@@ -1167,13 +1168,11 @@ int __cdecl screenDisplayHook(void* surface) {
             GlFunctions gl;
             int rect[2][4];
             if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
-                // NEXT TO THE EXE, not wherever the process happens to be standing.
+                // BESIDE GPLVR, not wherever the process happens to be standing.
                 // gplc67 runs with its working directory set to the `font` subfolder, so
                 // the first version of this wrote two files nobody could find and
                 // reported success doing it.
-                char base[MAX_PATH] = {};
-                GetModuleFileNameA(nullptr, base, MAX_PATH);
-                if (char* slash = strrchr(base, '\\')) slash[1] = '\0';
+                const char* base = pathsOwnDirectory();
 
                 char path[MAX_PATH];
                 for (int eye = 0; eye < 2; ++eye) {
@@ -1252,9 +1251,7 @@ int __cdecl screenDisplayHook(void* surface) {
         GlFunctions gl;
         int rect[2][4];
         if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
-            char base[MAX_PATH] = {};
-            GetModuleFileNameA(nullptr, base, MAX_PATH);
-            if (char* slash = strrchr(base, '\\')) slash[1] = '\0';
+            const char* base = pathsOwnDirectory();
 
             char path[MAX_PATH];
             for (int eye = 0; eye < 2; ++eye) {
@@ -2124,10 +2121,16 @@ void windowProcUnchain() {
 
 
 void loadOptions(const char* fileName) {
+    // Beside gplvr. An absolute path either way: GetPrivateProfile* resolves a bare name against
+    // the working directory, which gplc67 moves to `font`.
+    //
+    // A path that will not fit is said out loud, because GetPrivateProfile* answers an unreadable
+    // file with the default for every key -- which is a whole session running on defaults and
+    // looking exactly like a session that was configured that way.
     char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (char* slash = strrchr(path, '\\')) slash[1] = '\0';
-    strncat_s(path, fileName, _TRUNCATE);
+    if (!pathsOwnFile(path, sizeof(path), fileName))
+        logf("options: %s%s does not fit in a path, so EVERY option below is its default",
+             pathsOwnDirectory(), fileName);
 
     // Floats have to come back as text; GetPrivateProfileInt cannot represent them.
     // Declared up here because the float options are no longer all in one block at
@@ -2442,6 +2445,46 @@ void loadOptions(const char* fileName) {
          g_options.widescreenFix ? 1 : 0, g_options.renderWhenUnfocused ? 1 : 0,
          (!g_options.renderWhenUnfocused && g_options.vr) ? " (forced on by vr)" : "");
 
+}
+
+// The eight keys loadOptions reads just above, written back where the panel tweak mode
+// leaves them. Both layers go every time: vrHudLayer decides which one is live, and the
+// other one's numbers are still the driver's own from an earlier session.
+//
+// The leading space in the format is the value's: WritePrivateProfileString keeps the text
+// left of the `=` as the file has it and replaces the rest, so "0.70" would turn a
+// hand-written `vrHudSeatAhead = 0.70` into `vrHudSeatAhead =0.70`. GetPrivateProfile*
+// skips it coming back in.
+bool hudPlacementSave() {
+    char path[MAX_PATH] = {};
+    pathsOwnFile(path, sizeof(path), "gplvr.ini");
+
+    int  failed = 0;
+    auto write = [&](const char* key, float value) {
+        char text[32] = {};
+        _snprintf_s(text, sizeof(text), _TRUNCATE, " %.3f", static_cast<double>(value));
+        if (!WritePrivateProfileStringA("gplvr", key, text, path)) ++failed;
+    };
+    write("vrHudHeadAhead", g_options.vrHudHead.ahead);
+    write("vrHudHeadDown", g_options.vrHudHead.down);
+    write("vrHudHeadRight", g_options.vrHudHead.right);
+    write("vrHudHeadWidth", g_options.vrHudHead.width);
+    write("vrHudSeatAhead", g_options.vrHudSeat.ahead);
+    write("vrHudSeatDown", g_options.vrHudSeat.down);
+    write("vrHudSeatRight", g_options.vrHudSeat.right);
+    write("vrHudSeatWidth", g_options.vrHudSeat.width);
+
+    if (failed) {
+        logf("pribluda: %d of 8 HUD panel placements could not be written to %s (error %lu)",
+             failed, path, GetLastError());
+        return false;
+    }
+    logf("pribluda: HUD panel placement written to %s -- head ahead %.3f down %.3f "
+         "right %.3f width %.3f | seat ahead %.3f down %.3f right %.3f width %.3f",
+         path, g_options.vrHudHead.ahead, g_options.vrHudHead.down,
+         g_options.vrHudHead.right, g_options.vrHudHead.width, g_options.vrHudSeat.ahead,
+         g_options.vrHudSeat.down, g_options.vrHudSeat.right, g_options.vrHudSeat.width);
+    return true;
 }
 
 bool installFrameCounter(Binding& binding) {

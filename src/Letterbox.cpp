@@ -1,6 +1,7 @@
 #include "Letterbox.h"
 
 #include "Hooks.h"
+#include "DataRebase.h"
 #include "Log.h"
 #include "Pe.h"
 #include "Window.h"
@@ -39,7 +40,10 @@ constexpr uintptr_t kScreenVtbl[2] = {0x00537410, 0x005374C8};
 
 // The middle panel -- the picture band -- is resolved by name into a global, unlike the
 // two bars which live in the screen.
-void** const kMiddleElement = reinterpret_cast<void**>(0x005B79D4);
+// A reference-link address, placed at the read. The pointer it yields is validated by its
+// vtable in peerOf, so a wrong one degrades rather than misbehaves -- but on an image where
+// it cannot be placed the right answer is no middle panel at all, not a vtable gamble.
+constexpr uintptr_t kRetailMiddleElement = 0x005B79D4;
 
 // The widget list is TWO hops from the screen, and the first hop is the correction that
 // cost a run: the name lookups are member functions of the object at `screen + 4`, not of
@@ -215,8 +219,9 @@ void afterLayout(void* screen) {
     windowEngineModeSize(width, height);
     if (width <= 0 || height <= 0) return;
 
-    void* middle = readable(kMiddleElement, sizeof(void*))
-                       ? peerOf(*kMiddleElement, kPeerVtblTrackSprite)
+    auto  middleSlot = reinterpret_cast<void**>(rebase(kRetailMiddleElement));
+    void* middle = middleSlot && readable(middleSlot, sizeof(void*))
+                       ? peerOf(*middleSlot, kPeerVtblTrackSprite)
                        : nullptr;
     void* top = peerOf(readPointer(screen, kScreenTopElement), kPeerVtblRectSprite);
     void* bottom = peerOf(readPointer(screen, kScreenBottomElement), kPeerVtblRectSprite);

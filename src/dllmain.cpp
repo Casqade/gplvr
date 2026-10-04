@@ -21,6 +21,7 @@
 #include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "Paths.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "SimRing.h"
@@ -221,7 +222,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
         // Stamp the build. Two runs have now been discussed without knowing whether
         // the binary contained a given fix, which wastes the test.
-        logf("gplvr attached to %s -- built %s %s", exe, __DATE__, __TIME__);
+        //
+        // And gplvr's own folder, which is where this log, gplvr.ini and everything else of
+        // ours is: the game can be launched with any executable in any layout, so "which ini
+        // did it read" is a question the log has to answer rather than the reader assume.
+        logf("gplvr attached to %s -- built %s %s, from %s", exe, __DATE__, __TIME__,
+             pathsOwnDirectory());
 
         // Where this image keeps its globals, before anything reads or writes one. Links of
         // 1.2.0.2 ship identical code with the tail of `.data` 8 or 16 bytes apart, so a guard

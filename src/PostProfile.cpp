@@ -1,5 +1,6 @@
 #include "PostProfile.h"
 
+#include "Discovery.h"
 #include "GpuTimer.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -27,15 +28,34 @@ enum Group {
 
 // GPL's rasterizer entry points for 2D work, as gpl_rasterResolveEntryPoints 0x4E21B0 stores
 // them (the addresses are the `mov <global>, eax` operands there).
-struct RasterEntry {
-    uintptr_t   global;
-    const char* name;
-};
-constexpr RasterEntry kRasterEntries[kRasterKinds] = {
-    {0x00866DE0, "bitmapDraw"}, {0x00869FE8, "bitmapScale"}, {0x00867628, "stampDraw"},
-    {0x00866E08, "debugText"},  {0x00869748, "fillRect"},    {0x00869FF4, "drawLine"},
-    {0x00869784, "aaLine"},
-};
+// THE SEVEN SLOTS ARE RESOLVED BY NAME, NOT WRITTEN DOWN.
+//
+// They were a hard-coded table of addresses, which is the one place in this project that
+// WROTE to an address it had not placed: a thunk pointer into a slot taken from the
+// reference link. On any image whose data sits elsewhere that is a function pointer into
+// whatever the other link keeps there. Discovery finds them the way FastText does -- by the
+// name the rasterizer registers -- which needs no map and no reference link at all.
+//
+// Resolved once, lazily: this runs per frame, and the slots do not move. What DOES change is
+// their contents, which a mode change re-resolves, so each poll still re-reads *slot.
+void** g_rasterSlot[kRasterKinds] = {};
+bool   g_rasterSlotsTried = false;
+
+void resolveRasterSlots() {
+    if (g_rasterSlotsTried) return;
+    g_rasterSlotsTried = true;
+    ModuleImage image;
+    if (!getModuleImage(GetModuleHandleA(nullptr), image)) return;
+    int found = 0;
+    for (int kind = 0; kind < kRasterKinds; ++kind) {
+        g_rasterSlot[kind] = rasterGlobal(image, kRasterNames[kind]);
+        if (g_rasterSlot[kind]) ++found;
+    }
+    if (found != kRasterKinds)
+        logf("post: only %d of %d 2D entry-point globals resolved by name -- the ones that "
+             "did not are left alone and go untimed",
+             found, kRasterKinds);
+}
 typedef int(__cdecl* RasterFn)(int, int, int, int, int, int, int, int);
 
 struct State {
@@ -139,15 +159,16 @@ void postProfilePollFrame() {
     // so the lines below read the same either way. It also holds them while its install is
     // still retrying, so the two cannot end up patched over each other.
     if (fastTextOwnsRasterEntries()) return;
+    resolveRasterSlots();
     for (int kind = 0; kind < kRasterKinds; ++kind) {
-        auto slot = reinterpret_cast<void**>(kRasterEntries[kind].global);
+        void** slot = g_rasterSlot[kind];
         if (!slot || !*slot || *slot == kRasterThunks[kind]) continue;
         // A mode change re-resolves the globals, so whatever is there now is the real entry.
         g_realRaster[kind] = reinterpret_cast<RasterFn>(*slot);
         void* thunk = kRasterThunks[kind];
         if (!patchBytes(slot, &thunk, sizeof(thunk))) continue;
         logf("post: GPL's %s entry point %p goes through gplvr, to time GPL's 2D drawing",
-             kRasterEntries[kind].name, reinterpret_cast<void*>(g_realRaster[kind]));
+             kRasterNames[kind], reinterpret_cast<void*>(g_realRaster[kind]));
     }
 }
 
@@ -221,7 +242,7 @@ void postProfileReport(double periodMs) {
             at += static_cast<size_t>(std::snprintf(
                 line + at, sizeof(line) - at, "%s%s %.1f calls %.2f ms (in the scene %.1f calls "
                                               "%.2f ms)",
-                at ? ", " : "", kRasterEntries[kind].name,
+                at ? ", " : "", kRasterNames[kind],
                 static_cast<double>(s.rasterPostCalls[kind]) / s.frames,
                 s.rasterPost[kind] * perFrame,
                 static_cast<double>(s.rasterSceneCalls[kind]) / s.frames,

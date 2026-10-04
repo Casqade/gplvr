@@ -49,7 +49,8 @@ enum class TweakTarget : int32_t {
     // placed in fractions of the panel and saved to gplvr_pribluda.ini.
     HudElement,
     // The panel itself: where it hangs relative to the head or the seat, and how wide it
-    // is, in metres. Runtime only; gplvr.ini is never written.
+    // is, in metres. Saved to gplvr.ini's own vrHudHead*/vrHudSeat* keys, both layers at
+    // once, by hudPlacementSave.
     HudPanel,
     Count,
 };

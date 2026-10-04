@@ -3,7 +3,9 @@
 #include "FrameBudget.h"
 #include "GlInterop.h"
 #include "Hooks.h"
+#include "DataRebase.h"
 #include "Log.h"
+#include "Paths.h"
 #include "VrMenu.h"
 #include "presenter/Producer.h"
 
@@ -70,8 +72,11 @@ constexpr int kRasterizerRoglv2 = 3;
 // at the top of both of its own hooks, and it is the reason the overlay is absent in
 // menus. Out of a race the config object still holds enabled panels, so calling the draw
 // without this test would paint a board full of stale rows over the front end.
-constexpr int kStateRaceA = 0x005B7410;
-constexpr int kStateRaceB = 0x005B7418;
+// Reference-link addresses, so they go through DataRebase. Leaving them raw is worse than a
+// miss on a shifted image: the two objects are 8 bytes apart, so the other link puts the
+// SECOND one where the first is named here and the test accepts the wrong state.
+constexpr uintptr_t kRetailStateRaceA = 0x005B7410;
+constexpr uintptr_t kRetailStateRaceB = 0x005B7418;
 
 // prib_config ends where the driver table begins, at +0x228.
 constexpr size_t kConfigSize = 0x228;
@@ -118,14 +123,14 @@ constexpr int         kUnset = INT_MIN;
 // control someone actually wants, and two overlapping size controls is one too many.
 constexpr float kPribludaTextScale = 2.0f;
 
-// Written next to the game when it is missing. Positions are fractions of the panel, and
+// Written into gplvr's own folder when it is missing. Positions are fractions of the panel, and
 // the defaults are PRIBLUDA.INI's own monitor layout in those terms -- the three boards at
 // width-900/-600/-300, the tyre grid at 1180 and 100 up from the bottom, the fps counter
 // 120 in and 50 up -- so the panel starts out looking exactly like the monitor.
 constexpr const char* kDefaultLayout =
     "; gplvr_pribluda.ini -- pribluda's overlay, laid out on the headset's HUD PANEL.\r\n"
     ";\r\n"
-    "; gplvr wrote this because it was missing. While it sits next to gplc67.exe the panel\r\n"
+    "; gplvr wrote this because it was missing. While it sits beside gplvr.dll the panel\r\n"
     "; takes its layout from here, and the monitor keeps using PRIBLUDA.INI exactly as\r\n"
     "; before. It is read once, when the game starts: restart the game to apply an edit.\r\n"
     "; Delete it to get these defaults back.\r\n"
@@ -358,9 +363,7 @@ DWORD writeDefaultLayout() {
 // Read gplvr_pribluda.ini once, writing the default first if it is not there. Everything
 // stays in memory from here on.
 void loadLayout() {
-    GetModuleFileNameA(nullptr, g_layoutPath, MAX_PATH);
-    if (char* slash = strrchr(g_layoutPath, '\\')) slash[1] = '\0';
-    strcat_s(g_layoutPath, kLayoutFile);
+    pathsOwnFile(g_layoutPath, sizeof(g_layoutPath), kLayoutFile);
 
     if (GetFileAttributesA(g_layoutPath) == INVALID_FILE_ATTRIBUTES) {
         DWORD error = writeDefaultLayout();
@@ -518,8 +521,11 @@ bool bind() {
 
 bool inRace() {
     if (!g_prib.gameState) return false;
-    int state = g_prib.gameState();
-    return state == kStateRaceA || state == kStateRaceB;
+    uintptr_t a = rebase(kRetailStateRaceA);
+    uintptr_t b = rebase(kRetailStateRaceB);
+    if (!a || !b) return false;
+    auto state = static_cast<uintptr_t>(static_cast<unsigned>(g_prib.gameState()));
+    return state == a || state == b;
 }
 
 void swapBoxSizes() {
@@ -759,17 +765,35 @@ void moveAxis(Fraction& position, double delta, int extent, int size) {
     }
 }
 
-void writeFraction(const char* section, const char* key, const Fraction& f, int& written,
-                   int& failed, DWORD& error) {
-    if (!f.set) return;
-    char text[32] = {};
-    _snprintf_s(text, sizeof(text), _TRUNCATE, "%.4f", f.value);
+// WritePrivateProfileString keeps the text left of the `=` exactly as the file has it and
+// replaces everything right of it, so a value passed as "0.3483" turns a hand-written
+// `X = 0.3483` into `X =0.3483`. The space belongs to the value here, which is why every
+// one of these formats starts with one; GetPrivateProfile* skips it on the way back in.
+void writeValue(const char* section, const char* key, const char* text, int& written,
+                int& failed, DWORD& error) {
     if (WritePrivateProfileStringA(section, key, text, g_layoutPath)) {
         ++written;
     } else {
         ++failed;
         error = GetLastError();
     }
+}
+
+void writeFraction(const char* section, const char* key, const Fraction& f, int& written,
+                   int& failed, DWORD& error) {
+    if (!f.set) return;
+    char text[32] = {};
+    _snprintf_s(text, sizeof(text), _TRUNCATE, " %.4f", f.value);
+    writeValue(section, key, text, written, failed, error);
+}
+
+// An element with no `show` line follows pribluda's own hotkeys, which the file's header
+// offers as a thing to arrange by deleting the line. Writing one in would take that away,
+// so an unset flag stays unset.
+void writeShow(const char* section, const char* key, int show, int& written, int& failed,
+               DWORD& error) {
+    if (show == kUnset) return;
+    writeValue(section, key, show ? " 1" : " 0", written, failed, error);
 }
 
 // WritePrivateProfileString replaces each value in place, so the file's comments and order
@@ -787,16 +811,22 @@ void saveLayout() {
                       failed, error);
         writeFraction(kPanels[i].section, kPanels[i].yKey, g_layout.panel[i].y, written,
                       failed, error);
+        writeShow(kPanels[i].section, kPanels[i].showKey, g_layout.panel[i].show, written,
+                  failed, error);
     }
     writeFraction("dash", "X", g_layout.dash.x, written, failed, error);
     writeFraction("dash", "Y", g_layout.dash.y, written, failed, error);
+    writeFraction("dash", "width", g_layout.dashWidth, written, failed, error);
+    writeShow("dash", "show", g_layout.dash.show, written, failed, error);
     g_tweak.moved = false;
     if (failed) {
-        logf("pribluda: %d of %d HUD positions could not be written to %s (error %lu) -- the "
+        logf("pribluda: %d of %d HUD values could not be written to %s (error %lu) -- the "
              "panel keeps them until the game exits",
              failed, written + failed, g_layoutPath, error);
     } else {
-        logf("pribluda: %d HUD positions written to %s", written, g_layoutPath);
+        logf("pribluda: %d HUD values written to %s -- positions, dash width and every "
+             "show flag the file sets",
+             written, g_layoutPath);
     }
 }
 
@@ -1226,6 +1256,7 @@ bool pribludaElementSetShow(int element, int show) {
     int& slot = panel < 0 ? g_layout.dash.show : g_layout.panel[panel].show;
     if (slot == value) return false;
     slot = value;
+    g_tweak.moved = true;
     return true;
 }
 
@@ -1238,6 +1269,7 @@ bool pribludaSetDashWidth(float fraction) {
     if (g_layout.dashWidth.set && g_layout.dashWidth.value == value) return false;
     g_layout.dashWidth.set = true;
     g_layout.dashWidth.value = value;
+    g_tweak.moved = true;
     return true;
 }
 

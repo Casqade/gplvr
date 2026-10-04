@@ -5,6 +5,7 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "MirrorConfig.h"
+#include "Paths.h"
 #include "Pribluda.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
@@ -1303,26 +1304,32 @@ void runCommand(int command) {
 // where it stands: the file's comments, its order and every key the menu does not touch come
 // out unchanged. A rewrite would lose the comments, which are most of that file.
 //
-// The mirror aim and the pribluda layout are NOT here. They live in their own files, per car,
-// and each tweak mode asks about its own on the way out.
+// WHAT A TWEAK MODE CHANGES IS NOT HERE. The mirror aim and the pribluda layout live in
+// their own files, the HUD panel's placement in its own eight keys of this one, and each
+// tweak mode asks about its own on the way out -- so none of them needs this row.
 void saveSettings() {
+    // The same file loadOptions read, beside gplvr. Writing one in the game's folder instead
+    // would succeed, report success, and change nothing anybody reads.
     char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (char* slash = std::strrchr(path, '\\')) slash[1] = '\0';
-    strncat_s(path, "gplvr.ini", _TRUNCATE);
+    pathsOwnFile(path, sizeof(path), "gplvr.ini");
 
     int  failed = 0;
     auto writeText = [&](const char* key, const char* value) {
         if (!WritePrivateProfileStringA("gplvr", key, value, path)) ++failed;
     };
+    // THE LEADING SPACE IS THE VALUE'S. WritePrivateProfileString keeps the text left of the
+    // `=` exactly as the file has it and replaces everything right of it, so "1.000" turns a
+    // hand-written `vrWorldScale = 1.000` into `vrWorldScale =1.000`, and a file half of
+    // whose lines have been saved reads as two files. GetPrivateProfile* skips it on the way
+    // back in, and loadOptions has always read the hand-written lines the same way.
     auto writeInt = [&](const char* key, int value) {
         char text[32] = {};
-        _snprintf_s(text, sizeof(text), _TRUNCATE, "%d", value);
+        _snprintf_s(text, sizeof(text), _TRUNCATE, " %d", value);
         writeText(key, text);
     };
     auto writeFloat = [&](const char* key, float value) {
         char text[32] = {};
-        _snprintf_s(text, sizeof(text), _TRUNCATE, "%.3f", static_cast<double>(value));
+        _snprintf_s(text, sizeof(text), _TRUNCATE, " %.3f", static_cast<double>(value));
         writeText(key, text);
     };
 
@@ -1923,11 +1930,6 @@ void pollQuickRecentre() {
 
 const char* const kConfirmLabel[kConfirmCount] = {"Save", "Discard", "Keep tweaking"};
 
-// HudPanel has no file -- its placement is a runtime change and gplvr.ini is never written --
-// so "Save" is not an answer that target can give and the question is "Keep these?" instead.
-// Asked rather than skipped, because discarding is still worth offering.
-bool targetCanSave(TweakTarget target) { return target != TweakTarget::HudPanel; }
-
 const char* modeName(Mode mode) {
     switch (mode) {
         case Mode::MirrorTweak: return "mirror aim";
@@ -1952,18 +1954,15 @@ void answerConfirm(int choice) {
     }
 
     if (choice == kConfirmSave) {
-        if (!targetCanSave(target)) {
-            logf("vr menu: %s -- kept for this session; it has no file, so it is back to "
-                 "gplvr.ini's values at the next start",
-                 modeName(from));
-        } else {
-            TweakCommand save;
-            save.target = target;
-            save.action = TweakAction::Commit;
-            bool wrote = tweakApply(save);
-            logf("vr menu: %s -- %s", modeName(from),
-                 wrote ? "saved" : "NOT saved, and the tweak: line above says why");
-        }
+        // Each mode writes its own: the mirror aim to gplvr_mirrors.ini, the HUD layout to
+        // gplvr_pribluda.ini, the panel's placement to gplvr.ini. None of them needs the
+        // page's "Save settings" row, which writes a different set of keys entirely.
+        TweakCommand save;
+        save.target = target;
+        save.action = TweakAction::Commit;
+        bool wrote = tweakApply(save);
+        logf("vr menu: %s -- %s", modeName(from),
+             wrote ? "saved" : "NOT saved, and the tweak: line above says why");
     } else {
         snapshotRestore();
         logf("vr menu: %s -- discarded, back to what it was on the way in", modeName(from));
@@ -2671,11 +2670,10 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     // pointer test is the one that already exists.
     if (g_state.mode == Mode::Confirm) {
         float band = h / static_cast<float>(kConfirmCount + 1);
-        bool  canSave = targetCanSave(targetOf(g_state.confirmFrom));
         char  question[160] = {};
-        _snprintf_s(question, sizeof(question), _TRUNCATE, "%s the %s?  %d value%s changed",
-                    canSave ? "Save" : "Keep", modeName(g_state.confirmFrom),
-                    g_state.confirmChanged, g_state.confirmChanged == 1 ? "" : "s");
+        _snprintf_s(question, sizeof(question), _TRUNCATE, "Save the %s?  %d value%s changed",
+                    modeName(g_state.confirmFrom), g_state.confirmChanged,
+                    g_state.confirmChanged == 1 ? "" : "s");
         gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
         canvasText(gl, kVrTextBody, kHelpMargin, band * 0.5f, question);
 

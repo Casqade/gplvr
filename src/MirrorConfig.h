@@ -5,7 +5,7 @@ namespace gplvr {
 // Per-car mirror aim (docs/audit-2026-09-14/48-per-car-mirror-hud.md sections 2, 4, 5).
 //
 // The car is keyed `<cardir>/<teamfolder>`, lower-case, from gpl_carsetDirName (0x5A1928) and
-// mod_teamFolderNamePtrs (0xA0F798), e.g. `cars67/lotus`. gplvr_mirrors.ini next to the exe holds
+// mod_teamFolderNamePtrs (0xA0F798), e.g. `cars67/lotus`. gplvr_mirrors.ini in gplvr's folder holds
 // one section per key with any of vrMirrorYaw, vrMirrorPitch and vrMirrorFovScale; each value
 // missing from the section is gplvr.ini's. Everything here runs on the fg render thread: the
 // key poll and stereoRender.

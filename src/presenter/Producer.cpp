@@ -7,6 +7,7 @@
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "Paths.h"
 #include "Pribluda.h"
 #include "RenderPacing.h"
 #include "Stereo.h"
@@ -178,15 +179,15 @@ bool createControlBlock(State& state, wchar_t (&instance)[32]) {
 }
 
 bool launchPresenter(State& state, const wchar_t* instance) {
-    wchar_t directory[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, directory, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(directory, L'\\')) slash[1] = L'\0';
+    // Beside gplvr.dll, which is also where the presenter finds its own runtime folder: it opens
+    // runtime\openxr\win64\openxr_loader.dll relative to itself.
+    const wchar_t* directory = pathsOwnDirectoryW();
 
     wchar_t exePath[MAX_PATH] = {};
     _snwprintf_s(exePath, _TRUNCATE, L"%sgplvr-xr.exe", directory);
     if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {
         logf("vr: %S is not there -- build the x64 configuration and copy gplvr-xr.exe "
-             "and its runtime folder next to the game", exePath);
+             "and its runtime folder in beside gplvr.dll", exePath);
         return false;
     }
 
