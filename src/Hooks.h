@@ -375,6 +375,12 @@ struct Options {
     // this setting with that fix.
     float vrHorizonLock = 0.0f;
 
+    // Hear from the head instead of the driver's eye. In the cockpit, GPL's sound listener is
+    // moved to the head's position and turned with it, so turning your head moves the other cars
+    // between your ears; the car's own engine moves too. Pan only, as GPL computes it -- nothing
+    // sounds behind or above. TV cameras and replays keep GPL's own. VR only. See HeadAudio.h.
+    bool vrHeadAudio = true;
+
     // GPL world units per metre.
     //
     // Every angle in this mod has now been measured and is correct, and the distortion

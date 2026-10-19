@@ -4,6 +4,7 @@
 #include "FlatFrames.h"
 #include "FrameBudget.h"
 #include "FrameTrace.h"
+#include "HeadAudio.h"
 #include "Hooks.h"
 #include "Hud.h"
 #include "Interpolation.h"
@@ -1869,7 +1870,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     // Without this a frustum from the last tracked frame would keep being re-applied at
     // bind time after tracking drops, quietly overriding the game's own fov in a mode
     // that is supposed to be stock.
-    if (!tracked) g_state.pendingValid[0] = g_state.pendingValid[1] = false;
+    if (!tracked) {
+        g_state.pendingValid[0] = g_state.pendingValid[1] = false;
+        headAudioForget();
+    }
 
     g_state.geometryValid = tracked;
     if (tracked) {
@@ -2062,6 +2066,9 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     }
 
     std::memcpy(savedOrientation, levelled, sizeof(levelled));
+
+    // The head this frame is drawn from, for the sim thread's sound listener.
+    headAudioPublish(carOrientation, levelled, vr);
 
     g_state.frameMirror = savedMirror;
     g_state.frameMirrorSurface =

@@ -15,6 +15,7 @@
 #include "Discovery.h"
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
+#include "HeadAudio.h"
 #include "Hooks.h"
 #include "Hud.h"
 #include "fast_text/FastText.h"
@@ -169,6 +170,7 @@ DWORD WINAPI installThread(LPVOID) {
     if (g_options.vr) {
         hudBind(binding);
         billboardInstall(binding);
+        headAudioInstall();
     }
     // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
     // Hud.cpp has not touched. In VR it takes stampDraw alone and only with vrGplText = 1 --

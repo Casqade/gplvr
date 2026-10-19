@@ -102,6 +102,7 @@ else()
         src/MouseLook.cpp
         src/NoSignal.cpp
         src/FrameTrace.cpp
+        src/HeadAudio.cpp
         src/Paths.cpp
         src/Pe.cpp
         src/PostProfile.cpp
