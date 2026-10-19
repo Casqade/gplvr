@@ -121,12 +121,12 @@ Quat yawOnly(const Quat& q) {
 //     by nothing else. Sizing the font from the projected pixel height, as the first
 //     build did, made the tweak strip's readout three times too wide for its own strip.
 constexpr int kMenuCanvasWidth = 1024;
-// Tall enough for the rows there are. At 768 and nineteen rows a band came out 34 px for a
-// 30 px font -- the glyphs fit, but with nothing between one row and the next. The quad's
-// height in metres follows this through kPanelHeight, so the panel grows with it rather than
-// squeezing the same picture; that is the property to keep when rows are added again, and
-// 900 to 1024 is twenty-two rows keeping the 41 px band that nineteen had at 900.
-constexpr int kMenuCanvasHeight = 1024;
+// Tall enough for the lines there are: the buttons, the tabs and the tallest tab's rows. At
+// 768 and nineteen rows a band came out 34 px for a 30 px font -- the glyphs fit, but with
+// nothing between one row and the next. The quad's height in metres follows this through
+// kPanelHeight, so the panel grows with it rather than squeezing the same picture; that is the
+// property to keep when rows are added again. 640 is nine lines at about 62 px each.
+constexpr int kMenuCanvasHeight = 640;
 constexpr int kStripCanvasWidth = 1024;
 // Tall enough for the readout AND the mode's whole control list under it. A driver inside a
 // tweak mode cannot see the menu's help line, and leaving the mode to read what the buttons do
@@ -286,7 +286,16 @@ enum RowKind {
     // time; the fraction is what the setting actually does to the update.
     kRowRateInt,
     kRowSliderFloat,
+    // One of the tabs across the strip under the buttons. Its `tab` is the tab it opens.
+    kRowTab,
 };
+
+// THE TABS. Each setting lives on one, filed where somebody chasing the symptom would look:
+// the update rates are on Performance rather than beside the mirror and the panel, because a
+// driver reaches for them when the frame rate drops. The page's own buttons -- Save settings,
+// Reset, Close -- are on no tab and sit above the strip, so they are there whichever tab is open.
+enum MenuTab { kTabHeadset = 0, kTabCockpit, kTabPerformance, kTabDisplay, kTabCount };
+constexpr int kTabNone = -1;
 
 enum RowCommand {
     kCommandNone = 0,
@@ -310,10 +319,13 @@ struct MenuRow {
     float       high;
     float       step;
     const char* help;
+    // The tab the row is on, kTabNone for the buttons above the strip, and for a kRowTab the
+    // tab it opens.
+    int tab;
     // Whether the row belongs on the page at all, asked every time the page is laid out.
     // Null is yes, which is what every row that always applies leaves it as. A row this
-    // refuses takes no band, cannot be highlighted and is not drawn -- the rows below it
-    // move up and the ones that are left share the height.
+    // refuses takes no band, cannot be highlighted and is not drawn -- the rows below it on
+    // its tab move up.
     bool (*offered)();
 };
 
@@ -323,8 +335,8 @@ struct MenuRow {
 // ignored.
 bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 
-// The root page. Every row here changes a live value and nothing else; "Save settings" is
-// what writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
+// The root page. Every row here changes a live value and nothing else; Save settings is what
+// writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
 //
 // NOT AN OPTION, and deliberately not one: turning the HUD off is something a driver does for
 // a lap to see the road, or to find out what the panel costs. It is therefore not one of the
@@ -336,39 +348,86 @@ bool g_pribludaOn = true;
 // runtime's own control names in canvasControlLine; how to work a TWEAK MODE is the mode's
 // whole binding table, listed in the mode itself where it is needed. Putting the scheme in
 // each row's words repeated it thirteen times and still left it invisible from inside a mode.
+//
+// In page order: the buttons above the strip, the tabs, then each tab's rows, top to bottom.
 MenuRow g_rows[] = {
-    {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "aim the rear-view glasses and set how wide they see"},
-    {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "arrange the elements on pribluda's panel", pribludaRowOffered},
-    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "move the whole panel, and set how far away and how wide it hangs", pribludaRowOffered},
+    {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
+     "write the settings on every tab to gplvr.ini, so they are what the game starts with next "
+     "time. The mirror aim and the pribluda layout are not here -- each tweak mode asks about "
+     "its own on the way out",
+     kTabNone},
+    {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
+     "put things back to how they shipped -- it asks which. A stick click on any setting "
+     "resets that one alone",
+     kTabNone},
+    {"Close", kRowAction, kCommandClose, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabNone},
+
+    {"Headset", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
+     "how it feels to sit in the car: recentre, world scale, horizon lock, gamma and the "
+     "head-tracked sound",
+     kTabHeadset},
+    {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
+     "what is in the car with you: the mirrors and pribluda's panel", kTabCockpit},
+    {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
+     "what a frame costs: the frame rate, the render scale and how often the mirrors and the "
+     "panel are redrawn",
+     kTabPerformance},
+    {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
+     "text and screens: GPL's own text, its menus in the headset, and the monitor window",
+     kTabDisplay},
+
     {"Recentre", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
      "this pose becomes the seat -- also on a face button or a stick click at any time with "
-     "the menu closed, which is how to use it mid-lap"},
+     "the menu closed, which is how to use it mid-lap",
+     kTabHeadset},
+    {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
+     0.5f, 2.0f, 0.02f, "metres per world unit; moves the eye separation with it", kTabHeadset},
+    {"Horizon lock", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrHorizonLock,
+     0.0f, 1.0f, 0.05f,
+     "how much of the car's roll and pitch is taken out of the view. 0 rides with the car, "
+     "1 keeps the horizon level. Roll is the axis nobody can counteract with their own head, "
+     "so this is the comfort setting to reach for first",
+     kTabHeadset},
+    {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
+     2.0f, 0.05f, "lifts the mid-tones in the headset", kTabHeadset},
+    {"Head audio width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
+     "how hard the cockpit's sound pans between your ears as you turn your head. 0 is GPL's own "
+     "gentle panning, 1 makes a car 30 degrees off to one side clearly louder in that ear, 2 is "
+     "close to hard left and right. Takes effect as you move it",
+     kTabHeadset, headAudioWidthAdjustable},
+
+    {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "aim the rear-view glasses and set how wide they see", kTabCockpit},
+    {"Per-eye mirrors", kRowToggleBool, kCommandNone, &g_options.perEyeMirror, nullptr,
+     nullptr, 0, 1, 1,
+     "on, each eye renders both glasses from its own viewpoint, so the reflection has depth "
+     "like the rest of the frame -- and costs a second pair of renders. Off renders them "
+     "once from the head centre and shares them. To turn mirrors OFF entirely, set Mirror "
+     "update rate on the Performance tab to off",
+     kTabCockpit},
+    {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
+     "off skips the HUD pass entirely -- the panel goes from the headset and the monitor, "
+     "and its cost goes with it. Runtime only: nothing is written and it is back on next "
+     "time the game starts",
+     kTabCockpit, pribludaRowOffered},
+    {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "arrange the elements on pribluda's panel", kTabCockpit, pribludaRowOffered},
+    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "move the whole panel, and set how far away and how wide it hangs", kTabCockpit,
+     pribludaRowOffered},
     // vrHudLayer 1 is head-locked and 2 is seat-locked, so ON is 1 here: `low` is the value
     // the label is true for.
     {"Head-locked Pribluda", kRowToggleInt, kCommandNone, nullptr, &g_options.vrHudLayer,
      nullptr, 1, 2, 1,
      "on, the panel stays in front of you wherever you look; off, it is fixed to the seat "
      "and you look down at it",
-     pribludaRowOffered},
-    {"Per-eye mirrors", kRowToggleBool, kCommandNone, &g_options.perEyeMirror, nullptr,
-     nullptr, 0, 1, 1,
-     "on, each eye renders both glasses from its own viewpoint, so the reflection has depth "
-     "like the rest of the frame -- and costs a second pair of renders. Off renders them "
-     "once from the head centre and shares them. To turn mirrors OFF entirely, set the "
-     "update rate below to off"},
-    {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
-     "off skips the HUD pass entirely -- the panel goes from the headset and the monitor, "
-     "and its cost goes with it. Runtime only: nothing is written and it is back on next "
-     "time the game starts",
-     pribludaRowOffered},
-    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateRate,
-     nullptr, 0, 4, 1,
-     "render the mirror on one frame in N and keep the last image on the rest -- the "
-     "reflection only changes at the sim's rate anyway. Off goes further: nothing renders "
-     "it and the glasses are filled with black"},
+     kTabCockpit, pribludaRowOffered},
+    {"Pribluda opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
+     "how much of the world the panel's boxes hide. 0 is clear glass, 1 is solid",
+     kTabCockpit, pribludaRowOffered},
+
     {"Frame rate", kRowNamedInt, kCommandNone, nullptr, &g_options.frameRate, nullptr, 0,
      2, 1,
      "how often the game draws a picture. Vanilla is one per physics step -- the sim's 36, "
@@ -376,28 +435,27 @@ MenuRow g_rows[] = {
      "monitor's in flat mode. Unlimited is as fast as the machine manages. The last two "
      "blend the world between ticks, which is what makes the extra frames new pictures "
      "instead of copies, and costs one tick of latency. Vsync follows this and is not a "
-     "separate setting"},
-    {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
-     &g_options.pribludaUpdateRate, nullptr, 1, 4, 1,
-     "redraw the panel on one frame in N. The last image stays up in between, so a lower "
-     "rate costs nothing but the age of the numbers. No off here -- that is the Pribluda "
-     "HUD row above",
-     pribludaRowOffered},
+     "separate setting",
+     kTabPerformance},
     {"Render scale", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrRenderScale, 0.5f, 2.0f, 0.05f,
      "NOTE: NEEDS A RESTART. Multiplies the runtime's recommended per-eye size, clamped to "
      "the maximum it reports. The presenter is given this on its command line when it "
-     "starts, so changing it here does nothing until you Save settings and restart the "
-     "game"},
-    {"Menu size in headset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrMenuScale, 0.05f, 1.0f, 0.05f,
-     "how much of the view the game's own menus cover. They are flat images with no world "
-     "behind them, so at 1.00 they fill the whole view a few centimetres from your face. "
-     "Takes effect as you move it"},
-    {"Pribluda opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
-     "how much of the world the panel's boxes hide. 0 is clear glass, 1 is solid",
-     pribludaRowOffered},
+     "starts, so changing it here does nothing until you Save settings and restart the game",
+     kTabPerformance},
+    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateRate,
+     nullptr, 0, 4, 1,
+     "render the mirror on one frame in N and keep the last image on the rest -- the "
+     "reflection only changes at the sim's rate anyway. Off goes further: nothing renders "
+     "it and the glasses are filled with black",
+     kTabPerformance},
+    {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
+     &g_options.pribludaUpdateRate, nullptr, 1, 4, 1,
+     "redraw the panel on one frame in N. The last image stays up in between, so a lower "
+     "rate costs nothing but the age of the numbers. No off here -- that is the Pribluda "
+     "HUD row on the Cockpit tab",
+     kTabPerformance, pribludaRowOffered},
+
     // Both rows need vrGplText = 1, which is read when the game starts and is not a row: it
     // decides which module takes GPL's stampDraw global at install time, and a switch that
     // cannot act until the next run does not belong on a page whose other rows act as you move
@@ -409,7 +467,8 @@ MenuRow g_rows[] = {
      "must be stopped\". Not its fps counter, which GPL draws onto the window and the headset "
      "never sees. Whole steps, because the letters are tiny bitmaps and 2 makes each dot a 2x2 "
      "block while a half step would come out ragged. Needs vrGplText = 1 in gplvr.ini; with "
-     "that off GPL draws its own text and nothing here reaches it"},
+     "that off GPL draws its own text and nothing here reaches it",
+     kTabDisplay},
     {"GPL text inset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrGplTextInset, 0.1f, 1.0f, 0.05f,
      "how much of GPL's own distance from the middle survives. 1.00 keeps it at the size GPL "
@@ -418,73 +477,128 @@ MenuRow g_rows[] = {
      "moves the line and not the letters in it, so the spacing stays GPL's, and a line that "
      "would land on the one above it is moved down until it clears. Turn it down as you turn "
      "the size up -- a line too big to fit in one eye is dropped rather than spilling into "
-     "the other. Needs vrGplText = 1"},
-    {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
-     2.0f, 0.05f, "lifts the mid-tones in the headset"},
-    {"Horizon lock", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrHorizonLock,
-     0.0f, 1.0f, 0.05f,
-     "how much of the car's roll and pitch is taken out of the view. 0 rides with the car, "
-     "1 keeps the horizon level. Roll is the axis nobody can counteract with their own head, "
-     "so this is the comfort setting to reach for first"},
-    {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
-     0.5f, 2.0f, 0.02f, "metres per world unit; moves the eye separation with it"},
-    {"Head audio width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
-     "how hard the cockpit's sound pans between your ears as you turn your head. 0 is GPL's own "
-     "gentle panning, 1 makes a car 30 degrees off to one side clearly louder in that ear, 2 is "
-     "close to hard left and right. Takes effect as you move it",
-     headAudioWidthAdjustable},
+     "the other. Needs vrGplText = 1",
+     kTabDisplay},
+    {"Menu size in headset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrMenuScale, 0.05f, 1.0f, 0.05f,
+     "how much of the view the game's own menus cover. They are flat images with no world "
+     "behind them, so at 1.00 they fill the whole view a few centimetres from your face. "
+     "Takes effect as you move it",
+     kTabDisplay},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr, 0,
      3, 1,
      "what the game window on the monitor shows: both eyes side by side, one eye, or off. Off "
-     "leaves the window black and saves the copy into it. The headset is unaffected"},
-    {"Reset settings", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "put things back to how they shipped -- it asks which. A stick click on any row above "
-     "resets that one row on its own"},
-    {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "write the settings on this page to gplvr.ini, so they are what the game starts with "
-     "next time. The mirror aim and the pribluda layout are not here -- each tweak mode "
-     "asks about its own on the way out"},
-    {"Close", kRowAction, kCommandClose, nullptr, nullptr, nullptr, 0, 0, 0, ""},
+     "leaves the window black and saves the copy into it. The headset is unaffected",
+     kTabDisplay},
 };
 
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
 
+// The tab on show. It outlives the menu, so the menu reopens where the driver left it.
+int g_openTab = kTabHeadset;
+
 // -- which rows are on the page -----------------------------------------------------------
 //
 // A row keeps its index in g_rows for as long as the process lives, and that index is what
-// `hovered` and `pressed` hold, what resetRow takes and what Reset-all walks. What a refused
-// row loses is its SLOT: its place in the column of bands the page is divided into. So the
-// layout, the hit test, the stick and the draw all count in slots and convert, and nothing
-// that remembers a row has to be told the page changed shape.
+// `hovered` and `pressed` hold, what resetRow takes and what Reset-all walks. What changes is
+// the row's LINE: the bands the page is divided into, top to bottom. The buttons share the
+// first line with the title, the tabs share the second, and the open tab's rows take one line
+// each below them. The layout, the hit test, the stick and the draw all count in lines and
+// convert, and nothing that remembers a row has to be told the page changed shape.
+//
+// THE PAGE IS AS TALL AS ITS TALLEST TAB, whichever tab is open, so switching tabs moves
+// nothing that stays: the buttons and the strip keep their place under the pointer, and a
+// short tab leaves its lower bands empty.
+constexpr int kButtonLine = 0;
+constexpr int kTabLine = 1;
+constexpr int kFirstRowLine = 2;
 
 bool rowOffered(int row) {
     if (row < 0 || row >= kRowCount) return false;
     return !g_rows[row].offered || g_rows[row].offered();
 }
 
-int offeredCount() {
+// A setting on `tab` that is on the page, as opposed to a button or a tab of the strip.
+bool rowOnTab(int row, int tab) {
+    return rowOffered(row) && g_rows[row].kind != kRowTab && g_rows[row].tab == tab;
+}
+
+// The line `row` is drawn on, or -1 when it is not on the page: refused, or on a tab that is
+// not open.
+int rowLine(int row) {
+    if (!rowOffered(row)) return -1;
+    if (g_rows[row].kind == kRowTab) return kTabLine;
+    if (g_rows[row].tab == kTabNone) return kButtonLine;
+    if (g_rows[row].tab != g_openTab) return -1;
+    int line = kFirstRowLine;
+    for (int i = 0; i < row; ++i)
+        if (rowOnTab(i, g_openTab)) ++line;
+    return line;
+}
+
+int lineCount() {
+    int tallest = 0;
+    for (int tab = 0; tab < kTabCount; ++tab) {
+        int rows = 0;
+        for (int row = 0; row < kRowCount; ++row)
+            if (rowOnTab(row, tab)) ++rows;
+        if (rows > tallest) tallest = rows;
+    }
+    return kFirstRowLine + (tallest > 0 ? tallest : 1);
+}
+
+// How many rows share `line`: several on the first two, one or none below them.
+int lineWidth(int line) {
     int count = 0;
     for (int row = 0; row < kRowCount; ++row)
-        if (rowOffered(row)) ++count;
+        if (rowLine(row) == line) ++count;
     return count;
 }
 
-int slotRow(int slot) {
-    if (slot < 0) return -1;
+// The `column`th row on `line`, left to right, or -1.
+int lineRow(int line, int column) {
+    if (column < 0) return -1;
     for (int row = 0; row < kRowCount; ++row) {
-        if (!rowOffered(row)) continue;
-        if (slot-- == 0) return row;
+        if (rowLine(row) != line) continue;
+        if (column-- == 0) return row;
     }
     return -1;
 }
 
-int rowSlot(int row) {
-    if (!rowOffered(row)) return -1;
-    int slot = 0;
+int rowColumn(int row) {
+    int line = rowLine(row);
+    if (line < 0) return -1;
+    int column = 0;
     for (int i = 0; i < row; ++i)
-        if (rowOffered(i)) ++slot;
-    return slot;
+        if (rowLine(i) == line) ++column;
+    return column;
+}
+
+// The part of the page's width a line's rows divide between them, in panel fractions. The
+// buttons leave the left of their line to the title.
+void lineSpan(int line, float& left, float& right) {
+    left = line == kButtonLine ? 0.22f : 0.02f;
+    right = 0.98f;
+}
+
+// The strip's row for `tab`.
+int tabRow(int tab) {
+    for (int row = 0; row < kRowCount; ++row)
+        if (g_rows[row].kind == kRowTab && g_rows[row].tab == tab) return row;
+    return -1;
+}
+
+// Where the highlight goes when it has nowhere better: the open tab's first setting, or its
+// tab on the strip when the tab has none on the page.
+int firstRow() {
+    int row = lineRow(kFirstRowLine, 0);
+    return row >= 0 ? row : tabRow(g_openTab);
+}
+
+void openTab(int tab) {
+    if (tab < 0 || tab >= kTabCount || tab == g_openTab) return;
+    g_openTab = tab;
+    logf("vr menu: %s tab", g_rows[tabRow(tab)].label);
 }
 
 // -- what the footer is saying ------------------------------------------------------------
@@ -668,6 +782,8 @@ struct State {
     // takes it back the moment the ray lands on a DIFFERENT row, so neither locks the
     // other out and a driver can switch between them mid-menu.
     bool stickOwnsHighlight = false;
+    // Which button the highlight was last on, so the stick comes back up to it.
+    int buttonColumn = 0;
 
     // The front end's pointer.
     bool     pointerHasMouse = false;
@@ -1120,18 +1236,25 @@ void canvasSizeFor(int& width, int& height) {
 
 float helpFooterHeight(int slot, int lines);
 
-// The title takes the first slot's worth of what the footer leaves, so there are
-// offeredCount() + 1 bands above a reservation that never changes size. The pointer reads the
-// layout from the same two numbers the draw does, so a row is where it looks.
+// lineCount() bands above a reservation that never changes size. The pointer reads the layout
+// from the same two numbers the draw does, so a row is where it looks.
 float rowBand() {
     const float footer =
         helpFooterHeight(kVrTextSmall, kHelpLines) / static_cast<float>(kMenuCanvasHeight);
-    const int slots = offeredCount();
-    return (1.0f - footer) / static_cast<float>((slots > 0 ? slots : 1) + 1);
+    return (1.0f - footer) / static_cast<float>(lineCount());
 }
 
-int rowAt(float v) {
-    return slotRow(static_cast<int>(v / rowBand()) - 1);
+int rowAt(float u, float v) {
+    int line = static_cast<int>(v / rowBand());
+    int count = lineWidth(line);
+    if (count <= 0) return -1;
+    if (line >= kFirstRowLine) return lineRow(line, 0);
+    float left = 0.0f;
+    float right = 1.0f;
+    lineSpan(line, left, right);
+    if (u < left || u >= right) return -1;
+    float across = (u - left) / (right - left);
+    return lineRow(line, static_cast<int>(across * static_cast<float>(count)));
 }
 
 // The names a kRowNamedInt's values go by. Keyed on the option the row points at rather than
@@ -1390,7 +1513,7 @@ void runCommand(int command) {
     }
 }
 
-// -- "Save settings" ----------------------------------------------------------------------
+// -- Save settings -------------------------------------------------------------------------
 //
 // THE FIRST THING THAT EVER WRITES gplvr.ini, and it writes only what this page can change.
 //
@@ -1489,6 +1612,10 @@ void setRowInt(MenuRow& item, int value) {
 void activateRow(int row) {
     if (row < 0 || row >= kRowCount) return;
     MenuRow& item = g_rows[row];
+    if (item.kind == kRowTab) {
+        openTab(item.tab);
+        return;
+    }
     if (item.kind == kRowAction) {
         runCommand(item.command);
         return;
@@ -1537,18 +1664,33 @@ void dragRow(int row, float u) {
     }
 }
 
-// Stick forward and back moves the highlight, wrapping at both ends. Forward is +Y and
-// moves UP the list, which is the direction the highlighted row moves on the panel.
+// The row the stick lands on when it moves onto `line`: the open tab on the strip, the button
+// last highlighted on the button line, the one row anywhere else.
+int entryRow(int line) {
+    if (line == kTabLine) return tabRow(g_openTab);
+    if (line == kButtonLine) {
+        int row = lineRow(line, g_state.buttonColumn);
+        return row >= 0 ? row : lineRow(line, 0);
+    }
+    return lineRow(line, 0);
+}
+
+// Stick forward and back moves the highlight a line at a time, wrapping at both ends and
+// passing over the empty bands under a short tab. Forward is +Y and moves UP the page, which
+// is the direction the highlighted row moves on the panel.
 void navigateWithStick(const VrHandInput& hand) {
     const int step = stickDetent(hand.stickY, g_state.navDetent, g_state.navRepeatAt,
                                  qpcNow(), g_state.frequency);
-    const int slots = offeredCount();
-    if (!step || slots <= 0) return;
+    int lines = lineCount();
+    if (!step) return;
 
-    int slot = rowSlot(g_state.hovered);
-    if (slot < 0) slot = 0;
-    slot = ((slot - step) % slots + slots) % slots;
-    g_state.hovered = slotRow(slot);
+    int line = rowLine(g_state.hovered);
+    if (line < 0) line = kFirstRowLine;
+    for (int tried = 0; tried < lines; ++tried) {
+        line = ((line - step) % lines + lines) % lines;
+        if (lineWidth(line) > 0) break;
+    }
+    g_state.hovered = entryRow(line);
     // The pointer no longer owns the highlight: a driver who has just moved it with the
     // stick must not have it snatched back by a ray that is still lying across the panel.
     g_state.stickOwnsHighlight = true;
@@ -1575,6 +1717,23 @@ void adjustWithStick(const VrHandInput& hand, float seconds) {
     if (g_state.hovered < 0 || g_state.hovered >= kRowCount) return;
     MenuRow& item = g_rows[g_state.hovered];
     const float x = hand.stickX;
+
+    // On the button line and the strip, sideways moves along the line, and on the strip the
+    // tab it reaches opens: a driver on the stick alone cannot otherwise see what a tab holds
+    // without a trigger pull per tab.
+    int line = rowLine(g_state.hovered);
+    if (line == kButtonLine || line == kTabLine) {
+        int step = stickDetent(x, g_state.adjustDetent, g_state.adjustRepeatAt, qpcNow(),
+                               g_state.frequency);
+        if (!step) return;
+        int column = rowColumn(g_state.hovered) + step;
+        int count = lineWidth(line);
+        if (column < 0) column = 0;
+        if (column >= count) column = count - 1;
+        g_state.hovered = lineRow(line, column);
+        if (line == kTabLine) openTab(g_rows[g_state.hovered].tab);
+        return;
+    }
 
     if (item.kind == kRowSliderFloat && item.floatValue) {
         if (x == 0.0f || seconds <= 0.0f) return;
@@ -1904,10 +2063,10 @@ void enterMode(Mode mode, int hand) {
 
     g_state.mode = mode;
     g_state.hand = hand;
-    // The first row, not "nothing". A menu that opens with no highlight has nothing for
-    // the trigger to act on until the driver has aimed at it, which is exactly the state
+    // The open tab's first row, not "nothing". A menu that opens with no highlight has nothing
+    // for the trigger to act on until the driver has aimed at it, which is exactly the state
     // a one-controller driver got stuck in.
-    g_state.hovered = mode == Mode::Menu ? 0 : -1;
+    g_state.hovered = mode == Mode::Menu ? firstRow() : -1;
     g_state.stickOwnsHighlight = mode == Mode::Menu;
     // The dialog opens on Save: it is what someone who has just spent a minute aiming their
     // mirrors means, and the answer that loses work is the one they have to move to.
@@ -2078,7 +2237,7 @@ void answerConfirm(int choice) {
     if (choice == kConfirmSave) {
         // Each mode writes its own: the mirror aim to gplvr_mirrors.ini, the HUD layout to
         // gplvr_pribluda.ini, the panel's placement to gplvr.ini. None of them needs the
-        // page's "Save settings" row, which writes a different set of keys entirely.
+        // page's Save settings button, which writes a different set of keys entirely.
         TweakCommand save;
         save.target = target;
         save.action = TweakAction::Commit;
@@ -2136,17 +2295,23 @@ void pollReset(const VrHandInput& hand) {
             ((state.resetChoice - step) % kResetCount + kResetCount) % kResetCount;
         state.stickOwnsHighlight = true;
     }
-    if (state.pointerOn && !step) {
+    int pointed = -1;
+    if (state.pointerOn) {
         int row = static_cast<int>(state.pointerV * static_cast<float>(kResetCount + 1)) - 1;
-        if (row >= 0 && row < kResetCount) state.resetChoice = row;
+        if (row >= 0 && row < kResetCount) pointed = row;
     }
-    if (hand.triggerHeld.released) answerReset(state.resetChoice);
+    if (pointed >= 0 && !step) state.resetChoice = pointed;
+    // The trigger takes the answer the ray is on; the stick click takes the highlighted one.
+    if (hand.triggerHeld.released && pointed >= 0 && pointed == state.resetChoice)
+        answerReset(state.resetChoice);
+    else if (hand.stick.pressed)
+        answerReset(state.resetChoice);
 }
 
 void pollConfirm(const VrHandInput& hand) {
     State& state = g_state;
 
-    // The stick walks the three answers and the trigger takes one. Pointing works too, and
+    // The stick walks the three answers and its click takes one. Pointing works too, and
     // the rows are laid out by the same rowBand the menu uses, so the hit test is the same.
     int step = stickDetent(hand.stickY, state.navDetent, state.navRepeatAt, qpcNow(),
                            state.frequency);
@@ -2157,11 +2322,17 @@ void pollConfirm(const VrHandInput& hand) {
     }
     // The dialog's own grid, not the menu's: it has three bands and a title, the menu has
     // fourteen and a footer, and the draw below lays this one out the same way.
-    if (state.pointerOn && !step) {
+    int pointed = -1;
+    if (state.pointerOn) {
         int row = static_cast<int>(state.pointerV * static_cast<float>(kConfirmCount + 1)) - 1;
-        if (row >= 0 && row < kConfirmCount) state.confirmChoice = row;
+        if (row >= 0 && row < kConfirmCount) pointed = row;
     }
-    if (hand.triggerHeld.released) answerConfirm(state.confirmChoice);
+    if (pointed >= 0 && !step) state.confirmChoice = pointed;
+    // The trigger takes the answer the ray is on; the stick click takes the highlighted one.
+    if (hand.triggerHeld.released && pointed >= 0 && pointed == state.confirmChoice)
+        answerConfirm(state.confirmChoice);
+    else if (hand.stick.pressed)
+        answerConfirm(state.confirmChoice);
 }
 
 // -- the front end's pointer -----------------------------------------------------------
@@ -2543,6 +2714,10 @@ void frontEndPointerRelease(const char* why) {
 // layer is the only surface there is once the menu is a composition layer -- which is
 // why the rebuild is rate-limited rather than left to the frame rate.
 
+// The text colour of the page's Reset button and of Reset ALL, light enough to read on the
+// highlight's blue as well as on the panel.
+void setResetColour(const GlFunctions& gl) { gl.color4f(1.0f, 0.42f, 0.38f, 1.0f); }
+
 void canvasQuad(const GlFunctions& gl, float x0, float y0, float x1, float y1) {
     gl.begin(GL_QUADS);
     gl.vertex2f(x0, y0);
@@ -2589,6 +2764,20 @@ const char* boundName(int action) {
 }
 
 // -- the footer's text --------------------------------------------------------------------
+
+// What the trigger does on an action row, for the footer's control line.
+const char* actionEffect(int command) {
+    switch (command) {
+        case kCommandClose: return "close the menu";
+        case kCommandRecentre: return "recentre now";
+        case kCommandMirrorTweak: return "open Mirror setup";
+        case kCommandHudTweak: return "open Pribluda setup";
+        case kCommandPanelTweak: return "open Pribluda position";
+        case kCommandSaveSettings: return "write the settings to gplvr.ini";
+        case kCommandResetSettings: return "choose what to reset";
+        default: return "select it";
+    }
+}
 
 struct HelpBlock {
     char lines[kHintLines][kHelpLineChars];
@@ -2675,37 +2864,47 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
         const char* trigger = boundName(kInputTrigger);
         const char* stick = boundName(kInputStick);
         const char* grip = boundName(kInputSqueeze);
-        if (!trigger[0]) trigger = "the trigger";
-        if (!stick[0]) stick = "the stick";
-        if (!grip[0]) grip = "the grip";
+        if (!trigger[0]) trigger = "Trigger";
+        if (!stick[0]) stick = "Stick";
+        if (!grip[0]) grip = "Grip";
 
-        char how[kHelpLineChars * 2] = {};
-        switch (g_rows[g_state.hovered].kind) {
+        // Every part is "control: effect", and the effect names what it acts on. The line sits
+        // under the row's own help, so a bare "does it" read as belonging to that text.
+        const MenuRow& item = g_rows[g_state.hovered];
+        char           how[kHelpLineChars * 2] = {};
+        switch (item.kind) {
             case kRowAction:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s does it   |   %s up and down moves the highlight, %s closes "
-                            "the menu",
-                            trigger, stick, grip);
+                            "%s on it, or %s click: %s   |   %s: move the highlight   |   %s: "
+                            "close the menu",
+                            trigger, stick, actionEffect(item.command), stick, grip);
+                break;
+            case kRowTab:
+                _snprintf_s(how, sizeof(how), _TRUNCATE,
+                            "%s on it, or %s click: open the %s tab   |   %s left/right: walk "
+                            "the tabs   |   %s: close the menu",
+                            trigger, stick, item.label, stick, grip);
                 break;
             case kRowToggleBool:
             case kRowToggleInt:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s or %s left and right flips it   |   %s closes the menu",
-                            trigger, stick, grip);
+                            "%s on it, or %s left/right: turn %s on or off   |   %s click: "
+                            "back to default   |   %s: close the menu",
+                            trigger, stick, item.label, stick, grip);
                 break;
             case kRowChoiceInt:
             case kRowRateInt:
             case kRowNamedInt:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s left and right steps through the values, or hold %s and slide "
-                            "along the bar   |   %s closes the menu",
-                            stick, trigger, grip);
+                            "%s left/right: step %s through its values   |   hold %s on the "
+                            "bar and slide: set it directly   |   %s: close the menu",
+                            stick, item.label, trigger, grip);
                 break;
             case kRowSliderFloat:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s left and right slides it, or hold %s and drag the bar   |   "
-                            "%s closes the menu",
-                            stick, trigger, grip);
+                            "%s left/right: slide %s   |   hold %s on the bar and drag: set it "
+                            "directly   |   %s: close the menu",
+                            stick, item.label, trigger, grip);
                 break;
             default: break;
         }
@@ -2904,12 +3103,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                 canvasOutline(gl, w * 0.02f, top + band * 0.06f, w * 0.98f,
                               top + band * 0.94f);
             }
-            // The two that delete a file are warned in amber; the settings one is live-only
-            // and Cancel does nothing, so neither earns it.
-            bool destructive = choice == kResetMirrors || choice == kResetPribluda ||
-                               choice == kResetEverything;
-            if (destructive)
-                gl.color4f(1.0f, 0.78f, 0.30f, 1.0f);
+            // Reset ALL is red, the colour the page's Reset button is drawn in.
+            if (choice == kResetEverything)
+                setResetColour(gl);
             else
                 gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
             canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f, kResetLabel[choice]);
@@ -2946,11 +3142,61 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     HelpBlock block;
     buildHelpBlock(block, kVrTextSmall, w - kHelpMargin * 2.0f);
     float footer = helpFooterHeight(kVrTextSmall, kHelpLines);
-    int   slots = offeredCount();
-    float band = (h - footer) / static_cast<float>((slots > 0 ? slots : 1) + 1);
+    int   lines = lineCount();
+    float band = (h - footer) / static_cast<float>(lines);
 
     gl.color4f(0.88f, 0.91f, 0.97f, 1.0f);
     canvasText(gl, kVrTextBody, 20.0f, band * 0.5f, "GPLVR");
+
+    // THE BUTTONS AND THE STRIP: boxes side by side, each with its label centred. The open tab
+    // is filled and underlined so it reads as the page below it; the highlight is the same
+    // bar-and-outline every row gets, on top of either.
+    for (int line = kButtonLine; line <= kTabLine; ++line) {
+        int   count = lineWidth(line);
+        float left = 0.0f;
+        float right = 1.0f;
+        lineSpan(line, left, right);
+        float cell = count > 0 ? (right - left) / static_cast<float>(count) : 0.0f;
+        float top = band * static_cast<float>(line) + band * 0.10f;
+        float bottom = band * static_cast<float>(line + 1) - band * 0.10f;
+        for (int column = 0; column < count; ++column) {
+            int   row = lineRow(line, column);
+            float x0 = w * (left + cell * static_cast<float>(column)) + 4.0f;
+            float x1 = w * (left + cell * static_cast<float>(column + 1)) - 4.0f;
+            bool  open = g_rows[row].kind == kRowTab && g_rows[row].tab == g_openTab;
+
+            if (row == g_state.hovered)
+                gl.color4f(0.22f, 0.45f, 0.78f, 0.95f);
+            else if (open)
+                gl.color4f(0.30f, 0.34f, 0.42f, 0.95f);
+            else
+                gl.color4f(0.17f, 0.19f, 0.23f, 0.95f);
+            canvasQuad(gl, x0, top, x1, bottom);
+            if (open) {
+                gl.color4f(0.45f, 0.70f, 0.95f, 1.0f);
+                canvasQuad(gl, x0, bottom - 5.0f, x1, bottom);
+            }
+            if (row == g_state.hovered) {
+                gl.color4f(1.0f, 0.85f, 0.25f, 1.0f);
+                canvasOutline(gl, x0, top, x1, bottom);
+            }
+
+            float labelWidth = static_cast<float>(vrTextWidth(kVrTextBody, g_rows[row].label));
+            if (g_rows[row].command == kCommandResetSettings)
+                setResetColour(gl);
+            else if (g_rows[row].command == kCommandSaveSettings)
+                gl.color4f(0.45f, 0.95f, 0.50f, 1.0f);
+            else
+                gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
+            canvasText(gl, kVrTextBody, (x0 + x1 - labelWidth) * 0.5f,
+                       (top + bottom) * 0.5f, g_rows[row].label);
+        }
+    }
+    gl.color4f(0.30f, 0.34f, 0.42f, 0.9f);
+    gl.begin(GL_LINES);
+    gl.vertex2f(kHelpMargin, band * static_cast<float>(kFirstRowLine));
+    gl.vertex2f(w - kHelpMargin, band * static_cast<float>(kFirstRowLine));
+    gl.end();
 
     gl.color4f(0.30f, 0.34f, 0.42f, 0.9f);
     gl.begin(GL_LINES);
@@ -2968,9 +3214,10 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     const float trackRight = w * 0.94f;
 
     char value[64] = {};
-    for (int slot = 0; slot < slots; ++slot) {
-        const int   row = slotRow(slot);
-        const float top = band * static_cast<float>(slot + 1);
+    for (int line = kFirstRowLine; line < lines; ++line) {
+        const int row = lineRow(line, 0);
+        if (row < 0) break;
+        const float top = band * static_cast<float>(line);
         const float centre = top + band * 0.5f;
 
         if (row == g_state.hovered) {
@@ -3098,11 +3345,11 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
     }
 
     int used = written;
-    // offeredCount() goes in because it is what the bands are divided from: a row that stops
-    // being offered moves every row below it without changing any value, and the canvas has
-    // to be rebuilt for that alone.
-    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|%d|",
-                        footer, offeredCount());
+    // The open tab and lineCount() go in because they decide which row is drawn where: a tab
+    // switch or a row that stops being offered moves rows without changing any value, and the
+    // canvas has to be rebuilt for that alone.
+    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|%d|%d|",
+                        footer, g_openTab, lineCount());
 
     char value[64] = {};
     for (int row = 0; row < kRowCount && used > 0 && static_cast<size_t>(used) + 40 < size;
@@ -3382,7 +3629,7 @@ void vrMenuPoll() {
     if (dragging) {
         state.hovered = state.pressed;
     } else if (!editing && state.pointerOn) {
-        const int row = rowAt(state.pointerV);
+        const int row = rowAt(state.pointerU, state.pointerV);
         if (row >= 0 && (!state.stickOwnsHighlight || row != state.hovered)) {
             state.hovered = row;
             state.stickOwnsHighlight = false;
@@ -3392,11 +3639,23 @@ void vrMenuPoll() {
     // A row that stops being offered while the page is open takes the highlight with it, so
     // the clamp asks whether the highlighted row is still on the page rather than only
     // whether it is in range.
-    if (!rowOffered(state.hovered)) state.hovered = slotRow(0);
+    if (rowLine(state.hovered) < 0) state.hovered = firstRow();
+    if (rowLine(state.hovered) == kButtonLine) state.buttonColumn = rowColumn(state.hovered);
 
-    // A STICK CLICK PUTS THE HIGHLIGHTED ROW BACK, which is what it already means inside
-    // every tweak mode. Same control, same meaning, wherever the driver happens to be.
-    if (hand.stick.pressed) resetRow(state.hovered);
+    // A STICK CLICK PUTS THE HIGHLIGHTED SETTING BACK, which is what it already means inside
+    // every tweak mode. Same control, same meaning, wherever the driver happens to be. On a
+    // button or a tab, which have nothing to put back, it presses it: the stick alone selects
+    // and activates, and the trigger only ever acts on what the ray is on.
+    if (hand.stick.pressed) {
+        int kind = state.hovered >= 0 ? g_rows[state.hovered].kind : -1;
+        if (kind == kRowAction || kind == kRowTab) {
+            // It may have left the page -- closed the menu, opened a tweak mode or the reset
+            // dialog -- so nothing below runs against it this poll.
+            activateRow(state.hovered);
+            return;
+        }
+        resetRow(state.hovered);
+    }
 
     // The stick only adjusts while the trigger is not doing something of its own, so a
     // drag and a stick sweep cannot both write the same value in one poll.
@@ -3405,13 +3664,16 @@ void vrMenuPoll() {
     // Press, drag, release -- and a release only counts on the row it was pressed on,
     // which is what lets a mis-aimed press be dragged off and abandoned.
     //
-    // The DRAG only starts when the ray is actually on the panel. Without that check a
-    // trigger pulled while pointing at the floor would latch a slider and then move it to
-    // wherever pointerU happened to be left at, which is zero.
+    // THE TRIGGER ACTS ONLY ON THE ROW THE RAY IS ON, at the press and again at the release.
+    // The highlight stays on the last row the ray crossed, so pointing at the floor, or at an
+    // empty band under a short tab, still leaves a row highlighted -- and a press there used
+    // to drag that slider to wherever the ray happened to be, or fire that button. Without
+    // pointing, the stick does both jobs.
     const bool triggerDown = hand.triggerHeld.down;
+    int        pointed = state.pointerOn ? rowAt(state.pointerU, state.pointerV) : -1;
     if (hand.triggerHeld.pressed) {
-        state.pressed = state.hovered;
-        state.draggingSlider = state.pointerOn && state.pressed >= 0 &&
+        state.pressed = pointed >= 0 && pointed == state.hovered ? pointed : -1;
+        state.draggingSlider = state.pressed >= 0 &&
                                (g_rows[state.pressed].kind == kRowSliderFloat ||
                                 g_rows[state.pressed].kind == kRowChoiceInt ||
                                 g_rows[state.pressed].kind == kRowRateInt ||
@@ -3420,9 +3682,8 @@ void vrMenuPoll() {
     } else if (triggerDown && state.draggingSlider && state.pointerOn) {
         dragRow(state.pressed, state.pointerU);
     } else if (hand.triggerHeld.released) {
-        // Released on the row it was pressed on -- or, when the driver never pointed at
-        // all, on the row the stick has highlighted, which is the same row by definition.
-        if (!state.draggingSlider && state.pressed >= 0 && state.pressed == state.hovered)
+        // Released with the ray still on the row it was pressed on.
+        if (!state.draggingSlider && state.pressed >= 0 && state.pressed == pointed)
             activateRow(state.pressed);
         state.pressed = -1;
         state.draggingSlider = false;
@@ -3884,13 +4145,14 @@ bool vrMenuFormatStatus(char* out, size_t size) {
 
     _snprintf_s(out, size, _TRUNCATE,
                 "vr menu: %s, %u opened, %u commands, %u layers built, %u refused%s%s | "
-                "ray %u on the panel, %u missed | beam drawn %u, refused %u%s%s | row %d "
+                "ray %u on the panel, %u missed | beam drawn %u, refused %u%s%s | %s tab, row %d "
                 "(%s)",
                 modeName, state.opens, state.commands, state.draws, refused,
                 refused ? " -- mostly " : "", refused ? drawRefusalName(worst) : "",
                 state.rayHits, state.rayMisses, state.rayDraws, rayRefused,
                 rayRefused ? " -- mostly " : "", rayRefused ? rayRefusalName(rayWorst) : "",
-                state.hovered, state.stickOwnsHighlight ? "stick" : "pointer");
+                g_rows[tabRow(g_openTab)].label, state.hovered,
+                state.stickOwnsHighlight ? "stick" : "pointer");
 
     state.draws = 0;
     state.opens = 0;
