@@ -852,7 +852,9 @@ void noteMonitorHud(State& state, const char* reason, int monitorEye) {
              g_options.vrHudLayer == 1 ? "following the head" : "fixed to the seat",
              monitorEye == 1 ? "each eye" : (monitorEye == 2 ? "the left eye" : "the right eye"));
     } else {
-        logf("vr: monitor HUD not drawn -- %s; pribluda draws its own monitor HUD", reason);
+        logf("vr: monitor HUD not drawn -- %s; %s", reason,
+             monitorEye == 0 ? "pribluda's own monitor HUD is skipped too"
+                             : "pribluda draws its own monitor HUD");
     }
 }
 
@@ -883,7 +885,7 @@ void drawMonitorHud(State& state, int monitorEye) {
     // menu, which replaces nothing and is drawn whenever it is up.
     const char* common = nullptr;
     if (monitorEye == 0)
-        common = "vrMonitorEye = 0 puts no picture in the window";
+        common = "vrMonitorEye = 0 clears the window to black";
     else if (!renderTargetWindowPicture(picture))
         common = "the window shows no off-screen picture this frame";
     else if (!state.monitorViewsValid)
@@ -1459,6 +1461,9 @@ void presenterBlitToWindow(int eye) {
     state.windowBlitDone = false;
     if (state.stage == Stage::Off) return;
     if (!alreadyBlitted) renderTargetBlitToWindow(state.gl, eye);
+    // A black window stays black: pribluda's own monitor overlay is skipped as on a frame the
+    // HUD panel was drawn over the picture.
+    if (eye == 0 && renderTargetActive()) state.monitorHudTaken = true;
     if (state.stage != Stage::Publishing || !state.block) return;
     frameBudgetSwitch(kSpanWindowHud);
     drawMonitorHud(state, eye);

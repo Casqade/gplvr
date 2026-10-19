@@ -115,8 +115,9 @@ void renderTargetOverrideSurface(void* surfaceHandle);
 bool renderTargetNativeSize(int& width, int& height);
 
 // Scale the off-screen frame into the game window, which is what makes the flat window a
-// monitor rather than a blank rectangle. `monitorEye` is vrMonitorEye: 0 draws nothing,
-// 1 both halves, 2 the left eye alone, 3 the right. Aspect-fit, never stretched; the
+// monitor rather than a blank rectangle. `monitorEye` is vrMonitorEye: 0 clears the window to
+// black, 1 both halves, 2 the left eye alone, 3 the right. Read every frame, so the VR menu's
+// row takes effect at once. Aspect-fit, never stretched; the
 // letterbox bars are cleared every frame.
 void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye);
 

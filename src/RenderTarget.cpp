@@ -96,7 +96,7 @@ struct Target {
     bool bound = false;
     bool active = false;
     bool inMenuMode = false;
-    bool loggedMonitor = false;
+    int  loggedMonitorEye = -1;  // the vrMonitorEye the window line was last logged for
     bool splitBinding = false;   // GL_READ_FRAMEBUFFER / GL_DRAW_FRAMEBUFFER understood
     bool checkedSplit = false;
     bool verifiedBinding = false;
@@ -1028,6 +1028,32 @@ void clearRect(const GlFunctions& gl, int x, int y, int w, int h) {
     gl.clear(GL_COLOR_BUFFER_BIT);
 }
 
+// vrMonitorEye = 0. Every frame, because roglv2's pixel format asks for no PFD_SWAP_COPY: one
+// clear would leave the other buffer's last picture to alternate with the black. The bindings
+// it leaves are the blit's, so what runs after sees the same state in every mode.
+void clearWindow(const GlFunctions& gl) {
+    if (!gl.bindFramebuffer || !gl.clear || !gl.clearColor) return;
+    gl.bindFramebuffer(kGlDrawFramebuffer, 0);
+    gl.bindFramebuffer(kGlReadFramebuffer, 0);
+
+    bool      saved = gl.pushAttrib && gl.popAttrib;
+    GLboolean scissorWas = GL_FALSE;
+    if (saved)
+        gl.pushAttrib(GL_COLOR_BUFFER_BIT | GL_SCISSOR_BIT);
+    else if (gl.isEnabled)
+        scissorWas = gl.isEnabled(GL_SCISSOR_TEST);
+
+    if (gl.disable) gl.disable(GL_SCISSOR_TEST);
+    if (saved && gl.colorMask) gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+
+    if (saved)
+        gl.popAttrib();
+    else if (scissorWas && gl.enable)
+        gl.enable(GL_SCISSOR_TEST);
+}
+
 }  // namespace
 
 bool renderTargetNativeSize(int& width, int& height) {
@@ -1047,21 +1073,22 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
     g_pictureValid = false;
     if (!renderTargetActive()) return;
 
-    // vrMonitorEye = 0: not one GL call into the window. roglv2 still presents it, so it
-    // shows whatever its back buffer holds with pribluda's monitor overlay on top.
+    // Without the read/draw split this would blit the window to itself, and the clear would
+    // bind the window for drawing with the target still bound for reading.
+    if (!g_target.splitBinding) return;
+
+    // vrMonitorEye = 0: a black window. pribluda's monitor overlay is skipped on these frames
+    // (presenterBlitToWindow), so nothing draws over the black.
     if (monitorEye == 0) {
-        if (!g_target.loggedMonitor) {
-            g_target.loggedMonitor = true;
-            logf("target: vrMonitorEye = 0 -- gplvr draws nothing into the game window. It "
-                 "shows whatever its back buffer held, with pribluda's monitor overlay "
-                 "drawn over it every frame and never wiped.");
+        clearWindow(gl);
+        if (g_target.loggedMonitorEye != 0) {
+            g_target.loggedMonitorEye = 0;
+            logf("target: vrMonitorEye = 0 -- the game window is cleared to black every frame");
         }
         return;
     }
 
     if (!gl.blitFramebuffer) return;
-    // Without the read/draw split this would blit the window to itself.
-    if (!g_target.splitBinding) return;
 
     int windowW = 0;
     int windowH = 0;
@@ -1199,8 +1226,8 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
     else if (scissorWas && gl.enable)
         gl.enable(GL_SCISSOR_TEST);
 
-    if (!g_target.loggedMonitor) {
-        g_target.loggedMonitor = true;
+    if (g_target.loggedMonitorEye != monitorEye) {
+        g_target.loggedMonitorEye = monitorEye;
         logf("target: the game window is showing %s of the %dx%d off-screen frame, "
              "aspect-fitted into %dx%d",
              monitorEye == 2 ? "the LEFT eye"
@@ -1219,7 +1246,7 @@ void renderTargetRelease(const GlFunctions& gl) {
     // inMenuMode is deliberately NOT reset here: this is called every frame while the
     // menu is up, and clearing the latch would turn one transition line into a pair of
     // them per frame.
-    g_target.loggedMonitor = false;
+    g_target.loggedMonitorEye = -1;
 }
 
 }  // namespace gplvr
