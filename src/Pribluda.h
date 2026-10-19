@@ -38,6 +38,23 @@
 
 namespace gplvr {
 
+// IS PRIBLUDA THERE AT ALL. Three answers and not two, because pribluda.dll is loaded by
+// gpl_rasterBegin long after gplvr attaches: until a frame has been presented, "no module"
+// means "not yet" as readily as it means "not installed", and a menu that hid its rows on
+// the first answer would hide them on every install. `kPribludaUnknown` is therefore the
+// answer to treat as yes -- offer the rows, and let them refuse the way they already do.
+//
+// It turns Absent when a run of presented frames has gone by with no pribluda.dll in the
+// process (gplc67 built without the GEM+ pribluda patch, or the 2020 demo), or when the
+// module is there and is not a build gplvr can call -- which the log has already explained.
+enum PribludaPresence {
+    kPribludaUnknown = 0,
+    kPribludaAbsent,
+    kPribludaPresent,
+};
+
+PribludaPresence pribludaPresence();
+
 // Draw the overlay into the HUD panel texture. Call it from the present hook, where the
 // game's GL context is current. Inert unless vr and vrHudLayer are on, the game is in a
 // race, and pribluda is loaded with its font lists built. Resolution is lazy: pribluda is

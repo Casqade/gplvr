@@ -25,7 +25,7 @@
 // normalise a stick and a menu needs it to draw a slider, and neither has to know whether
 // it is looking at degrees of mirror yaw or a fraction of the HUD panel's width.
 //
-// WHERE THE VALUES LIVE. Nowhere new. Mirror axes are MirrorConfig's g_mirrorAim, which
+// WHERE THE VALUES LIVE. Nowhere new. Mirror axes are MirrorConfig's per-glass aims, which
 // aimPane already reads every frame; HUD axes are Pribluda's live layout, which
 // buildCopies already reads every frame. A tweak therefore shows on the next frame with
 // no plumbing, and Commit writes the same files the keyboard modes write.
@@ -42,8 +42,9 @@ namespace gplvr {
 // What is being adjusted.
 enum class TweakTarget : int32_t {
     None = 0,
-    // The rear-view glasses' aim: MirrorConfig::g_mirrorAim, saved per car to
-    // gplvr_mirrors.ini.
+    // The rear-view glasses' aim, one per glass: MirrorConfig's live set, saved per car to
+    // gplvr_mirrors.ini. An index is a glass; the selection can also be -1, every glass
+    // together, with yaw moving the left and right glasses opposite ways.
     Mirror,
     // One element of pribluda's HUD panel -- the times, the boards, the tyres, the dash --
     // placed in fractions of the panel and saved to gplvr_pribluda.ini.
@@ -155,7 +156,8 @@ int32_t     tweakIndexCount(TweakTarget target);
 const char* tweakIndexName(TweakTarget target, int32_t index);
 
 // The target's current selection, or -1 when it has none (nothing selectable, or the
-// target does not have a selection at all).
+// target does not have a selection at all). For the mirror -1 is a selection of its own:
+// every glass together.
 int32_t tweakSelected(TweakTarget target);
 
 // True when this index can be adjusted at all right now -- a HUD element that is hidden,

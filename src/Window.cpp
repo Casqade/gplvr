@@ -63,6 +63,7 @@ int  g_modeWidth = 640;
 int  g_modeHeight = 480;
 bool g_frontEnd = true;
 bool g_modeTracked = false;
+bool g_frontEndEntered = false;  // latched on the edge, cleared by the reader
 
 // The 3D view's real size in pixels, recorded by the bitmapInstanceAlloc thunk from the
 // rect the engine actually asks for. Measured rather than reconstructed, because an exe
@@ -70,6 +71,10 @@ bool g_modeTracked = false;
 // and the widescreen fov correction is only as good as its idea of the view's shape.
 int g_viewWidth = 0;
 int g_viewHeight = 0;
+// Where it sits on that surface, and the handle the allocator returned for it. GPL's "no signal"
+// static is drawn on this handle, at this rect of the frame (NoSignal.h).
+int   g_viewTop = 0;
+void* g_viewSurface = nullptr;
 
 // Whether the game window had the foreground at the last edge.
 bool g_hasFocus = true;
@@ -266,6 +271,11 @@ void windowRefreshEngineMode() {
         logf("window: the engine's mode is %dx%d (%s)", width, height,
              frontEnd ? "the front end" : "a world mode");
     }
+    // The EDGE into the front end, latched for whoever asks. This is the single place the mode
+    // is decided, and three callers reach it, so an edge taken here is taken once however the
+    // session ended. What it is for: every rasterizer handle gplvr cached during the race
+    // stops meaning anything the moment GPL tears the session down.
+    if (g_modeTracked && frontEnd && !g_frontEnd) g_frontEndEntered = true;
     g_modeWidth = width;
     g_modeHeight = height;
     g_frontEnd = frontEnd;
@@ -277,7 +287,23 @@ void windowEngineModeSize(int& width, int& height) {
     height = g_modeTracked ? g_modeHeight : 0;
 }
 
+bool windowViewSurface(void* surface, int rect[4]) {
+    if (!surface || surface != g_viewSurface || g_viewWidth <= 0 || g_viewHeight <= 0)
+        return false;
+    rect[0] = 0;
+    rect[1] = g_viewTop;
+    rect[2] = g_viewWidth;
+    rect[3] = g_viewHeight;
+    return true;
+}
+
 bool windowInFrontEnd() { return g_modeTracked && g_frontEnd; }
+
+bool windowTakeFrontEndEntered() {
+    bool entered = g_frontEndEntered;
+    g_frontEndEntered = false;
+    return entered;
+}
 
 bool windowCorrectMainFov(float fov, float& corrected) {
     if (!g_options.widescreenFix) return false;
@@ -451,14 +477,34 @@ int __cdecl instanceAllocThunk(void** out, void* source, int x, int y, int w, in
     if (source && width && height) {
         int parentWidth = width(source);
         int parentHeight = height(source);
-        int bar = 50 * parentHeight / 480;
+        int modeWidth = 0;
+        int modeHeight = 0;
+        windowEngineModeSize(modeWidth, modeHeight);
 
-        if (!g_options.enableLetterbox && bar >= 4 && x == 0 && w == parentWidth) {
-            if (y == bar && h == parentHeight - 2 * bar) {
+        // THE LAYOUT IS IN THE MODE'S PIXELS, AND THE PARENT MAY NOT BE. Mid-race the back
+        // buffer's size fields hold the off-screen target's 6344x3172 (RenderTarget), while
+        // gpl_uiLayoutLetterboxPanels still lays out against the 2560x1440 mode. A replay
+        // entered from the race allocates its view then -- 2560x1140 at y 150 of a 6344x3172
+        // parent -- so a test against the parent's own size never matched, the view stayed
+        // letterboxed and the replay went out as a mono menu viewport (2026-10-18), while a
+        // replay loaded from the menu, whose view is allocated before the target takes over,
+        // went stereo. A request exactly the mode's width on a parent at least the mode's size
+        // is measured against the mode.
+        int layoutWidth = parentWidth;
+        int layoutHeight = parentHeight;
+        if (w != parentWidth && modeWidth > 0 && modeHeight > 0 && w == modeWidth &&
+            parentWidth >= modeWidth && parentHeight >= modeHeight) {
+            layoutWidth = modeWidth;
+            layoutHeight = modeHeight;
+        }
+        int bar = 50 * layoutHeight / 480;
+
+        if (!g_options.enableLetterbox && bar >= 4 && x == 0 && w == layoutWidth) {
+            if (y == bar && h == layoutHeight - 2 * bar) {
                 y = 0;
-                h = parentHeight;
-            } else if (y == 0 && h == parentHeight - bar) {
-                h = parentHeight;
+                h = layoutHeight;
+            } else if (y == 0 && h == layoutHeight - bar) {
+                h = layoutHeight;
             }
         }
 
@@ -470,19 +516,23 @@ int __cdecl instanceAllocThunk(void** out, void* source, int x, int y, int w, in
         // so in as many words. The driving view is carved out of the back buffer, so
         // the parent must be the size the engine says its mode is; the same 7/8 margin
         // Stereo and RenderTarget use to tell a full-screen surface from a panel.
-        int modeWidth = 0;
-        int modeHeight = 0;
-        windowEngineModeSize(modeWidth, modeHeight);
         bool onTheBackBuffer = modeWidth > 0 && parentWidth * 8 >= modeWidth * 7 &&
                                parentHeight * 8 >= modeHeight * 7;
 
-        if (onTheBackBuffer && x == 0 && w == parentWidth && h * 2 >= parentHeight) {
-            if (w != g_viewWidth || h != g_viewHeight) {
-                g_viewWidth = w;
-                g_viewHeight = h;
-                logf("window: the 3D view is %dx%d of a %dx%d surface (bar would be %d)",
-                     w, h, parentWidth, parentHeight, bar);
+        if (onTheBackBuffer && x == 0 && w == layoutWidth && h * 2 >= layoutHeight) {
+            int result = g_originalInstanceAlloc ? g_originalInstanceAlloc(out, source, x, y, w, h)
+                                                 : 0;
+            void* handle = out ? *out : nullptr;
+            if (w != g_viewWidth || h != g_viewHeight || handle != g_viewSurface) {
+                logf("window: the 3D view is %dx%d at y %d of a %dx%d surface (bar would be %d), "
+                     "handle %p",
+                     w, h, y, parentWidth, parentHeight, bar, handle);
             }
+            g_viewWidth = w;
+            g_viewHeight = h;
+            g_viewTop = y;
+            g_viewSurface = handle;
+            return result;
         }
     }
 

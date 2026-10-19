@@ -54,6 +54,11 @@ void renderTargetBeginFrame(const GlFunctions& gl);
 // Unbound before the presenter reads and before the game presents.
 void renderTargetEndFrame(const GlFunctions& gl);
 
+// The whole target to black, while it is bound for the next frame; nothing otherwise. GL state
+// is saved and put back around it. For GPL's race static, which a world frame does not
+// entirely paint over.
+void renderTargetClear(const GlFunctions& gl);
+
 // True when the frame just rendered went off-screen. Everything downstream keys off
 // this rather than off the option, so a failure to build the target is indistinguishable
 // from the option being off.

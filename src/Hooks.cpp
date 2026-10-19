@@ -5,6 +5,7 @@
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
 #include "FrameBudget.h"
+#include "FrameTrace.h"
 #include "Hud.h"
 #include "Interpolation.h"
 #include "Letterbox.h"
@@ -13,12 +14,15 @@
 #include "MirrorConfig.h"
 #include "MirrorTarget.h"
 #include "MouseLook.h"
+#include "MirrorDriverArms.h"
+#include "NoSignal.h"
 #include "Log.h"
 #include "Paths.h"
 #include "PostProfile.h"
 #include "Pribluda.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
+#include "ReplayPanel.h"
 #include "SimRing.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
@@ -114,6 +118,8 @@ bool      g_vrMirrorModeKeyLast = false;
 bool      g_dumpEyesKeyLast = false;
 bool      g_dumpEyesRequested = false;
 bool      g_dumpEyesLate = false;
+bool      g_frameRateKeyLast = false;
+int       g_frameRateWanted = 1;  // what the ini asked for, so the toggle can put it back
 
 // One eye's rect to a TGA, read from the framebuffer the headset's copy is taken from.
 //
@@ -133,6 +139,7 @@ bool dumpEyeRect(GlFunctions& gl, const int rect[4], const char* path) {
     if (bound) gl.bindFramebuffer(kGlFramebuffer, 0);
     return ok;
 }
+
 bool      g_vrMouseLookKeyLast = false;
 bool      g_loggedMouseLook = false;
 
@@ -160,6 +167,88 @@ LONGLONG  g_lastPresentTick = 0;
 LONGLONG  g_frameInterval = 0;
 bool      g_loggedExtraRenders = false;
 bool      g_lastFrameWasStereo = false;
+// Frames published as a stereo pair while nothing was rendered into them. Bounded, because
+// the condition can hold for every frame of a long stall and the point is to name it once.
+int       g_heldPairReports = 4;
+
+// GPL's "no signal" static (NoSignal.h) under vrNoSignal = 1: one episode is the run of frames
+// it fills, from the first to the next frame it does not.
+constexpr ULONGLONG kNoSignalHoldMs = 250;
+struct NoSignalEpisode {
+    ULONGLONG since = 0;     // GetTickCount64 at the episode's first frame, 0 between episodes
+    bool      replay = false;  // the replay screen was up when it began
+    int       held = 0;      // frames not published, so the headset kept its last one
+    int       flat = 0;      // frames published as one flat image for both eyes
+    int       unplaced = 0;  // frames whose static was on a surface no rect is known for: held
+    int       withWorld = 0;  // frames that also rendered the stereo world, counted in the above
+    int       leftOver = 0;  // frames GPL drew nothing on after its static; in the above
+    void*     surface = nullptr;      // the surface the last of them was drawn on
+    int       size[2] = {};           // its own size
+    const char* where = nullptr;      // which part of the frame that is, null if unknown
+    int       rect[4] = {};  // that part, all zero for the whole frame
+};
+NoSignalEpisode g_noSignal;
+int             g_noSignalReports = 10;
+// ONE HOLD A SPELL, NOT ONE AN EPISODE. Upside down, GPL draws its static in bursts of 140-420 ms
+// with 300-450 ms of world between them (2026-10-18). Each burst is an episode of its own, so a
+// hold per episode kept the headset frozen for most of the spell and showed the noise only for
+// the tail of the rare burst that outlasted it. A race episode that begins within
+// kNoSignalRejoinMs of the last static frame continues the spell, and the hold is measured from
+// the spell's start.
+constexpr ULONGLONG kNoSignalRejoinMs = 500;
+ULONGLONG       g_noSignalSpellSince = 0;
+ULONGLONG       g_noSignalLastDrawnMs = 0;
+// One-frame holds in a race, summed rather than logged one by one: FlatFrames' early release
+// for a BG request causes them ten a second at a session's start, and they spent the whole
+// report budget in one run. Summarised at the end of an episode once kNoSignalBlipMs has passed.
+constexpr ULONGLONG kNoSignalBlipMs = 10000;
+int             g_noSignalBlips = 0;
+ULONGLONG       g_noSignalBlipsSince = 0;
+// Whether the presenter has been handed any frame yet, so there is one for a hold to keep.
+bool            g_publishedAny = false;
+
+// Where this frame's static is, into g_noSignal: the surface of the camera it was drawn through.
+// The 3D view's surface is its rect at the frame's top left; an eye's surface is that eye's rect;
+// the surface the eyes were carved out of is the whole frame; any other surface roglv2 draws
+// through the framebuffer is its own rect. Anything else is a place the flat image cannot be taken
+// from, and `where` stays null.
+void placeNoSignalStatic() {
+    void*       surface = noSignalSurface();
+    int         rect[4] = {};
+    const char* where = nullptr;
+    if (windowViewSurface(surface, rect)) where = "the 3D view's rect";
+    for (int eye = 0; eye < 2 && !where; ++eye)
+        if (surface && surface == stereoEyeSurface(eye) && stereoEyeRect(eye, rect))
+            where = eye ? "the right eye's rect" : "the left eye's rect";
+    if (!where && surface && surface == stereoSourceSurface()) where = "the whole frame";
+    // A framebuffer surface's pixels sit at its origin in the framebuffer bound for the frame,
+    // which is the one the presenter copies. The replay screen and the race both draw the static
+    // through a camera of their own, on a window-sized surface at 0,0 (handles 6D and C5,
+    // 2026-10-16/17), which the three tests above never match.
+    int  origin[2] = {};
+    int  extent[2] = {};
+    bool framebuffer = false;
+    if (!where && surface &&
+        fastTextSurfaceInfo(static_cast<int>(reinterpret_cast<intptr_t>(surface)), origin[0],
+                            origin[1], extent[0], extent[1], framebuffer) &&
+        framebuffer && extent[0] > 0 && extent[1] > 0) {
+        rect[0] = origin[0];
+        rect[1] = origin[1];
+        rect[2] = extent[0];
+        rect[3] = extent[1];
+        where = "a framebuffer surface, at";
+    }
+    int size[2] = {};
+    if (surface) stereoSurfaceSize(surface, size[0], size[1]);
+    g_noSignal.surface = surface;
+    g_noSignal.size[0] = size[0];
+    g_noSignal.size[1] = size[1];
+    g_noSignal.where = where;
+    for (int i = 0; i < 4; ++i) g_noSignal.rect[i] = rect[i];
+    frameTraceStatic(noSignalCamera(), surface, size[0], size[1],
+                     where ? where : "not the 3D view, an eye, the frame or a framebuffer surface");
+}
+
 bool      g_warnedSlowTick = false;
 bool      g_loggedMirrorPath = false;
 // How many scene renders this second actually REFRESHED the mirror texture.
@@ -190,6 +279,7 @@ struct ExtraFrameCounts {
     unsigned noDeadline = 0;   // the tick clock had no reading, so the old estimate was used
     unsigned noPose = 0;       // the presenter published no newer view set before the deadline
     unsigned noRoom = 0;       // a render would not have finished before the next tick
+    unsigned suppressed = 0;   // vrExtraRenders = 0: the deliberate bisect, not a refusal
     LONGLONG roomShort = 0;    // how much it was short by, summed, for the worst case below
     LONGLONG roomWorst = 0;
 };
@@ -241,6 +331,18 @@ bool                g_mirrorDistanceScaleSaid = false;
 // 0x60000000, a5 an ahead bound read only past 135 degrees, a6 the behind-far bound, a7 the
 // ahead-far bound, a8 the behind near and mid bounds. Repeatable comment at 0x487F8A, and the
 // instruments that measured them are described in docs/audit-2026-09-18/85-instrument-archive.md.
+// THE EIGHT ARGUMENTS ARE FORWARDED UNCHANGED, and the decode is worth keeping even though
+// nothing here uses it any more. From the push order at 0x487F7D..0x487FAA: a1 is the segment
+// table, a2 and a3 the camera dlong twice (a3 from a second camera below the fov threshold at
+// 0x487E71), a4 the heading as a binary angle whose magnitude picks the segment order at
+// 0x40000000 and the distance columns at 0x20000000 and 0x60000000, a5 and a6 two table
+// columns multiplied by flt_7743E8, a7 and a8 two columns used raw. a5 is read only past 135
+// degrees. Repeatable comment at 0x487F8A.
+//
+// TWO KNOBS THAT SCALED THE DISTANCES AND PINNED THE HEADING LIVED HERE and were removed on
+// 2026-10-05, once `fixEyeSegment` turned out to be the whole of the artifact. Scaling the
+// distances did move the strip's far edge, which proved the 1-D window is real, but the fault
+// was never the range -- see STATUS.md. Both are two lines if either is ever wanted again.
 void __cdecl mainWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7,
                                 int a8) {
     if (stereoMirrorOnlyPass()) return;
@@ -366,6 +468,7 @@ void reportOncePerSecond() {
         postProfileReport(period);
     }
     fastTextReport();
+    replayPanelReport();
 
     // Both of these divide by FRAMES, so they read across against the frame budget above
     // rather than against each other.
@@ -415,13 +518,18 @@ void reportOncePerSecond() {
         double toMsShort = e.noRoom ? 1000.0 / static_cast<double>(frequency.QuadPart) : 0.0;
         logf("extra: %u drawn from %u game frames%s | refused: no room %u (short by %.1f ms "
              "mean, %.1f worst), no newer pose %u, frame already late %u, game under 25 fps "
-             "%u, no tracked stereo frame %u, no tick clock %u | one costs %.2f ms",
+             "%u, no tracked stereo frame %u, no tick clock %u | one costs %.2f ms%s",
              e.rendered, e.ticks, e.ticks ? "" : " -- NONE REACHED THE BUDGET", e.noRoom,
              e.noRoom ? toMsShort * static_cast<double>(e.roomShort) / e.noRoom : 0.0,
              toMsShort * static_cast<double>(e.roomWorst), e.noPose, e.late, e.slow,
              e.notStereo, e.noDeadline,
              1000.0 * static_cast<double>(g_extraRenderCost) /
-                 static_cast<double>(frequency.QuadPart));
+                 static_cast<double>(frequency.QuadPart),
+             e.suppressed ? " | vrExtraRenders = 0, so these are SUPPRESSED on purpose: "
+                            "blending is still on and the extra renders are not. An artifact "
+                            "that survives this is in the blended values; one that goes is in "
+                            "what an extra render fails to redraw."
+                          : "");
         g_extraFrames = ExtraFrameCounts{};
     }
 
@@ -441,11 +549,6 @@ void reportOncePerSecond() {
 
     char ring[512] = {};
     if (simRingFormat(ring, sizeof(ring), g_frames)) logf("%s", ring);
-
-    // Which part of the track each eye pass selected to walk. A jump here is the world being
-    // drawn from somewhere else while the view transform stays put.
-    char walk[1024] = {};
-    if (stereoWalkFormat(walk, sizeof(walk))) logf("%s", walk);
 
     // The controllers and the menu. Both print only when something happened, so a session
     // with no headset adds nothing to the log -- and both print their REFUSALS, because a
@@ -478,17 +581,20 @@ void reportOncePerSecond() {
     frameBudgetLeave(reporting);
 }
 
-// Mirror tweak mode: aiming the glasses from the headset. It changes g_mirrorAim, which aimPane
-// reads every frame, so each step shows at once. Leaving saves the aim to the viewed car's
-// section of gplvr_mirrors.ini (MirrorConfig); gplvr.ini is never written. It shares the arrows
-// and Page Up/Down with HUD tweak mode, so entering either leaves the other.
-constexpr unsigned kMirrorTweakKeys[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
+// Mirror tweak mode: aiming the glasses from the headset. It changes MirrorConfig's per-glass
+// aims, which aimPane reads every frame, so each step shows at once. Leaving saves them to the
+// viewed car's section of gplvr_mirrors.ini; gplvr.ini is never written. Home steps through the
+// glasses -- all of them together, then each in turn. It shares the arrows and Page Up/Down with
+// HUD tweak mode, so entering either leaves the other.
+constexpr unsigned kMirrorTweakKeys[] = {VK_LEFT, VK_RIGHT, VK_UP,  VK_DOWN,
+                                         VK_PRIOR, VK_NEXT, VK_HOME};
 constexpr double   kMirrorTweakMaxStepSeconds = 0.1;  // the most one poll turns after a stall
 constexpr double   kMirrorTweakLogSeconds = 0.5;      // between progress lines while adjusting
 
 struct MirrorTweak {
     bool     active = false;
     bool     keyLast = false;
+    bool     selectLast = false;  // Home, which steps once per press rather than per poll
     bool     unlogged = false;  // the values changed since the last line
     LONGLONG frequency = 0;
     LONGLONG lastPoll = 0;
@@ -502,8 +608,9 @@ bool mirrorTweakKeyHeld(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
 void mirrorTweakLogProgress(LONGLONG now) {
     g_mirrorTweak.unlogged = false;
     g_mirrorTweak.loggedAt = now;
-    logf("mirror: yaw %.2f pitch %.2f fovScale %.3f", g_mirrorAim.yaw, g_mirrorAim.pitch,
-         g_mirrorAim.fovScale);
+    char aims[512];
+    mirrorConfigFormatAims(aims, sizeof(aims));
+    logf("mirror: %s", aims);
 }
 
 void mirrorTweakEnter() {
@@ -517,11 +624,12 @@ void mirrorTweakEnter() {
     g_mirrorTweak.active = true;
     g_mirrorTweak.unlogged = false;
     const char* key = mirrorConfigKey();
-    logf("mirror: tweak mode on for %s (%s) -- yaw %.2f pitch %.2f fovScale %.3f",
-         key ? key : "no identified car", mirrorConfigPerCar() ? "per-car" : "global",
-         g_mirrorAim.yaw, g_mirrorAim.pitch, g_mirrorAim.fovScale);
+    char        aims[512];
+    mirrorConfigFormatAims(aims, sizeof(aims));
+    logf("mirror: tweak mode on for %s (%s), aiming %s -- %s", key ? key : "no identified car",
+         mirrorConfigPerCar() ? "per-car" : "no section", mirrorConfigSelectedName(), aims);
     logf("mirror: Left/Right turn the glasses, Up/Down tilt them, Page Up/Down widen and "
-         "narrow the field; key 0x%02X again leaves",
+         "narrow the field, Home picks a glass (all, then each in turn); key 0x%02X again leaves",
          g_options.vrMirrorTweakKey);
 }
 
@@ -551,13 +659,24 @@ void mirrorTweakPoll() {
     if (GetForegroundWindow() != gameWindow()) return;
     if (togglePressed) {
         if (g_mirrorTweak.active) {
-            mirrorTweakExit("");
+            // The key IS the save. Nothing else writes.
+            mirrorTweakExit("", true);
         } else {
             mirrorTweakEnter();
         }
         return;
     }
     if (!g_mirrorTweak.active) return;
+
+    bool select = mirrorTweakKeyHeld(VK_HOME);
+    bool selectPressed = select && !g_mirrorTweak.selectLast;
+    g_mirrorTweak.selectLast = select;
+    if (selectPressed) {
+        TweakCommand step;
+        step.target = TweakTarget::Mirror;
+        step.action = TweakAction::SelectNext;
+        if (tweakApply(step)) mirrorTweakLogProgress(now);
+    }
 
     int turn = (mirrorTweakKeyHeld(VK_RIGHT) ? 1 : 0) - (mirrorTweakKeyHeld(VK_LEFT) ? 1 : 0);
     int tilt = (mirrorTweakKeyHeld(VK_UP) ? 1 : 0) - (mirrorTweakKeyHeld(VK_DOWN) ? 1 : 0);
@@ -618,13 +737,22 @@ bool mirrorTweakSwallowsKey(unsigned virtualKey) {
 
 bool mirrorTweakActive() { return g_mirrorTweak.active; }
 
-void mirrorTweakExit(const char* why) {
+void mirrorTweakExit(const char* why, bool save) {
     if (!g_mirrorTweak.active) return;
     g_mirrorTweak.active = false;
     g_mirrorTweak.unlogged = false;
-    logf("mirror: tweak mode off -- yaw %.2f pitch %.2f fovScale %.3f%s", g_mirrorAim.yaw,
-         g_mirrorAim.pitch, g_mirrorAim.fovScale, why);
-    mirrorConfigSave();
+    char aims[512];
+    mirrorConfigFormatAims(aims, sizeof(aims));
+    logf("mirror: tweak mode off -- %s%s", aims, why);
+    // Leaving without saving writes nothing and reverts nothing: the aim stays where it was put
+    // until it is saved or the game exits, which is how the pribluda layout and the VR menu's
+    // settings already behave. Changing the viewed car or the car set takes an unsaved aim away
+    // (MirrorConfig), because nothing may ever write a car that is not in view.
+    if (save)
+        mirrorConfigSave();
+    else
+        logf("mirror: NOT saved -- the aim stays as you left it; press the key in tweak mode to "
+             "write it to gplvr_mirrors.ini");
 }
 
 namespace {
@@ -639,6 +767,22 @@ void pollToggle() {
             g_dumpEyesLate = true;
         }
         g_dumpEyesKeyLast = down;
+    }
+
+    // The blend, on and off, in the same session. A visual artifact is compared far better
+    // against itself a second ago than against a memory of another run, and both readers of
+    // frameRate take it per call, so there is nothing to reinstall either way.
+    if (g_options.frameRateKey) {
+        const bool down = (GetAsyncKeyState(g_options.frameRateKey) & 0x8000) != 0;
+        if (down && !g_frameRateKeyLast) {
+            g_options.frameRate = g_options.frameRate > 0 ? 0 : g_frameRateWanted;
+            logf("frames: frameRate now %d -- the world is %s, and %s", g_options.frameRate,
+                 g_options.frameRate > 0 ? "BLENDED again" : "drawn at the last latched tick",
+                 g_options.frameRate > 0
+                     ? "frames between ticks are new pictures"
+                     : "the loop waits for each tick, which is vanilla pacing");
+        }
+        g_frameRateKeyLast = down;
     }
 
     // Recentre: whatever pose the driver is in becomes the seat. Needed because
@@ -700,6 +844,15 @@ void pollToggle() {
         g_vrMirrorModeKeyLast = down;
     }
 
+
+    // THE TOP OF A FRAME, BEFORE ANYTHING ASKS FOR A SURFACE. The session that owned gplvr's
+    // cached rasterizer handles has ended, and a handle outliving its session is what killed
+    // the process on 2026-10-09 -- `roglv2!bitmapWidth+0x27`, handle 0x6F, resolved through a
+    // table slot the teardown had zeroed. Dropped here rather than in the present hook because
+    // the crashing path was INSIDE the present hook: MenuScale's rasterFlushPending synthesises
+    // a 2D call every front-end frame, and by then it is too late to find out the handles are
+    // dead.
+    if (windowTakeFrontEndEntered()) stereoForgetSurfaces("the session is over");
 
     fastTextPollFrame();
     postProfilePollFrame();
@@ -769,6 +922,15 @@ void __cdecl callOriginalSceneRender(void* params);  // defined below
 // are genuinely newer.
 void renderExtraFrames() {
     if (!g_options.vr || g_options.frameRate <= 0) return;
+    // THE BISECT. `frameRate = 0` turns off blending AND these extra renders together, so an
+    // A/B against it cannot say which of the two a blending-only artifact belongs to -- and the
+    // 2026-10-09 test did exactly that A/B and came back "absent", which fits either. This
+    // separates them: blending stays on, the extra renders stop. If the artifact survives, it
+    // is in the blended values; if it goes, it is in what an extra render fails to redraw.
+    if (!g_options.vrExtraRenders) {
+        ++g_extraFrames.suppressed;
+        return;
+    }
     // THE FALLBACK ONLY. When the frame loop's wait is ours every frame is a whole frame of
     // GPL's own, drawn through its loop with the mirror pass and the HUD, and there is nothing
     // for a partial repeat after the present to add. This path exists for the case where those
@@ -1121,6 +1283,25 @@ int __cdecl screenDisplayHook(void* surface) {
     presenterUpdateVrMenu();
     presenterDrawCursor(g_stereoRenderedFrame);
 
+    // GPL'S OWN STAMPED TEXT HAS TO BE DRAWN WHILE THE OFF-SCREEN TARGET IS STILL BOUND.
+    //
+    // With vrGplText = 1 the fast text path batches GPL's glyphs as quads and draws them in one
+    // go, and its own end-of-frame flush sits far below -- after the headset's copy and after
+    // the window blit, which is where it belongs in flat mode and is a frame too late here.
+    // Flushed from this side so the pixels are in the image the headset is handed; the call
+    // below then has nothing left to draw and keeps doing its bookkeeping.
+    fastTextFlushNow();
+
+    // GPL'S STATIC IS ONE QUAD, AND roglv2 HAS NOT DRAWN IT YET. gpl_drivingViewWidgetDraw
+    // clears the surface black and submits the noise to roglv2's bins, and only a destination
+    // change or a 2D call issues them. With no HUD text after it, the first of those was the
+    // flush below the unbind: the quad went to the window, through the target's 6344x3172
+    // viewport and off the top of a 2560x1440 buffer, and the eye target kept only the black
+    // clear (static probes of 2026-10-18: noise in the target on the one frame with text after
+    // it, black on the two without). That black is what a static past kNoSignalHoldMs published
+    // to both eyes.
+    if (g_options.vrNoSignal && noSignalDrawnThisFrame()) rasterFlushPending();
+
     // The off-screen frame has to stop being the draw target before the presenter
     // reads it and before the game presents: glCopyTexSubImage2D reads the READ
     // framebuffer, and SwapBuffers only ever shows the window's own.
@@ -1130,10 +1311,14 @@ int __cdecl screenDisplayHook(void* surface) {
     // The aiming ray goes in HERE, between the window's picture and the transfer: it
     // belongs in the headset's image and not in the monitor's. presenterEndFrame has
     // taken the picture on the direct path; presenterDrawVrRay takes it on the other one
-    // before it draws, and does nothing at all while the menu is closed.
+    // before it draws, and does nothing at all while the menu is closed -- except over the
+    // replay panel, while a hand is pointing.
     presenterDrawVrRay(true);
 
     frameBudgetSwitch(kSpanPublish);
+    // Set by a race frame that had GPL's static in the target; acted on once the target is
+    // bound for the next frame, below.
+    bool clearStaticFromTarget = false;
     if (g_options.vr) {
         if (!g_vrStarted) {
             g_vrStarted = true;
@@ -1188,7 +1373,172 @@ int __cdecl screenDisplayHook(void* surface) {
             }
         }
 
-        presenterFrame(g_stereoRenderedFrame, vrFrustumInjected());
+        // WHETHER THE BUFFER HOLDS A STEREO PAIR IS NOT THE SAME QUESTION AS WHETHER THIS
+        // FRAME DREW ONE.
+        //
+        // presenterFrame's first argument decides `sideBySide`, and the consumer reads that
+        // to choose between sampling each eye's own rect and treating the whole texture as
+        // one mono image. Passing g_stereoRenderedFrame conflated the two: on a frame where
+        // GPL never called sceneRender the publish went out mono, so each eye was handed the
+        // ENTIRE side-by-side texture and the player saw both eye images side by side in
+        // each eye.
+        //
+        // The buffer is still a side-by-side pair in that situation when nothing has drawn
+        // over it. GPL's "no signal" screen (0x423148) is the one case known to: it fills the
+        // whole frame with static, and is handled separately below. Otherwise the label follows
+        // the buffer, and the pose follows the frame:
+        // vrClearRendered() below still reports no head pose, which is the honest answer and
+        // is what stops the runtime reprojecting a stale one.
+        //
+        // g_lastFrameWasStereo is what separates this from a menu, where the buffer really
+        // does hold one mono image and must be presented as one. It costs the first frame
+        // after leaving a race, which is published as a pair while holding a menu -- the same
+        // one-frame cost the extra-render gate accepts for the same reason.
+        //
+        // THIS IS PLUMBING, NOT A FIX. On its own it holds the last good pair, and a held
+        // image reads as a hang rather than as a missing picture. What it buys is that
+        // anything drawn per eye on such a frame now ARRIVES per eye -- without it, noise
+        // drawn into both eye rects would still show up as two rectangles in each eye.
+        //
+        // GPL's "no signal" static is the exception, under vrNoSignal = 1. It fills the surface
+        // of the camera bound last. On the replay screen that is the 3D view: the window's size,
+        // at the top left of the headset-sized frame (the whole-frame dump of 2026-10-15 showed
+        // it), over the left eye's previous picture. As a pair that is noise in one eye, which
+        // reads as a rendering fault. In a race nothing is published and the headset keeps its
+        // last frame, with that frame's own poses, exactly as for a dropped frame; the camera
+        // switches that cause it last a frame or three. Once a spell of static has lasted
+        // kNoSignalHoldMs, the part of the frame the static is on goes out as ONE flat image both
+        // eyes share, stretched over the whole eye. On the replay screen it goes out at once, the
+        // same way: the camera switch it marks lasts a few frames and is not worth holding.
+        //
+        // A frame that also rendered the stereo world is no exception: the static is in the
+        // buffer all the same, and publishing it as a pair is the fault itself.
+        //
+        // NOR IS A FRAME THAT DREW NOTHING. Between static frames, and on the frame after a
+        // refused car reset, GPL often renders neither the world nor its static, and the buffer
+        // still holds the static over the last pair. Published as an ordinary frame that went
+        // out as the whole buffer in one image: a frozen two-eye picture with noise in its top
+        // left (presenter log, 2026-10-17). Such a frame continues the episode. On the replay
+        // screen it is shown as the static's flat rect like the frame that drew it; in a race it
+        // is held, because the target was cleared after the static's own frame. Only a rendered
+        // world, or leaving the race, ends it.
+        // NOT IN THE FRONT END. There the static is the lobby TV's, on its own 373x280 surface,
+        // and it belongs to the menu picture like the rest of the lobby. Treated as an episode it
+        // was held a frame at a time, which nobody saw -- until spells joined one-frame bursts and
+        // the TV's picture went out stretched over both eyes at random frames (2026-10-18).
+        bool noSignal =
+            g_options.vrNoSignal && noSignalDrawnThisFrame() && !windowInFrontEnd();
+        bool staticLeftOver = g_options.vrNoSignal && !noSignal && g_noSignal.since &&
+                              !g_stereoRenderedFrame && !windowInFrontEnd();
+        if (noSignal || staticLeftOver) {
+            ULONGLONG nowMs = GetTickCount64();
+            if (noSignal) {
+                if (!g_noSignal.since) {
+                    g_noSignal = NoSignalEpisode{};
+                    g_noSignal.since = nowMs;
+                    g_noSignal.replay = gplReplayScreenShown();
+                    bool rejoins = !g_noSignal.replay && g_noSignalLastDrawnMs &&
+                                   nowMs - g_noSignalLastDrawnMs < kNoSignalRejoinMs;
+                    if (!rejoins) g_noSignalSpellSince = nowMs;
+                }
+                g_noSignalLastDrawnMs = nowMs;
+                if (g_stereoRenderedFrame) ++g_noSignal.withWorld;
+                placeNoSignalStatic();
+            } else {
+                ++g_noSignal.leftOver;
+            }
+
+            // In a race the static is cleared out of the target once its frame has gone (see
+            // clearStaticFromTarget), so a frame that drew nothing has no static left to publish
+            // and holds the last one instead.
+            if (!g_noSignal.replay) clearStaticFromTarget = true;
+            const int* rect = g_noSignal.rect;
+            bool hold = g_publishedAny && !gplReplayScreenShown() &&
+                        (nowMs - g_noSignalSpellSince < kNoSignalHoldMs ||
+                         (!noSignal && !g_noSignal.replay));
+            if (hold) {
+                ++g_noSignal.held;
+                frameTracePublish(noSignal ? "HELD for the static"
+                                           : "HELD, GPL drew nothing after its static",
+                                  false, false);
+            } else if (g_noSignal.where) {
+                ++g_noSignal.flat;
+                // The noise fills the eye, stretched: it has no text to keep legible and no shape
+                // to keep, and at the menu's size it read as a screen floating in the dark. The
+                // replay screen's controls are on their own layer and stay over it.
+                presenterFrame(false, true, rect[2] ? rect : nullptr);
+                g_publishedAny = true;
+                frameTracePublish(noSignal ? "the static published as one flat image"
+                                           : "the static left in the buffer published as one "
+                                             "flat image",
+                                  false, false);
+            } else {
+                ++g_noSignal.unplaced;
+                frameTracePublish("HELD, the static is on a surface gplvr cannot place", false,
+                                  false);
+            }
+        } else {
+            if (g_noSignal.since) {
+                ULONGLONG nowMs = GetTickCount64();
+                bool blip = !g_noSignal.replay && g_noSignal.held == 1 && g_noSignal.flat == 0 &&
+                            g_noSignal.unplaced == 0;
+                if (blip) {
+                    if (!g_noSignalBlips) g_noSignalBlipsSince = nowMs;
+                    ++g_noSignalBlips;
+                    if (nowMs - g_noSignalBlipsSince >= kNoSignalBlipMs) {
+                        logf("vr: no signal -- %d one-frame holds in a race over the last %.1f s, "
+                             "each kept the headset on its last frame. FlatFrames' `released "
+                             "early for a BG request` count is the known source.",
+                             g_noSignalBlips, (nowMs - g_noSignalBlipsSince) / 1000.0);
+                        g_noSignalBlips = 0;
+                    }
+                } else if (g_noSignalReports > 0) {
+                    --g_noSignalReports;
+                    char shown[192] = "";
+                    sprintf_s(shown, ". The last was drawn on surface %p, %dx%d, %s %d,%d %dx%d",
+                              g_noSignal.surface, g_noSignal.size[0], g_noSignal.size[1],
+                              g_noSignal.where ? g_noSignal.where
+                                               : "not the 3D view's, an eye's, the frame's or a "
+                                                 "framebuffer surface --",
+                              g_noSignal.rect[0], g_noSignal.rect[1], g_noSignal.rect[2],
+                              g_noSignal.rect[3]);
+                    int frames = g_noSignal.held + g_noSignal.flat + g_noSignal.unplaced;
+                    logf("vr: no signal -- GPL's static was in the buffer for %d frame%s (%llu "
+                         "ms)%s: %d drew it, %d drew nothing at all and kept it; %d with the "
+                         "stereo world rendered too. %d held, so the headset kept its last frame; "
+                         "%d published as one flat image; %d held because the surface was not "
+                         "one gplvr can place%s%s",
+                         frames, frames == 1 ? "" : "s", nowMs - g_noSignal.since,
+                         g_noSignal.replay ? " on the replay screen" : " in a race",
+                         frames - g_noSignal.leftOver, g_noSignal.leftOver,
+                         g_noSignal.withWorld, g_noSignal.held, g_noSignal.flat,
+                         g_noSignal.unplaced, shown,
+                         g_noSignalReports ? "" : " (further episodes will not be reported)");
+                }
+                g_noSignal = NoSignalEpisode{};
+            }
+
+            int eyeRect[2][4];
+            bool pairStillInBuffer = g_lastFrameWasStereo && stereoEyeRect(0, eyeRect[0]) &&
+                                     stereoEyeRect(1, eyeRect[1]);
+            bool publishAsPair = g_stereoRenderedFrame || pairStillInBuffer;
+            if (!g_stereoRenderedFrame && pairStillInBuffer && g_heldPairReports > 0) {
+                --g_heldPairReports;
+                logf("vr: no scene render this frame, but the eye targets are intact and the "
+                     "last frame was a tracked pair -- published as side-by-side so each eye "
+                     "samples its own rect. The head pose is cleared, so this frame holds "
+                     "still. If this repeats for more than a moment the picture is frozen and "
+                     "the cause is upstream: GPL drew no world.");
+            }
+            presenterFrame(publishAsPair, vrFrustumInjected());
+            g_publishedAny = true;
+            frameTracePublish(!publishAsPair         ? "published as one image"
+                              : g_stereoRenderedFrame ? "published as a pair"
+                                                      : "published as a HELD PAIR: no world was "
+                                                        "rendered, the buffer's last pair went out",
+                              publishAsPair, vrFrustumInjected());
+        }
+        noSignalEndFrame();
         // WHAT THE HEADSET HAS ALREADY BEEN GIVEN. Anything drawn after this point
         // reaches the monitor, which presents later, and never reaches the eyes.
         g_framePublished = true;
@@ -1295,6 +1645,16 @@ int __cdecl screenDisplayHook(void* surface) {
     // returns, so catching only the world would put the world in one buffer and the
     // instruments in another.
     presenterBeginFrame();
+
+    // GPL'S STATIC DOES NOT GET PAINTED OVER. It fills the window-sized 3D view at the top left
+    // of the target, and the world frame that ends an episode does not cover every one of those
+    // pixels: noise stayed visible along the top edge of the view after the static had gone
+    // (user, 2026-10-18). Its frame has been published or held by now, so it is cleared before
+    // GPL draws the next one, which either draws the static again or draws the world over black.
+    if (clearStaticFromTarget) {
+        GlFunctions gl;
+        if (glResolve(gl)) renderTargetClear(gl);
+    }
 
     // After the sim target, and it declines whenever that one took the frame: the two
     // are mutually exclusive by mode -- the off-screen target owns a world mode, this
@@ -1420,6 +1780,7 @@ void __cdecl sceneRenderHook(void* params) {
     // targets the texture directly, nothing is copied, the bit is never set -- and a
     // counter that tested it would read zero while the mirror worked perfectly.
     if (scene->mirrorCamera) {
+        mirrorDriverArmsEnsure();
         // What is actually rendered, not what GPL asked for: with mirrorUpdateRate above 1 the
         // request comes every frame and `stereoRender` drops most of them, and a counter that
         // read the request would have reported the mirror at the full frame rate while it was
@@ -1502,6 +1863,9 @@ void __cdecl sceneRenderHook(void* params) {
     else
         callOriginalSceneRender(params);
     mirrorTargetEndScene();
+    // GPL's 3D view has been repainted, which in flat mode paints over the replay bands' area
+    // too; the replay panel's next capture starts empty to match.
+    if (g_options.vr) replayPanelNoteScene();
 
     if (fovCorrected) scene->mainFov = savedFov;
     if (overridden)
@@ -1639,18 +2003,18 @@ void applyPendingSceneRenderHook() {
         auto site = reinterpret_cast<unsigned char*>(kMainWalkSite);
         const int32_t rel = static_cast<int32_t>(
             reinterpret_cast<uintptr_t>(&mainWorldWalkThunk) - (kMainWalkSite + 5));
+        const char* carries = "per-pane mirrors are off";
         if (std::memcmp(site, kMainWalkStock, sizeof(kMainWalkStock)) != 0) {
-            logf("mirror: %08X does not hold the stock `call gpl_worldRenderSegmentRange` "
-                 "(%02X %02X %02X %02X %02X) -- per-pane mirrors are off",
+            logf("walk: %08X does not hold the stock `call gpl_worldRenderSegmentRange` "
+                 "(%02X %02X %02X %02X %02X) -- %s",
                  static_cast<unsigned>(kMainWalkSite), site[0], site[1], site[2], site[3],
-                 site[4]);
+                 site[4], carries);
         } else if (!patchBytes(site + 1, &rel, sizeof(rel))) {
-            logf("mirror: could not write the main world walk call at %08X -- per-pane "
-                 "mirrors are off",
-                 static_cast<unsigned>(kMainWalkSite));
+            logf("walk: could not write the main world walk call at %08X -- %s",
+                 static_cast<unsigned>(kMainWalkSite), carries);
         } else {
             g_mainWalkRedirected = true;
-            logf("mirror: main world walk call at %08X redirected to %08X, which skips it "
+            logf("walk: main world walk call at %08X redirected to %08X -- it skips the walk "
                  "during a mirror-only render",
                  static_cast<unsigned>(kMainWalkSite),
                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(&mainWorldWalkThunk)));
@@ -2120,6 +2484,47 @@ void windowProcUnchain() {
 }
 
 
+// EVERY HOTKEY, CHECKED AGAINST EVERY OTHER ONE. Two removed hotkeys once shipped on one key,
+// both handlers polled GetAsyncKeyState independently, and one press did both things with
+// nothing refusing.
+//
+// This is the whole table. A key added without a line here is a key this cannot see.
+void hotkeyCollisionReport() {
+    struct Entry {
+        const char* name;
+        int         code;
+    };
+    const Entry keys[] = {
+        {"vrMirrorTweakKey", g_options.vrMirrorTweakKey},
+        {"vrMirrorModeKey", g_options.vrMirrorModeKey},
+        {"dumpEyesKey", g_options.dumpEyesKey},
+        {"frameRateKey", g_options.frameRateKey},
+        {"vrRecentreKey", g_options.vrRecentreKey},
+        {"vrMouseLookKey", g_options.vrMouseLookKey},
+        {"vrHudLayerKey", g_options.vrHudLayerKey},
+        {"vrHudTweakKey", g_options.vrHudTweakKey},
+    };
+    int count = static_cast<int>(sizeof(keys) / sizeof(keys[0]));
+    int clashes = 0;
+    int enabled = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!keys[i].code) continue;  // 0 is off, and any number of features may be off
+        ++enabled;
+        for (int j = i + 1; j < count; ++j) {
+            if (keys[j].code != keys[i].code) continue;
+            ++clashes;
+            logf("options: HOTKEY CLASH -- %s and %s are both 0x%02X ('%c'). Both handlers poll "
+                 "the key and neither refuses, so one press does both things and any evidence "
+                 "collected by it describes two different states. Give one of them another key "
+                 "in gplvr.ini.",
+                 keys[i].name, keys[j].name, keys[i].code,
+                 (keys[i].code >= 32 && keys[i].code < 127) ? keys[i].code : '?');
+        }
+    }
+    if (!clashes)
+        logf("options: %d hotkeys bound of %d, no two on the same key", enabled, count);
+}
+
 void loadOptions(const char* fileName) {
     // Beside gplvr. An absolute path either way: GetPrivateProfile* resolves a bare name against
     // the working directory, which gplc67 moves to `font`.
@@ -2180,6 +2585,10 @@ void loadOptions(const char* fileName) {
     if (g_options.profileTargetHz < 30) g_options.profileTargetHz = 30;
     if (g_options.profileTargetHz > 240) g_options.profileTargetHz = 240;
     g_options.dumpEyesKey = GetPrivateProfileIntA("gplvr", "dumpEyesKey", '0', path);
+    g_options.vrExtraRenders = GetPrivateProfileIntA("gplvr", "vrExtraRenders", 1, path);
+    if (g_options.vrExtraRenders < 0 || g_options.vrExtraRenders > 1)
+        g_options.vrExtraRenders = 1;
+    g_options.frameRateKey = GetPrivateProfileIntA("gplvr", "frameRateKey", '7', path);
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
@@ -2217,6 +2626,9 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "enableLetterbox", 0, path) != 0;
     g_options.widescreenFix =
         GetPrivateProfileIntA("gplvr", "widescreenFix", 0, path) != 0;
+    g_options.skipCredits = GetPrivateProfileIntA("gplvr", "skipCredits", 1, path) != 0;
+    g_options.mirrorDriverArms =
+        GetPrivateProfileIntA("gplvr", "mirrorDriverArms", 1, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrMenuScale", "0.5", text, sizeof(text), path);
     g_options.vrMenuScale = static_cast<float>(atof(text));
     GetPrivateProfileStringA("gplvr", "vrGamma", "1.0", text, sizeof(text), path);
@@ -2227,6 +2639,24 @@ void loadOptions(const char* fileName) {
     g_options.vrHudDepth = static_cast<float>(atof(text));
     g_options.vrHudLayer = GetPrivateProfileIntA("gplvr", "vrHudLayer", 2, path);
     if (g_options.vrHudLayer < 0 || g_options.vrHudLayer > 2) g_options.vrHudLayer = 2;
+    GetPrivateProfileStringA("gplvr", "vrHudInset", "1.0", text, sizeof(text), path);
+    g_options.vrHudInset = static_cast<float>(atof(text));
+    // Zero collapses every item onto the eye's centre, which is what this setting did while
+    // it was a constant, and the whole layout arriving at one point reads as the HUD being
+    // absent rather than as a setting being wrong.
+    if (g_options.vrHudInset < 0.1f) g_options.vrHudInset = 0.1f;
+    if (g_options.vrHudInset > 1.0f) g_options.vrHudInset = 1.0f;
+    g_options.vrGplText = GetPrivateProfileIntA("gplvr", "vrGplText", 0, path);
+    if (g_options.vrGplText < 0 || g_options.vrGplText > 1) g_options.vrGplText = 0;
+    g_options.vrGplTextScale = GetPrivateProfileIntA("gplvr", "vrGplTextScale", 1, path);
+    if (g_options.vrGplTextScale < 1) g_options.vrGplTextScale = 1;
+    if (g_options.vrGplTextScale > 4) g_options.vrGplTextScale = 4;
+    GetPrivateProfileStringA("gplvr", "vrGplTextInset", "1.0", text, sizeof(text), path);
+    g_options.vrGplTextInset = static_cast<float>(atof(text));
+    // The same floor vrHudInset has, for the same reason: 0 is every run on one point at the
+    // eye's centre, which reads as the text being gone rather than as a setting being wrong.
+    if (g_options.vrGplTextInset < 0.1f) g_options.vrGplTextInset = 0.1f;
+    if (g_options.vrGplTextInset > 1.0f) g_options.vrGplTextInset = 1.0f;
     // A key that is absent keeps the default the Options struct was built with.
     auto readFloat = [&](const char* key, float& value) {
         GetPrivateProfileStringA("gplvr", key, "", text, sizeof(text), path);
@@ -2256,10 +2686,11 @@ void loadOptions(const char* fileName) {
     g_options.vrHudTweakSpeed = static_cast<float>(atof(text));
     if (g_options.vrHudTweakSpeed < 0.005f) g_options.vrHudTweakSpeed = 0.005f;
     if (g_options.vrHudTweakSpeed > 2.0f) g_options.vrHudTweakSpeed = 2.0f;
-    g_options.vrPredictPosition =
-        GetPrivateProfileIntA("gplvr", "vrPredictPosition", 1, path) != 0;
     g_options.frameRate = GetPrivateProfileIntA("gplvr", "frameRate", 1, path);
     if (g_options.frameRate < 0 || g_options.frameRate > 2) g_options.frameRate = 1;
+    // What frameRateKey puts back. A toggle from an ini that already says 0 has to turn the
+    // blend ON, not off again.
+    g_frameRateWanted = g_options.frameRate > 0 ? g_options.frameRate : 1;
 
     // FRAME RATE IS ONE LEVER, AND VSYNC FALLS OUT OF IT.
     //
@@ -2372,17 +2803,14 @@ void loadOptions(const char* fileName) {
          "frame in %d)",
          g_options.vrTransferFinish ? 1 : 0, g_options.pribludaUpdateRate,
          g_options.pribludaUpdateRate);
-    // 0 by default, so an ini written before this existed does not silently gain a
-    // cursor. The ini shipped with the mod turns it on, which is where the feature is
-    // meant to be exercised from.
-    g_options.vrCursor = GetPrivateProfileIntA("gplvr", "vrCursor", 0, path);
-    if (g_options.vrCursor < 0 || g_options.vrCursor > 2) g_options.vrCursor = 0;
-    logf("options: vrCursor=%d (%s)", g_options.vrCursor,
-         g_options.vrCursor == 0
-             ? "no pointer is drawn into the VR image"
-             : (g_options.vrCursor == 1 ? "drawn while Windows says the pointer is "
-                                          "showing"
-                                        : "drawn whatever Windows says"));
+    g_options.vrNoSignal = GetPrivateProfileIntA("gplvr", "vrNoSignal", 1, path);
+    if (g_options.vrNoSignal < 0 || g_options.vrNoSignal > 1) g_options.vrNoSignal = 1;
+    logf("options: vrNoSignal=%d (%s)", g_options.vrNoSignal,
+         g_options.vrNoSignal
+             ? "GPL's no-signal static: a race holds the last frame for a moment, then the static "
+               "fills both eyes; the replay screen fills them at once -- watch the `vr: no "
+               "signal` lines"
+             : "GPL's no-signal static is published as a stereo pair, as before");
 
     logf("options: vrMenuScale=%.2f vrGamma=%.2f vrHudDepth=%.2f vrRenderScale=%.2f "
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
@@ -2390,9 +2818,19 @@ void loadOptions(const char* fileName) {
          g_options.vrRenderScale, g_options.vrRecentreKey, g_options.vrMonitorEye);
     logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f", g_options.vrHorizonLock,
          g_options.vrWorldScale);
-    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f vrPredictPosition=%d",
-         g_options.vrHudLayer, g_options.vrHudBackdropOpacity,
-         g_options.vrPredictPosition ? 1 : 0);
+    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f vrHudInset=%.2f (%s)",
+         g_options.vrHudLayer, g_options.vrHudBackdropOpacity, g_options.vrHudInset,
+         g_options.vrHudInset >= 0.999f
+             ? "GPL's own layout, every relative position exact"
+             : "pulled toward the eye centre -- dense groups compress");
+    logf("options: vrGplText=%d vrGplTextScale=%d vrGplTextInset=%.2f -- %s",
+         g_options.vrGplText, g_options.vrGplTextScale, g_options.vrGplTextInset,
+         g_options.vrGplText == 0
+             ? "GPL's stamped text stays roglv2's, drawn where GPL put it: in VR that is the "
+               "left eye's periphery at zero disparity, and nothing can move it"
+             : "gplvr draws GPL's stamped glyphs from its own atlas, once per eye, scaled and "
+               "pulled in -- watch the `fast text:` lines for how many glyphs it took and "
+               "which term refused the rest");
     logf("options: frameRate=%d (%s)", g_options.frameRate,
          g_options.frameRate == 0
              ? "THE SIM'S RATE: one frame per sim tick, unblended, as GPL ships"
@@ -2434,6 +2872,18 @@ void loadOptions(const char* fileName) {
          g_options.vrHudSeat.right, g_options.vrHudSeat.width);
     logf("options: vrHudLayerKey=0x%02X vrHudTweakKey=0x%02X vrHudTweakSpeed=%.3f",
          g_options.vrHudLayerKey, g_options.vrHudTweakKey, g_options.vrHudTweakSpeed);
+    logf("options: vrExtraRenders=%d (%s)", g_options.vrExtraRenders,
+         g_options.vrExtraRenders
+             ? "the interpolated renders between sim ticks are drawn, as always"
+             : "SUPPRESSED -- blending is still on and the extra renders are not. This is the "
+               "bisect frameRate = 0 cannot do, because that removes both at once: an artifact "
+               "that survives this is in the blended values, one that goes is in what an extra "
+               "render fails to redraw");
+    logf("options: frameRateKey=0x%02X (%s)", g_options.frameRateKey,
+         g_options.frameRateKey
+             ? "toggles frameRate between 0 and the ini's value live -- the A/B for anything "
+               "that might be the blend's"
+             : "off -- frameRate cannot be changed without a restart");
     logf("options: vrMouseLook=%d sensitivity=%.3f invertPitch=%d key=0x%02X",
          g_options.vrMouseLook ? 1 : 0, g_options.vrMouseLookSensitivity,
          g_options.vrMouseLookInvertPitch ? 1 : 0, g_options.vrMouseLookKey);
@@ -2445,6 +2895,7 @@ void loadOptions(const char* fileName) {
          g_options.widescreenFix ? 1 : 0, g_options.renderWhenUnfocused ? 1 : 0,
          (!g_options.renderWhenUnfocused && g_options.vr) ? " (forced on by vr)" : "");
 
+    hotkeyCollisionReport();
 }
 
 // The eight keys loadOptions reads just above, written back where the panel tweak mode
@@ -2620,6 +3071,8 @@ bool frameAlreadyPublished() { return g_framePublished; }
 
 bool hooksMainWalkRedirected() { return g_mainWalkRedirected; }
 
+unsigned hooksFrameCount() { return g_frames; }
+
 void* hooksLastSceneParams() { return g_lastSceneParams; }
 
 bool keepDrawingWhileUnfocused() {
@@ -2675,6 +3128,49 @@ bool patchModuleImport(HMODULE module, const char* name, void* replacement,
 }
 
 void setSelfModule(HMODULE module) { g_selfModule = module; }
+
+// SKIPPING THE CREDITS IS ONE BYTE, AND GPL ALREADY HAS THE SWITCH.
+//
+// The quit path is sub_423C20: it calls sub_40ECF0 and branches on the result -- true shows the
+// credits screen (the global at 0x5B6170, whose vtable 0x537298 names credits.win), false calls
+// the object's own +0x28 and the game exits.
+//
+//     0x423C3F  call sub_40ECF0
+//     0x423C44  test al, al
+//     0x423C46  jz   short loc_423C57     <- the exit without credits
+//
+// sub_40ECF0 is `return byte_54C5CC;` and that byte has exactly two references in the whole
+// image: this read, and a write inside an accessor at 0x40ED00 that NOTHING calls. It ships as 1
+// and nothing ever changes it, so writing 0 once is permanent and needs no code patch, no hook
+// and no cave -- the branch GPL already has is simply taken.
+//
+// THE ADDRESS IS INSIDE GPLPATCHDLL'S REBASE BAND (0x0054C5B8..0x00971FFF), so it is one of the
+// globals that moves between the UK and US links. It goes through rebase() like everything else
+// that does; reading it raw would poke a neighbour on one of the two.
+constexpr uintptr_t kRetailCreditsOnExit = 0x0054C5CC;
+
+void creditsSkipInstall() {
+    if (!g_options.skipCredits) return;
+
+    uintptr_t flag = rebase(kRetailCreditsOnExit);
+    if (!flag) {
+        logf("credits: the exit-credits flag could not be placed in this image -- the credits "
+             "roll as they always did");
+        return;
+    }
+
+    unsigned char before = 0;
+    std::memcpy(&before, reinterpret_cast<const void*>(flag), sizeof(before));
+    unsigned char off = 0;
+    if (!patchBytes(reinterpret_cast<void*>(flag), &off, sizeof(off))) {
+        logf("credits: %08X could not be written -- the credits roll as they always did",
+             static_cast<unsigned>(flag));
+        return;
+    }
+    logf("credits: quitting now exits straight away -- %08X %u -> 0, so the quit path takes the "
+         "branch past credits.win. skipCredits = 0 leaves it alone.",
+         static_cast<unsigned>(flag), before);
+}
 
 void patchDisplaySettingsImportsEverywhere() {
     HMODULE modules[512];

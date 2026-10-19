@@ -95,8 +95,13 @@ else()
         src/MenuScale.cpp
         src/MirrorCache.cpp
         src/MirrorConfig.cpp
+        src/MirrorDriverArms.cpp
+        src/MirrorGeometry.cpp
         src/MirrorTarget.cpp
+        src/MirrorUv.cpp
         src/MouseLook.cpp
+        src/NoSignal.cpp
+        src/FrameTrace.cpp
         src/Paths.cpp
         src/Pe.cpp
         src/PostProfile.cpp
@@ -104,7 +109,9 @@ else()
         src/RenderPacing.cpp
         src/RenderProfile.cpp
         src/RenderTarget.cpp
+        src/ReplayPanel.cpp
         src/SimRing.cpp
+        src/SkidFlood.cpp
         src/Stereo.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
@@ -139,6 +146,8 @@ else()
     # Its own PDB name: with OUTPUT_NAME "gplvr" the loader's link would write gplvr.pdb over
     # the DLL's.
     set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr" PDB_NAME "gplvr-loader")
+    # shell32 for CommandLineToArgvW, which splits the command line so --exe can be taken out of
+    # it by the same rules the game would have parsed the rest by.
     target_link_libraries(gplvr_loader PRIVATE user32 shell32)
 
     set(GPLVR_TARGETS gplvr gplvr_loader)

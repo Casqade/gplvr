@@ -25,6 +25,25 @@
 // both eyes, so there is no disparity to be wrong -- there is simply half a HUD in each
 // eye, in different places.
 //
+// THAT FIX DOES NOT WORK, AND THE STAMP PATH HAS BEEN HANDED OVER BECAUSE OF IT.
+//
+// Measured 2026-10-07: a destination handle decides where IN a surface a glyph lands, not which
+// framebuffer receives it. With the world rendering off-screen the eye targets are not carved
+// out of GPL's 2D destination, so re-issuing a call against an eye surface puts the pixels in a
+// buffer nobody reads -- the text left the eye dumps AND left the monitor, while GPL's own fps
+// counter, which the split excludes, stayed. `destinationCanSplit` below now declines in VR for
+// exactly that reason, and everything GPL stamps goes through untouched.
+//
+// So GPL's stamped text is placed by the fast text path instead, behind `vrGplText = 1`: it
+// reads the glyph out of roglv2's own font and draws it as a quad of its own, which has a
+// position and a size, once per eye. With that on this file does not thunk stampDraw at all --
+// one owner per slot, because both modules re-assert per mode change and two would adopt each
+// other -- and the thunks it keeps call fastTextFlushNow() in place of the six globals the other
+// path gives up. See FastText.h.
+//
+// The per-eye re-issue below survives for the destinations where it CAN work: a destination the
+// eyes really are sub-rects of, which is every flat-mode and non-off-screen case.
+//
 // The fix needs no `drawHud()` to call twice, because the destination is an ARGUMENT.
 // `drawDebugText` is one of the rasterizer function-pointer globals gplvr already
 // resolves by name, its first argument is the destination surface, and the two eye
@@ -52,6 +71,9 @@ void hudBeginFrame();
 // The frame's stamped text, flushed. From the present hook, after GPL has issued every
 // stampDraw of the frame: logs new or changed strings under a per-second cap, and once a
 // second a summary of stamp calls and the strings they formed.
+//
+// Silent with `vrGplText = 1`: the stamp thunk is not installed then, so nothing is recorded
+// here and the `fast text:` lines carry the census instead.
 void hudEndFrame();
 
 // Re-issue this frame's HUD. Called after each EXTRA render, which re-enters

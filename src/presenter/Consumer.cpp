@@ -432,7 +432,8 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     float rectTop = 0.0f;
     const uint32_t* published =
         (eye >= 0 && eye < 2) ? current_.eyeRect[eye] : nullptr;
-    if (current_.sideBySide && published && published[2] && published[3]) {
+    // A one-image frame may name a rect too, when only part of it is the picture.
+    if (published && published[2] && published[3]) {
         rectLeft = static_cast<float>(published[0]) / static_cast<float>(sourceWidth_);
         rectTop = static_cast<float>(published[1]) / static_cast<float>(sourceHeight_);
         rectWidth = static_cast<float>(published[2]) / static_cast<float>(sourceWidth_);

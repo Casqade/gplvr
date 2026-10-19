@@ -62,6 +62,14 @@ bool interpolationViewedCarDlong(float& metres);
 // A snap is a camera cut, a car reset or a tick gap: the value legitimately jumps there.
 bool interpolationViewDlong(float& metres, bool& snapped);
 
+// THE SAME CAMERA, THE SAME FIELD, AT THE NEWEST LATCHED TICK -- what the blend started from.
+// The pair with interpolationViewDlong above is the only honest "with blending and without it"
+// for the one quantity the world walk is centred on: same body, same frame, one value the sim
+// wrote and one the blend wrote over it. False until a tick has been latched.
+//
+// It is NOT interpolationViewedCarDlong. That is a different body and is itself blended.
+bool interpolationViewDlongAtTick(float& metres);
+
 // The once-a-second interp: line. False when the window latched no world frame.
 bool interpolationFormat(char* out, size_t size);
 

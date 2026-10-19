@@ -61,7 +61,7 @@ namespace gplvr {
 // `sideBySide` is true when this frame holds two eyes, in which case one cursor is drawn
 // per eye rect; false for a single image shown to both eyes, which is what a menu is.
 //
-// Inert unless the `vrCursor` option asks for it. Every refusal says which one it was: a
+// Drawn while Windows says the pointer is showing. Every refusal says which one it was: a
 // silent return here reads as "the feature does not work" and costs a whole session.
 //
 // It also SAVES the pixels it is about to cover, into a scratch texture; the restore
@@ -90,5 +90,12 @@ void cursorOverlayRestore(const GlFunctions& gl);
 // either does nothing or destroys somebody else's object of the same name. The next
 // frame that draws rebuilds it from the HCURSOR.
 void cursorOverlayReleaseGl();
+
+// The Windows pointer's own shape -- the texture cursorOverlayDraw keeps -- with its hotspot at
+// (x, y) and `scale` units of the current 2D transform per screen pixel, drawn into whatever is
+// bound. For a surface of gplvr's own rather than the frame: the replay panel draws the pointer on
+// its canvas with this. No backing store, because that canvas is rebuilt whole. False when
+// the shape cannot be read, and the caller draws something else.
+bool cursorOverlayDrawShape(const GlFunctions& gl, float x, float y, float scale);
 
 }  // namespace gplvr

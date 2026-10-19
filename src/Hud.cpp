@@ -6,8 +6,10 @@
 #include "Log.h"
 #include "Pe.h"
 #include "RenderTarget.h"
+#include "ReplayPanel.h"
 #include "Stereo.h"
 #include "Window.h"
+#include "fast_text/FastText.h"
 
 #include <windows.h>
 
@@ -93,6 +95,25 @@ bool firstSightOf(void* surface) {
 int g_lastReportedCount = 0;
 int g_countReports = 8;
 
+// Handles that resolved to a freed table slot. Above zero means gplvr is holding a surface
+// handle past its life -- which used to be a crash and is now a refusal, but is still a bug
+// wherever the handle came from.
+unsigned g_staleHandleReads = 0;
+int      g_staleHandleReports = 3;
+
+// Said out loud the first few times, because a counter nobody prints is a crash that became a
+// silent wrong answer. Not in the once-a-second burst: this should never fire at all.
+void noteStaleHandle(void* bitmap) {
+    ++g_staleHandleReads;
+    if (g_staleHandleReports <= 0) return;
+    --g_staleHandleReports;
+    logf("hud: surface %p resolved to a FREED handle-table slot -- its size reads as 0 and the "
+         "per-eye split declines. This is gplvr holding a surface handle past its life; the "
+         "handle carries no generation, so nothing here can tell a recycled one from a live "
+         "one. #%u this session.",
+         bitmap, g_staleHandleReads);
+}
+
 // A NULL SURFACE IS NOT A QUESTION THE RASTERIZER CAN BE ASKED.
 //
 // roglv2 resolves a handle as `*(handleTable + 2) + 8 * handle` and dereferences what it
@@ -100,16 +121,106 @@ int g_countReports = 8;
 // with it. That is exactly what happened when the census asked for the size of
 // stereoSourceSurface() while still in the front end, where there are no eyes and the
 // source is null -- an instrument that crashed the thing it was measuring.
+// A NON-NULL HANDLE IS NOT A LIVE ONE EITHER, and that is the half this guard used to miss.
+// The 2026-10-09 crash was `roglv2!bitmapWidth+0x27` reading `[eax+0Ch]` with eax = 0: handle
+// 0x6F was not null, it was RECYCLED -- the lobby-to-main-menu teardown freed the block and
+// left table slots 0x6D..0x73 zeroed, so the lookup produced a null POINTER from a perfectly
+// ordinary-looking handle. Nothing gplvr holds can tell the two apart, because a handle carries
+// no generation and roglv2 validates nothing.
+//
+// So these two cannot be allowed to fault. A size that cannot be read is 0, which every caller
+// already treats as "do not split", and a diagnostic accessor must not be able to kill the
+// process it is measuring. SEH costs nothing until something faults, and only PODs live here.
 int bitmapWidth(void* bitmap) {
     if (!bitmap) return 0;
     if (!g_bitmapWidthSlot || !*g_bitmapWidthSlot) return 0;
-    return reinterpret_cast<BitmapWidthFn>(*g_bitmapWidthSlot)(bitmap);
+    __try {
+        return reinterpret_cast<BitmapWidthFn>(*g_bitmapWidthSlot)(bitmap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        noteStaleHandle(bitmap);
+        return 0;
+    }
 }
 
 int bitmapHeight(void* bitmap) {
     if (!bitmap) return 0;
     if (!g_bitmapHeightSlot || !*g_bitmapHeightSlot) return 0;
-    return reinterpret_cast<BitmapWidthFn>(*g_bitmapHeightSlot)(bitmap);
+    __try {
+        return reinterpret_cast<BitmapWidthFn>(*g_bitmapHeightSlot)(bitmap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        noteStaleHandle(bitmap);
+        return 0;
+    }
+}
+
+// screenGetBackBuffer, for telling the window's own surface from the frame GPL lays its 2D out
+// against. They are the same size, so size alone cannot separate them.
+typedef void*(__cdecl* BackBufferFn)();
+void** g_backBufferSlot = nullptr;
+
+// CAN THIS DESTINATION BE SPLIT PER EYE AT ALL?
+//
+// Only when the eyes are sub-rects of the very surface GPL is drawing into. Re-issuing a 2D
+// call with an eye surface as its destination moves WHERE IN THAT SURFACE the pixels go; it
+// does not move them to a different framebuffer. So the split works when the eye targets were
+// carved out of GPL's own destination, and does nothing whatsoever when they live on a separate
+// off-screen target.
+//
+// THIS WAS A SIZE TEST AGAINST stereoSourceSurface() AND THAT WAS CORRECT. I replaced it with a
+// test against the engine's display mode, on the reading that the old one had rotted when the
+// world moved off-screen -- 2560x1440 destination, 6344x3172 source, no longer equal, every
+// stamp passing through. The sizes stopped matching because the PREMISE stopped holding, and
+// the old test was right to decline. Measured 2026-10-07, which is what settles it: with the
+// mode test in place GPL's "car must be stopped" text vanished from the MONITOR as well, while
+// GPL's own fps counter -- which targets the back buffer and is excluded here -- stayed. The
+// split had taken the text away from the one surface it was visible on and put it in a buffer
+// nobody reads.
+//
+// So the eyes must come from this destination. What GPL's 2D needs in order to reach a headset
+// that renders off-screen is a quad layer, not a per-eye re-issue: the 2D surface is readable as
+// a GL texture, and a layer is composited rather than drawn into an eye.
+bool destinationCanSplit(void* dest, int& fullWidth, int& fullHeight) {
+    fullWidth = bitmapWidth(dest);
+    fullHeight = bitmapHeight(dest);
+    if (fullWidth <= 0 || fullHeight <= 0) return false;
+
+    void* source = stereoSourceSurface();
+    if (!source) return false;
+    if (fullWidth != bitmapWidth(source) || fullHeight != bitmapHeight(source)) return false;
+
+    // AND THE SOURCE MUST STILL BE THE SURFACE THE EYES WERE CARVED FROM. A recycled source
+    // handle reads as whatever now owns the slot: after a replay it was the mirror camera's
+    // 512x512 surface, mirror.mip's copy-out matched it, and was split into eye instances whose
+    // parent had been freed -- roglv2 then read a GL framebuffer as memory and faulted
+    // (gplc67.exe.18520.dmp). The size it was carved at cannot be recycled with it.
+    int carvedWidth = 0;
+    int carvedHeight = 0;
+    if (!stereoSourceCarvedSize(carvedWidth, carvedHeight) || fullWidth != carvedWidth ||
+        fullHeight != carvedHeight)
+        return false;
+
+    // Only a destination roglv2 draws through the framebuffer is part of a frame. mirror.mip is
+    // a texture, and splitting a copy into it changes roglv2's blit from a GL copy to a CPU one.
+    // Asked through fast text's handle-table read, which answers false when it is not located;
+    // the size checks above stand alone then.
+    int  originX = 0;
+    int  originY = 0;
+    int  width = 0;
+    int  height = 0;
+    bool framebuffer = false;
+    if (fastTextSurfaceInfo(static_cast<int>(reinterpret_cast<intptr_t>(dest)), originX, originY,
+                            width, height, framebuffer) &&
+        !framebuffer)
+        return false;
+
+    // THE BACK BUFFER CAN BE THE SAME SIZE AND IS NOT THIS. The frame-time readout targets it --
+    // surface 2, the one whose collisions with the menu's version string cost three
+    // explanations. Splitting it would put a diagnostic readout inside the picture twice.
+    if (g_backBufferSlot && *g_backBufferSlot) {
+        auto getBackBuffer = reinterpret_cast<BackBufferFn>(*g_backBufferSlot);
+        if (dest == getBackBuffer()) return false;
+    }
+    return true;
 }
 
 // THE ANCHOR REMAP, AND WHY THREE CLASSES ARE ENOUGH.
@@ -125,6 +236,26 @@ int bitmapHeight(void* bitmap) {
 // The quarter-width thresholds are what sort an item into its class. They have room to
 // spare: the nearest item to a boundary is the centre block's W/2 - 64, which at the
 // smallest eye GPL can render is still far above W/4.
+// GPL'S 2D IS LAID OUT AGAINST THE ENGINE FRAME, AND THE EYES NEED NOT BE THAT SIZE.
+//
+// remapAnchor below puts an item into a space half the destination's width, and for a long time
+// that was the whole mapping, because the eyes WERE the two halves of the destination. Once the
+// world renders off-screen they are not: a 2560x1440 engine frame against two 3172x3172 eyes.
+// Translating alone then leaves the whole layout bunched into the top-left of each eye at the
+// wrong relative position, which is what the replay control band showed.
+//
+// Only positions scale. The glyphs and bitmaps drawn at them keep their authored pixel size, so
+// the layout comes out proportionally right and the art stays the angular size it already was.
+// That is the most a per-eye re-issue can do; making the art itself bigger needs GPL's 2D on a
+// quad layer, where the whole surface is scaled as one.
+void scaleToEye(int& x, int& y, int fullWidth, int fullHeight, int eyeWidth, int eyeHeight) {
+    int half = fullWidth / 2;
+    if (half > 0 && eyeWidth > 0)
+        x = static_cast<int>(static_cast<long long>(x) * eyeWidth / half);
+    if (fullHeight > 0 && eyeHeight > 0)
+        y = static_cast<int>(static_cast<long long>(y) * eyeHeight / fullHeight);
+}
+
 int remapAnchor(int x, int fullWidth) {
     if (x >= 3 * fullWidth / 4) return x - fullWidth / 2;
     if (x >= fullWidth / 4) return x - fullWidth / 4;
@@ -139,10 +270,20 @@ int remapAnchor(int x, int fullWidth) {
 // look. The pixels were in the published frame all along -- measured, not assumed -- and
 // still read as missing.
 //
-// So the layout is scaled about the eye's centre, keeping every relative position and
+// So the layout can be scaled about the eye's centre, keeping every relative position and
 // bringing the whole thing into the cone a seated driver actually uses. 1.0 is the raw
 // layout and the corners it implies; 0.6 puts a corner item at 20% in from the edge.
-constexpr float kHudInset = 0.0f;
+//
+// THIS WAS A CONSTANT AT 0.0, which is x = eyeWidth/2 and y = eyeHeight/2 for every item --
+// the whole of GPL's 2D on one point at the centre of the eye. It went unnoticed because the
+// surface test below was declining before this line could be reached, so the only evidence
+// was one log line from the single frame where both agreed.
+//
+// It scales positions and not the art drawn at them, so anything below 1.0 compresses a dense
+// group while its pieces keep their size. The replay control band is ten buttons at a
+// 37-pixel step; at 0.6 the step is 22 and they overlap. Moving a whole group belongs in that
+// screen's own layout, which preserves the spacing exactly.
+float hudInset() { return g_options.vrHudInset; }
 
 // Horizontal disparity in pixels for `vrHudDepth` metres, or 0 for infinity.
 //
@@ -179,37 +320,68 @@ int disparityPixels(int eyeWidth) {
 void emit(const Call& call) {
     if (!g_original) return;
 
+    // THE FRONT END HAS NO EYES, AND THE SOURCE HANDLE IT WOULD ASK ABOUT IS A CORPSE.
+    //
+    // This is the guard `stampDrawThunk` and `bitmapDrawThunk` already carry and this caller
+    // did not -- the one of the three callers of destinationCanSplit that was unprotected, and
+    // the one that crashed on 2026-10-09. MenuScale's rasterFlushPending synthesises a
+    // drawDebugText of "" against the back buffer once per front-end frame, so this path runs
+    // continuously in the menus, with g_state.sourceSurface still holding the race's 0x6F.
+    // Leaving a race never clears it: stereoRelease() is the only writer of null and both of
+    // its call sites are inside the world-render build.
+    if (windowInFrontEnd()) {
+        g_original(call.surface, call.colour, call.x, call.y, call.text, call.background);
+        return;
+    }
+
     int rect[2][4];
     void* left = stereoEyeSurface(0);
     void* right = stereoEyeSurface(1);
 
-    // Everything that is not the in-race HUD on the stereo surface goes through
-    // untouched. The frame-time readout is the one to keep in mind: its destination is
-    // screenGetBackBuffer(), not the camera's surface, so it fails this test and stays
-    // where GPL put it.
-    if (!left || !right || call.surface != stereoSourceSurface() ||
+    // Everything that is not GPL's 2D on the engine's own frame goes through untouched. The
+    // frame-time readout is the one to keep in mind: its destination is
+    // screenGetBackBuffer(), not the engine frame, so it fails this test and stays where GPL
+    // put it.
+    //
+    // Declining is also correct whenever the eyes are not carved out of this destination --
+    // see destinationCanSplit, which is the whole of why.
+    int fullWidth = 0;
+    int fullHeight = 0;
+    if (!left || !right || !destinationCanSplit(call.surface, fullWidth, fullHeight) ||
         !stereoEyeRect(0, rect[0]) || !stereoEyeRect(1, rect[1])) {
         // Say so, once per destination. The pass-through is correct for the frame-time
         // readout and wrong for the in-race HUD, and from the outside the two look
         // identical: a HUD that never reached an eye and a HUD that was never meant to.
         // Naming the surface is what separates them without another guess.
         if (firstSightOf(call.surface)) {
-            logf("hud: \"%s\" went to surface %p UNCHANGED -- the stereo source is %p, "
-                 "eyes %p/%p. Expected for the frame-time readout; for an in-race item "
-                 "it means the HUD and the eyes are drawn into different surfaces.",
-                 call.text, call.surface, stereoSourceSurface(), left, right);
+            void* source = stereoSourceSurface();
+            logf("hud: \"%s\" went to surface %p (%dx%d) UNCHANGED -- the stereo source is %p "
+                 "(%dx%d), eyes %p/%p. Expected for the frame-time readout, whose destination "
+                 "is the back buffer, and expected for everything while the world renders "
+                 "off-screen: the eyes are not part of this surface, so a per-eye re-issue "
+                 "would put the pixels in a buffer nobody reads.",
+                 call.text, call.surface, fullWidth, fullHeight, source, bitmapWidth(source),
+                 bitmapHeight(source), left, right);
         }
         g_original(call.surface, call.colour, call.x, call.y, call.text, call.background);
         return;
     }
 
-    int fullWidth = bitmapWidth(call.surface);
-    if (fullWidth <= 0) {
-        g_original(call.surface, call.colour, call.x, call.y, call.text, call.background);
-        return;
+    int x = remapAnchor(call.x, fullWidth);
+    int y = call.y;
+
+    // The same inset the stamp path applies, so the two halves of GPL's 2D cannot be placed
+    // by different rules and drift apart.
+    int eyeWidth = rect[0][2];
+    int eyeHeight = rect[0][3];
+    scaleToEye(x, y, fullWidth, fullHeight, eyeWidth, eyeHeight);
+    if (eyeWidth > 0 && eyeHeight > 0) {
+        float halfX = static_cast<float>(eyeWidth) * 0.5f;
+        float halfY = static_cast<float>(eyeHeight) * 0.5f;
+        x = static_cast<int>(halfX + (static_cast<float>(x) - halfX) * hudInset());
+        y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * hudInset());
     }
 
-    int x = remapAnchor(call.x, fullWidth);
     int disparity = disparityPixels(rect[0][2]);
     if (disparity != g_lastDisparity && g_reports > 0) {
         --g_reports;
@@ -220,10 +392,10 @@ void emit(const Call& call) {
              disparity ? "" : " (at infinity)");
     }
 
-    // y needs no remap: each eye is the full height of the buffer, and a sub-rect
+    // y needs no anchor remap: each eye is the full height of the buffer, and a sub-rect
     // instance already offsets into the root by its own origin.
-    g_original(left, call.colour, x + disparity / 2, call.y, call.text, call.background);
-    g_original(right, call.colour, x - disparity / 2, call.y, call.text, call.background);
+    g_original(left, call.colour, x + disparity / 2, y, call.text, call.background);
+    g_original(right, call.colour, x - disparity / 2, y, call.text, call.background);
 }
 
 // -- THE 2D CENSUS ---------------------------------------------------------------------
@@ -258,6 +430,32 @@ int   g_bitmapDrawReports = 12;
 int   g_bitmapDrawCount = 0;
 int   g_bitmapDrawHighWater = 0;
 bool  g_wasFrontEnd = true;
+
+// How many bitmapDraw calls the per-eye branch took, against how many it saw. A split that
+// never runs reads exactly like one that is not needed, which is what cost this path its
+// first two builds.
+int   g_bitmapSplitCount = 0;
+int   g_bitmapSplitReports = 4;
+
+// Destinations whose refusal has been named already, so a per-frame call does not print a line
+// a frame. Separate from g_seenDest, which the census owns and spends on its own budget.
+int   g_refusedDest[16] = {};
+int   g_refusedDestCount = 0;
+int   g_bitmapRefuseReports = 8;
+
+// ONE OWNER PER SLOT. With vrGplText = 1 the fast text path takes stampDraw, so this file does
+// not: both re-assert their thunk over whatever a mode change left in a slot and adopt what
+// they find as "the original", and two such modules on one slot make each the other's original
+// and the chain calls itself. Read from the option rather than from the other module's state,
+// because hudBind runs before fastTextBind and would see "not installed yet" either way.
+bool stampsBelongToFastText() { return g_options.vr && g_options.vrGplText != 0; }
+
+bool knownRefusal(int dest) {
+    for (int i = 0; i < g_refusedDestCount; ++i)
+        if (g_refusedDest[i] == dest) return true;
+    if (g_refusedDestCount < 16) g_refusedDest[g_refusedDestCount++] = dest;
+    return false;
+}
 
 // -- THE REST OF THE 2D SURFACE, SWEPT IN ONE GO --------------------------------------
 //
@@ -294,10 +492,23 @@ Census g_census[] = {
     {"aaLine", nullptr, nullptr, 0, 0, 6},      {"aaTriangle", nullptr, nullptr, 0, 0, 6},
 };
 constexpr int kCensusCount = sizeof(g_census) / sizeof(g_census[0]);
+// fillRect's index in the table above. It gets its own column in the per-frame signature: a
+// black letterbox bar is a filled rectangle, and the artifact being hunted is described as
+// something drawn OVER a frame that was already complete.
+constexpr int kCensusFillRect = 0;
 
 int censusEnter(int which, int a1, int a2, int a3, int a4) {
     Census& c = g_census[which];
     ++c.count;
+    // THE ORDERING CONTRACT THE FAST TEXT PATH GIVES UP IN VR. It normally holds all seven 2D
+    // globals so that any other 2D call flushes its pending quads first, and a run of text
+    // issued before a polygon is on the framebuffer before it. With stampDraw its only global,
+    // these thunks are where that flush has to happen. Inert when nothing is batched.
+    fastTextFlushNow();
+    // Listed once per kind. The anti-aliased primitives take floats, so a3 and a4 are not a
+    // position for all of them, and a replay draws aaLines at new values every frame.
+    if (replayPanelCapturing())
+        replayPanelNoteDraw(c.name, 0, 0, 0, 0, false, "a primitive, listed once per kind");
     if (c.reports > 0 && c.count <= 2) {
         --c.reports;
         void* dest = reinterpret_cast<void*>(static_cast<intptr_t>(a1));
@@ -312,6 +523,27 @@ template <int N>
 int __cdecl censusThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8) {
     censusEnter(N, a1, a2, a3, a4);
     void* original = g_census[N].original;
+    // A FILL IN A RACE IS ONE OF GPL'S DIALOGS -- F1's help is a 640x480 root over a translucent
+    // box -- and the dialog goes to a panel of its own over the stereo picture, at GPL's own
+    // pixels: its box, its frame art, its scroll arrows and its text together. Placed per eye,
+    // the text was spread to stay legible and the box could not follow it.
+    // fillRect(destination, colour, x, y, width, height) -- width and height, not a corner.
+    if (N == kCensusFillRect && original) {
+        int  originX = 0;
+        int  originY = 0;
+        int  width = 0;
+        int  height = 0;
+        bool framebuffer = false;
+        if (fastTextSurfaceInfo(a1, originX, originY, width, height, framebuffer) &&
+            framebuffer) {
+            replayPanelNoteFill(originX + a3, originY + a4, a5, a6);
+            if (replayPanelCapturing() && replayPanelTakes(originX + a3, originY + a4, a5, a6)) {
+                fastTextOpenRasterBatch();
+                ReplayPanelTarget target;
+                return reinterpret_cast<WideFn>(original)(a1, a2, a3, a4, a5, a6, a7, a8);
+            }
+        }
+    }
     return original ? reinterpret_cast<WideFn>(original)(a1, a2, a3, a4, a5, a6, a7, a8)
                     : 0;
 }
@@ -634,37 +866,35 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
 
     // THE HUD'S DESTINATION IS NOT THE SURFACE STEREO SPLIT, AND IT NEVER WAS.
     //
-    // It is 109 where the stereo source is 111 -- both 2560x1440, different objects. The
-    // log said so the first time the destination was ever printed, and the identity test
-    // written afterwards ignored it, so every stamp took the pass-through branch and the
-    // per-eye re-issue never ran once.
+    // It is 109 where the stereo source is 111 -- both 2560x1440, different objects, both
+    // views onto one framebuffer. An identity test written against the source ignored that,
+    // so the first version of this branch declined on every call.
     //
-    // Both are views onto the same framebuffer, so what actually matters is whether this
-    // destination spans the WHOLE side-by-side buffer rather than whether it is the same
-    // handle the eyes were carved from. Size answers that, and size is also immune to the
-    // handle recycling that caught this function out a build ago: 0x6F was the render
-    // surface during a race and a 38x22 scrap in the menu afterwards.
-    int fullWidth = bitmapWidth(dest);
-    int fullHeight = bitmapHeight(dest);
-    void* source = stereoSourceSurface();
-    bool spansTheBuffer = fullWidth > 0 && source && fullWidth == bitmapWidth(source) &&
-                          fullHeight == bitmapHeight(source);
+    // The size test against stereoSourceSurface() that replaced it then declined on every call
+    // once the world moved off-screen, and that too was correct: the eyes were no longer
+    // sub-rects of GPL's destination, so a re-issue had nowhere to put anything. See
+    // destinationCanSplit.
+    int fullWidth = 0;
+    int fullHeight = 0;
+    bool canSplit = destinationCanSplit(dest, fullWidth, fullHeight);
 
     // One record per call GPL makes, before any re-issue; flushed by hudEndFrame.
     ++g_frameStampCalls;
     recordStamp(a1, fullWidth, fullHeight, a2, a3, a4, a5);
 
-    if (!left || !right || !spansTheBuffer || !stereoEyeRect(0, rect[0]) ||
+    if (!left || !right || !canSplit || !stereoEyeRect(0, rect[0]) ||
         !stereoEyeRect(1, rect[1])) {
         // Once per distinct destination, so a pass-through that should have been a split
         // says so instead of being silent. Five rounds of this were lost to a branch that
         // declined without comment.
         if (firstSightOf(dest)) {
-            logf("hud: stampDraw to surface %d (%dx%d) passed through UNCHANGED -- the "
-                 "stereo source is %p (%dx%d), eyes %p/%p. A destination that spans the "
-                 "whole buffer is what gets split; this one did not qualify.",
-                 a1, fullWidth, fullHeight, source, bitmapWidth(source),
-                 bitmapHeight(source), left, right);
+            void* source = stereoSourceSurface();
+            logf("hud: stampDraw to surface %d (%dx%d) passed through UNCHANGED -- the stereo "
+                 "source is %p (%dx%d), eyes %p/%p. Only a destination the eyes were carved "
+                 "out of can be split; while the world renders off-screen none is, and GPL's "
+                 "2D stays where GPL put it.",
+                 a1, fullWidth, fullHeight, source, bitmapWidth(source), bitmapHeight(source),
+                 left, right);
         }
         g_stampDrawOriginal(a1, a2, a3, a4, a5);
         return;
@@ -676,12 +906,14 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
     int x = remapAnchor(a2, fullWidth);
     int y = a3;
 
+    scaleToEye(x, y, fullWidth, fullHeight, eyeWidth, eyeHeight);
+
     // Toward the middle of the eye, both axes, about its centre.
     if (eyeWidth > 0 && eyeHeight > 0) {
         float halfX = static_cast<float>(eyeWidth) * 0.5f;
         float halfY = static_cast<float>(eyeHeight) * 0.5f;
-        x = static_cast<int>(halfX + (static_cast<float>(x) - halfX) * kHudInset);
-        y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * kHudInset);
+        x = static_cast<int>(halfX + (static_cast<float>(x) - halfX) * hudInset());
+        y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * hudInset());
     }
 
     int disparity = disparityPixels(eyeWidth);
@@ -707,7 +939,7 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
              "becomes (%d,%d) in a %dx%d eye after the anchor remap and a %.2f inset, "
              "separated by %d px (clamped from %d) for vrHudDepth = %.2f. The headset's "
              "copy of this frame was %s.",
-             a2, a3, fullWidth, x, y, eyeWidth, eyeHeight, kHudInset, half * 2, disparity,
+             a2, a3, fullWidth, x, y, eyeWidth, eyeHeight, hudInset(), half * 2, disparity,
              g_options.vrHudDepth,
              frameAlreadyPublished()
                  ? "ALREADY TAKEN -- these pixels reach the monitor and never the eyes"
@@ -722,6 +954,8 @@ void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
 
 int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     ++g_bitmapDrawCount;
+    // Anything the fast text path still has batched goes down first -- see censusEnter.
+    fastTextFlushNow();
 
     if (g_bitmapDrawReports > 0) {
         bool known = false;
@@ -741,17 +975,147 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
 
     // gpl_sceneRender's mirror copy-out is bitmapDraw(mirror.mip's bitmap, 0, 0, mirror
     // camera surface): roglv2 binds the FIRST argument's texture and reads the FOURTH's
-    // pixels, the reverse of the names above. The +Y mirror pane's image belongs in the right
-    // half of the texture, so its copy is moved there; roglv2 copies the read surface's own
-    // width, so exactly that half is written.
-    x = stereoMirrorCopy(source, dest, x);
+    // pixels, the reverse of the names above. Each mirror pane's image belongs in the region of
+    // mirror.mip its glass's UVs read, so both coordinates are rewritten here. roglv2 copies the
+    // read surface's own width and height, so exactly that rect is written.
+    stereoMirrorCopy(source, dest, x, y);
 
-    return g_bitmapDrawOriginal ? g_bitmapDrawOriginal(source, x, y, dest) : 0;
+    if (!g_bitmapDrawOriginal) return 0;
+
+    // GPL'S REPLAY BANDS GO TO THE REPLAY PANEL, at the coordinates GPL gave them. The button art
+    // is drawn into the panel's layer and shown on a quad of its own; see ReplayPanel.h. Only a
+    // destination roglv2 draws through the framebuffer -- the mirror copy-out writes a texture.
+    // The batch is opened first, so the polygons GPL queued before this call are flushed into the
+    // frame they belong to rather than into the layer.
+    if (replayPanelCapturing()) {
+        int   originX = 0;
+        int   originY = 0;
+        int   surfaceWidth = 0;
+        int   surfaceHeight = 0;
+        bool  framebuffer = false;
+        void* art = reinterpret_cast<void*>(static_cast<intptr_t>(dest));
+        bool  known = fastTextSurfaceInfo(source, originX, originY, surfaceWidth,
+                                          surfaceHeight, framebuffer);
+        int   artWidth = bitmapWidth(art);
+        int   artHeight = bitmapHeight(art);
+        bool  taken = known && framebuffer &&
+                     replayPanelTakes(originX + x, originY + y, artWidth, artHeight);
+        char  detail[96];
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                    "destination %d, %s, %dx%d at %d,%d in its root; art %d", source,
+                    !known ? "UNREADABLE" : (framebuffer ? "framebuffer" : "NOT the framebuffer"),
+                    surfaceWidth, surfaceHeight, originX, originY, dest);
+        replayPanelNoteDraw("bitmapDraw", originX + x, originY + y, artWidth, artHeight, taken,
+                            detail);
+        if (taken) {
+            fastTextOpenRasterBatch();
+            ReplayPanelTarget target;
+            return g_bitmapDrawOriginal(source, x, y, dest);
+        }
+    }
+
+    // GPL'S 2D ART, ONCE PER EYE -- the same treatment the stamp path gives its text.
+    //
+    // This path had no per-eye branch at all, which is why GPL's bitmap 2D stayed in window
+    // coordinates even when the text was relocated: the replay control band is drawn here,
+    // and its labels are drawn by stampDraw, so the two halves of one widget band went to
+    // different places. The destination is an ARGUMENT, so the re-issue needs nothing the
+    // stamp path does not already do.
+    //
+    // The front-end test comes first for the reason recorded in stampDrawThunk: leaving a
+    // race never clears a cached surface handle, and bitmapWidth on a freed one is a null
+    // dereference rather than a zero.
+    // THE FIRST ARGUMENT IS THE DESTINATION, not the fourth.
+    //
+    // roglv2 binds a1's texture and reads a4's pixels, so a1 is where the pixels land -- which
+    // is why stereoMirrorCopy above takes a1 as `writeBitmap` and rewrites it. The parameter
+    // names here came from the C signature rather than from roglv2 and are backwards. Testing
+    // a4 measured the surface being READ: for the mirror copy-out that is a 256x512 pane, which
+    // is why this branch reported "not the engine's own frame" for every mirror copy and
+    // declined the one case it exists for.
+    //
+    // Read after stereoMirrorCopy, which may have redirected it.
+    void* destSurface = reinterpret_cast<void*>(static_cast<intptr_t>(source));
+    int   fullWidth = 0;
+    int   fullHeight = 0;
+    int   rect[2][4];
+    void* left = stereoEyeSurface(0);
+    void* right = stereoEyeSurface(1);
+
+    // EVERY TERM NAMES ITSELF. A split that declines without saying why reads exactly like one
+    // that was never needed, and the replay control band spent a build looking like a placement
+    // problem because this branch was silent.
+    const char* refusal = nullptr;
+    if (windowInFrontEnd())
+        refusal = "the engine is in the front end";
+    else if (!left || !right)
+        refusal = "there are no eye surfaces";
+    else if (!destinationCanSplit(destSurface, fullWidth, fullHeight))
+        refusal = "the eyes are not carved out of this destination, so a per-eye re-issue has "
+                  "nowhere to put anything -- either a different surface size from the stereo "
+                  "source, or the window's back buffer";
+    else if (!stereoEyeRect(0, rect[0]) || !stereoEyeRect(1, rect[1]))
+        refusal = "there are no eye rects this frame";
+
+    if (refusal) {
+        if (g_bitmapRefuseReports > 0 && !knownRefusal(dest)) {
+            --g_bitmapRefuseReports;
+            int modeWidth = 0;
+            int modeHeight = 0;
+            windowEngineModeSize(modeWidth, modeHeight);
+            logf("hud: bitmapDraw to destination %d (%dx%d) was NOT split -- %s. The engine's "
+                 "mode is %dx%d and the eyes are %p/%p. A destination that is the engine's own "
+                 "frame is what gets split.",
+                 dest, fullWidth, fullHeight, refusal, modeWidth, modeHeight, left, right);
+        }
+        return g_bitmapDrawOriginal(source, x, y, dest);
+    }
+
+    int eyeWidth = rect[0][2];
+    int eyeHeight = rect[0][3];
+
+    int outX = remapAnchor(x, fullWidth);
+    int outY = y;
+    scaleToEye(outX, outY, fullWidth, fullHeight, eyeWidth, eyeHeight);
+    if (eyeWidth > 0 && eyeHeight > 0) {
+        float halfX = static_cast<float>(eyeWidth) * 0.5f;
+        float halfY = static_cast<float>(eyeHeight) * 0.5f;
+        outX = static_cast<int>(halfX + (static_cast<float>(outX) - halfX) * hudInset());
+        outY = static_cast<int>(halfY + (static_cast<float>(outY) - halfY) * hudInset());
+    }
+
+    int disparity = disparityPixels(eyeWidth);
+    int half = disparity / 2;
+    if (eyeWidth > 0) {
+        if (outX - half < 0) half = outX;
+        if (outX + half > eyeWidth - 1) half = eyeWidth - 1 - outX;
+        if (half < 0) half = 0;
+    }
+
+    ++g_bitmapSplitCount;
+    if (g_bitmapSplitReports > 0) {
+        --g_bitmapSplitReports;
+        logf("hud: bitmapDraw split once per eye -- source %d at (%d,%d) on a %dx%d engine "
+             "frame becomes (%d,%d) in a %dx%d eye, separated by %d px. Split %d of the %d "
+             "bitmapDraw calls so far.",
+             source, x, y, fullWidth, fullHeight, outX, outY, eyeWidth, eyeHeight, half * 2,
+             g_bitmapSplitCount, g_bitmapDrawCount);
+    }
+
+    // The EYE goes in the first argument, which is the one the pixels land in, and `dest` keeps
+    // the surface being read. Swapping these drew each eye's image into the art instead of the
+    // art into each eye.
+    g_bitmapDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)), outX + half, outY,
+                         dest);
+    return g_bitmapDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(right)),
+                                outX - half, outY, dest);
 }
 
 void __cdecl drawDebugTextThunk(void* surface, unsigned colour, int x, int y,
                                 const char* text, int background) {
     frameBudgetHudText();
+    // Anything the fast text path still has batched goes down first -- see censusEnter.
+    fastTextFlushNow();
     Call call;
     call.surface = surface;
     call.colour = colour;
@@ -766,6 +1130,14 @@ void __cdecl drawDebugTextThunk(void* surface, unsigned colour, int x, int y,
         size_t length = strnlen(text, kMaxText - 1);
         memcpy(call.text, text, length);
         call.text[length] = 0;
+    }
+
+    // An empty string is rasterFlushPending's own call, not GPL's.
+    if (call.text[0] && replayPanelCapturing()) {
+        char detail[96];
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "\"%s\" on a %dx%d surface", call.text,
+                    bitmapWidth(surface), bitmapHeight(surface));
+        replayPanelNoteDraw("drawDebugText", x, y, 0, 0, false, detail);
     }
 
     if (!g_replaying) {
@@ -787,6 +1159,7 @@ void __cdecl drawDebugTextThunk(void* surface, unsigned colour, int x, int y,
 void hudBind(const Binding& binding) {
     g_bitmapWidthSlot = binding.raster.bitmapWidth;
     g_bitmapHeightSlot = binding.raster.bitmapHeight;
+    g_backBufferSlot = binding.raster.screenGetBackBuffer;
 
     g_slot = rasterGlobal(binding.image, "drawDebugText");
     if (!g_slot || !*g_slot) {
@@ -845,8 +1218,15 @@ void hudBind(const Binding& binding) {
          "drawDebugText, bitmapDraw and stampDraw are silent for a whole race, so it is "
          "one of these or it is 3D geometry.");
 
-    g_stampDrawSlot = rasterGlobal(binding.image, "stampDraw");
-    if (g_stampDrawSlot && *g_stampDrawSlot) {
+    if (stampsBelongToFastText()) {
+        logf("hud: stampDraw is NOT thunked here -- vrGplText = 1, so the fast text path owns "
+             "that global and draws GPL's glyphs from its own atlas, once per eye, where "
+             "vrGplTextScale and vrGplTextInset put them. This file's own stamp census and its "
+             "string reconstruction go with it; the `fast text:` lines carry both. The other "
+             "thunks here flush that path's pending batch before they draw, which is the "
+             "ordering the six globals it gives up were holding.");
+    } else if ((g_stampDrawSlot = rasterGlobal(binding.image, "stampDraw")) != nullptr &&
+               *g_stampDrawSlot) {
         g_stampDrawOriginal = reinterpret_cast<StampDrawFn>(*g_stampDrawSlot);
         void* census = reinterpret_cast<void*>(&stampDrawThunk);
         if (patchBytes(g_stampDrawSlot, &census, sizeof(census))) {
@@ -945,6 +1325,10 @@ void hudBeginFrame() {
         g_seenDestCount = 0;
         g_bitmapDrawReports = 12;
         g_bitmapDrawHighWater = 0;
+        g_bitmapSplitCount = 0;
+        g_bitmapSplitReports = 4;
+        g_refusedDestCount = 0;
+        g_bitmapRefuseReports = 8;
         g_stampReports = 12;
         g_stampHighWater = 0;
         for (int i = 0; i < kCensusCount; ++i) {

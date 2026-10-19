@@ -5,6 +5,8 @@
 #include "Log.h"
 #include "Pe.h"
 #include "PostProfile.h"
+#include "ReplayPanel.h"
+#include "Stereo.h"
 #include "Window.h"
 #include "fast_text/TextDraw.h"
 
@@ -13,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -59,6 +62,13 @@ constexpr unsigned kGlyphStride = 16;
 constexpr unsigned kGlyphBitmap = 0x00;
 constexpr unsigned kGlyphOriginX = 0x08;
 constexpr unsigned kGlyphOriginY = 0x0C;
+
+// A set without a palette of its own skips the recolour in rogl_fontBlitGlyph, so its glyphs are
+// drawn in the glyph bitmap's own colormap: rogl_blitSysToGl_drawPixels takes it through the
+// bitmap's vtable slot 3, which writes {16 dwords 0xAARRGGBB, reference count} and adds a
+// reference. The classes keep it at different offsets (BitmapMemory 0x2005FE74 at +0x38,
+// BitmapInstance 0x2006029C at +0x3C), so it is asked for through the slot.
+constexpr unsigned kBitmapVtableColormap = 0x0C;
 
 // PolyDrawerZBuffer +184 is the DisplayOpenGL; the display's +0x0C/+0x10 are the width and
 // height the ortho is built from and +0x24/+0x28 the destination origin it was last given
@@ -109,9 +119,59 @@ constexpr uint32_t kAlphaScaleBits = 0x3B888889u;
 constexpr size_t kMaxCachedGlyphs = 4096;
 constexpr size_t kMaxBatchQuads = 2048;
 
+// -- GPL'S TEXT, PLACED IN THE EYES (VR only, vrGplText = 1) --------------------------------
+//
+// A RUN IS THE UNIT THAT MOVES, not a glyph and not the surface.
+//
+// GPL anchors its notices to the corners of its 2560x1440 layout -- "PRESS F1 FOR HELP" at
+// (5, 143), "PRESS PAUSE TO RESUME" at (2, 1310) -- so anything that scales the LAYOUT drives
+// those corners further into the periphery, which is the opposite of what is wanted. Scaling a
+// run about its own centre and then moving that centre keeps the spacing GPL authored inside
+// the line and puts the line where it can be read.
+//
+// A run's extent is only known once it has ended, and its first glyph has to be placed before
+// that. So the extent comes from the FRAME BEFORE: a run is recognised across frames by its
+// stamp set and the BASELINE GPL ASKED FOR, both of which hold still while the text changes,
+// and a run seen for the first time is placed by its own first glyph and counted. GPL's
+// destination handles are recycled every frame -- the message band is a fresh 2540x15 instance
+// each time -- so the handle cannot be part of the key.
+//
+// THE BASELINE, NOT THE ROW THE GLYPH LANDS ON. roglv2 takes the glyph's own hot spot off the
+// y before it rasterises, and a hot spot belongs to the glyph: keying on the result cut one
+// line into a run for every distinct bearing in it, each of those was centred on the two or
+// three letters that happened to share a bearing, and the inset then pulled those centres
+// together until the letters of one word sat on top of each other. GPL's `y` is the line.
+constexpr int kMaxPlacedRuns = 32;
+
+struct PlacedRun {
+    int  set = 0;
+    int  row = 0;  // the baseline GPL passed, in its own layout space
+    bool known = false;
+    int  lastMinX = 0;  // the previous frame's extent, which is what places this frame
+    int  lastMaxX = 0;
+    int  minX = 0;  // this frame's, accumulating
+    int  maxX = 0;
+    // The rows the run's glyphs cover, relative to its baseline: this frame's, accumulating, and
+    // the previous frame's, which is what separateRuns stacks.
+    int  top = 0;
+    int  bottom = 0;
+    int  lastTop = 0;
+    int  lastBottom = 0;
+    // Eye pixels added to the run's placed row so it clears every run above it.
+    float pushY = 0.0f;
+    bool seenThisFrame = false;
+};
+
 typedef int(__cdecl* RasterFn)(int, int, int, int, int, int, int, int);
 typedef int(__thiscall* PixelLockFn)(void* self);
 typedef int(__fastcall* DrawerSlotFn)(void* self, void* argument);
+
+// What a bitmap's colormap slot writes: the entries and the shared reference count.
+struct ColormapRef {
+    uint32_t* entries;
+    long*     references;
+};
+typedef void(__thiscall* ColormapFn)(void* self, ColormapRef* out);
 
 // What one stamp needs, read out of roglv2's objects in one guarded block.
 struct StampSource {
@@ -135,6 +195,13 @@ struct StampSource {
     int      hotY;
     uint32_t colour;
     int      hasPalette;
+    // The glyph bitmap's own colormap, read only for a set without a palette.
+    uint32_t glyphColormap[16];
+    // Which of readStamp's checks refused, in words, or null when it read the whole stamp. For a
+    // block that failed `readable`, the block it asked about.
+    const char* refusal;
+    const void* refusedAt;
+    size_t      refusedBytes;
 };
 
 // One frame a second is sampled for WHAT is being stamped, because the cost only matters if it
@@ -142,10 +209,19 @@ struct StampSource {
 // stamp text at spa67 to be GPL's "PRESS PAUSE TO RESUME", so a line naming the runs is what
 // separates "the HUD costs 5.78 ms" from "the pause message costs 5.78 ms". A glyph joins the
 // run before it when the destination, the set and the row match and it sits a little to the
-// right; the code is printed as a character when it is printable, which these fonts' codes are
-// (a set with a sub-pixel phase adds 0..3 to it).
+// right.
+//
+// A CODE IS NOT A CHARACTER. gpl_fontGlyphIndex (0x4EDC80) looks the character up in the font's
+// own STL map, so the index is font data with no formula behind it, and the sets behind the
+// in-race notices come through as 0, 14, 17, 48 for ' ', '.', '1', 'P'. A code outside printable
+// ASCII is therefore escaped with its raw value rather than collapsed to one character, which is
+// what lets this line serve as the inventory of what GPL stamps: a set nobody has decoded yet
+// still arrives as readable numbers. With `vrGplText = 1` it is the ONLY such inventory, because
+// Hud.cpp's own census is not installed then.
 constexpr int kMaxSampleRuns = 4;
 constexpr int kMaxSampleChars = 40;
+// Room for every sampled code to arrive as "<255>".
+constexpr int kMaxSampleBytes = kMaxSampleChars * 5;
 
 struct SampleRun {
     int  dest = 0;
@@ -153,8 +229,9 @@ struct SampleRun {
     int  x = 0;
     int  y = 0;
     int  lastX = 0;
-    int  length = 0;
-    char text[kMaxSampleChars + 1] = {};
+    int  length = 0;  // codes recorded, which is not the number of bytes `text` holds
+    int  used = 0;
+    char text[kMaxSampleBytes + 1] = {};
 };
 
 // What became of one stamp. A kind of stamp is a stamp set plus an outcome, and one of each is
@@ -180,7 +257,9 @@ const char* const kOutcomeNames[kOutcomes] = {
     // the outcomes keep their numbers, which the probe records carry.
     "(no longer used)",  "unreadable",
     "destination is not the GL framebuffer",
-    "the set carries no palette",
+    // Unreachable since 2026-10-17: a set without a palette is drawn in the glyph bitmap's own
+    // colormap. The slot stays for the same reason as the one above.
+    "(no longer used)",
     "the glyph is not an 8-bit colour-index image",
     "no GL",             "the atlas is full",
 };
@@ -239,13 +318,25 @@ struct Counters {
     unsigned cacheMisses = 0;
     unsigned clippedAway = 0;
     unsigned fellBackDestination = 0;
-    unsigned fellBackNoPalette = 0;
+    unsigned glyphColormaps = 0;  // drawn in the glyph bitmap's own colormap, set without palette
     unsigned fellBackFormat = 0;
     unsigned fellBackUnreadable = 0;
     unsigned fellBackAtlasFull = 0;
     unsigned fellBackNoGl = 0;
     unsigned frames = 0;
     long long cpuTicks = 0;
+
+    // The VR placement's own tally. EVERY TERM THAT CAN DECLINE HAS ONE: a glyph drawn where
+    // GPL put it and a glyph placed in the eyes look identical from a counter that only says
+    // "drawn", and this path exists to move them.
+    unsigned placedPairs = 0;      // glyphs drawn once per eye at a chosen place
+    unsigned placeNoEyeRects = 0;  // no stereo pair this frame
+    unsigned placeFrontEnd = 0;    // the engine is in the front end; GPL's layout is left alone
+    unsigned placeNoLayout = 0;    // the engine's mode size is not known yet
+    unsigned placeOffLayout = 0;   // the destination is not part of GPL's own 2D frame
+    unsigned placeFirstSight = 0;  // a run with no extent yet, placed by its first glyph
+    unsigned placeOutsideEye = 0;  // scaled past the eye's own rect, so dropped rather than bled
+    unsigned placeRunTableFull = 0;
 };
 
 // How long the install is allowed to keep trying. The slots are resolved at discovery, but the
@@ -284,11 +375,37 @@ struct State {
     StampProbe               probes[kMaxProbes];
     int                      probeCount = 0;
     bool                     sampling = true;
+    bool                     wantSample = false;
 
     Counters                 window;
     fasttext::DrawStats      drawStats;
     bool                     loggedScale = false;
     int                      reportsLeft = 6;
+
+    // Which of the seven 2D globals this path holds. In flat mode it is all of them; in VR it
+    // is stampDraw alone, because Hud.cpp needs bitmapDraw for the mirror panes' copy offset
+    // and the two cannot both re-assert over one slot -- each would adopt the other's thunk as
+    // "the original" and the chain would call itself.
+    bool  owns[kRasterKinds] = {};
+    bool  vrPlacement = false;  // vr and vrGplText, decided once at bind
+    int   placeReports = 4;
+
+    PlacedRun runs[kMaxPlacedRuns];
+    int       runCount = 0;
+    int       runsPushed = 0;  // runs separateRuns moved, as of the last frame
+
+    // The pending quads belong in the replay panel's layer rather than in the frame. One batch
+    // never mixes the two: a glyph for the other side flushes first.
+    bool batchToPanel = false;
+
+    // Each distinct (set, refusal) readStamp has given, so each is logged once with what had
+    // been read before it refused.
+    struct UnreadableSeen {
+        int         set;
+        const char* refusal;
+    };
+    UnreadableSeen unreadableSeen[16] = {};
+    int            unreadableSeenCount = 0;
 };
 
 State g_state;
@@ -462,18 +579,66 @@ bool clipToBitmap(int destWidth, int destHeight, int& x, int& y, int& width, int
 // sit under a structured exception handler. roglv2 checks none of these handles itself, and a
 // stamp against a surface whose table slot has been freed has taken this game down before
 // (Hud.cpp, 2026-09-12).
+bool canRead(StampSource& out, const void* address, size_t bytes, const char* refusal) {
+    if (address && readable(address, bytes)) return true;
+    out.refusal = refusal;
+    out.refusedAt = address;
+    out.refusedBytes = bytes;
+    return false;
+}
+
+// The glyph bitmap's colormap, taken the way rogl_blitSysToGl_drawPixels takes it. Only an 8-bit
+// glyph has one to take; any other format is refused later by its own check. Called inside
+// readStamp's guarded block.
+bool readGlyphColormap(StampSource& out) {
+    if (out.glyphFormat < 0 || out.glyphFormat > 2) return true;
+    uint8_t* vtable = readPointer(out.glyph, 0);
+    if (!canRead(out, vtable, kBitmapVtableColormap + 4,
+                 "the glyph bitmap's vtable cannot be read"))
+        return false;
+    auto colormap = reinterpret_cast<ColormapFn>(readPointer(vtable, kBitmapVtableColormap));
+    uint8_t* code = reinterpret_cast<uint8_t*>(colormap);
+    if (!g_state.roglBase || code < g_state.roglBase || code >= g_state.roglBase + kModuleWindow) {
+        out.refusal = "the glyph bitmap's colormap slot is not roglv2 code";
+        out.refusedAt = code;
+        return false;
+    }
+    ColormapRef ref = {};
+    colormap(out.glyph, &ref);
+    // The slot added a reference. The bitmap keeps its own, so dropping ours never frees.
+    if (ref.references && *ref.references > 1) --*ref.references;
+    if (!canRead(out, ref.entries, sizeof(out.glyphColormap),
+                 ref.entries ? "the glyph bitmap's colormap cannot be read"
+                             : "neither the set nor the glyph bitmap has a palette"))
+        return false;
+    std::memcpy(out.glyphColormap, ref.entries, sizeof(out.glyphColormap));
+    return true;
+}
+
 bool readStamp(int handle, int set, int glyph, StampSource& out) {
     State& s = g_state;
     std::memset(&out, 0, sizeof(out));
-    if (handle <= 0 || set < 0 || glyph < 0) return false;
-    if (!s.handleTable || !s.stampSetManager) return false;
+    if (handle <= 0 || set < 0 || glyph < 0) {
+        out.refusal = "a negative or zero handle, set or glyph";
+        return false;
+    }
+    if (!s.handleTable || !s.stampSetManager) {
+        out.refusal = "roglv2's handle table or stamp set manager is not located";
+        return false;
+    }
     __try {
         uint8_t* table = *s.handleTable;
-        if (!table || !readable(table, 12)) return false;
+        if (!canRead(out, table, 12, "the handle table cannot be read")) return false;
         uint8_t* entries = readPointer(table, 8);
-        if (!entries || !readable(entries + 8 * static_cast<unsigned>(handle), 8)) return false;
+        if (!entries) {
+            out.refusal = "the handle table has no entries";
+            return false;
+        }
+        if (!canRead(out, entries + 8 * static_cast<unsigned>(handle), 8,
+                     "the destination's handle-table entry cannot be read"))
+            return false;
         out.dest = readPointer(entries, 8 * static_cast<unsigned>(handle));
-        if (!out.dest || !readable(out.dest, 0x2C)) return false;
+        if (!canRead(out, out.dest, 0x2C, "the destination bitmap cannot be read")) return false;
         out.destWidth = readInt(out.dest, kBitmapWidth);
         out.destHeight = readInt(out.dest, kBitmapHeight);
         out.destClass = readInt(out.dest, kBitmapClass);
@@ -481,41 +646,74 @@ bool readStamp(int handle, int set, int glyph, StampSource& out) {
         out.destOriginY = readInt(out.dest, kBitmapOriginY);
 
         uint8_t* manager = *s.stampSetManager;
-        if (!manager || !readable(manager, 12)) return false;
+        if (!canRead(out, manager, 12, "the stamp set manager cannot be read")) return false;
         uint8_t* sets = readPointer(manager, 8);
-        if (!sets || !readable(sets + 8 * static_cast<unsigned>(set), 8)) return false;
+        if (!sets) {
+            out.refusal = "the stamp set manager has no sets";
+            return false;
+        }
+        if (!canRead(out, sets + 8 * static_cast<unsigned>(set), 8,
+                     "the set's entry in the manager cannot be read"))
+            return false;
         uint8_t* setObject = readPointer(sets, 8 * static_cast<unsigned>(set));
-        if (!setObject || !readable(setObject, 0x44)) return false;
+        if (!canRead(out, setObject, 0x44, "the stamp set object cannot be read")) return false;
         out.set = setObject;
         out.hasPalette = readPointer(setObject, kSetPalette) != nullptr ? 1 : 0;
-        uint8_t* holder = readPointer(setObject, kSetColourHolder);
-        if (!holder || !readable(holder, kColourInHolder + 4)) return false;
-        out.colour = static_cast<uint32_t>(readInt(holder, kColourInHolder));
+        // rogl_fontBlitGlyph reads the colour only for a set with a palette; the sets without one
+        // (6, 2 and 9 in the 2026-10-16 logs) have no colour holder at all.
+        if (out.hasPalette) {
+            uint8_t* holder = readPointer(setObject, kSetColourHolder);
+            if (!canRead(out, holder, kColourInHolder + 4,
+                         holder ? "the set's colour holder cannot be read"
+                                : "the set has a palette and no colour holder"))
+                return false;
+            out.colour = static_cast<uint32_t>(readInt(holder, kColourInHolder));
+        }
 
         uint8_t* records = readPointer(setObject, kSetGlyphs);
-        if (!records) return false;
+        if (!records) {
+            out.refusal = "the set has no glyph records";
+            return false;
+        }
         uint8_t* record = records + kGlyphStride * static_cast<unsigned>(glyph);
-        if (!readable(record, kGlyphStride)) return false;
+        if (!canRead(out, record, kGlyphStride, "the glyph's record cannot be read"))
+            return false;
         out.hotX = readInt(record, kGlyphOriginX);
         out.hotY = readInt(record, kGlyphOriginY);
         out.glyph = readPointer(record, kGlyphBitmap);
-        if (!out.glyph || !readable(out.glyph, 0x2C)) return false;
+        if (!canRead(out, out.glyph, 0x2C,
+                     out.glyph ? "the glyph's bitmap cannot be read"
+                               : "the glyph record has no bitmap"))
+            return false;
         out.glyphWidth = readInt(out.glyph, kBitmapWidth);
         out.glyphHeight = readInt(out.glyph, kBitmapHeight);
         out.glyphFormat = readInt(out.glyph, kBitmapFormat);
         out.glyphOriginX = readInt(out.glyph, kBitmapOriginX);
         out.glyphOriginY = readInt(out.glyph, kBitmapOriginY);
         out.pixels = readPointer(out.glyph, kBitmapPixels);
-        if (!out.pixels || !readable(out.pixels, 0x20)) return false;
+        if (!canRead(out, out.pixels, 0x20,
+                     out.pixels ? "the glyph's pixel buffer cannot be read"
+                                : "the glyph bitmap has no pixel buffer"))
+            return false;
         out.pitch = readInt(out.pixels, kPixelsPitch);
         out.rowLength = readInt(out.pixels, kPixelsRowLength);
+        if (!out.hasPalette && !readGlyphColormap(out)) return false;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out.refusal = "a read faulted";
         return false;
     }
-    if (out.glyphWidth <= 0 || out.glyphHeight <= 0) return false;
-    if (out.glyphWidth > fasttext::kMaxGlyphSide || out.glyphHeight > fasttext::kMaxGlyphSide)
+    if (out.glyphWidth <= 0 || out.glyphHeight <= 0) {
+        out.refusal = "the glyph bitmap has no area";
         return false;
-    if (out.pitch <= 0) return false;
+    }
+    if (out.glyphWidth > fasttext::kMaxGlyphSide || out.glyphHeight > fasttext::kMaxGlyphSide) {
+        out.refusal = "the glyph is larger than the atlas takes";
+        return false;
+    }
+    if (out.pitch <= 0) {
+        out.refusal = "the pixel buffer's pitch is not positive";
+        return false;
+    }
     return true;
 }
 
@@ -610,7 +808,14 @@ void flushPending() {
         float screen[16];
         screenMatrix(width, height, readInt(display, kDisplayOriginX),
                      readInt(display, kDisplayOriginY), screen);
-        s.draw.draw(screen, s.drawStats);
+        if (s.batchToPanel) {
+            // The same quads under the same transform, into the panel's layer instead; if it
+            // cannot be bound they land where GPL put them, which is where they always did.
+            ReplayPanelTarget target;
+            s.draw.draw(screen, s.drawStats);
+        } else {
+            s.draw.draw(screen, s.drawStats);
+        }
     }
 }
 
@@ -700,11 +905,17 @@ void sampleStamp(int handle, int x, int y, int set, int glyph) {
         run->y = y;
     }
     run->lastX = x;
-    if (run->length < kMaxSampleChars) {
-        run->text[run->length++] =
-            (glyph >= 32 && glyph < 127) ? static_cast<char>(glyph) : '?';
-        run->text[run->length] = 0;
-    }
+    if (run->length >= kMaxSampleChars) return;
+    ++run->length;
+    size_t room = static_cast<size_t>(kMaxSampleBytes - run->used);
+    int written = 0;
+    if (glyph >= 32 && glyph < 127)
+        written = std::snprintf(run->text + run->used, room, "%c", static_cast<char>(glyph));
+    else
+        written = std::snprintf(run->text + run->used, room, "<%d>", glyph);
+    if (written < 0 || static_cast<size_t>(written) >= room) return;
+    run->used += written;
+    run->text[run->used] = 0;
 }
 
 // One of each kind of stamp a second, described in full. `source` may be all zeroes when the
@@ -760,6 +971,376 @@ void noteProbeQuad(int set, int outcome, float v0, float v1) {
 }
 
 // One stampDraw call. True when we drew it (or when roglv2 would have drawn nothing).
+// -- THE VR PLACEMENT ------------------------------------------------------------------------
+//
+// Everything below is reached only with `vr` and `vrGplText = 1`. Flat mode runs the original
+// path untouched, and so does the front end, every menu and every frame with no stereo pair --
+// which is what keeps the shared code above exercised in the mode this project has four times
+// found a VR-only gate hiding a bug in.
+
+PlacedRun* findRun(int set, int row) {
+    State& s = g_state;
+    for (int i = 0; i < s.runCount; ++i) {
+        PlacedRun& run = s.runs[i];
+        if (run.set == set && run.row == row) return &run;
+    }
+    if (s.runCount >= kMaxPlacedRuns) {
+        ++s.window.placeRunTableFull;
+        return nullptr;
+    }
+    PlacedRun& run = s.runs[s.runCount++];
+    run = PlacedRun{};
+    run.set = set;
+    run.row = row;
+    return &run;
+}
+
+// The previous frame's extent becomes this frame's placement, and this frame starts a new one.
+// From fastTextEndFrame, once a frame, after everything has been drawn.
+void rollRuns() {
+    State& s = g_state;
+    int kept = 0;
+    for (int i = 0; i < s.runCount; ++i) {
+        PlacedRun& run = s.runs[i];
+        // A run nobody stamped this frame is dropped rather than kept with a stale extent: the
+        // notices come and go, and a row that comes back is a new string.
+        if (!run.seenThisFrame) continue;
+        run.lastMinX = run.minX;
+        run.lastMaxX = run.maxX;
+        run.lastTop = run.top;
+        run.lastBottom = run.bottom;
+        run.known = true;
+        run.seenThisFrame = false;
+        run.minX = 0;
+        run.maxX = 0;
+        run.top = 0;
+        run.bottom = 0;
+        if (kept != i) s.runs[kept] = run;
+        ++kept;
+    }
+    s.runCount = kept;
+}
+
+// THE INSET MOVES LINES TOGETHER WHILE THE SCALE MAKES THEM TALLER. Two of GPL's notices a line
+// apart end up a quarter of a line apart at twice the height, one over the other. So the runs are
+// laid out the way placeInEyes will put them -- the previous frame's extents, scaled about the
+// run's centre, at the inset row -- and walked in GPL's own top-to-bottom order, each one moved
+// down until it clears every run above it that it shares columns with. GPL's order survives;
+// only the spacing the inset took away is given back, and only where it was needed.
+//
+// Right after rollRuns, so the push is ready for the next frame's first glyph of each run.
+void separateRuns() {
+    State& s = g_state;
+    s.runsPushed = 0;
+    int layoutWidth = 0;
+    int layoutHeight = 0;
+    windowEngineModeSize(layoutWidth, layoutHeight);
+    if (layoutWidth <= 0 || layoutHeight <= 0) return;
+
+    float scale = static_cast<float>(g_options.vrGplTextScale);
+    float inset = g_options.vrGplTextInset;
+    // A clear row between stacked lines, at the glyphs' own scale.
+    float gap = scale;
+
+    int order[kMaxPlacedRuns];
+    int count = 0;
+    for (int i = 0; i < s.runCount; ++i) {
+        // Insertion by row, then set, so the walk is GPL's top-to-bottom order and repeatable.
+        int at = count++;
+        while (at > 0) {
+            const PlacedRun& before = s.runs[order[at - 1]];
+            const PlacedRun& run = s.runs[i];
+            if (before.row < run.row || (before.row == run.row && before.set <= run.set)) break;
+            order[at] = order[at - 1];
+            --at;
+        }
+        order[at] = i;
+    }
+
+    float left[kMaxPlacedRuns];
+    float right[kMaxPlacedRuns];
+    float top[kMaxPlacedRuns];
+    float bottom[kMaxPlacedRuns];
+    for (int k = 0; k < count; ++k) {
+        PlacedRun& run = s.runs[order[k]];
+        float centreX = 0.5f * static_cast<float>(run.lastMinX + run.lastMaxX);
+        float halfWidth = 0.5f * static_cast<float>(run.lastMaxX - run.lastMinX) * scale;
+        float placedX = (centreX - 0.5f * static_cast<float>(layoutWidth)) * inset;
+        float placedY = (static_cast<float>(run.row) - 0.5f * static_cast<float>(layoutHeight)) *
+                        inset;
+        left[k] = placedX - halfWidth;
+        right[k] = placedX + halfWidth;
+        top[k] = placedY + static_cast<float>(run.lastTop) * scale;
+        bottom[k] = placedY + static_cast<float>(run.lastBottom) * scale;
+
+        // Moving down past one run can put this one over another, so the walk repeats until a
+        // pass moves nothing. Every move is downward and bounded by the runs above, so it ends.
+        float push = 0.0f;
+        for (int pass = 0; pass <= k; ++pass) {
+            bool moved = false;
+            for (int j = 0; j < k; ++j) {
+                if (left[k] >= right[j] || left[j] >= right[k]) continue;
+                if (top[k] + push >= bottom[j] + gap || top[j] >= bottom[k] + push) continue;
+                push = bottom[j] + gap - top[k];
+                moved = true;
+            }
+            if (!moved) break;
+        }
+        top[k] += push;
+        bottom[k] += push;
+        if (push != run.pushY && s.placeReports > 0 && push > 0.0f) {
+            --s.placeReports;
+            logf("fast text: the run on GPL row %d (set %d) would overlap the one above it at "
+                 "inset %.2f and scale %d -- moved down %.0f eye pixels to clear it",
+                 run.row, run.set, static_cast<double>(inset), g_options.vrGplTextScale,
+                 static_cast<double>(push));
+        }
+        run.pushY = push;
+        if (push > 0.0f) ++s.runsPushed;
+    }
+}
+
+// Horizontal disparity in pixels for `vrHudDepth` metres, or 0 for infinity. The same
+// derivation Hud.cpp uses -- Z = f * IPD / d with f the eye's focal length in pixels -- so the
+// two paths cannot disagree about what a depth means. The separation is the runtime's, not a
+// constant: without a tracked frame there is none to use and the two copies are identical.
+int disparityPixels(int eyeWidth) {
+    if (g_options.vrHudDepth <= 0.0f || eyeWidth <= 0) return 0;
+
+    float fov = 0.0f;
+    float separation = 0.0f;
+    if (!stereoEyeGeometry(fov, separation)) return 0;
+
+    float halfAngle = fov * 0.5f;
+    if (halfAngle <= 0.0f || halfAngle >= 1.5f) return 0;
+
+    float focal = (static_cast<float>(eyeWidth) * 0.5f) / std::tan(halfAngle);
+    float pixels = focal * separation / g_options.vrHudDepth;
+    float ceiling = static_cast<float>(eyeWidth) * 0.05f;
+    if (pixels > ceiling) pixels = ceiling;
+    return static_cast<int>(pixels + 0.5f);
+}
+
+// One glyph, placed once per eye. True when the quads were appended and the caller must not
+// also append the unplaced one; false means the caller carries on exactly as in flat mode, and
+// a counter above says which term declined.
+//
+// `ax`/`ay` are the glyph's clipped rectangle in GPL's own layout space -- absolute, origin
+// included -- which is the space the notices' coordinates were authored in. The eye rects are
+// in the off-screen target's pixels, and roglv2's own 2D transform spans that target (the
+// render target overrides the display's size), so a quad written in target pixels lands where
+// it is put. That is the whole reason this works where re-issuing the call cannot: the quad
+// goes through the transform, and the destination handle no longer decides anything.
+bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, int width,
+                 int height, const CachedGlyph& cached, int skipX, int skipY,
+                 uint32_t paletteRow) {
+    State& s = g_state;
+    if (!s.vrPlacement) return false;
+
+    if (windowInFrontEnd()) {
+        ++s.window.placeFrontEnd;
+        return false;
+    }
+
+    int layoutWidth = 0;
+    int layoutHeight = 0;
+    windowEngineModeSize(layoutWidth, layoutHeight);
+    if (layoutWidth <= 0 || layoutHeight <= 0) {
+        ++s.window.placeNoLayout;
+        return false;
+    }
+
+    // Only a destination that is part of GPL's own 2D frame. The full-frame surface and the
+    // message band's 2540x15 instance both are; anything laid out against something else has
+    // no business being measured from the centre of a layout it was not laid out against.
+    if (source.destOriginX < 0 || source.destOriginY < 0 ||
+        source.destOriginX + source.destWidth > layoutWidth ||
+        source.destOriginY + source.destHeight > layoutHeight) {
+        ++s.window.placeOffLayout;
+        return false;
+    }
+
+    int rect[2][4];
+    if (!stereoEyeRect(0, rect[0]) || !stereoEyeRect(1, rect[1])) {
+        ++s.window.placeNoEyeRects;
+        return false;
+    }
+
+    // THE KEY IS THE BASELINE GPL ASKED FOR, NOT THE ROW THE GLYPH LANDS ON. `ay` has already
+    // had the glyph's own hot spot taken off it, and a hot spot is per glyph -- so keying on it
+    // split one line into a run for every distinct bearing in it, each run was then centred on
+    // its own two or three letters, and with the inset applied to each of those centres the
+    // letters of one word piled up on each other. GPL's `y` is the line, and it holds still for
+    // every glyph on it.
+    PlacedRun* run = findRun(set, baseY);
+    if (!run) return false;
+
+    // This frame's extent, accumulated whether or not the run is placeable yet.
+    if (!run->seenThisFrame) {
+        run->seenThisFrame = true;
+        run->minX = ax;
+        run->maxX = ax + width;
+        run->top = ay - baseY;
+        run->bottom = ay + height - baseY;
+    } else {
+        if (ax < run->minX) run->minX = ax;
+        if (ax + width > run->maxX) run->maxX = ax + width;
+        if (ay - baseY < run->top) run->top = ay - baseY;
+        if (ay + height - baseY > run->bottom) run->bottom = ay + height - baseY;
+    }
+
+    // A run with no extent yet is placed by this glyph alone, which puts a one-frame-old string
+    // a few characters off centre and corrects itself on the next frame. Counted, because
+    // "every glyph is a first sighting" would mean the key is not holding still.
+    float anchorX = 0.0f;
+    if (run->known) {
+        anchorX = 0.5f * static_cast<float>(run->lastMinX + run->lastMaxX);
+    } else {
+        ++s.window.placeFirstSight;
+        anchorX = static_cast<float>(ax) + 0.5f * static_cast<float>(width);
+    }
+    // The line GPL asked for, so every glyph on it shares one anchor and the difference between
+    // them is the glyph's own bearing, which the scale carries.
+    float anchorY = static_cast<float>(baseY);
+
+    float scale = static_cast<float>(g_options.vrGplTextScale);
+    float inset = g_options.vrGplTextInset;
+
+    // GPL'S OWN PIXELS, PULLED TOWARD THE MIDDLE. This was a fraction of the layout re-read as
+    // the same fraction of the eye, and the two rects are not the same shape: the eye measured
+    // 3172x3172 against a 2560x1440 layout, so that route stretched x by 1.24 and y by 2.20,
+    // which no glyph size followed. A delta measured in GPL's pixels keeps the layout's shape
+    // and matches the glyphs, which are drawn in those same pixels; `inset` is then just how
+    // much of the delta survives, and 0 would be dead centre.
+    float placedX = (anchorX - 0.5f * static_cast<float>(layoutWidth)) * inset;
+    float placedY = (anchorY - 0.5f * static_cast<float>(layoutHeight)) * inset;
+    if (run->known) placedY += run->pushY;
+
+    float offsetX = (static_cast<float>(ax) - anchorX) * scale;
+    float offsetY = (static_cast<float>(ay) - anchorY) * scale;
+    float span = static_cast<float>(height) * scale;
+    float glyphWidth = static_cast<float>(width) * scale;
+
+    int disparity = disparityPixels(rect[0][2]);
+
+    bool appended = false;
+    for (int eye = 0; eye < 2; ++eye) {
+        float ex = static_cast<float>(rect[eye][0]);
+        float ey = static_cast<float>(rect[eye][1]);
+        float ew = static_cast<float>(rect[eye][2]);
+        float eh = static_cast<float>(rect[eye][3]);
+        // The left eye's copy goes right of centre and the right eye's left of centre, which is
+        // convergent and pulls the text toward the viewer.
+        float shift = static_cast<float>(eye == 0 ? disparity : -disparity) * 0.5f;
+
+        float x0 = ex + 0.5f * ew + placedX + shift + offsetX;
+        float rasterY = ey + 0.5f * eh + placedY + offsetY;
+
+        // A GLYPH THAT LEAVES ITS OWN EYE IS DROPPED, NOT CLAMPED. The off-screen target's two
+        // eye rects are adjacent, so a quad hanging off one edge is drawn into the other eye's
+        // picture -- one eye's text bleeding into the other is the first of the three faults
+        // this project recorded against hand-placed 2D, and a run scaled 4x can reach it.
+        if (x0 < ex || x0 + glyphWidth > ex + ew || rasterY < ey ||
+            rasterY + span > ey + eh) {
+            ++s.window.placeOutsideEye;
+            continue;
+        }
+
+        Quad quad;
+        quad.x0 = x0;
+        quad.x1 = x0 + glyphWidth;
+        quad.yV0 = s.pixelZoomY < 0.0f ? rasterY : rasterY + 1.0f;
+        quad.yV1 = s.pixelZoomY < 0.0f ? rasterY + span : quad.yV0 - span;
+        quad.u0 = static_cast<float>(cached.atlasX + skipX);
+        quad.u1 = quad.u0 + static_cast<float>(width);
+        quad.v0 = static_cast<float>(cached.atlasY + skipY);
+        quad.v1 = quad.v0 + static_cast<float>(height);
+        quad.palette = paletteRow;
+        // The probe line reads "ours spans ..." off this, and a placed glyph that did not set it
+        // would be reported as not drawn at all. The left eye's copy is the one recorded.
+        if (!appended) noteProbeQuad(set, kOutcomeDrawn, quad.yV0, quad.yV1);
+        s.draw.append(quad);
+        appended = true;
+    }
+
+    if (!appended) {
+        // Both eyes refused. Returning false here would draw the glyph where GPL put it, which
+        // is the one thing this path exists to stop; it is reported instead and the glyph is
+        // dropped, so the only way to see nothing is to ask for a placement nothing fits.
+        if (s.placeReports > 0) {
+            --s.placeReports;
+            logf("fast text: a glyph of set %d at GPL (%d,%d) %dx%d landed outside both eye "
+                 "rects at scale %d and inset %.2f -- %u glyphs have landed outside this "
+                 "second. Lower vrGplTextScale or raise vrGplTextInset.",
+                 set, ax, ay, width, height, g_options.vrGplTextScale,
+                 static_cast<double>(inset), s.window.placeOutsideEye);
+        }
+        return true;
+    }
+
+    ++s.window.placedPairs;
+    if (s.placeReports > 0 && s.window.placedPairs == 1) {
+        --s.placeReports;
+        logf("fast text: GPL's stamped text is placed in the eyes -- set %d at GPL (%d,%d) on a "
+             "%dx%d layout became (%.0f,%.0f) in a %dx%d eye at scale %d, inset %.2f, %d px of "
+             "convergent disparity for vrHudDepth = %.2f. The run's anchor came from %s.",
+             set, ax, baseY, layoutWidth, layoutHeight,
+             static_cast<double>(static_cast<float>(rect[0][0]) +
+                                 0.5f * static_cast<float>(rect[0][2]) + placedX),
+             static_cast<double>(static_cast<float>(rect[0][1]) +
+                                 0.5f * static_cast<float>(rect[0][3]) + placedY),
+             rect[0][2], rect[0][3], g_options.vrGplTextScale, static_cast<double>(inset),
+             disparity, static_cast<double>(g_options.vrHudDepth),
+             run->known ? "the previous frame's extent" : "this glyph alone, for one frame");
+    }
+    return true;
+}
+
+// One line per distinct (set, refusal): which of readStamp's checks gave up on a stamp, and
+// everything it had read by then. A block that failed `readable` is described as VirtualQuery
+// sees it at both ends, because a block crossing into a second region is refused even when both
+// regions are committed and readable.
+void reportUnreadable(int handle, int x, int y, int set, int glyph, const StampSource& source) {
+    State& s = g_state;
+    for (int i = 0; i < s.unreadableSeenCount; ++i) {
+        if (s.unreadableSeen[i].set == set && s.unreadableSeen[i].refusal == source.refusal)
+            return;
+    }
+    if (s.unreadableSeenCount >= static_cast<int>(sizeof(s.unreadableSeen) /
+                                                  sizeof(s.unreadableSeen[0])))
+        return;
+    s.unreadableSeen[s.unreadableSeenCount++] = {set, source.refusal};
+
+    logf("fast text: set %d glyph %d at GPL (%d,%d) on handle %d is unreadable -- %s. Read so "
+         "far: destination %p class %d %dx%d, set %p, colour %08X, palette %d, glyph bitmap %p "
+         "%dx%d format %d, pixels %p pitch %d row length %d.",
+         set, glyph, x, y, handle, source.refusal ? source.refusal : "no reason recorded",
+         static_cast<const void*>(source.dest), source.destClass, source.destWidth,
+         source.destHeight, static_cast<const void*>(source.set), source.colour,
+         source.hasPalette, static_cast<const void*>(source.glyph), source.glyphWidth,
+         source.glyphHeight, source.glyphFormat, static_cast<const void*>(source.pixels),
+         source.pitch, source.rowLength);
+    if (!source.refusedAt) return;
+
+    auto describe = [](const void* address, char* text, size_t size) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(address, &info, sizeof(info))) {
+            _snprintf_s(text, size, _TRUNCATE, "VirtualQuery failed (%lu)", GetLastError());
+            return;
+        }
+        _snprintf_s(text, size, _TRUNCATE, "region %p + %zu, state %lX, protect %lX",
+                    info.BaseAddress, info.RegionSize, info.State, info.Protect);
+    };
+    auto first = static_cast<const uint8_t*>(source.refusedAt);
+    const uint8_t* last = first + (source.refusedBytes ? source.refusedBytes - 1 : 0);
+    char firstText[96];
+    char lastText[96];
+    describe(first, firstText, sizeof(firstText));
+    describe(last, lastText, sizeof(lastText));
+    logf("fast text:   the refused block is %p + %zu: first byte in %s; last byte in %s",
+         source.refusedAt, source.refusedBytes, firstText, lastText);
+}
+
 bool handleStamp(int handle, int x, int y, int set, int glyph) {
     State&      s = g_state;
     StampSource source;
@@ -770,6 +1351,7 @@ bool handleStamp(int handle, int x, int y, int set, int glyph) {
 
     if (!readStamp(handle, set, glyph, source)) {
         ++s.window.fellBackUnreadable;
+        reportUnreadable(handle, x, y, set, glyph, source);
         recordProbe(handle, set, glyph, source, kOutcomeUnreadable, 0, 0, 0, 0, 0, 0);
         flushPending();
         s.window.cpuTicks += now() - start;
@@ -778,13 +1360,6 @@ bool handleStamp(int handle, int x, int y, int set, int glyph) {
     if (source.destClass != kBlitClassGlFramebuffer) {
         ++s.window.fellBackDestination;
         recordProbe(handle, set, glyph, source, kOutcomeDestination, 0, 0, 0, 0, 0, 0);
-        flushPending();
-        s.window.cpuTicks += now() - start;
-        return false;
-    }
-    if (!source.hasPalette) {
-        ++s.window.fellBackNoPalette;
-        recordProbe(handle, set, glyph, source, kOutcomeNoPalette, 0, 0, 0, 0, 0, 0);
         flushPending();
         s.window.cpuTicks += now() - start;
         return false;
@@ -842,7 +1417,17 @@ bool handleStamp(int handle, int x, int y, int set, int glyph) {
     }
 
     uint32_t entries[16];
-    buildPalette(source.colour, entries);
+    if (source.hasPalette) {
+        buildPalette(source.colour, entries);
+    } else {
+        // The glyph's own colormap, 0xAARRGGBB, into the texture's R, G, B, A byte order.
+        ++s.window.glyphColormaps;
+        for (int i = 0; i < 16; ++i) {
+            uint32_t c = source.glyphColormap[i];
+            entries[i] = ((c >> 16) & 0xFFu) | (c & 0xFF00u) | ((c & 0xFFu) << 16) |
+                         (c & 0xFF000000u);
+        }
+    }
     int row = s.draw.paletteRow(entries);
     if (row < 0) {
         // Every row is spoken for by quads that have not been drawn yet. Draw them, then the
@@ -874,6 +1459,37 @@ bool handleStamp(int handle, int x, int y, int set, int glyph) {
     //
     // Because the quad goes through the same projection, modelview and viewport the raster
     // position does, the two land on the same pixels whatever those are set to.
+
+    // IN VR THE SAME QUAD GOES SOMEWHERE ELSE, TWICE. The transform is the same, so the
+    // arithmetic above still says where roglv2 would have put it; placeInEyes takes that
+    // rectangle and lays it off from the centre of each eye instead. It declines, by name,
+    // whenever this is not a world-mode stereo frame with GPL's own 2D as the destination, and
+    // then the untouched quad below is appended exactly as in flat mode.
+    //
+    // A glyph in GPL's replay bands is not placed: the untouched quad goes to the replay panel's
+    // layer, where GPL's own coordinates are the right ones. A batch holds one side or the other.
+    bool toPanel = s.vrPlacement && replayPanelCapturing() &&
+                   replayPanelTakes(drawX + source.destOriginX, drawY + source.destOriginY,
+                                    width, height);
+    if (toPanel != s.batchToPanel) {
+        flushPending();
+        s.batchToPanel = toPanel;
+    }
+    if (!toPanel && s.vrPlacement && replayPanelCapturing())
+        replayPanelNoteDraw("stampDraw", drawX + source.destOriginX, drawY + source.destOriginY,
+                            width, height, false, "placed in the eyes instead");
+    if (!toPanel &&
+        placeInEyes(source, set, drawX + source.destOriginX, drawY + source.destOriginY,
+                    y + source.destOriginY, width, height, *cached, skipX, skipY,
+                    static_cast<uint32_t>(row))) {
+        recordProbe(handle, set, glyph, source, kOutcomeDrawn, drawX + source.destOriginX,
+                    drawY + source.destOriginY, width, height, skipX, skipY);
+        ++s.window.drawn;
+        if (s.draw.pending() >= kMaxBatchQuads) flushPending();
+        s.window.cpuTicks += now() - start;
+        return true;
+    }
+
     float rasterY = static_cast<float>(drawY + source.destOriginY);
     float span = static_cast<float>(height);
     Quad  quad;
@@ -900,10 +1516,42 @@ int rasterCall(int kind, int a0, int a1, int a2, int a3, int a4, int a5, int a6,
     State&    s = g_state;
     long long start = postProfileRasterEnter(kind);
     bool      taken = false;
-    if (kind == kRasterStampDraw)
+    if (kind == kRasterStampDraw) {
         taken = handleStamp(a0, a1, a2, a3, a4);
-    else
+        // A GLYPH THIS PATH GAVE BACK IS STILL GPL'S, AND IN A REPLAY BAND IT BELONGS ON THE PANEL.
+        // roglv2 draws it itself, so it is drawn with the panel's layer bound: GPL's own pixels
+        // at GPL's own place in the layer. Measured 2026-10-14: btnLive's label, "Live Feed", is
+        // nine glyphs fast text reads as unreadable, and drawn by roglv2 into the frame they sat
+        // in the eye's top left at native size.
+        if (!taken && s.vrPlacement && replayPanelCapturing()) {
+            int  originX = 0;
+            int  originY = 0;
+            int  width = 0;
+            int  height = 0;
+            bool framebuffer = false;
+            bool onPanel = fastTextSurfaceInfo(a0, originX, originY, width, height,
+                                               framebuffer) &&
+                           framebuffer &&
+                           replayPanelTakes(originX + a1, originY + a2, 1, 1);
+            replayPanelNoteDraw("stampDraw by roglv2", originX + a1, originY + a2, 0, 0, onPanel,
+                                "fast text gave it back -- see its `back to roglv2` counts");
+            if (onPanel && s.real[kind]) {
+                // What fast text has batched goes first, and roglv2's batch is opened before the
+                // layer is bound, so the glyph's own prologue flushes nothing into it.
+                flushPending();
+                openStampBatch();
+                int result = 0;
+                {
+                    ReplayPanelTarget target;
+                    result = s.real[kind](a0, a1, a2, a3, a4, a5, a6, a7);
+                }
+                postProfileRasterLeave(kind, start);
+                return result;
+            }
+        }
+    } else {
         flushPending();
+    }
     int result = 0;
     if (!taken && s.real[kind]) result = s.real[kind](a0, a1, a2, a3, a4, a5, a6, a7);
     postProfileRasterLeave(kind, start);
@@ -1066,12 +1714,14 @@ void reassert(int kind) {
     }
 }
 
-// Locate roglv2 through the slot as it stands now and, if that works, take all seven globals.
+// Locate roglv2 through the slot as it stands now and, if that works, take the globals this
+// path owns -- all seven in flat mode, stampDraw alone in VR.
 bool tryInstall(bool loud) {
     State& s = g_state;
     if (!s.slot[kRasterStampDraw] || !*s.slot[kRasterStampDraw]) return false;
     if (!locateRoglv2(*s.slot[kRasterStampDraw], loud)) return false;
     for (int kind = 0; kind < kRasterKinds; ++kind) {
+        if (!s.owns[kind]) continue;
         if (!s.slot[kind] || !*s.slot[kind]) return false;
         s.real[kind] = reinterpret_cast<RasterFn>(*s.slot[kind]);
         void* thunk = thunkFor(kind);
@@ -1080,6 +1730,7 @@ bool tryInstall(bool loud) {
              kRasterNames[kind]);
         // Put back whatever was already patched: a half-installed chain would drop calls.
         for (int undo = 0; undo < kind; ++undo) {
+            if (!s.owns[undo]) continue;
             void* original = reinterpret_cast<void*>(s.real[undo]);
             patchBytes(s.slot[undo], &original, sizeof(original));
         }
@@ -1087,10 +1738,20 @@ bool tryInstall(bool loud) {
     }
     s.installed = true;
     s.pending = false;
-    logf("fast text: installed on all seven 2D globals (stampDraw at %p). GPL's stamped glyphs "
-         "are drawn from a GPU atlas as one batched quad list; the other six flush that list "
-         "first, so nothing changes order. No setting: it is what this path does.",
-         reinterpret_cast<void*>(s.slot[kRasterStampDraw]));
+    if (s.vrPlacement) {
+        logf("fast text: installed on the stampDraw global alone (%p), because in VR Hud.cpp "
+             "holds bitmapDraw for the mirror panes' copy offset. The batch is flushed from "
+             "Hud.cpp's own thunks instead, so the ordering contract is unchanged: anything "
+             "GPL draws after a run of text still lands over it. GPL's stamped glyphs are "
+             "drawn from a GPU atlas, once per eye, at vrGplTextScale and vrGplTextInset.",
+             reinterpret_cast<void*>(s.slot[kRasterStampDraw]));
+    } else {
+        logf("fast text: installed on all seven 2D globals (stampDraw at %p). GPL's stamped "
+             "glyphs are drawn from a GPU atlas as one batched quad list; the other six flush "
+             "that list first, so nothing changes order. No setting in flat mode: it is what "
+             "this path does.",
+             reinterpret_cast<void*>(s.slot[kRasterStampDraw]));
+    }
     return true;
 }
 
@@ -1100,12 +1761,29 @@ void fastTextBind(const Binding& binding) {
     State& s = g_state;
     if (s.bound) return;
     s.bound = true;
-    if (g_options.vr) {
-        logf("fast text: not installed -- in VR the seven 2D globals belong to Hud.cpp, which "
-             "re-issues every stamp once per eye");
+    if (g_options.vr && !g_options.vrGplText) {
+        logf("fast text: not installed -- vrGplText = 0, so in VR the 2D globals belong to "
+             "Hud.cpp and GPL's stamped text stays where GPL put it: the left eye's periphery "
+             "at zero disparity. vrGplText = 1 hands stampDraw over so it can be placed.");
         return;
     }
+
+    // WHICH GLOBALS THIS PATH TAKES, and why VR is not all of them.
+    //
+    // The other six exist here to FLUSH the pending quad batch before anything else draws, so
+    // text issued before a polygon is on the framebuffer before it. In VR Hud.cpp already holds
+    // every one of them -- bitmapDraw carries the mirror panes' copy offset, which is the only
+    // place it can be applied -- and both modules re-assert their thunk over whatever is in a
+    // slot and adopt what they find as "the original". Installing both on one slot therefore
+    // makes each one the other's original, and the chain calls itself for ever. Hud.cpp calls
+    // fastTextFlushNow() from its own thunks instead, which honours the same contract with one
+    // owner per slot.
+    s.vrPlacement = g_options.vr && g_options.vrGplText != 0;
+    for (int kind = 0; kind < kRasterKinds; ++kind)
+        s.owns[kind] = !s.vrPlacement || kind == kRasterStampDraw;
+
     for (int kind = 0; kind < kRasterKinds; ++kind) {
+        if (!s.owns[kind]) continue;
         s.slot[kind] = rasterGlobal(binding.image, kRasterNames[kind]);
         if (s.slot[kind] && *s.slot[kind]) continue;
         logf("fast text: the %s global did not resolve -- nothing is installed",
@@ -1123,6 +1801,12 @@ bool fastTextOwnsRasterEntries() { return g_state.installed || g_state.pending; 
 
 void fastTextPollFrame() {
     State& s = g_state;
+    // The frame the report asked for, armed at the top of a frame so the stamps that follow are
+    // inside it and fastTextEndFrame closes it at the end of the same one.
+    if (s.wantSample) {
+        s.wantSample = false;
+        s.sampling = true;
+    }
     if (!s.installed) {
         if (!s.pending) return;
         ++s.attempts;
@@ -1136,7 +1820,8 @@ void fastTextPollFrame() {
         }
         return;
     }
-    for (int kind = 0; kind < kRasterKinds; ++kind) reassert(kind);
+    for (int kind = 0; kind < kRasterKinds; ++kind)
+        if (s.owns[kind]) reassert(kind);
 
     // The fonts are reloaded around a mode change, so a cached glyph bitmap pointer could be a
     // different glyph afterwards. The atlas is dropped whenever the engine crosses between the
@@ -1144,6 +1829,14 @@ void fastTextPollFrame() {
     bool inFrontEnd = windowInFrontEnd();
     if (inFrontEnd != s.wasFrontEnd) {
         s.wasFrontEnd = inFrontEnd;
+        // The run extents go with the atlas. They are keyed on a stamp set and a row in GPL's
+        // layout, and a mode change rebuilds both the fonts and the layout, so an extent
+        // carried across it would place the first frame of the new mode from the old one's.
+        s.runCount = 0;
+        // A fresh detail budget for the phase under test, so a race gets its own lines rather
+        // than finding them spent on the front end -- the failure three instruments in Hud.cpp
+        // made before this one.
+        s.placeReports = 4;
         if (s.glReady) {
             flushPending();
             s.draw.resetAtlas();
@@ -1159,12 +1852,45 @@ void fastTextEndFrame() {
     if (!s.installed) return;
     flushPending();
     ++s.window.frames;
+    // After the draw, so a run's extent is complete: it becomes the placement the NEXT frame's
+    // first glyph is put by, which is how a line can be centred before its length is known.
+    if (s.vrPlacement) {
+        rollRuns();
+        separateRuns();
+    }
     s.sampling = false;  // one frame a second is enough to say what is being stamped
 }
 
 void fastTextFlushNow() {
     if (!g_state.installed) return;
     flushPending();
+}
+
+bool fastTextSurfaceInfo(int handle, int& originX, int& originY, int& width, int& height,
+                         bool& framebuffer) {
+    State& s = g_state;
+    if (handle <= 0 || !s.handleTable) return false;
+    __try {
+        uint8_t* table = *s.handleTable;
+        if (!table || !readable(table, 12)) return false;
+        uint8_t* entries = readPointer(table, 8);
+        if (!entries || !readable(entries + 8 * static_cast<unsigned>(handle), 8)) return false;
+        uint8_t* bitmap = readPointer(entries, 8 * static_cast<unsigned>(handle));
+        if (!bitmap || !readable(bitmap, 0x2C)) return false;
+        originX = readInt(bitmap, kBitmapOriginX);
+        originY = readInt(bitmap, kBitmapOriginY);
+        width = readInt(bitmap, kBitmapWidth);
+        height = readInt(bitmap, kBitmapHeight);
+        framebuffer = readInt(bitmap, kBitmapClass) == kBlitClassGlFramebuffer;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+void fastTextOpenRasterBatch() {
+    if (!g_state.installed) return;
+    openStampBatch();
 }
 
 void fastTextReport() {
@@ -1175,22 +1901,41 @@ void fastTextReport() {
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     double perFrame = 1000.0 / static_cast<double>(frequency.QuadPart) / c.frames;
-    unsigned fellBack = c.fellBackDestination + c.fellBackNoPalette + c.fellBackFormat +
-                        c.fellBackUnreadable + c.fellBackAtlasFull + c.fellBackNoGl;
+    unsigned fellBack = c.fellBackDestination + c.fellBackFormat + c.fellBackUnreadable +
+                        c.fellBackAtlasFull + c.fellBackNoGl;
     logf("fast text: %.1f stampDraw calls a frame, %.1f drawn by us in %.1f draws "
-         "(cache %u hit, %u uploaded), %.1f clipped away, %.1f back to roglv2 (destination not "
-         "the framebuffer %u, no palette %u, glyph format %u, unreadable %u, atlas full %u, no "
-         "GL %u); atlas %dx%d holding %zu glyphs, %u uploads of %u KiB, %u palette uploads; "
-         "cpu %.3f ms a frame (%.3f of it in the draw, %.3f in uploads)",
+         "(cache %u hit, %u uploaded, %u in the glyph's own colormap), %.1f clipped away, %.1f "
+         "back to roglv2 (destination not the framebuffer %u, glyph format %u, unreadable %u, "
+         "atlas full %u, no GL %u); atlas %dx%d holding %zu glyphs, %u uploads of %u KiB, %u "
+         "palette uploads; cpu %.3f ms a frame (%.3f of it in the draw, %.3f in uploads)",
          static_cast<double>(c.calls) / c.frames,
          static_cast<double>(c.drawn) / c.frames,
          static_cast<double>(s.drawStats.draws) / c.frames, c.cacheHits, c.cacheMisses,
-         static_cast<double>(c.clippedAway) / c.frames, static_cast<double>(fellBack) / c.frames,
-         c.fellBackDestination, c.fellBackNoPalette, c.fellBackFormat, c.fellBackUnreadable,
+         c.glyphColormaps, static_cast<double>(c.clippedAway) / c.frames,
+         static_cast<double>(fellBack) / c.frames, c.fellBackDestination, c.fellBackFormat,
+         c.fellBackUnreadable,
          c.fellBackAtlasFull, c.fellBackNoGl, fasttext::kAtlasSize, fasttext::kAtlasSize,
          s.glyphs.size(), s.drawStats.glyphUploads, s.drawStats.glyphBytes / 1024u,
          s.drawStats.paletteUploads, c.cpuTicks * perFrame, s.drawStats.drawTicks * perFrame,
          s.drawStats.uploadTicks * perFrame);
+    // THE PLACEMENT'S OWN LINE, and only in VR, because in flat mode every term below is
+    // structurally zero and a line of zeroes is a line nobody reads. `placed` is the number
+    // that says whether vrGplTextScale and vrGplTextInset reached anything at all: zero with a
+    // non-zero `drawn` means every glyph went where GPL put it, and one of the refusals says
+    // which term decided that.
+    if (s.vrPlacement) {
+        logf("fast text: placement -- %.1f glyphs a frame placed once per eye at scale %d, "
+             "inset %.2f, over %d live run(s), %d of them moved down to clear the run above; "
+             "refused: front end %u, no eye rects %u, no "
+             "layout size %u, destination off GPL's 2D frame %u, outside the eye rect %u; %u "
+             "glyphs placed from their own position because the run was new, %u run sightings "
+             "past the %d-entry table",
+             static_cast<double>(c.placedPairs) / c.frames, g_options.vrGplTextScale,
+             static_cast<double>(g_options.vrGplTextInset), s.runCount, s.runsPushed,
+             c.placeFrontEnd,
+             c.placeNoEyeRects, c.placeNoLayout, c.placeOffLayout, c.placeOutsideEye,
+             c.placeFirstSight, c.placeRunTableFull, kMaxPlacedRuns);
+    }
     for (int i = 0; i < s.sampleCount; ++i) {
         const SampleRun& run = s.samples[i];
         logf("fast text: stamped on surface %d, set %d, at %d,%d: \"%s\"%s", run.dest, run.set,
@@ -1226,7 +1971,11 @@ void fastTextReport() {
     }
     s.sampleCount = 0;
     s.probeCount = 0;
-    s.sampling = true;
+    // ARMED BY THE NEXT FRAME'S POLL, NOT HERE. This report runs from the present hook and
+    // fastTextEndFrame runs later in that same hook, so arming here was undone before a single
+    // stamp of the next frame could be seen: the census and the probe lines never once printed,
+    // and a log with neither in it reads exactly like a frame with no text in it.
+    s.wantSample = true;
     c = Counters{};
     s.drawStats = fasttext::DrawStats{};
 }

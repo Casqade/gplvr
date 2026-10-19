@@ -4,6 +4,7 @@
 
 #include "CursorOverlay.h"
 #include "FrameBudget.h"
+#include "FrameTrace.h"
 #include "GlInterop.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -108,6 +109,10 @@ struct State {
     int  width = 0;
     int  height = 0;
     int  frameSequence = 0;
+    // Side-by-side frames held because they were rendered at a size other than the one the
+    // presenter asked for: in the current run, and reports left.
+    int  wrongSizeHeld = 0;
+    int  wrongSizeReports = 8;
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
 
@@ -496,6 +501,10 @@ constexpr int kHudTextureWidth = 2048;
 // How long the panel layer stays published after the last panel image. Long enough to ride
 // over a frame that skips the draw, short enough that leaving a race clears it at once.
 constexpr double kHudGraceSeconds = 0.25;
+
+// How many side-by-side frames rendered at a size other than the presenter's are held before
+// they go out anyway. Race entry needs one to three; 30 is a third of a second at 90 Hz.
+constexpr int kWrongSizeHoldFrames = 30;
 
 bool createHudTextures(State& state, int width, int height) {
     releaseHudTextures(state);
@@ -1049,7 +1058,7 @@ bool presenterStart() {
     return true;
 }
 
-void presenterFrame(bool sideBySide, bool stretchToFill) {
+void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     State& state = g_state;
     if (state.stage == Stage::Off || state.stage == Stage::Failed) return;
 
@@ -1155,9 +1164,14 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         return;
 
     if (width != state.width || height != state.height) {
-        if (state.width)
+        if (state.width) {
             logf("vr: render size changed %dx%d -> %dx%d, recreating shared textures",
                  state.width, state.height, width, height);
+            char why[96];
+            sprintf_s(why, "the render size changed %dx%d -> %dx%d", state.width, state.height,
+                      width, height);
+            frameTraceArm(12, why);
+        }
         bool wasDirect = state.directSlot >= 0;
         if (!createTextures(state, width, height)) {
             fail("the shared textures could not be created");
@@ -1170,6 +1184,41 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
         if (wasDirect) {
             acquireDirect(state);
             return;
+        }
+    }
+
+    // A PAIR RENDERED AT THE WRONG SIZE IS HELD. On race entry the first frames render into the
+    // window-sized surface, two 1280x1440 eyes, before the target reaches the size requested
+    // above; published, each tall eye is shown in a square view, squashed or clipped. Nothing is
+    // published for them, so the headset keeps its last frame. Capped, because a target the
+    // driver cannot allocate stays on the window for good and its frames must still go out.
+    if (sideBySide && g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
+        int  wantWidth = static_cast<int>(block->targetEyeWidth) * 2;
+        int  wantHeight = static_cast<int>(block->targetEyeHeight);
+        bool wrongSize = width != wantWidth || height != wantHeight;
+        frameTracePresenter(width, height, wantWidth, wantHeight,
+                            wrongSize && state.wrongSizeHeld < kWrongSizeHoldFrames);
+        if (!wrongSize) {
+            if (state.wrongSizeHeld && state.wrongSizeHeld <= kWrongSizeHoldFrames &&
+                state.wrongSizeReports > 0) {
+                --state.wrongSizeReports;
+                logf("vr: %d side-by-side frame%s rendered at the wrong size were held; the "
+                     "target is %dx%d now",
+                     state.wrongSizeHeld, state.wrongSizeHeld == 1 ? "" : "s", width, height);
+            }
+            state.wrongSizeHeld = 0;
+        } else if (state.wrongSizeHeld < kWrongSizeHoldFrames) {
+            ++state.wrongSizeHeld;
+            return;
+        } else if (state.wrongSizeHeld == kWrongSizeHoldFrames) {
+            ++state.wrongSizeHeld;  // past the cap: said once, then published as they are
+            if (state.wrongSizeReports > 0) {
+                --state.wrongSizeReports;
+                logf("vr: side-by-side frames are still %dx%d after %d held, against %dx%d "
+                     "wanted -- publishing them as they are; the render target is not reaching "
+                     "that size (see the target: lines)",
+                     width, height, kWrongSizeHoldFrames, wantWidth, wantHeight);
+            }
         }
     }
 
@@ -1187,9 +1236,20 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     // Where each eye actually landed. Published every frame rather than at setup,
     // because the eye targets rebuild themselves whenever the game changes render size
     // and a stale rect would sample the wrong pixels rather than fail visibly.
+    //
+    // A one-image frame names a rect only when part of it is the picture: GPL's static fills
+    // the 3D view, the window's size at the top left of a frame sized for the headset, and the
+    // rest keeps the previous picture. A rect outside the frame is dropped and the whole frame
+    // shown.
+    bool haveMonoRect = !sideBySide && monoRect && monoRect[0] >= 0 && monoRect[1] >= 0 &&
+                        monoRect[2] > 0 && monoRect[3] > 0 &&
+                        monoRect[0] + monoRect[2] <= width &&
+                        monoRect[1] + monoRect[3] <= height;
     for (int eye = 0; eye < 2; ++eye) {
         int rect[4] = {};
-        const bool have = sideBySide && stereoEyeRect(eye, rect);
+        bool have = sideBySide ? stereoEyeRect(eye, rect) : haveMonoRect;
+        if (!sideBySide && have)
+            for (int i = 0; i < 4; ++i) rect[i] = monoRect[i];
         for (int i = 0; i < 4; ++i)
             block->eyeRect[eye][i] = have ? static_cast<uint32_t>(rect[i]) : 0u;
     }
@@ -1301,7 +1361,6 @@ void presenterFrame(bool sideBySide, bool stretchToFill) {
     ++state.frameSequence;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
-    vrNoteFramePublished();
     renderPacingNotePublished();
 
     // The next frame's slot is taken here rather than at the top of the next frame: an

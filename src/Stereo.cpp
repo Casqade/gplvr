@@ -3,6 +3,7 @@
 #include "DataRebase.h"
 #include "FlatFrames.h"
 #include "FrameBudget.h"
+#include "FrameTrace.h"
 #include "Hooks.h"
 #include "Hud.h"
 #include "Interpolation.h"
@@ -10,6 +11,9 @@
 #include "MenuScale.h"
 #include "MirrorCache.h"
 #include "MirrorConfig.h"
+#include "MirrorGeometry.h"
+#include "RenderProfile.h"
+#include "MirrorUv.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "VrCamera.h"
@@ -179,17 +183,23 @@ struct State {
     // we. 512 is four times what the object needs.
     alignas(16) unsigned char storage[2][512] = {};
 
-    // The mirror panes: a camera per glass on a mipWidth/2 x mipHeight instance at (0, 0) of
-    // the source surface, the shape of one half of mirror.mip. [0] is the +Y (left) glass,
-    // copied to the right half of the texture; [1] is the -Y (right) glass, copied to x = 0.
+    // THE MIRROR PANES: ONE CAMERA PER SURFACE, each on an instance of the source surface the
+    // size of the rect that surface's reflection is copied into.
+    //
+    // One per derived glass, each in the region of mirror.mip MirrorUv gave it. A car it refused
+    // has two, both mipWidth/2 x mipHeight -- [0] the +Y (left) glass copied to x = mipWidth/2,
+    // [1] the -Y (right) glass copied to x = 0.
+    //
     // Rebuilt with the eye targets, since rasterizer handles are recycled across mode changes.
-    Half  pane[2];
+    Half              pane[kMaxMirrorSurfaces];
+    MirrorTextureRect paneRect[kMaxMirrorSurfaces];
+    int               paneCount = 0;
     void* paneSource = nullptr;
     int   paneMipWidth = 0;
     int   paneMipHeight = 0;
     bool  panesGaveUp = false;
     int   paneBuildReports = 8;
-    alignas(16) unsigned char paneStorage[2][512] = {};
+    alignas(16) unsigned char paneStorage[kMaxMirrorSurfaces][512] = {};
 
     // Set around the mirror-only sceneRender.
     bool mirrorOnly = false;
@@ -397,7 +407,19 @@ bool ensureEyes(void* mainCamera) {
                      viewport ? "a MENU viewport (mono, vrMenuScale applies)"
                               : "a WORLD view (split into two eyes)");
             }
-            if (viewport) return false;
+            if (viewport) {
+                // GPL'S VIEW HAS LEFT THE SURFACE THE EYES WERE CARVED FROM, so the handles
+                // describing it are on borrowed time. The replay screen draws its 3D view on a
+                // 2560x1140 instance between its bands, GPL frees the race's frame surface on
+                // the way back, and the handle came back as the mirror camera's 512x512 surface
+                // -- which matched mirror.mip's size, so the mirror copy-out was split into the
+                // dead eyes and roglv2 faulted reading a framebuffer as memory (crash
+                // gplc67.exe.18520.dmp, 2026-10-18). Forgetting touches nothing of roglv2's; the
+                // next world frame carves new eyes from the surface it actually renders to.
+                if (g_state.sourceSurface && source != g_state.sourceSurface)
+                    stereoForgetSurfaces("GPL's 3D view is a viewport on another surface");
+                return false;
+            }
         }
     }
 
@@ -451,12 +473,18 @@ bool ensureEyes(void* mainCamera) {
     g_state.sourceSurface = source;
     g_state.sourceWidth = width;
     g_state.sourceHeight = height;
+    char why[96];
+    sprintf_s(why, "the eye targets were rebuilt from a %dx%d surface", width, height);
+    frameTraceArm(12, why);
     return true;
 }
 
 void releasePanes() {
-    releaseHalf(g_state.pane[0]);
-    releaseHalf(g_state.pane[1]);
+    for (int i = 0; i < kMaxMirrorSurfaces; ++i) {
+        releaseHalf(g_state.pane[i]);
+        g_state.paneRect[i] = MirrorTextureRect{};
+    }
+    g_state.paneCount = 0;
     g_state.paneSource = nullptr;
     g_state.paneMipWidth = 0;
     g_state.paneMipHeight = 0;
@@ -468,9 +496,33 @@ void reportPanes(const char* reason) {
     logf("mirror: %s", reason);
 }
 
-// Builds the two pane cameras from the live mirror camera, whose surface is GPL's
+// Where each pane's reflection lands in mirror.mip. Every glass is given a disjoint region of it
+// by MirrorUv, which moved that glass's own UVs there; a car it refused falls back to the two
+// halves, which is the layout every stock glass was authored for.
+int planePanes(int mipWidth, int mipHeight, MirrorTextureRect rect[kMaxMirrorSurfaces]) {
+    int regions = mirrorUvCount();
+    if (regions > 0) {
+        bool usable = true;
+        for (int i = 0; i < regions && usable; ++i) usable = mirrorUvRect(i, rect[i]);
+        if (usable) return regions;
+    }
+
+    // [0] is the +Y (left) glass in the right half, [1] the -Y (right) glass at x = 0.
+    int half = mipWidth / 2;
+    for (int i = 0; i < 2; ++i) {
+        rect[i].x = i == 0 ? half : 0;
+        rect[i].y = 0;
+        rect[i].w = half;
+        rect[i].h = mipHeight;
+    }
+    return 2;
+}
+
+void publishPaneGlasses();
+
+// Builds the pane cameras from the live mirror camera, whose surface is GPL's
 // mipWidth x mipHeight instance for this frame. Cheap after the first frame: it only rebuilds
-// when the source surface or the mirror's size changes.
+// when the source surface, the mirror's size, or the set of rects changes.
 bool ensurePanes(void* mirrorCamera) {
     State& s = g_state;
     if (s.panesGaveUp || !s.sourceSurface) return false;
@@ -480,9 +532,22 @@ bool ensurePanes(void* mirrorCamera) {
     int   mipHeight = bitmapHeight(mirrorSurface);
     if (mipWidth < 2 || mipHeight < 1) return false;
 
-    if (s.pane[0].camera && s.pane[1].camera && s.paneSource == s.sourceSurface &&
-        s.paneMipWidth == mipWidth && s.paneMipHeight == mipHeight)
-        return true;
+    // mirror.mip's own size is what `RasterV2:MirrorSize` decided, so it is the size the regions
+    // are laid out in -- read from the thing that setting configured rather than from the ini
+    // it was written in. This also re-asserts the moved UVs.
+    mirrorUvEnsure(mipWidth, mipHeight);
+
+    MirrorTextureRect rect[kMaxMirrorSurfaces] = {};
+    int               count = planePanes(mipWidth, mipHeight, rect);
+    if (count < 1) return false;
+
+    bool same = s.paneCount == count && s.paneSource == s.sourceSurface &&
+                s.paneMipWidth == mipWidth && s.paneMipHeight == mipHeight;
+    for (int i = 0; same && i < count; ++i)
+        same = s.pane[i].camera && s.paneRect[i].x == rect[i].x &&
+               s.paneRect[i].y == rect[i].y && s.paneRect[i].w == rect[i].w &&
+               s.paneRect[i].h == rect[i].h;
+    if (same) return true;
 
     releasePanes();
 
@@ -490,51 +555,62 @@ bool ensurePanes(void* mirrorCamera) {
     auto release = reinterpret_cast<BitmapInstanceFreeFn>(*g_entries.instanceFreeSlot);
     if (!alloc || !release) return false;
 
-    int   width = mipWidth / 2;
     float fov = cameraFloat(mirrorCamera, kCameraFov);
     float nearZ = cameraFloat(mirrorCamera, kCameraNear);
 
-    for (int side = 0; side < 2; ++side) {
+    for (int i = 0; i < count; ++i) {
+        int width = rect[i].w;
+        int height = rect[i].h;
+        if (width < 1 || height < 1) {
+            logf("mirror: pane %d would be %dx%d, which is not a rect to render into -- the "
+                 "mirror stays one stock image",
+                 i, width, height);
+            releasePanes();
+            s.panesGaveUp = true;
+            return false;
+        }
+
         void* instance = nullptr;
-        if (!alloc(&instance, s.sourceSurface, 0, 0, width, mipHeight) || !instance ||
-            bitmapWidth(instance) != width || bitmapHeight(instance) != mipHeight) {
+        if (!alloc(&instance, s.sourceSurface, 0, 0, width, height) || !instance ||
+            bitmapWidth(instance) != width || bitmapHeight(instance) != height) {
             logf("mirror: pane %d instance (%p, 0,0 %dx%d) failed or came back %dx%d -- the "
                  "mirror stays one stock image",
-                 side, s.sourceSurface, width, mipHeight, bitmapWidth(instance),
+                 i, s.sourceSurface, width, height, bitmapWidth(instance),
                  bitmapHeight(instance));
             if (instance) release(instance);
             releasePanes();
             s.panesGaveUp = true;
             return false;
         }
-        // aspect 0.5 on a w = h/2 surface makes the horizontal and vertical angles equal
+        // aspect = w/h makes the horizontal and vertical angles equal
         // (tan(v/2) = tan(h/2) * aspect * height / width); aimPane refines it per glass.
-        std::memset(s.paneStorage[side], 0, kCameraSize);
-        void* camera = g_entries.cameraCreate(s.paneStorage[side], instance, fov, 0.0f, 0.0f,
-                                              nearZ, 0.5f);
+        std::memset(s.paneStorage[i], 0, kCameraSize);
+        void* camera = g_entries.cameraCreate(
+            s.paneStorage[i], instance, fov, 0.0f, 0.0f, nearZ,
+            static_cast<float>(width) / static_cast<float>(height));
         if (!camera) {
             logf("mirror: pane %d camera could not be created -- the mirror stays one stock "
                  "image",
-                 side);
+                 i);
             release(instance);
             releasePanes();
             s.panesGaveUp = true;
             return false;
         }
-        s.pane[side].surface = instance;
-        s.pane[side].camera = camera;
+        s.pane[i].surface = instance;
+        s.pane[i].camera = camera;
+        s.paneRect[i] = rect[i];
     }
 
+    s.paneCount = count;
     s.paneSource = s.sourceSurface;
     s.paneMipWidth = mipWidth;
     s.paneMipHeight = mipHeight;
+    publishPaneGlasses();
     if (s.paneBuildReports > 0) {
         --s.paneBuildReports;
-        logf("mirror: pane cameras built -- mirror.mip is %dx%d, so each pane is %dx%d at 0,0 "
-             "of surface %p. +Y (left glass) surface %p camera %p, copied to x = %d; -Y "
-             "(right glass) surface %p camera %p, copied to x = 0. near %.4f",
-             mipWidth, mipHeight, width, mipHeight, s.sourceSurface, s.pane[0].surface,
-             s.pane[0].camera, width, s.pane[1].surface, s.pane[1].camera, nearZ);
+        logf("mirror: %d pane camera%s built on surface %p -- mirror.mip is %dx%d, near %.4f",
+             count, count == 1 ? "" : "s", s.sourceSurface, mipWidth, mipHeight, nearZ);
     }
     return true;
 }
@@ -561,7 +637,6 @@ __declspec(naked) void paneDropThunk() {
 // about to use. Returns the segment index the walk is centred on.
 using WalkSegmentFn = int(__cdecl*)(int hint, int* out, int x, int y, int z);
 constexpr uintptr_t kWalkSegmentOf = 0x00460B40;
-constexpr double    kDlongUnitsPerMetre = 19685.0;
 
 // THE FALLBACK. gpl_sceneRender asks this function where the camera is on the track, and uses
 // the answer to centre the world walk and to set gpl_selectorCameraDlong / Dlat / Height. In
@@ -580,12 +655,10 @@ constexpr double    kDlongUnitsPerMetre = 19685.0;
 // Both call sites are redirected: 0x487D73 for the eye pass, 0x4877D9 for the mirror pass, so the
 // whole frame is centred on the same point.
 void* g_walkLookupOriginal = nullptr;
-unsigned g_walkSubstituted = 0;   // calls where the car's position was used
-unsigned g_walkPassedThrough = 0; // calls with no viewed car, left alone
 
 // THE DEFECT THIS GUARDS, as measured in report 84.
 //
-// The walkmark trace caught it directly: for ONE frame -- both eye passes -- the dlong this
+// A walk trace (since removed) caught it directly: for ONE frame -- both eye passes -- the dlong this
 // search writes jumps 32 m and comes straight back, while the eye's and the car's own dlongs in
 // the interpolation ring are smooth to a tenth of a metre across the whole window. So the input
 // is clean and the answer is not.
@@ -661,49 +734,30 @@ int placementOf(int segment, int x, int y) {
 int      g_walkLastDlong = 0;
 float    g_walkLastPosition[3] = {};
 bool     g_walkHaveLast = false;
-unsigned g_walkCorrected = 0;      // answers replaced with the car's own dlong
-unsigned g_walkCorrectedBig = 0;   // of those, the ones past kBigExcess
-unsigned g_walkOutside = 0;        // GPL settled on a segment the point is not in
-unsigned g_walkOverMargin = 0;     // the dlong moved further than the car did
-unsigned g_walkNoDlong = 0;        // rejected, but the car's dlong was unavailable
-float    g_walkWorstExcess = 0.0f; // biggest rejected overshoot, metres
 
-// A HYSTERESIS AND A FRAME-TO-FRAME JUMP COUNTER USED TO BE HERE. Both are gone.
+// MODE 3: ONE ANSWER PER FRAME, AND A SELF-CONSISTENCY TEST ON GPL'S PAIR.
 //
-// The hysteresis held the car-derived answer until GPL's own came back into agreement, to stop the
-// switch between two disagreeing sources being the jump. Measured with an exact-agreement
-// window: 38 re-asks, 26 answers held, ONE release on agreement. The two sources do not reconverge,
-// so it suppressed a steady disagreement rather than smoothing a transient -- and a jump still got
-// through. The table lookup removes the second source instead of filtering it.
+// The two things mode 2 bought were inter-eye agreement and continuity, and mode 2 paid for
+// both by moving the question metres away to the car. Neither actually needs that:
 //
-// The counter compared each frame's accepted segment with the last frame's and flagged changes of
-// more than one, which is a flip rather than motion: a car at 300 km/h advances 0.93 m in a 90 Hz
-// frame and segments run to tens of metres. It caught the defect red-handed -- seven segments on a
-// frame where the car moved 22 cm, in five consecutive clean windows -- and it is out because the
-// table lookup makes that structurally impossible, which the driver has confirmed by eye.
+//  - AGREEMENT IS A CACHING QUESTION. The measured defect was "each eye pass asks the segment
+//    lookup about its OWN position, so at a boundary the two eyes walk different ranges" -- 6
+//    one-frame disagreements in a 322 s session. Answering once a frame and handing every pass
+//    the same answer removes it by construction, and the answer is then one eye's own position
+//    rather than the car's: tens of millimetres off the other eye instead of metres.
+//  - CONTINUITY IS WHAT THE CONSISTENCY TEST IS FOR. `gpl_segmentPlacePoint` returns 0, which
+//    reads as "inside", for a segment whose type is neither 1 nor 2 -- and in that case it
+//    writes NEITHER out-parameter, so gpl_cameraTrackPositionFromWorld publishes the seed as
+//    the dlong. The containment test cannot see it. But the table can: a dlong that is really
+//    inside `segment` must land back in `segment` when looked up, so when the table answers a
+//    DIFFERENT segment, GPL's (segment, dlong) pair disagrees with itself and is not sound.
 //
-// The one thing still worth saying is a REFUSAL: if the table cannot answer, the answer falls back
-// to GPL's search and the artifact can return. That is a silent failure, so it says so once.
-bool g_walkTableSaidRefused = false;
-
-// HOW OFTEN THE TABLE ANSWERS, counted per lookup rather than announced once.
-//
-// The notice above fires on the first refusal of a track and then stays quiet, so a refusal on one
-// frame in several hundred reads exactly like no refusal at all -- and one frame of GPL's own
-// search is one frame of the artifact. A one-frame artifact that gets more frequent as the frame
-// rate rises is what a per-lookup fallback looks like: its chance is per draw, so drawing more
-// often multiplies it while nothing about the simulation changes.
-//
-// The two causes are separated because they want different fixes. No view dlong means the blend
-// had nothing to offer for this frame; a dlong outside the table means the table itself did not
-// cover where the camera is. A track change legitimately produces a burst of either while the new
-// table loads, so the session totals are read against the per-window counts: a burst in the window
-// after a mode change is a load, a trickle spread over every window while driving is the defect.
-unsigned g_walkTableAnswered = 0;      // the dlong decided the segment
-unsigned g_walkTableNoViewDlong = 0;   // the blend had no dlong for the view
-unsigned g_walkTableOutside = 0;       // a dlong, but outside the table
-unsigned g_walkTableRefusedTotal = 0;  // both causes, over the session
-unsigned g_walkTableWorstWindow = 0;   // most refusals in any one window
+// The frame key is hooksFrameCount(), which advances in the present hook, between renders.
+unsigned g_walkFrameKey = 0;        // which frame the cached answer belongs to
+bool     g_walkFrameValid = false;
+int      g_walkFrameSegment = 0;
+int      g_walkFrameDlong = 0;
+int      g_walkFrameDlat = 0;
 
 // BOTH EYES ASK ABOUT THE HEAD CENTRE, and this is the fix for the one-frame eye-segment
 // artifact. MEASURED AND CLOSED.
@@ -739,20 +793,6 @@ void walkSetCentre(float x, float y, float z) {
     g_walkCentre[2] = toUnits(z);
     g_walkHaveCentre = true;
 }
-
-// TWO DIFFERENT THINGS LOOK THE SAME TO THE CONTRACT, so they are counted apart.
-//
-// A one-frame excursion of tens of metres moves the walk's centre by more than a segment for a
-// single frame: the frames either side draw the correct range, that one does not, and the change
-// is what the eye sees. That is the artifact.
-//
-// A SUSTAINED disagreement of a few metres is a static shift of a fraction of a segment, held for
-// hundreds of frames. It cannot be seen, and it may not even be the lookup failing: the car
-// record's dlong (byte 12) and its position (bytes 16..27) may simply be measured from different
-// points on the car, with the gap opening in corners. If the big bucket alone is what stops the
-// artifact, the margin should be raised and the small corrections dropped rather than overriding
-// GPL on a quarter of all passes for no visible gain.
-constexpr float kBigExcess = 10.0f;
 
 // Signed difference the short way round the lap, in dlong units.
 // THE SEGMENT FOR A DLONG, by table lookup instead of by search.
@@ -799,24 +839,12 @@ int segmentForDlong(float metres) {
     return -1;
 }
 
-// ANYTHING COMPARING TWO SEGMENT INDICES needs the shortest way round the ring, the way dlongDelta
-// below does for the dlong: the count is at kSegmentCount, and without the wrap a lap crossing reads
-// as a jump of the whole track. A helper for that lived here and went with the jump counter.
+// ANYTHING COMPARING TWO SEGMENT INDICES needs the shortest way round the ring, the way
+// stereoDlongDelta does for the dlong: the count is at kSegmentCount, and without the wrap a lap
+// crossing reads as a jump of the whole track. A helper for that lived here and went with the
+// jump counter.
 
-int dlongDelta(int from, int to) {
-    // A zero length means no wrap, which is also what a global this image cannot be shown to
-    // keep should produce: the delta passes through unwrapped rather than being folded around a
-    // track length read from somewhere else.
-    uintptr_t lengthAt = rebase(kTrackLengthDlong);
-    int       length = lengthAt ? *reinterpret_cast<const int*>(lengthAt) : 0;
-    int       delta = to - from;
-    if (length <= 0) return delta;
-    while (delta > length / 2) delta -= length;
-    while (delta < -length / 2) delta += length;
-    return delta;
-}
-
-int walkLookupBody(int hint, int* out, int x, int y, int z) {
+int walkLookupCompute(int hint, int* out, int x, int y, int z) {
     auto original = reinterpret_cast<WalkSegmentFn>(g_walkLookupOriginal);
 
     // THE EYE'S OWN ANSWER FIRST, and kept whenever it is sound.
@@ -834,39 +862,19 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     int  segment = original(hint, out, x, y, z);
     bool sound = placementOf(segment, x, y) == 0;
 
-    // THE DLONG DECIDES THE SEGMENT, when the table can answer.
-    //
-    // The search above stays because out[1], the dlat, is its work and is a level-of-detail input.
-    // What is replaced is the segment index and the dlong, taken together from one smooth source so
-    // the pair cannot disagree with each other.
-    float viewDlong = 0.0f;
-    bool  viewSnapped = false;
-    bool  haveViewDlong = interpolationViewDlong(viewDlong, viewSnapped);
-    int   fromTable = haveViewDlong ? segmentForDlong(viewDlong) : -1;
-    if (fromTable >= 0) {
-        ++g_walkTableAnswered;
-        out[0] = static_cast<int>(static_cast<double>(viewDlong) * kDlongUnitsPerMetre);
-        return fromTable;
-    }
-
-    if (haveViewDlong)
-        ++g_walkTableOutside;
-    else
-        ++g_walkTableNoViewDlong;
-    ++g_walkTableRefusedTotal;
-
-    if (!g_walkTableSaidRefused) {
-        g_walkTableSaidRefused = true;
-        logf("walk: the segment table could not answer for the view's dlong, so the camera's "
-             "segment falls back to GPL's own search for as long as that lasts -- which is the "
-             "unstable answer the table exists to replace. Either the view dlong is unavailable, "
-             "or the dlong is outside the table, or this image's globals could not be placed "
-             "(deltas %s).",
-             rebaseSummary());
+    // THE SECOND TEST: is GPL's own (segment, dlong) pair consistent with itself? A dlong
+    // really inside `segment` must look up to `segment`. When the table answers a different
+    // one, the pair disagrees -- which is the failure `placementOf` is blind to, because
+    // gpl_segmentPlacePoint returns 0 for a segment whose type is neither 1 nor 2 while writing
+    // neither out-parameter, leaving the seed in out[0]. A refusal from the table (-1) proves
+    // nothing and is left alone.
+    if (sound) {
+        int fromDlong = segmentForDlong(static_cast<float>(
+            static_cast<double>(out[0]) / kDlongUnitsPerMetre));
+        if (fromDlong >= 0 && fromDlong != segment) sound = false;
     }
 
     if (sound) {
-        ++g_walkPassedThrough;
         g_walkHaveLast = false;  // the memory is about the substituted point, not this one
         return segment;
     }
@@ -877,7 +885,6 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     float blended[3] = {}, tick[3] = {};
     if (!interpolationViewedCarPosition(blended, tick)) {
         // Nothing to substitute, so GPL's answer goes out as it always did.
-        ++g_walkPassedThrough;
         g_walkHaveLast = false;
         return segment;
     }
@@ -886,7 +893,6 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
         return static_cast<int>(static_cast<double>(metres) * kDlongUnitsPerMetre);
     };
 
-    ++g_walkSubstituted;
     int ux = toUnits(blended[0]);
     int uy = toUnits(blended[1]);
     int uz = toUnits(blended[2]);
@@ -902,9 +908,7 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     float moved = std::sqrt(dx * dx + dy * dy + dz * dz);
 
     // THE PRIMARY TEST: did the search settle on a segment the point is actually in?
-    int placement = placementOf(segment, ux, uy);
-    bool extrapolated = placement > 0;
-    if (extrapolated) ++g_walkOutside;
+    bool extrapolated = placementOf(segment, ux, uy) > 0;
 
     // The secondary net, for the one failure the containment test cannot see. A segment whose
     // type is neither 1 nor 2 makes gpl_segmentPlacePoint return 0 -- "inside" -- WITHOUT writing
@@ -921,28 +925,19 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     constexpr float kMargin = 10.0f;
     constexpr float kGiveUp = 10.0f;  // a restart or teleport really did move; re-learn from it
     bool impossible = false;
-    float excess = 0.0f;
     if (g_walkHaveLast && moved < kGiveUp) {
-        excess = std::fabs(static_cast<float>(dlongDelta(g_walkLastDlong, out[0]))) /
-                     static_cast<float>(kDlongUnitsPerMetre) -
-                 moved;
+        float excess =
+            std::fabs(static_cast<float>(stereoDlongDelta(g_walkLastDlong, out[0]))) /
+                static_cast<float>(kDlongUnitsPerMetre) -
+            moved;
         impossible = excess > kMargin;
-        if (impossible) ++g_walkOverMargin;
     }
 
     if (extrapolated || impossible) {
-        if (excess > g_walkWorstExcess) g_walkWorstExcess = excess;
-
         // Only out[0] is replaced. out[1], the dlat, feeds gpl_selectorCameraDlat, a
         // level-of-detail input, and out[2] is the z we passed in, echoed back.
         float carDlong = 0.0f;
-        if (interpolationViewedCarDlong(carDlong)) {
-            ++g_walkCorrected;
-            if (excess >= kBigExcess) ++g_walkCorrectedBig;
-            out[0] = toUnits(carDlong);
-        } else {
-            ++g_walkNoDlong;
-        }
+        if (interpolationViewedCarDlong(carDlong)) out[0] = toUnits(carDlong);
     }
 
     g_walkLastDlong = out[0];
@@ -950,6 +945,27 @@ int walkLookupBody(int hint, int* out, int x, int y, int z) {
     g_walkLastPosition[1] = blended[1];
     g_walkLastPosition[2] = blended[2];
     g_walkHaveLast = true;
+    return segment;
+}
+
+// ONE ANSWER PER FRAME, so that the two eyes cannot walk different ranges. The cache is read
+// before GPL's search runs, so a later pass in the same frame costs nothing at all; the dlat goes
+// in it too, because half of one pass's pair and half of another's is the same disagreement by a
+// quieter route.
+int walkLookupBody(int hint, int* out, int x, int y, int z) {
+    unsigned frame = hooksFrameCount();
+    if (g_walkFrameValid && g_walkFrameKey == frame) {
+        out[0] = g_walkFrameDlong;
+        out[1] = g_walkFrameDlat;
+        return g_walkFrameSegment;
+    }
+
+    int segment = walkLookupCompute(hint, out, x, y, z);
+    g_walkFrameKey = frame;
+    g_walkFrameSegment = segment;
+    g_walkFrameDlong = out[0];
+    g_walkFrameDlat = out[1];
+    g_walkFrameValid = true;
     return segment;
 }
 
@@ -971,8 +987,21 @@ int __cdecl walkLookupMainThunk(int hint, int* out, int x, int y, int z) {
     return walkLookupBody(hint, out, x, y, z);
 }
 
+// THE MIRROR PASS DOES NOT SHARE THE EYES' ANSWER.
+//
+// It used to call walkLookupBody, which is the one-answer-per-frame cache -- and a cache has no
+// idea which pass seeded it. The mirror camera looks astern from a point metres
+// from the head and is NOT head-centred (the thunk above substitutes the centre; this one passes
+// the caller's own position through), so on a frame where the mirror asked first both eyes were
+// centred on the mirror's answer, and on every other frame on the head's. With
+// mirrorUpdateRate = 4 that alternates one frame in four, which is a submission order that
+// alternates, which is a seam artifact that flips -- measured 2026-10-07: mode 3 flipped every
+// frame where mode 1 was steady, with `0 of GPL's answers disagreed` proving the consistency
+// test was contributing nothing and the cache was the only difference left.
+//
+// The cache still does its job: making the two EYES agree, which is what it was built for.
 int __cdecl walkLookupMirrorThunk(int hint, int* out, int x, int y, int z) {
-    return walkLookupBody(hint, out, x, y, z);
+    return walkLookupCompute(hint, out, x, y, z);
 }
 
 void walkPassBegin(int pass) { g_walkPass = pass; }
@@ -1063,6 +1092,112 @@ int callDriverGetTeamIndex(int driver) {
 // paneTeamFallback. `changed` is set when the driver index moved, which is the only time the
 // game is asked, or when the car set changed under the same driver. Each ask also selects the
 // car's mirror aim (MirrorConfig); without a viewed car the last car's aim stays.
+//
+// The derived surfaces, the two glasses the pair of panes is aimed from when they share one
+// mirror.mip, and the one glass per surface they are aimed from when each has a texture.
+MirrorSurfaceSet g_derivedSet;
+// The team the set above was walked for, which is the REPORTED team and not the clamped one a
+// car outside the 1967 table falls back to. Kept so a model reload can be noticed: it moves the
+// cockpit node, and with it every polygon address MirrorUv has rewritten.
+int              g_derivedTeam = -1;
+// The left/right pair, for a car whose glasses were derived but could not each be given a region:
+// it is then drawn with the two halves of mirror.mip, so it has exactly two panes to aim.
+PaneGeometry     g_derivedGlass[2];
+// One glass per derived surface, nothing synthesised: one pane each, in its own region.
+PaneGeometry     g_surfaceGlass[kMaxMirrorSurfaces];
+bool             g_derivedActive = false;
+
+// Pick the surface for each side. Sorted outermost first, so the first with a positive Y is the
+// left glass and the first with a negative Y the right.
+void buildDerivedGlasses() {
+    for (int i = 0; i < g_derivedSet.count && i < kMaxMirrorSurfaces; ++i) {
+        const MirrorSurface& source = g_derivedSet.surface[i];
+        PaneGeometry&        g = g_surfaceGlass[i];
+        g.team = source.label;
+        for (int axis = 0; axis < 3; ++axis) {
+            g.centre[axis] = source.centre[axis];
+            g.normal[axis] = source.normal[axis];
+        }
+        g.halfWidth = source.halfWidth;
+        g.halfHeight = source.halfHeight;
+    }
+
+    const MirrorSurface* chosen[2] = {nullptr, nullptr};
+    for (int i = 0; i < g_derivedSet.count; ++i) {
+        const MirrorSurface& s = g_derivedSet.surface[i];
+        int side = s.centre[1] >= 0.0f ? 0 : 1;
+        if (!chosen[side]) chosen[side] = &s;
+    }
+
+    // A single-mirror car, or three with both wings on one side of the sort. The missing side
+    // falls back to the Y mirror of the one there is -- the same assumption the table makes,
+    // now applied to a glass that is at least in the right place.
+    for (int side = 0; side < 2; ++side) {
+        const MirrorSurface* source = chosen[side] ? chosen[side] : chosen[1 - side];
+        if (!source) continue;
+        float flip = chosen[side] ? 1.0f : -1.0f;
+        PaneGeometry& g = g_derivedGlass[side];
+        g.team = source->label;
+        g.centre[0] = source->centre[0];
+        g.centre[1] = flip * source->centre[1];
+        g.centre[2] = source->centre[2];
+        g.normal[0] = source->normal[0];
+        g.normal[1] = flip * source->normal[1];
+        g.normal[2] = source->normal[2];
+        g.halfWidth = source->halfWidth;
+        g.halfHeight = source->halfHeight;
+    }
+}
+
+// The glass a pane is aimed from: the surface's own when each glass has a region, the left/right
+// pair when the two halves are in use, the table row when nothing was derived. In table mode
+// both sides get the same row and aimPane negates Y for side 1; in derived mode each pane
+// already holds its own glass and nothing is negated.
+//
+// g_derivedGlass HAS TWO ENTRIES, so a pane past 1 must never read it: the regions path has one
+// pane per surface, and a third pane once read past its end and aimed the 330P4's centre mirror
+// with the left wing's geometry.
+const PaneGeometry& paneGlass(const PaneGeometry& table, int pane) {
+    if (pane < 0) return table;
+    if (mirrorUvCount() > 0) return g_surfaceGlass[pane < kMaxMirrorSurfaces ? pane : 0];
+    if (!g_derivedActive) return table;
+    return g_derivedGlass[pane < 2 ? pane : 0];
+}
+
+static_assert(kMaxMirrorGlasses == kMaxMirrorSurfaces,
+              "MirrorConfig keeps a name per pane, so it needs room for every surface");
+
+// NAMES FOR THE GLASSES THE PANES ARE DRAWN FOR, which is what each glass's aim is keyed on in
+// gplvr_mirrors.ini. A pane per surface takes the surface's own label, numbered from the second
+// of a kind; the two shared halves are the left and right glass whichever path drew them, so a
+// car aimed with one keeps its aim with the other.
+void publishPaneGlasses() {
+    const State& s = g_state;
+    const char*  labels[kMaxMirrorGlasses] = {};
+    char         names[kMaxMirrorGlasses][kMirrorGlassNameBytes] = {};
+    const char*  pointers[kMaxMirrorGlasses] = {};
+    int          sides[kMaxMirrorGlasses] = {};
+    int          count = s.paneCount < kMaxMirrorGlasses ? s.paneCount : kMaxMirrorGlasses;
+    bool         perSurface = mirrorUvCount() > 0;
+
+    for (int i = 0; i < count; ++i) {
+        labels[i] = perSurface ? g_surfaceGlass[i].team : (i == 0 ? "left" : "right");
+        if (!labels[i] || !labels[i][0]) labels[i] = "glass";
+        int same = 1;
+        for (int j = 0; j < i; ++j)
+            if (std::strcmp(labels[j], labels[i]) == 0) ++same;
+        if (same > 1)
+            _snprintf_s(names[i], sizeof(names[i]), _TRUNCATE, "%s%d", labels[i], same);
+        else
+            strncpy_s(names[i], labels[i], _TRUNCATE);
+        pointers[i] = names[i];
+        sides[i] = std::strcmp(labels[i], "left") == 0    ? 1
+                   : std::strcmp(labels[i], "right") == 0 ? -1
+                                                          : 0;
+    }
+    mirrorConfigSetGlasses(pointers, sides, count);
+}
+
 const PaneGeometry& viewedCarGlass(bool& changed) {
     State& s = g_state;
     changed = false;
@@ -1083,7 +1218,18 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
         return kPaneGeometry[s.paneTeam];
     }
     int driver = *reinterpret_cast<const int*>(driverAt);
-    if (driver == s.paneDriver) return kPaneGeometry[s.paneTeam];
+    if (driver == s.paneDriver) {
+        // THE SAME CAR IS NOT THE SAME MODEL. mod_teamModelLoadIfNeeded can reload a team's
+        // model under a driver index that never moves, which puts a different cockpit node in
+        // the team record and leaves every material node address this derived pointing at
+        // memory that has been freed. One dword a frame says so, and the walk is redone.
+        if (!g_derivedActive || g_derivedTeam < 0 ||
+            mirrorGeometryCockpit(g_derivedTeam) == g_derivedSet.cockpit)
+            return kPaneGeometry[s.paneTeam];
+        logf("mirror: team %d's model was reloaded -- its cockpit node moved, so the glasses "
+             "and the mirror textures are derived again",
+             g_derivedTeam);
+    }
 
     s.paneDriver = driver;
     changed = true;
@@ -1122,10 +1268,51 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
     if (fallback)
         logf("mirror: driver %d -> team index %d: %s -- using the Lotus glasses", driver, team,
              fallback);
+
+    // THE GLASSES THE CAR ACTUALLY HAS, when the model will say.
+    //
+    // The team index is still what names the ini section and what the table falls back to, but
+    // it is NOT what decides the geometry any more. Note this runs on the REPORTED team, not on
+    // the clamped one: a car outside the 1967 table has a model of its own to read even though
+    // it has no row.
+    //
+    // The authored UVs go back BEFORE the model is read. The derive takes each glass's UV span
+    // from the polygons, and a model that stayed loaded since the last derive (a loaded replay
+    // switching between cars of one team) still holds the regions written for it. Read as
+    // authored, they map the real authored UVs onto themselves: a car whose regions are stacked
+    // (the 1967 Ferrari, 512x256 each) then showed half of each reflection, stretched.
+    mirrorUvRelease();
+    g_derivedActive = false;
+    g_derivedTeam = -1;
+    if (team >= 0) {
+        if (mirrorGeometryDerive(team, g_derivedSet)) {
+            buildDerivedGlasses();
+            g_derivedActive = true;
+            g_derivedTeam = team;
+        }
+        mirrorGeometryReport(team, g_derivedSet);
+    }
+    // The regions follow the geometry: a car whose surfaces were not derived has nothing to lay
+    // out, and the UVs of the car before it are put back either way.
+    mirrorUvSetSurfaces(team, g_derivedActive ? &g_derivedSet : nullptr);
+    releasePanes();
     return kPaneGeometry[s.paneTeam];
 }
 
 }  // namespace
+
+int stereoDlongDelta(int from, int to) {
+    // A zero length means no wrap, which is also what a global this image cannot be shown to
+    // keep should produce: the delta passes through unwrapped rather than being folded around a
+    // track length read from somewhere else.
+    uintptr_t lengthAt = rebase(kTrackLengthDlong);
+    int       length = lengthAt ? *reinterpret_cast<const int*>(lengthAt) : 0;
+    int       delta = to - from;
+    if (length <= 0) return delta;
+    while (delta > length / 2) delta -= length;
+    while (delta < -length / 2) delta += length;
+    return delta;
+}
 
 void localToWorld(const float m[9], float lx, float ly, float lz, float& wx, float& wy,
                   float& wz) {
@@ -1166,9 +1353,12 @@ bool stereoAvailable() {
 void stereoOnCameraBind(void* camera) {
     // In a mirror-only render the only camera bound other than a pane is the main one, and
     // everything drawn from here to the end of the call would land in the eye.
-    if (g_state.mirrorOnly && camera && camera != g_state.pane[0].camera &&
-        camera != g_state.pane[1].camera)
-        g_paneDropPolys = 1;
+    if (g_state.mirrorOnly && camera) {
+        bool pane = false;
+        for (int i = 0; i < g_state.paneCount; ++i)
+            if (camera == g_state.pane[i].camera) pane = true;
+        if (!pane) g_paneDropPolys = 1;
+    }
 
     for (int pass = 0; pass < 2; ++pass) {
         if (!g_state.pendingValid[pass] || camera != g_state.half[pass].camera) continue;
@@ -1214,6 +1404,51 @@ void* stereoEyeSurface(int eye) {
 
 void* stereoSourceSurface() { return g_state.sourceSurface; }
 
+bool stereoSurfaceSize(void* surface, int& width, int& height) {
+    width = bitmapWidth(surface);
+    height = bitmapHeight(surface);
+    return width > 0 && height > 0;
+}
+
+// THE RACE IS OVER, SO THE HANDLES IT LEFT ARE NOT ANSWERS ANY MORE.
+//
+// A rasterizer handle carries no generation. Once GPL tears a session down, roglv2 recycles the
+// slot, and a handle gplvr is still holding reads as an ordinary small number that resolves to
+// a freed slot -- a NULL POINTER out of a non-null handle. That is the 2026-10-09 crash
+// (`roglv2!bitmapWidth+0x27`, handle 0x6F, table slots 0x6D..0x73 zeroed by the lobby-to-main-
+// menu teardown) and the three before it. Nothing downstream can validate the handle, so the
+// only fix is to stop handing it out.
+//
+// DELIBERATELY NOT stereoRelease(). That also frees cameras and panes and puts the cars'
+// material nodes back, and by the time the front end is visible the model those nodes live in
+// may already be gone -- restoring a pointer into freed memory to avoid a dangling mip is no
+// trade at all. This touches gplvr's own State and nothing else, so it cannot fault. The heavy
+// teardown still happens where it always did, on the rebuild path, which this forces by
+// clearing the handles the "same source, same size" check compares against.
+void stereoForgetSurfaces(const char* why) {
+    State& s = g_state;
+    if (!s.sourceSurface && !s.half[0].surface && !s.half[1].surface) return;
+    logf("stereo: %s -- forgetting the source surface %p and the eyes %p/%p. They are roglv2 "
+         "handles into a table GPL recycles, and a recycled one resolves to a null pointer or to "
+         "somebody else's surface rather than to nothing.",
+         why, s.sourceSurface, s.half[0].surface, s.half[1].surface);
+    s.sourceSurface = nullptr;
+    s.sourceWidth = 0;
+    s.sourceHeight = 0;
+    for (int eye = 0; eye < 2; ++eye) {
+        s.half[eye].surface = nullptr;
+        s.half[eye].camera = nullptr;
+        for (int i = 0; i < 4; ++i) s.eyeRect[eye][i] = 0;
+    }
+}
+
+bool stereoSourceCarvedSize(int& width, int& height) {
+    if (!g_state.sourceSurface) return false;
+    width = g_state.sourceWidth;
+    height = g_state.sourceHeight;
+    return width > 0 && height > 0;
+}
+
 bool stereoEyeGeometry(float& fov, float& separation) {
     if (!g_state.geometryValid) return false;
     fov = g_state.eyeFov;
@@ -1224,105 +1459,54 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
 
 void stereoInstallWalkLookup() {
-    // NO SETTING. The defect is GPL's own search answering from a segment the camera is not in,
-    // and the fallback is the viewed car's blended position -- so this is wanted wherever such a
+    // The defect is GPL's own search answering from a segment the camera is not in, and the
+    // fallback is the viewed car's blended position -- so this is wanted wherever such a
     // position exists, which is VR always and flat mode whenever the blend is on. Anywhere else
     // the thunk would find no car to ask about and hand every lookup straight back, so
     // installing it would buy one containment probe per lookup and nothing at all.
+    //
+    // `fixEyeSegment` chose between GPL's lookup untouched (0) and three designs until
+    // 2026-10-19; this is its mode 3, which cleared every artifact it was built for.
     if (g_options.vr || g_options.frameRate > 0) installWalkLookup();
 }
 
 bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
 
-bool stereoWalkFormat(char* out, size_t size) {
-    unsigned refused = g_walkTableNoViewDlong + g_walkTableOutside;
-    if (refused > g_walkTableWorstWindow) g_walkTableWorstWindow = refused;
-    if (!g_walkTableAnswered && !refused && !g_walkSubstituted && !g_walkPassedThrough)
-        return false;
-
-    // The table's record first, and it prints on a window where nothing went wrong: a refusal
-    // rate is only readable against the number of lookups that asked.
-    // _TRUNCATE returns -1 rather than failing, so a line that outgrows its buffer silently loses
-    // whatever was added last -- which is always the newest instrument. Say so instead.
-    int written = _snprintf_s(out, size, _TRUNCATE,
-                              "walk: the table answered %u of %u, refused %u (%u with no view "
-                              "dlong, %u with a dlong outside it) | session refusals %u, worst "
-                              "window %u",
-                              g_walkTableAnswered, g_walkTableAnswered + refused, refused,
-                              g_walkTableNoViewDlong, g_walkTableOutside,
-                              g_walkTableRefusedTotal, g_walkTableWorstWindow);
-
-    // What a refusal then led to, so the two are read together. Silent while the table is
-    // answering every lookup, which is when GPL's search is never reached.
-    if (written >= 0 && (g_walkSubstituted || g_walkPassedThrough))
-        written = _snprintf_s(
-            out + written, size - static_cast<size_t>(written), _TRUNCATE,
-            " || GPL's search was used: the camera's own answer stood %u times, asked again about "
-            "the car %u | of those, %u still OUTSIDE the segment GPL settled on, %u impossible "
-            "for the distance moved, %u CORRECTED from the car's own dlong (%u of them 10 m or "
-            "more, the kind that is visible), worst %.1f m over, %u with no car dlong",
-            g_walkPassedThrough, g_walkSubstituted, g_walkOutside, g_walkOverMargin,
-            g_walkCorrected, g_walkCorrectedBig, static_cast<double>(g_walkWorstExcess),
-            g_walkNoDlong);
-    if (written < 0) {
-        static bool said = false;
-        if (!said) {
-            said = true;
-            logf("walk: THE LINE ABOVE IS TRUNCATED -- it does not fit %zu bytes, so its last "
-                 "fields are missing. Grow the buffer in Hooks.cpp.",
-                 size);
-        }
-    }
-    g_walkSubstituted = 0;
-    g_walkPassedThrough = 0;
-    g_walkCorrected = 0;
-    g_walkCorrectedBig = 0;
-    g_walkOutside = 0;
-    g_walkOverMargin = 0;
-    g_walkNoDlong = 0;
-    g_walkWorstExcess = 0.0f;
-    g_walkTableAnswered = 0;
-    g_walkTableNoViewDlong = 0;
-    g_walkTableOutside = 0;
-    return true;
-}
-
-int stereoMirrorCopy(int writeBitmap, int readSurface, int x) {
+void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y) {
     State& s = g_state;
-    if (!s.frameMirrorSurface) return x;
+    if (!s.frameMirrorSurface) return;
 
-    // The three surfaces a mirror copy-out can read from: either pane when the glasses render
+    // The surfaces a mirror copy-out can read from: any pane when the glasses render
     // separately, GPL's own frame-corner instance when they do not. Everything else going
     // through bitmapDraw in a frame -- and the HUD is most of a hundred of them -- leaves here
     // on this comparison.
     auto handleOf = [](void* pointer) {
         return static_cast<int>(reinterpret_cast<intptr_t>(pointer));
     };
-    bool fromPane0 = s.pane[0].surface && readSurface == handleOf(s.pane[0].surface);
-    if (!fromPane0 && !(s.pane[1].surface && readSurface == handleOf(s.pane[1].surface)) &&
-        readSurface != handleOf(s.frameMirrorSurface))
-        return x;
+    int pane = -1;
+    for (int i = 0; i < s.paneCount; ++i)
+        if (s.pane[i].surface && readSurface == handleOf(s.pane[i].surface)) pane = i;
+    if (pane < 0 && readSurface != handleOf(s.frameMirrorSurface)) return;
 
-    // The first argument is where the pixels LAND -- mirror.mip's level-0 bitmap, which is the
-    // one thing in this process that names the texture the two glasses are read out of. It is a
+    // `writeBitmap` is where the pixels LAND. GPL always passes mirror.mip's level-0 bitmap,
+    // the one thing in this process that names the texture every glass is read out of. It is a
     // handle, like everything roglv2's C API passes; the accessors here take one, and so does
     // the cache.
     void* handle = reinterpret_cast<void*>(static_cast<intptr_t>(writeBitmap));
     mirrorCacheNoteTexture(writeBitmap, bitmapWidth(handle), bitmapHeight(handle));
 
-    if (!fromPane0 || !s.mirrorOnly) return x;
+    if (pane < 0) return;
+    x = s.paneRect[pane].x;
+    y = s.paneRect[pane].y;
     ++s.paneCopies;
-    return x + s.paneMipWidth / 2;
 }
 
 void stereoRelease() {
-    // A track change may legitimately put the dlong outside a table that has not loaded yet, so the
-    // one-shot refusal notice is armed again for the new one.
-    g_walkTableSaidRefused = false;
-
     // The mirror's bitmap may not outlive the mode change, so the cache is told to forget it
-    // before anything here can look at it again.
+    // before anything here can look at it again. The car's authored UVs go back too, and the
+    // regions are laid out again on the next frame that has a mirror.
     mirrorCacheRelease();
+    mirrorUvRelease();
     releasePanes();
     releaseHalf(g_state.half[0]);
     releaseHalf(g_state.half[1]);
@@ -1451,16 +1635,23 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
     params->mirrorFov = stock.fov;
     aim = PaneAim{};
 
+    // THE Y FLIP IS THE TABLE'S, NOT THE CAR'S. kPaneGeometry holds one glass and synthesises
+    // the other by negating Y, which is false for any car whose mirrors are not symmetric and
+    // cannot express one on the centreline at all. A derived glass already carries its own Y, so
+    // only the driver's yaw keeps a side.
     float sign = side == 0 ? 1.0f : -1.0f;
-    float c[3] = {glass.centre[0], sign * glass.centre[1], glass.centre[2]};
-    float n0[3] = {glass.normal[0], sign * glass.normal[1], glass.normal[2]};
+    float geomSign = g_derivedActive ? 1.0f : sign;
+    float c[3] = {glass.centre[0], geomSign * glass.centre[1], glass.centre[2]};
+    float n0[3] = {glass.normal[0], geomSign * glass.normal[1], glass.normal[2]};
 
-    // The driver's adjustment of the glass on its mount. Yaw turns the normal about the car's
-    // up axis so its sideways component points at the centreline -- toward -Y for the +Y glass,
-    // +Y for the -Y glass, hence the sign -- and pitch then turns it about the car's sideways
-    // axis so a positive angle lifts the face.
-    float yaw = sign * g_mirrorAim.yaw * 0.0174532925f;
-    float pitch = g_mirrorAim.pitch * 0.0174532925f;
+    // The driver's adjustment of THIS glass on its mount, from its own entry in
+    // gplvr_mirrors.ini. Yaw turns the normal about the car's up axis, positive anticlockwise
+    // seen from above, and a mirror turned by an angle turns its reflection by twice that the
+    // same way -- so a positive yaw swings the view, which looks astern, toward the car's right.
+    // Pitch then turns it about the car's sideways axis so a positive angle lifts the face.
+    MirrorAim tweak = mirrorAimFor(side);
+    float     yaw = tweak.yaw * 0.0174532925f;
+    float     pitch = tweak.pitch * 0.0174532925f;
     float cy = std::cos(yaw), sy = std::sin(yaw);
     float cp = std::cos(pitch), sp = std::sin(pitch);
     float yx = n0[0] * cy - n0[1] * sy;
@@ -1505,8 +1696,8 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
     // the texture half's, and the glass maps that half onto its whole face, so the aspect
     // makes the vertical angle the glass's own: tan(v/2) = tan(h/2) * aspect * height / width.
     float span = distance < kMirrorMinDistance ? kMirrorMinDistance : distance;
-    float fov = 2.0f * std::atan(glass.halfWidth / span) * g_mirrorAim.fovScale;
-    float fovV = 2.0f * std::atan(glass.halfHeight / span) * g_mirrorAim.fovScale;
+    float fov = 2.0f * std::atan(glass.halfWidth / span) * tweak.fovScale;
+    float fovV = 2.0f * std::atan(glass.halfHeight / span) * tweak.fovScale;
     if (fov < kMirrorMinFov) fov = kMirrorMinFov;
     if (fov > kMirrorMaxFov) fov = kMirrorMaxFov;
     if (fovV < kMirrorMinFov) fovV = kMirrorMinFov;
@@ -1559,9 +1750,9 @@ void reportPaneGeometry(const PaneGeometry& glass, const PaneFrame& frame,
          std::acos(forward) * 57.2957795f, std::acos(up) * 57.2957795f);
 }
 
-// Both glasses' aims from one viewpoint, at most every two seconds and only after the
+// Every glass's aim from one viewpoint, at most every two seconds and only after the
 // viewpoint has moved 2 cm in the car.
-void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim[2],
+void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim[], int count,
                    const char* viewpoint) {
     State& s = g_state;
     float local[3];
@@ -1581,43 +1772,41 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
     s.paneAimReportQpc = now.QuadPart;
     std::memcpy(s.paneAimReportEye, local, sizeof(local));
 
-    logf("mirror: from the %s at %+.3f %+.3f %+.3f in car axes -- left glass %.3f m away, "
-         "fov %.1f deg, looking yaw %+.1f pitch %+.1f | right glass %.3f m, fov %.1f, yaw "
-         "%+.1f pitch %+.1f (car axes, yaw +/-180 = astern)",
-         viewpoint, local[0], local[1], local[2], aim[0].distance, aim[0].fov, aim[0].yaw,
-         aim[0].pitch, aim[1].distance, aim[1].fov, aim[1].yaw, aim[1].pitch);
+    logf("mirror: from the %s at %+.3f %+.3f %+.3f in car axes, %d pane%s", viewpoint, local[0],
+         local[1], local[2], count, count == 1 ? "" : "s");
+    for (int i = 0; i < count; ++i)
+        logf("  %s glass: %.3f m away, fov %.1f deg, looking yaw %+.1f pitch %+.1f (car axes, "
+             "yaw +/-180 = astern)",
+             mirrorConfigGlassName(i), aim[i].distance, aim[i].fov, aim[i].yaw, aim[i].pitch);
 }
 
-// WHICH GLASS PUTS THE WHITE IN THE SKY. A temporary bisect, not a setting.
-//
-// The two glasses are rendered by different paths, which is worth knowing here: glass 0 (+Y) is
-// a whole extra gpl_sceneRender of its own with mirrorOnly set, and glass 1 (-Y) rides the eye's
-// own gpl_sceneRender as params->mirrorCamera.
-//
-// Both were rendered alone in turn to find where the white mirror sky above ~13 degrees of glass
-// pitch comes from, and both showed it, so it is common to the two paths and not in either.
+// The panes are rendered by two different paths -- all but the last in a mirror-only
+// gpl_sceneRender of their own, the last riding the eye's as params->mirrorCamera -- and the
+// white mirror sky above ~13 degrees of glass pitch was bisected across both. Each was rendered
+// alone in turn and both showed it, so it is common to the two paths and in neither.
 
 }  // namespace
 
-// The mirror on one frame in mirrorUpdateRate, counting from the frame that latched the tick.
+// Whether the glasses show anything at all. One switch: mirrorUpdateRate = 0 is off, and it
+// comes out as a dark glass rather than a frozen one, because the car keeps sampling whatever
+// was last written.
 //
 // A frame drawn between two sim ticks is one of GPL's own and redraws everything, the mirror
 // included -- measured at frameRate = 2, 231 mirror-only renders a second against a 36 Hz
 // simulation, which doubles the cost of every frame and so halves the rate. What a rear-view
 // mirror shows changes with the tick and with the head, and neither needs every frame.
 //
-// With perEyeMirror on, each eye's pass renders the panes from its own eye into the SAME mirror
-// texture, so the image in it at the end of a frame is the right eye's, and a frame that skipped
-// the render left both eyes sampling that one -- the left eye alternating between its own
+// With perEyeMirror on, each eye's pass renders the panes from its own eye into the same
+// textures, so what is in them at the end of a frame is the right eye's, and a frame that
+// skipped the render left both eyes sampling that -- the left eye alternating between its own
 // reflection and the right's, which is a visible flicker and was reported as one. MirrorCache
 // gives each eye a copy and puts it back on the frames that do not render; until both copies
 // exist there is nothing to put back, so the frame renders.
-// Whether the glasses show anything at all. One switch now: mirrorUpdateRate = 0 is off, and
-// it comes out as a dark glass rather than a frozen one. perEyeMirror used to be a second way
-// to say no -- it was 0/1/2 with 0 meaning off -- and having two was the reason to fold it
-// down to what it is actually about, which is whether each eye gets its own reflection.
 bool stereoMirrorOn() { return g_options.mirrorUpdateRate > 0; }
 
+// Every glass is a region of the one shared mirror.mip, so they are all rendered on the same
+// frames: the cache restores the whole texture, and restoring it after writing one region would
+// put the other eye's reflection back on the region that had just been drawn.
 bool stereoMirrorDueThisFrame() {
     if (!stereoMirrorOn()) return false;
     if (g_options.mirrorUpdateRate <= 1) return true;
@@ -1735,18 +1924,26 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                         "cannot be moved -- one stock image");
         } else if (!ensurePolyGate()) {
             reportPanes("the polyDraw gate could not be installed -- one stock image");
-        } else if (!ensurePanes(savedMirror)) {
-            reportPanes("the pane cameras are not built -- one stock image");
         } else {
-            panes = true;
-            reportPanes("each glass renders its own reflection");
-            paneFrameFromStock(mirrorStock, paneFrame);
+            // THE CAR FIRST, THE PANES AFTER IT. A change of car releases the previous car's
+            // mirror textures, and a pane built before that would be holding a bitmap handle
+            // belonging to a mip that has just been freed -- which the copy-out would then
+            // write through. ensurePanes rebuilds whenever the rects or the destinations move,
+            // so asking about the car first costs nothing and closes that window.
             bool teamChanged = false;
             glass = &viewedCarGlass(teamChanged);
-            if (teamChanged || !g_state.paneGeometryReported) {
-                g_state.paneGeometryReported = true;
-                float seat[3] = {savedX, savedY, savedZ};
-                reportPaneGeometry(*glass, paneFrame, mirrorStock, carOrientation, seat);
+            if (!ensurePanes(savedMirror)) {
+                reportPanes("the pane cameras are not built -- one stock image");
+                glass = nullptr;
+            } else {
+                panes = true;
+                reportPanes("each glass renders its own reflection");
+                paneFrameFromStock(mirrorStock, paneFrame);
+                if (teamChanged || !g_state.paneGeometryReported) {
+                    g_state.paneGeometryReported = true;
+                    float seat[3] = {savedX, savedY, savedZ};
+                    reportPaneGeometry(*glass, paneFrame, mirrorStock, carOrientation, seat);
+                }
             }
         }
     }
@@ -1954,16 +2151,21 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                  (readFov == useFov) ? "" : "  <-- THE WRITE DID NOT STICK");
         }
 
-        // The mirrors. A pass that renders them renders BOTH glasses from its viewpoint: the
-        // +Y glass in a mirror-only sceneRender first, copied into the right half of
-        // mirror.mip, then the -Y glass in the eye's own render, copied into the left half
-        // just before that render draws the car whose glasses sample both halves. 1 does this
-        // on the left eye's pass only, from the head centre, and the right eye samples what
-        // it left; 2 does it on both passes, each from its own eye. Without panes the same
-        // passes render GPL's single stock image.
+        // The mirrors. A pass that renders them renders every glass from its viewpoint: all but
+        // the last in a mirror-only sceneRender of its own, copied into its region, and the last
+        // riding the eye's own render so its copy lands just before that render draws the car
+        // whose glasses sample it. perEyeMirror 0 does this on the left eye's pass only, from
+        // the head centre, and the right eye samples what it left; 1 does it on both passes, each
+        // from its own eye. Without panes the same passes render GPL's single stock image.
+        //
+        // N glasses cost N-1 EXTRA gated sceneRenders per pass, at about 2.1 ms each: a car with
+        // one mirror saves one of the two a pair costs, and a car with three pays one more.
         bool mirrorThisPass = mirrorWanted && (g_options.perEyeMirror || pass == 0);
         params->mirrorCamera = mirrorThisPass ? savedMirror : nullptr;
-        if (mirrorThisPass && panes) {
+
+        int dueCount = mirrorThisPass && panes ? g_state.paneCount : 0;
+
+        if (dueCount > 0) {
             float eye[3] = {params->eyeX, params->eyeY, params->eyeZ};
             if (!g_options.perEyeMirror) {
                 // vr[i].offset is each eye's own displacement from the recentre pose, in GPL
@@ -1977,29 +2179,30 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                 eye[2] = savedZ + hz;
             }
 
-            PaneAim aim[2];
-            aimPane(params, mirrorStock, paneFrame, *glass, 0, eye, g_state.pane[0].camera,
-                    aim[0]);
-            params->mirrorCamera = g_state.pane[0].camera;
+            PaneAim aim[kMaxMirrorSurfaces];
+            for (int surface = 0; surface < dueCount; ++surface) {
+                aimPane(params, mirrorStock, paneFrame, paneGlass(*glass, surface), surface, eye,
+                        g_state.pane[surface].camera, aim[surface]);
+                params->mirrorCamera = g_state.pane[surface].camera;
+                if (surface + 1 >= dueCount) break;
 
-            int copies = g_state.paneCopies;
-            g_state.mirrorOnly = true;
-            original(params);
-            g_state.mirrorOnly = false;
-            g_paneDropPolys = 0;
-            if (g_state.paneCopies == copies && !g_state.reportedNoCopy) {
-                g_state.reportedNoCopy = true;
-                logf("mirror: the left glass's copy-out did not pass through the bitmapDraw "
-                     "thunk, so it landed in the right glass's half of mirror.mip");
+                int copies = g_state.paneCopies;
+                g_state.mirrorOnly = true;
+                original(params);
+                g_state.mirrorOnly = false;
+                g_paneDropPolys = 0;
+                if (g_state.paneCopies == copies && !g_state.reportedNoCopy) {
+                    g_state.reportedNoCopy = true;
+                    logf("mirror: pane %d's copy-out did not pass through the bitmapDraw thunk, "
+                         "so it landed wherever GPL addressed it rather than in this surface's "
+                         "own rect",
+                         surface);
+                }
             }
-
-            aimPane(params, mirrorStock, paneFrame, *glass, 1, eye, g_state.pane[1].camera,
-                    aim[1]);
-            params->mirrorCamera = g_state.pane[1].camera;
             mirrorMoved = true;
 
             if (pass == 0)
-                reportPaneAim(paneFrame, eye, aim,
+                reportPaneAim(paneFrame, eye, aim, dueCount,
                               !g_options.perEyeMirror ? "head centre" : "left eye");
         }
 
@@ -2029,14 +2232,14 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                  worst, yaw * 57.29578f, pitch * 57.29578f, roll * 57.29578f);
         }
 
-        // This pass is not rendering the mirror, so mirror.mip still holds whichever eye wrote
-        // it last. Put this eye's own reflection back before the render that samples it.
+        // mirror.mip, when this pass is not rendering it, still holds whichever eye wrote it last.
+        // Put this eye's own reflection back before the render that samples it.
         //
         // FLUSH FIRST. roglv2 does not rasterise when polyDraw is called -- it appends to the
         // ZBuffer drawer's bins and issues them at a destination change or a 2D call. The eye
-        // before this one can still have the car queued, and that car samples mirror.mip, so
-        // replacing the texture underneath it hands it the other eye's reflection: the glasses
-        // read as swapped, and intermittently, because it depends on what is still in the bin.
+        // before this one can still have the car queued, and that car samples these textures,
+        // so replacing one underneath it hands it the other eye's reflection: the glasses read
+        // as swapped, and intermittently, because it depends on what is still in the bin.
         // GPL's own copy-out has exactly this hazard and bitmapDraw flushes on its way in,
         // which is why the stock mirror is never stale. This blit is not a bitmapDraw.
         if (cacheEyes && !mirrorThisPass) {
@@ -2045,9 +2248,22 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         }
 
         original(params);
+        // Inside a frame-trace window: the eye's bins are flushed now rather than at the next
+        // bind, so the GL viewport and scissor read are the ones its polygons were drawn with.
+        if (frameTraceArmed()) {
+            rasterFlushPending();
+            int   eye = pass & 1;
+            void* surface = stereoEyeSurface(eye);
+            int   size[2] = {};
+            int   rect[4] = {};
+            if (surface) stereoSurfaceSize(surface, size[0], size[1]);
+            stereoEyeRect(eye, rect);
+            frameTraceEye(eye, surface, size[0], size[1], rect);
+        }
 
-        // Both halves of mirror.mip are this eye's only now: the +Y glass was copied in before
-        // the render and the -Y glass during it, just ahead of the car that samples them.
+        // mirror.mip is this eye's own now, if this pass wrote it: the panes before the last were
+        // copied in ahead of the render and the last during it, just before the car that
+        // samples them was drawn.
         if (cacheEyes && mirrorThisPass) mirrorCacheSave(pass);
 
         // Did the projection actually get REBUILT?

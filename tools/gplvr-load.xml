@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<GPLPatch>
+
+   <ExeSection>
+      <Name>modtext</Name>
+      <MinimumFileSize>0x0000C040</MinimumFileSize>
+   </ExeSection>
+
+   <BinaryPatch>
+      <VirtualAddress>0x0098C000</VirtualAddress>
+      <Data>608B15172B4E006814C09800FF1261E91C2BB5FF67706C76725C67706C76722E646C6C00</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <VirtualAddress>0x005202FD</VirtualAddress>
+      <Data>E8FEBC4600</Data>
+   </BinaryPatch>
+
+</GPLPatch>

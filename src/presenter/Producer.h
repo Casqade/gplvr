@@ -22,7 +22,9 @@ bool presenterStart();
 
 // Called from the frame hook, before the game presents, so the render target still
 // holds the finished frame. Drives the handshake, then copies and publishes.
-void presenterFrame(bool sideBySide, bool stretchToFill);
+// `monoRect` (x, y, width, height, rows from the top) is the part of the frame a one-image
+// publish shows; null shows all of it. Ignored for a side-by-side frame.
+void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect = nullptr);
 
 // The off-screen render target, which is what decouples the eye resolution from the
 // game window. These own the GL entry points, which is why they live here rather than
@@ -65,7 +67,8 @@ void presenterUpdateVrMenu();
 // Call it AFTER presenterEndFrame and BEFORE presenterFrame: it takes the window's
 // picture first if that has not happened yet, so the ray is in the image the headset
 // gets and not in the one the monitor shows. Inert unless a mode is open and the owning
-// hand is tracked, and it moves nothing about the frame's ordering when it is inert.
+// hand is tracked, or the replay panel is up and a hand is pointing, and it moves nothing
+// about the frame's ordering when it is inert.
 void presenterDrawVrRay(bool takeWindowPicture);
 
 // The names the runtime gives the controls each action is bound to, for the menu's help

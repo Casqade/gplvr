@@ -68,8 +68,19 @@ void windowRefreshEngineMode();
 // What the engine says its display mode is. Zero until the read above has succeeded.
 void windowEngineModeSize(int& width, int& height);
 
+// Whether `surface` is the 3D view's handle as the engine last allocated it, and if so its rect
+// on the frame: x, y, w, h, rows from the top. It is the window's size at the frame's top left,
+// whatever size the frame is.
+bool windowViewSurface(void* surface, int rect[4]);
 // True while that mode is GPL's 640x480 front end.
 bool windowInFrontEnd();
+
+// Did the engine just LEAVE a session for the front end? True once per transition, cleared by
+// the asking -- so exactly one caller acts on each edge. Latched where the mode is decided
+// rather than polled, because three paths reach that decision and a session can end down any
+// of them. Everything gplvr cached from the race, rasterizer handles above all, stops meaning
+// anything here.
+bool windowTakeFrontEndEntered();
 
 // GPL fixes the HORIZONTAL field of view and derives the vertical from the surface's
 // shape -- `tan(vhalf) = tan(fov/2) * H/W` with square pixels -- so a wider window shows

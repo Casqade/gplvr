@@ -131,6 +131,10 @@ bool createFramebuffer(int width, int height) {
     // would give unevenly sized pixels.
     GLint filter = g_options.menuFilter == 2 ? GL_LINEAR : GL_NEAREST;
 
+    // The binding found here goes back afterwards: roglv2 keeps its own copy of the bound
+    // texture and does not rebind one it believes is bound (display +0x38).
+    GLint previousTexture = 0;
+    if (s.gl.getIntegerv) s.gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
     s.gl.genTextures(1, &s.colour);
     s.gl.bindTexture(GL_TEXTURE_2D, s.colour);
     s.gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
@@ -139,7 +143,7 @@ bool createFramebuffer(int width, int height) {
     s.gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     s.gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kGlClampToEdge);
     s.gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kGlClampToEdge);
-    s.gl.bindTexture(GL_TEXTURE_2D, 0);
+    s.gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
 
     // The front end draws no depth, but roglv2's ZBufferOpenGL clears and tests one
     // regardless, and a framebuffer without a depth attachment answers those calls with

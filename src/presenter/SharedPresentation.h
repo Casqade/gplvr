@@ -335,6 +335,9 @@ struct ControlBlock {
     //
     // All zero means "fall back to the eyeHalfWidth split", so a producer that has not
     // filled this in still works.
+    //
+    // With sideBySide zero, a non-zero rect is the part of the texture that one image is in,
+    // the same for both eyes; all zero means the whole texture.
     uint32_t eyeRect[2][4] = {};
 
     // Non-zero when the two eyes are the left and right halves of the texture, which is

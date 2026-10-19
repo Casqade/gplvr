@@ -64,6 +64,17 @@ void renderProfileInstallDriverThunks();
 // which is where they hold the render that just finished.
 void renderProfileAfterRender();
 
+// roglv2's free-running "polygons accepted" counter, or -1 when it was not resolved.
+//
+// roglv2 gives every accepted polygon a constant z = seq * (0.9999 / N) - 0.9999, N being how
+// many it accepted in that flush (rogl_zbufferAssignOrderDepth 0x20011370). Under its
+// glOrtho(..., 0, 1) that is window depth 0.9999 - seq * 0.9999 / N, against a depth cleared to
+// 1.0 with GL_LEQUAL, so the LATER submission is nearer and wins: painter's order. N only scales
+// the spacing; the order, and so the winner, is the same for any N. A count that differs between
+// the eyes therefore means the eyes submitted different sets of polygons, not that they ordered
+// the same ones differently. Read it either side of a pass to get that pass's count.
+int renderProfilePolysDrawn();
+
 // Bracket the engine's own screenDisplay, so a glFinish can be charged to the half of the
 // frame it happened in. roglv2 issues them from more than one place.
 void renderProfileSetInPresent(bool inPresent);

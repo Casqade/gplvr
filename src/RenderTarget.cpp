@@ -597,6 +597,10 @@ bool createFramebuffer(const GlFunctions& gl, int width, int height) {
     // Before allocating 180 MB and finding out the hard way.
     if (!sizeWithinGlLimits(gl, width, height)) return false;
 
+    // The binding found here goes back afterwards: roglv2 keeps its own copy of the bound
+    // texture and does not rebind one it believes is bound (display +0x38).
+    GLint previousTexture = 0;
+    if (gl.getIntegerv) gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
     gl.genTextures(1, &g_target.colour);
     gl.bindTexture(GL_TEXTURE_2D, g_target.colour);
     gl.texImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
@@ -605,7 +609,7 @@ bool createFramebuffer(const GlFunctions& gl, int width, int height) {
     gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kGlClampToEdge);
     gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kGlClampToEdge);
-    gl.bindTexture(GL_TEXTURE_2D, 0);
+    gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
 
     // 24-bit depth, where the window's own buffer is 16: DisplayOpenGL asks for
     // cDepthBits = 16 once for the whole process, and an FBO is not bound by that. Free
@@ -866,6 +870,20 @@ void renderTargetEndFrame(const GlFunctions& gl) {
     if (!g_target.bound) return;
     gl.bindFramebuffer(kGlFramebuffer, 0);
     g_target.bound = false;
+}
+
+void renderTargetClear(const GlFunctions& gl) {
+    // Only with the state put back afterwards: roglv2 caches what it last set, and a scissor or
+    // a clear colour changed under it is a fault in a later frame that nothing points back to.
+    if (!g_target.bound || !gl.clear || !gl.clearColor || !gl.disable || !gl.colorMask ||
+        !gl.pushAttrib || !gl.popAttrib)
+        return;
+    gl.pushAttrib(GL_COLOR_BUFFER_BIT | GL_SCISSOR_BIT);
+    gl.disable(GL_SCISSOR_TEST);
+    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+    gl.popAttrib();
 }
 
 bool renderTargetActive() { return g_target.active && g_target.framebuffer != 0; }

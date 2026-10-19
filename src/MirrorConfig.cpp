@@ -12,9 +12,6 @@
 #include <cstring>
 
 namespace gplvr {
-
-MirrorAim g_mirrorAim;
-
 namespace {
 
 // gpl_carsetDirName: gpl_teamModelLoadBindNodes (0x4067E0) strcpy's the loaded car-set
@@ -27,46 +24,126 @@ constexpr uintptr_t kRetailCarsetDirName = 0x005A1928;
 constexpr int       kCarsetDirBytes = 16;
 
 // mod_teamFolderNamePtrs: pointers into the mod layer's 9-byte folder-name slots at 0xA079C8,
-// which a mod patches to rename team folders. The loader reads [team] for team < 7 and [0]
-// otherwise (0x985726), so the key names the model actually drawn.
+// which a mod patches to rename team folders.
 constexpr uintptr_t kTeamFolderNamePtrs = 0x00A0F798;
 constexpr uintptr_t kModDataBegin = 0x00A00000;
 constexpr uintptr_t kModDataEnd = 0x00A10000;
 constexpr int       kTeamFolderBytes = 9;
-constexpr int       kTeamModels = 7;
+
+// HOW MANY TEAMS GET A SECTION OF THEIR OWN -- 50, which is the table's own size.
+//
+// mod_teamFolderNamePtrs is a regular array: entry i points at the 9-byte name slot
+// 0xA079C8 + 9*i, exactly, for 50 entries; entry 50 points elsewhere and the pattern stops.
+// So 50 is read from the image rather than picked, and it costs 50 * sizeof(CarEntry).
+//
+// This was 7, the stock 1967 field, with every higher team index folded onto slot 0. That was
+// RIGHT FOR gplc67: mod_teamFolderName (0x985726) and mod_carTypeTeamSlot (0x9852A1) both do
+// `if (index >= 7) index = 0`, so on this executable a higher team really does draw team 0's
+// model and sharing its aim is honest.
+//
+// It is wrong for the GPL 2020 demo, which is a different build. That ships cars18/c00..c09,
+// its drivers report team indices up to 9, and c07/c08/c09 plainly draw their own models --
+// c07 is a Ferrari 330P4 with three mirror glasses, one on the ceiling. Folded onto slot 0 all
+// three shared cars18/c00's section, so aiming one from tweak mode silently re-aimed the other
+// three.
+//
+// buildKey resolves which regime it is in FROM THE DATA rather than from the build: the name
+// slot of a team the running executable never populates is empty, and an empty slot falls back
+// to slot 0's name, which reproduces that clamp exactly. No build detection, and a mod that
+// does populate the higher slots gets its own sections automatically.
+constexpr int kTeamSlots = 50;
 
 constexpr const char kFileName[] = "gplvr_mirrors.ini";
 constexpr const char kFileHeader[] =
-    "; gplvr_mirrors.ini -- per-car mirror aim, written by gplvr's mirror tweak mode.\r\n"
+    "; gplvr_mirrors.ini -- per-car, per-glass mirror aim, written by gplvr's mirror tweak mode.\r\n"
     "; One section per car: [<car-set folder>/<team folder>], lower case, e.g. [cars67/lotus].\r\n"
-    "; A car with no section, or a value missing from one, gets the glasses where GPL points\r\n"
-    "; them: 0 yaw, 0 pitch, 1.0 scale. gplvr.ini has no mirror-aim keys. Delete a section to\r\n"
-    "; put that car back to neutral and aim it again.\r\n"
+    "; In it <glass>Yaw, <glass>Pitch and <glass>FovScale for each glass -- left, right,\r\n"
+    "; centre. Positive yaw turns that glass's view toward the car's right, so a symmetric\r\n"
+    "; pair has opposite signs. A glass with no values gets the aim GPL gives it: 0 yaw,\r\n"
+    "; 0 pitch, 1.0 scale. Delete a section to put that car back to neutral and aim it again.\r\n"
     "\r\n";
 
 constexpr int kKeyBytes = 40;
 
-struct CarEntry {
-    bool      resolved = false;
-    bool      perCar = false;
-    char      key[kKeyBytes] = {};
+// Glasses a car's section can name. More than the 8 panes there can be, because the file may
+// hold a glass the car is not being drawn with right now -- a centre glass saved while every
+// glass had a pane, read back on a run where the two shared halves are in use.
+constexpr int kAimSlots = 16;
+
+// A glass is not given a value outside these. The same limits tweak mode clamps to.
+constexpr float kMaxAimAngle = 45.0f;
+constexpr float kMinFovScale = 0.25f;
+constexpr float kMaxFovScale = 6.0f;
+
+struct NamedAim {
+    char      name[kMirrorGlassNameBytes] = {};
     MirrorAim aim;
+};
+
+struct AimSet {
+    int      count = 0;
+    NamedAim glass[kAimSlots];
+};
+
+struct CarEntry {
+    bool   resolved = false;
+    bool   perCar = false;
+    char   key[kKeyBytes] = {};
+    AimSet aims;  // what the file holds for this car; tweak mode only ever moves `live`
 };
 
 struct Config {
     char     path[MAX_PATH] = {};
     char     carsetDir[kCarsetDirBytes] = {};
     bool     carsetKnown = false;
-    CarEntry car[kTeamModels];
-    // The slot g_mirrorAim came from: a team model slot, -1 for gplvr.ini's values, -2 before
-    // the first resolution or after a car-set change.
-    int  current = -2;
-    char key[kKeyBytes] = {};  // empty while no car is identified
-    bool perCar = false;
-    bool edited = false;       // tweak mode changed g_mirrorAim since it was loaded or saved
+    CarEntry car[kTeamSlots];
+    // The slot the live aims came from: a team model slot, -1 for none, -2 before the first
+    // resolution or after a car-set change.
+    int    current = -2;
+    char   key[kKeyBytes] = {};  // empty while no car is identified
+    bool   perCar = false;
+    bool   edited = false;       // tweak mode changed `live` since it was loaded or saved
+    AimSet live;                 // what aimPane uses, and what tweak mode edits
+    unsigned generation = 0;     // bumped whenever the viewed car, and so `live`, is replaced
+
+    // The glasses the panes are drawn for, from Stereo.
+    int  glasses = 0;
+    char glassName[kMaxMirrorGlasses][kMirrorGlassNameBytes] = {};
+    int  glassSide[kMaxMirrorGlasses] = {};
+    int  selected = -1;  // -1: every glass together
 };
 
 Config g_config;
+
+int findAim(const AimSet& set, const char* name) {
+    for (int i = 0; i < set.count; ++i)
+        if (_stricmp(set.glass[i].name, name) == 0) return i;
+    return -1;
+}
+
+MirrorAim* findOrAddAim(AimSet& set, const char* name) {
+    int at = findAim(set, name);
+    if (at >= 0) return &set.glass[at].aim;
+    if (set.count >= kAimSlots || !name[0]) return nullptr;
+    NamedAim& added = set.glass[set.count++];
+    added = NamedAim{};
+    strncpy_s(added.name, name, _TRUNCATE);
+    return &added.aim;
+}
+
+void formatSet(const AimSet& set, char* out, size_t size) {
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < set.count && used < size; ++i) {
+        const NamedAim& entry = set.glass[i];
+        int wrote = _snprintf_s(out + used, size - used, _TRUNCATE,
+                                "%s%s yaw %.2f pitch %.2f fov %.3f", i ? ", " : "", entry.name,
+                                entry.aim.yaw, entry.aim.pitch, entry.aim.fovScale);
+        if (wrote < 0) break;
+        used += static_cast<size_t>(wrote);
+    }
+    if (!set.count) _snprintf_s(out, size, _TRUNCATE, "every glass neutral");
+}
 
 // No C++ objects in here, so structured exception handling is allowed. The mod-layer sections
 // only exist in a patched exe.
@@ -103,21 +180,6 @@ const char* ensurePath() {
     return c.path;
 }
 
-// THE AIM A CAR WITH NO SECTION GETS: neutral, and not configurable.
-//
-// It was three gplvr.ini options until 2026-09-27, which put the same quantity in two files --
-// the per-car values here, the fallback there -- with only the per-car one reachable from the
-// headset. There is no fallback to configure now: a car nobody has aimed gets the glasses
-// where GPL points them, and aiming it takes ten seconds in the headset and is then saved
-// against that car.
-MirrorAim globalAim() {
-    MirrorAim aim;
-    aim.yaw = 0.0f;
-    aim.pitch = 0.0f;
-    aim.fovScale = 1.0f;
-    return aim;
-}
-
 // `<cardir>/<teamfolder>` in lower case, or `<cardir>/team<N>` when the folder name cannot be
 // trusted. False when the car-set directory itself is not a readable name.
 bool buildKey(int slot, char* key, size_t size) {
@@ -127,15 +189,33 @@ bool buildKey(int slot, char* key, size_t size) {
     std::memcpy(dir, reinterpret_cast<const void*>(carsetDir), kCarsetDirBytes);
     if (!validName(dir, kCarsetDirBytes - 1)) return false;
 
-    char      folder[kTeamFolderBytes + 1] = {};
-    uintptr_t pointer = 0;
-    bool      folderValid =
-        readBytes(kTeamFolderNamePtrs + 4 * slot, &pointer, sizeof(pointer)) &&
-        pointer >= kModDataBegin && pointer + kTeamFolderBytes <= kModDataEnd &&
-        readBytes(pointer, folder, kTeamFolderBytes) && validName(folder, kTeamFolderBytes - 1);
+    // The folder name for a team slot, or nothing when that slot has never been populated.
+    auto readFolder = [](int which, char* out) {
+        uintptr_t pointer = 0;
+        return readBytes(kTeamFolderNamePtrs + 4 * which, &pointer, sizeof(pointer)) &&
+               pointer >= kModDataBegin && pointer + kTeamFolderBytes <= kModDataEnd &&
+               readBytes(pointer, out, kTeamFolderBytes) &&
+               validName(out, kTeamFolderBytes - 1);
+    };
+
+    // AN EMPTY SLOT MEANS THIS EXECUTABLE FOLDED THIS TEAM ONTO SLOT 0.
+    //
+    // gplc67's own lookups clamp any index >= 7 to 0, so it never writes a name above slot 6 and
+    // a car reporting team 9 is drawing team 0's model. Taking slot 0's name there gives that
+    // car team 0's key, which is the model actually drawn and the aim it should share. A build
+    // whose mod layer does populate the higher slots -- the GPL 2020 demo does, to nine --
+    // answers on the first read and gets a key of its own. The data decides, not the build.
+    char folder[kTeamFolderBytes + 1] = {};
+    bool folderValid = readFolder(slot, folder);
+    if (!folderValid && slot > 0) {
+        std::memset(folder, 0, sizeof(folder));
+        folderValid = readFolder(0, folder);
+    }
     if (folderValid) {
         _snprintf_s(key, size, _TRUNCATE, "%s/%s", dir, folder);
     } else {
+        uintptr_t pointer = 0;
+        readBytes(kTeamFolderNamePtrs + 4 * slot, &pointer, sizeof(pointer));
         _snprintf_s(key, size, _TRUNCATE, "%s/team%d", dir, slot);
         logf("mirror config: team slot %d has no readable folder name at 0x%08X (pointer %08X) "
              "-- keyed by slot",
@@ -146,34 +226,80 @@ bool buildKey(int slot, char* key, size_t size) {
     return true;
 }
 
-// The one read of gplvr_mirrors.ini for this slot in this car set.
+// The one read of gplvr_mirrors.ini for this slot in this car set. The whole section at once,
+// because which glasses it names is not known in advance: every key ending in Yaw, Pitch or
+// FovScale is a value of the glass its prefix names.
 bool loadEntry(int slot, CarEntry& entry) {
     if (!buildKey(slot, entry.key, sizeof(entry.key))) return false;
-    entry.aim = globalAim();
+    entry.aims = AimSet{};
     entry.perCar = false;
     const char* path = ensurePath();
-    auto readValue = [&](const char* name, float& value, float low, float high) {
-        char text[32] = {};
-        GetPrivateProfileStringA(entry.key, name, "", text, sizeof(text), path);
-        if (!text[0]) return;
-        float parsed = static_cast<float>(atof(text));
-        if (!(parsed >= low)) parsed = low;
-        if (parsed > high) parsed = high;
-        value = parsed;
-        entry.perCar = true;
-    };
-    readValue("vrMirrorYaw", entry.aim.yaw, -45.0f, 45.0f);
-    readValue("vrMirrorPitch", entry.aim.pitch, -45.0f, 45.0f);
-    readValue("vrMirrorFovScale", entry.aim.fovScale, 0.25f, 6.0f);
+
+    char section[4096] = {};
+    DWORD length = GetPrivateProfileSectionA(entry.key, section, sizeof(section), path);
+    int   ignored = 0;
+    for (const char* line = section; length && *line; line += std::strlen(line) + 1) {
+        const char* equals = std::strchr(line, '=');
+        if (!equals) continue;
+        char key[48] = {};
+        size_t keyLength = static_cast<size_t>(equals - line);
+        if (keyLength >= sizeof(key)) {
+            ++ignored;
+            continue;
+        }
+        std::memcpy(key, line, keyLength);
+        while (keyLength && key[keyLength - 1] == ' ') key[--keyLength] = '\0';
+
+        struct Suffix {
+            const char* text;
+            float       low, high;
+            int         which;  // 0 yaw, 1 pitch, 2 fov
+        };
+        const Suffix suffixes[] = {{"FovScale", kMinFovScale, kMaxFovScale, 2},
+                                   {"Pitch", -kMaxAimAngle, kMaxAimAngle, 1},
+                                   {"Yaw", -kMaxAimAngle, kMaxAimAngle, 0}};
+        bool matched = false;
+        for (const Suffix& suffix : suffixes) {
+            size_t suffixLength = std::strlen(suffix.text);
+            if (keyLength <= suffixLength ||
+                _stricmp(key + keyLength - suffixLength, suffix.text) != 0)
+                continue;
+            char name[kMirrorGlassNameBytes] = {};
+            size_t nameLength = keyLength - suffixLength;
+            if (nameLength >= sizeof(name)) break;
+            std::memcpy(name, key, nameLength);
+            MirrorAim* aim = findOrAddAim(entry.aims, name);
+            if (!aim) break;
+
+            float value = static_cast<float>(atof(equals + 1));
+            if (!(value >= suffix.low)) value = suffix.low;
+            if (value > suffix.high) value = suffix.high;
+            if (suffix.which == 0) aim->yaw = value;
+            else if (suffix.which == 1) aim->pitch = value;
+            else aim->fovScale = value;
+            entry.perCar = true;
+            matched = true;
+            break;
+        }
+        if (!matched) ++ignored;
+    }
+    // A key this does not read is a value somebody expected to matter, most likely one written
+    // before the aim was per glass. Said once per car rather than dropped in silence.
+    if (ignored)
+        logf("mirror config: [%s] has %d key%s that %s not a <glass>Yaw/Pitch/FovScale value and "
+             "%s ignored",
+             entry.key, ignored, ignored == 1 ? "" : "s", ignored == 1 ? "is" : "are",
+             ignored == 1 ? "is" : "are");
     entry.resolved = true;
     return true;
 }
 
 void logResolution(const char* reason) {
     const Config& c = g_config;
-    logf("mirror config: %s -> %s yaw %.2f pitch %.2f fov %.3f%s%s",
-         c.key[0] ? c.key : "(no car)", c.perCar ? "per-car" : "global", g_mirrorAim.yaw,
-         g_mirrorAim.pitch, g_mirrorAim.fovScale, reason ? " -- " : "", reason ? reason : "");
+    char aims[512];
+    formatSet(c.live, aims, sizeof(aims));
+    logf("mirror config: %s -> %s, %s%s%s", c.key[0] ? c.key : "(no car)",
+         c.perCar ? "per-car" : "no section", aims, reason ? " -- " : "", reason ? reason : "");
 }
 
 // Creates gplvr_mirrors.ini with its comment header when it is not there; an existing file is
@@ -188,6 +314,29 @@ void ensureFile(const char* path) {
     CloseHandle(file);
 }
 
+// Every glass of one set into one section, three values each. The count of values that could
+// not be written, with the last error in `error`.
+int writeSet(const char* key, const AimSet& set, const char* path, DWORD& error) {
+    int failed = 0;
+    for (int i = 0; i < set.count; ++i) {
+        const NamedAim& entry = set.glass[i];
+        auto write = [&](const char* suffix, const char* format, float value) {
+            char name[48] = {};
+            char text[32] = {};
+            _snprintf_s(name, sizeof(name), _TRUNCATE, "%s%s", entry.name, suffix);
+            _snprintf_s(text, sizeof(text), _TRUNCATE, format, value);
+            if (!WritePrivateProfileStringA(key, name, text, path)) {
+                ++failed;
+                error = GetLastError();
+            }
+        };
+        write("Yaw", "%.2f", entry.aim.yaw);
+        write("Pitch", "%.2f", entry.aim.pitch);
+        write("FovScale", "%.3f", entry.aim.fovScale);
+    }
+    return failed;
+}
+
 }  // namespace
 
 void mirrorConfigReset() {
@@ -198,7 +347,9 @@ void mirrorConfigReset() {
     c.perCar = false;
     c.edited = false;
     c.carsetKnown = false;
-    g_mirrorAim = globalAim();
+    c.live = AimSet{};
+    ++c.generation;
+    // The glasses are the panes', which this does not lay out, so they stay.
 }
 
 bool mirrorConfigClearAll() {
@@ -232,14 +383,15 @@ bool mirrorConfigCarSetChanged() {
     char shown[kCarsetDirBytes + 1] = {};
     std::memcpy(shown, c.carsetDir, kCarsetDirBytes);
     logf("mirror config: car-set directory is now \"%s\" -- cached cars dropped", shown);
-    if (c.edited) mirrorConfigSave();
+    mirrorConfigDiscard("the car set changed");
     for (CarEntry& entry : c.car) entry = CarEntry{};
-    // The old key names a car of the previous set, so nothing may be saved to it; the aim is
-    // gplvr.ini's until the next viewed team is read.
+    // The old key names a car of the previous set, so nothing may be saved to it; every glass is
+    // neutral until the next viewed team is read.
     c.current = -2;
     c.key[0] = '\0';
     c.perCar = false;
-    g_mirrorAim = globalAim();
+    c.live = AimSet{};
+    ++c.generation;
     return true;
 }
 
@@ -247,38 +399,141 @@ void mirrorConfigViewedTeam(int team, const char* reason) {
     Config& c = g_config;
     int         slot = -1;
     const char* why = nullptr;
-    if (team >= 0) {
-        slot = team < kTeamModels ? team : 0;
+    if (team >= 0 && team < kTeamSlots) {
+        slot = team;
         CarEntry& entry = c.car[slot];
         if (!entry.resolved && !loadEntry(slot, entry)) {
             slot = -1;
             why = "the car-set directory could not be placed in this image, or is not a "
                   "readable name";
         }
+    } else if (team >= kTeamSlots) {
+        why = "the viewed car's team index is past the slots gplvr keeps a section for";
     } else {
         why = reason ? reason : "the viewed car's team could not be read";
     }
     if (slot == c.current) return;
 
-    // Tweaks made on the previous car belong to it.
-    if (c.edited && c.key[0]) mirrorConfigSave();
-    if (c.edited) {
-        logf("mirror config: the tweaked aim was not saved -- no car had been identified");
-        c.edited = false;
-    }
+    // AN UNSAVED AIM DIES WITH THE VIEW. It belongs to the car it was made on, and nothing may
+    // write a car the player is not looking at -- so leaving that car discards it, exactly as
+    // leaving tweak mode without saving does. What was dropped is logged, so a stray switch to
+    // another driver costs a line in the log rather than an aim nobody can see.
+    mirrorConfigDiscard("the viewed car changed");
 
+    ++c.generation;
     c.current = slot;
     if (slot >= 0) {
         const CarEntry& entry = c.car[slot];
         strncpy_s(c.key, entry.key, _TRUNCATE);
         c.perCar = entry.perCar;
-        g_mirrorAim = entry.aim;
+        c.live = entry.aims;
     } else {
         c.key[0] = '\0';
         c.perCar = false;
-        g_mirrorAim = globalAim();
+        c.live = AimSet{};
     }
     logResolution(why);
+}
+
+void mirrorConfigSetGlasses(const char* const names[], const int sides[], int count) {
+    Config& c = g_config;
+    if (count < 0) count = 0;
+    if (count > kMaxMirrorGlasses) count = kMaxMirrorGlasses;
+
+    bool same = count == c.glasses;
+    for (int i = 0; same && i < count; ++i)
+        same = std::strcmp(c.glassName[i], names[i]) == 0 && c.glassSide[i] == sides[i];
+    if (same) return;
+
+    c.glasses = count;
+    for (int i = 0; i < count; ++i) {
+        strncpy_s(c.glassName[i], names[i], _TRUNCATE);
+        c.glassSide[i] = sides[i];
+    }
+    // A selection is a pane index, and the same index on a different set of glasses is a
+    // different glass -- which is also why a copy indexed by glass is out of date now. The new
+    // car's glasses arrive a frame after the car itself, when its panes are laid out.
+    c.selected = -1;
+    ++c.generation;
+
+    char list[160] = {};
+    size_t used = 0;
+    for (int i = 0; i < count && used < sizeof(list); ++i) {
+        int wrote = _snprintf_s(list + used, sizeof(list) - used, _TRUNCATE, "%s%s", i ? ", " : "",
+                                c.glassName[i]);
+        if (wrote < 0) break;
+        used += static_cast<size_t>(wrote);
+    }
+    logf("mirror config: %d glass%s to aim -- %s", count, count == 1 ? "" : "es",
+         count ? list : "none");
+}
+
+int mirrorConfigGlassCount() { return g_config.glasses; }
+
+const char* mirrorConfigGlassName(int glass) {
+    if (glass < 0 || glass >= g_config.glasses) return "no glass";
+    return g_config.glassName[glass];
+}
+
+int mirrorConfigGlassSide(int glass) {
+    if (glass < 0 || glass >= g_config.glasses) return 0;
+    return g_config.glassSide[glass];
+}
+
+MirrorAim mirrorAimFor(int glass) {
+    const Config& c = g_config;
+    if (glass < 0 || glass >= c.glasses) return MirrorAim{};
+    int at = findAim(c.live, c.glassName[glass]);
+    return at >= 0 ? c.live.glass[at].aim : MirrorAim{};
+}
+
+MirrorAim* mirrorAimSlot(int glass) {
+    Config& c = g_config;
+    if (glass < 0 || glass >= c.glasses) return nullptr;
+    return findOrAddAim(c.live, c.glassName[glass]);
+}
+
+int mirrorConfigSelected() { return g_config.selected; }
+
+bool mirrorConfigSelect(int glass) {
+    Config& c = g_config;
+    if (glass < -1 || glass >= c.glasses) return false;
+    if (glass == c.selected) return false;
+    c.selected = glass;
+    return true;
+}
+
+int mirrorConfigSelectStep(int direction) {
+    Config& c = g_config;
+    // All, then each glass, then all again: count + 1 positions, all at -1.
+    int positions = c.glasses + 1;
+    int at = c.selected + 1;
+    at = ((at + (direction < 0 ? -1 : 1)) % positions + positions) % positions;
+    c.selected = at - 1;
+    return c.selected;
+}
+
+const char* mirrorConfigSelectedName() {
+    return g_config.selected < 0 ? "all glasses" : mirrorConfigGlassName(g_config.selected);
+}
+
+void mirrorConfigFormatAims(char* out, size_t size) {
+    const Config& c = g_config;
+    if (!c.glasses) {
+        formatSet(c.live, out, size);
+        return;
+    }
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < c.glasses && used < size; ++i) {
+        MirrorAim aim = mirrorAimFor(i);
+        int wrote = _snprintf_s(out + used, size - used, _TRUNCATE,
+                                "%s%s%s yaw %.2f pitch %.2f fov %.3f", i ? ", " : "",
+                                i == c.selected ? "*" : "", c.glassName[i], aim.yaw, aim.pitch,
+                                aim.fovScale);
+        if (wrote < 0) break;
+        used += static_cast<size_t>(wrote);
+    }
 }
 
 const char* mirrorConfigKey() { return g_config.key[0] ? g_config.key : nullptr; }
@@ -287,50 +542,58 @@ bool mirrorConfigPerCar() { return g_config.perCar; }
 
 void mirrorConfigMarkEdited() { g_config.edited = true; }
 
+void mirrorConfigDiscard(const char* why) {
+    Config& c = g_config;
+    if (!c.edited) return;
+    c.edited = false;
+    // Back to what the file holds for this car -- the entry is the loaded copy, untouched by
+    // tweak mode, which only ever moves the live set.
+    char previous[512];
+    formatSet(c.live, previous, sizeof(previous));
+    c.live = c.current >= 0 ? c.car[c.current].aims : AimSet{};
+    char restored[512];
+    formatSet(c.live, restored, sizeof(restored));
+    logf("mirror config: the tweaked aim (%s) was DISCARDED%s%s -- %s is unchanged, back to %s",
+         previous, why ? " -- " : "", why ? why : "", c.key[0] ? c.key : "no car", restored);
+}
+
+unsigned mirrorConfigGeneration() { return g_config.generation; }
+
 void mirrorConfigSave() {
     Config& c = g_config;
     if (!c.edited) {
         logf("mirror config: nothing changed, %s not written", c.key[0] ? c.key : "no car");
         return;
     }
-    c.edited = false;
+    char aims[512];
+    formatSet(c.live, aims, sizeof(aims));
     if (!c.key[0]) {
-        logf("mirror config: not saved -- no car has been identified yet, which means the "
-             "mirror panes have not run. The aim (yaw %.2f pitch %.2f fov %.3f) stays for "
-             "this session; drive a lap and save again.",
-             g_mirrorAim.yaw, g_mirrorAim.pitch, g_mirrorAim.fovScale);
+        logf("mirror config: the live aim is not saved -- no car has been identified yet, which "
+             "means the mirror panes have not run. It (%s) stays for this session; drive a lap "
+             "and save again.",
+             aims);
         return;
     }
 
+    // ONLY THE CAR IN VIEW. An edit never outlives its car being in view, so there is nothing
+    // else to write.
     const char* path = ensurePath();
     ensureFile(path);
-    int   failed = 0;
     DWORD error = 0;
-    auto  writeValue = [&](const char* name, const char* format, float value) {
-        char text[32] = {};
-        _snprintf_s(text, sizeof(text), _TRUNCATE, format, value);
-        if (!WritePrivateProfileStringA(c.key, name, text, path)) {
-            ++failed;
-            error = GetLastError();
-        }
-    };
-    writeValue("vrMirrorYaw", "%.2f", g_mirrorAim.yaw);
-    writeValue("vrMirrorPitch", "%.2f", g_mirrorAim.pitch);
-    writeValue("vrMirrorFovScale", "%.3f", g_mirrorAim.fovScale);
+    int   failed = writeSet(c.key, c.live, path, error);
     if (failed) {
-        logf("mirror config: %d of 3 values for [%s] could not be written to %s (error %lu) -- "
+        logf("mirror config: %d of %d values for [%s] could not be written to %s (error %lu) -- "
              "the aim stays until the game exits",
-             failed, c.key, path, error);
+             failed, 3 * c.live.count, c.key, path, error);
         return;
     }
-
+    c.edited = false;
     c.perCar = true;
     if (c.current >= 0 && std::strcmp(c.car[c.current].key, c.key) == 0) {
-        c.car[c.current].aim = g_mirrorAim;
+        c.car[c.current].aims = c.live;
         c.car[c.current].perCar = true;
     }
-    logf("mirror config: saved for %s to %s -- yaw %.2f pitch %.2f fov %.3f", c.key, path,
-         g_mirrorAim.yaw, g_mirrorAim.pitch, g_mirrorAim.fovScale);
+    logf("mirror config: saved for %s to %s -- %s", c.key, path, aims);
 }
 
 }  // namespace gplvr

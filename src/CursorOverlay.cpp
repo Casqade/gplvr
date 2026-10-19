@@ -2,6 +2,7 @@
 
 #include "Hooks.h"
 #include "Log.h"
+#include "ReplayPanel.h"
 #include "Stereo.h"
 
 #include <windows.h>
@@ -106,7 +107,6 @@ struct Pending {
 // under investigation, which has happened five times in this project.
 enum class Refusal {
     None,
-    OptionOff,
     NoEntryPoints,
     NoViewport,
     NoWindow,
@@ -114,6 +114,7 @@ enum class Refusal {
     NoCursorPos,
     PointerHidden,
     ShapeUnreadable,
+    ReplayPanel,
 };
 
 struct State {
@@ -156,8 +157,6 @@ const char* refusalText(Refusal reason, char* scratch, size_t scratchSize) {
     switch (reason) {
         case Refusal::None:
             return "no reason";
-        case Refusal::OptionOff:
-            return "vrCursor = 0";
         case Refusal::NoEntryPoints:
             return "the immediate-mode GL entry points did not resolve -- glBegin, "
                    "glEnd, glVertex2f, glTexCoord2f, glColor4f, glBlendFunc, glTexEnvi, "
@@ -175,13 +174,14 @@ const char* refusalText(Refusal reason, char* scratch, size_t scratchSize) {
                         "GetCursorPos failed (error %lu)", GetLastError());
             return scratch;
         case Refusal::PointerHidden:
-            return "Windows reports the pointer HIDDEN, and vrCursor = 1 follows "
-                   "Windows. If the menus are unusable and this is the line you are "
-                   "reading, set vrCursor = 2 to draw it anyway";
+            return "Windows reports the pointer HIDDEN, and the overlay follows Windows";
         case Refusal::ShapeUnreadable:
             return "the cursor Windows is showing could not be turned into pixels -- the "
                    "'cursor shape' line above says which step refused. Nothing is drawn "
                    "rather than a stand-in that is not the real pointer";
+        case Refusal::ReplayPanel:
+            return "the replay panel is up and draws the pointer on itself, where the "
+                   "controls are";
     }
     return "unknown";
 }
@@ -615,6 +615,32 @@ void cursorOverlayReleaseGl() {
     g_pending = Pending{};
 }
 
+bool cursorOverlayDrawShape(const GlFunctions& gl, float x, float y, float scale) {
+    if (!entryPointsPresent(gl)) return false;
+    CURSORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!GetCursorInfo(&info) || !info.hCursor) return false;
+
+    // The same texture, rebuilt only when the handle changes, and a handle that could not be
+    // converted is not retried -- exactly as cursorOverlayDraw keeps it.
+    if (!g_image.valid || g_image.source != info.hCursor) {
+        if (info.hCursor == g_image.failedFor) return false;
+        if (!buildCursorTexture(gl, info.hCursor)) {
+            g_image.valid = false;
+            g_image.failedFor = info.hCursor;
+            return false;
+        }
+    }
+
+    Quad quad;
+    quad.left = x - static_cast<float>(g_image.hotX) * scale;
+    quad.top = y - static_cast<float>(g_image.hotY) * scale;
+    quad.right = quad.left + static_cast<float>(g_image.width) * scale;
+    quad.bottom = quad.top + static_cast<float>(g_image.height) * scale;
+    drawCursorImage(gl, quad);
+    return true;
+}
+
 void cursorOverlayRestore(const GlFunctions& gl) {
     if (!g_pending.armed) return;
     g_pending.armed = false;
@@ -722,25 +748,24 @@ void cursorOverlayRestore(const GlFunctions& gl) {
 }
 
 void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
-    if (g_options.vrCursor <= 0) {
-        noteRefusal(Refusal::OptionOff);
-        return;
-    }
     if (!entryPointsPresent(gl)) {
         noteRefusal(Refusal::NoEntryPoints);
         return;
     }
+    // GPL's replay controls are on a panel of their own, and a pointer drawn into the eyes at
+    // window coordinates would sit somewhere unrelated to them.
+    if (replayPanelShown()) {
+        noteRefusal(Refusal::ReplayPanel);
+        return;
+    }
 
-    // Windows' own opinion of whether there is a pointer to show. vrCursor = 1 follows
-    // it, so nothing is painted over the driving view once the game hides the cursor;
-    // vrCursor = 2 ignores it, which is the escape hatch if it turns out GPL never sets
-    // the flag in the first place. Which of the two happened is in the log either way,
-    // so it is one ini digit rather than a rebuild.
+    // Windows' own opinion of whether there is a pointer to show, so nothing is painted
+    // over the driving view once the game hides the cursor.
     CURSORINFO info = {};
     info.cbSize = sizeof(info);
     const bool asked = GetCursorInfo(&info) != FALSE;
     const bool showing = asked && (info.flags & CURSOR_SHOWING) != 0;
-    if (g_options.vrCursor == 1 && asked && !showing) {
+    if (asked && !showing) {
         noteRefusal(Refusal::PointerHidden);
         return;
     }

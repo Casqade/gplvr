@@ -42,6 +42,10 @@ void logEcho(bool enabled) {
     g_echo = enabled;
 }
 
+double logSeconds() {
+    return static_cast<double>(GetTickCount() - g_startTick) / 1000.0;
+}
+
 void logf(const char* format, ...) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_file && !g_echo) return;

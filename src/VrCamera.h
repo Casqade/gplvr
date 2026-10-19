@@ -131,8 +131,4 @@ void vrClearRendered();
 // stretched to fill the swapchain, not aspect-fitted into it.
 bool vrFrustumInjected();
 
-// A frame has just been handed to the presenter. Times the span from reading the pose it
-// was rendered with to this moment, which is how far ahead position prediction has to look.
-void vrNoteFramePublished();
-
 }  // namespace gplvr

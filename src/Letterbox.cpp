@@ -189,21 +189,33 @@ int reportWidgets(void* screen) {
     }
     auto record = static_cast<uint8_t*>(readPointer(uiRoot, kUiRootWidgetList));
 
+    // ONLY THE WIDGETS WITH A REAL RECT ARE LISTED. The driving screen declares 105, and about
+    // a hundred of them are the help dialog's children at 0x0 -- parent-relative, which the
+    // comment above explains is not a band test of anything. Listing them all cost 105 log
+    // lines per screen for three useful ones. A widget that ever does sit in a bar has a size,
+    // so it still shows up here, which is the whole reason this report exists.
     int seen = 0;
+    int listed = 0;
     for (; record && seen < kWidgetLimit && readable(record, kRecordStride) &&
            record[0] != 0;
          record += kRecordStride, ++seen) {
+        int w = readInt(record, kRecordW);
+        int h = readInt(record, kRecordH);
+        if (w <= 0 || h <= 0) continue;
+
         char name[64] = {};
         for (size_t i = 0; i + 1 < sizeof(name) && record[i]; ++i)
             name[i] = static_cast<char>(record[i]);
 
+        ++listed;
         logf("letterbox:   %-28s type %-3d rect %d,%d %dx%d", name,
              readInt(record, kRecordType), readInt(record, kRecordX),
-             readInt(record, kRecordY), readInt(record, kRecordW),
-             readInt(record, kRecordH));
+             readInt(record, kRecordY), w, h);
     }
 
-    logf("letterbox: %d widgets declared on this screen, none of them touched", seen);
+    logf("letterbox: %d widgets declared on this screen, %d with a rect of their own (the rest "
+         "are 0x0 and parent-relative), none of them touched",
+         seen, listed);
     return seen;
 }
 

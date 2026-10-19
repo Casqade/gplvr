@@ -585,12 +585,18 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
         gl.readBuffer(GL_BACK);
         step("restoring the framebuffer bindings");
     } else {
+        // The binding found here goes back afterwards -- roglv2 keeps its own copy of the
+        // bound texture and does not rebind one it believes is bound (display +0x38) -- and
+        // the shared texture is never left bound, which the unlock below requires.
+        GLint previousTexture = 0;
+        if (gl.getIntegerv) gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        if (static_cast<GLuint>(previousTexture) == shared.name) previousTexture = 0;
         gl.readBuffer(GL_BACK);
         gl.bindTexture(GL_TEXTURE_2D, shared.name);
         step("glBindTexture(shared)");
         gl.copyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
         step("glCopyTexSubImage2D");
-        gl.bindTexture(GL_TEXTURE_2D, 0);
+        gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
     }
 
     // One unlock for everything locked above. On NVIDIA this is where the CPU waits for the

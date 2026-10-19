@@ -148,6 +148,26 @@ bool stereoEyeRect(int eye, int out[4]);
 // beyond the anchor remap.
 void* stereoEyeSurface(int eye);
 void* stereoSourceSurface();
+// A rasterizer surface's own size. Only for a handle that is live this frame: roglv2 resolves a
+// recycled handle to a freed slot and faults.
+bool stereoSurfaceSize(void* surface, int& width, int& height);
+
+// Drop every cached rasterizer handle, because the session that owned them has ended. A handle
+// carries no generation: once GPL recycles the slot, one gplvr is still holding resolves to a
+// NULL POINTER rather than to nothing, and every accessor that takes it dies inside roglv2.
+// That is four crashes now, the last one `roglv2!bitmapWidth+0x27` on handle 0x6F.
+//
+// Called on the edge into the front end, and when GPL's 3D view moves to a viewport on another
+// surface (the letterboxed replay screen). It is NOT stereoRelease(): it frees nothing and
+// touches no GPL or roglv2 memory, so it cannot fault on a model that has already gone; the
+// cost is two eye instances left allocated. The real teardown still happens on the rebuild
+// path, which this forces by clearing the handles that path compares against. `why` goes in the
+// log line.
+void stereoForgetSurfaces(const char* why);
+
+// The size the source surface had when the eyes were carved from it. A live read of the source
+// handle that disagrees means the handle has been recycled for another surface.
+bool stereoSourceCarvedSize(int& width, int& height);
 
 // The geometry the last tracked stereo frame was built with: `fov` is ONE eye's full
 // horizontal angle in radians, `separation` the distance between the two eye positions in
@@ -186,20 +206,23 @@ void stereoInstallWalkLookup();
 // cameraBind). A renderer that takes polygons before they reach polyDraw must drop them too.
 bool stereoDroppingPolygons();
 
-// The once-a-second `walk:` line: how often the segment table answered the camera's "where am I on
-// the track", how often it refused and why, and -- when a refusal sent the question to GPL's own
-// search -- how often that answer had to be corrected and by how much. False when no lookup ran in
-// the window. A refusal is one frame drawn from GPL's unstable search, so the refusal count is the
-// rate of the one-frame segment artifact. See report 84.
-bool stereoWalkFormat(char* out, size_t size);
+// GPL's dlong unit: metres x 19685, the factor gpl_sceneRender applies before every __ftol
+// (`dbl_53A020` 0x53A020). The internal unit is 1/500 inch.
+constexpr double kDlongUnitsPerMetre = 19685.0;
+
+// `to - from` folded the shortest way round the lap, so a lap crossing is a small step rather
+// than the length of the track. Unwrapped when the track length cannot be read from this image,
+// which is a wrong answer only where a real lap crossing is being measured.
+int stereoDlongDelta(int from, int to);
 
 // gpl_sceneRender's mirror copy-out, on its way through bitmapDraw. `writeBitmap` is where the
 // pixels land (the first argument) and `readSurface` is what they come from (the fourth), which
 // is the reverse of what those argument positions are named after everywhere else.
 //
-// Returns the x to write at: the +Y pane's copy moves to the right half of the texture, where
-// the +Y glass samples, and everything else keeps `x`. It also notes mirror.mip's bitmap for
-// MirrorCache, because this is the one place in the process that names it.
-int stereoMirrorCopy(int writeBitmap, int readSurface, int x);
+// Rewrites x and y in place when the copy is a pane's, to that glass's region of mirror.mip --
+// the +Y pane's half when the car is drawn with the two halves. The destination is left as GPL
+// passed it, which is mirror.mip, and so is everything else. It also notes the destination
+// bitmap for MirrorCache, because this is the one place in the process that names it.
+void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y);
 
 }  // namespace gplvr

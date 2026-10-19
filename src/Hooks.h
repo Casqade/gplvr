@@ -158,6 +158,19 @@ struct Options {
     // On installs none of it and the game keeps its 4:3 band.
     bool enableLetterbox = false;
 
+    // Quit straight out instead of sitting through the credits roll. Flat mode too: the credits
+    // are a screen like any other and nothing about them is VR-specific, they are just a much
+    // worse thing to be shown in a headset you are trying to take off.
+    //
+    // One byte, not a code patch -- see creditsSkipInstall.
+    bool skipCredits = true;
+
+    // Turn on GPL's mirror "driver arms" option, which has no ini key or checkbox of its own and
+    // is off. Off, the mirror draws a stock car's low-detail steering wheel in its flat colour,
+    // an opaque yellow square, once RasterV2:MirrorSize is large enough to pick that LOD. On, it
+    // is textured as in the forward view. Flat mode too. See MirrorDriverArms.h.
+    bool mirrorDriverArms = true;
+
     // Correct the field of view for a surface wider than 4:3.
     //
     // GPL fixes the HORIZONTAL angle and derives the vertical from the surface's shape,
@@ -247,6 +260,32 @@ struct Options {
     // actual clipped halves, which is the picture that settles whether something is in
     // the frame or only appears to be. 0 = off.
     int dumpEyesKey = 0;
+
+    // DRAW THE EXTRA (INTERPOLATED) RENDERS. 1 as always; 0 keeps blending and stops them.
+    //
+    // THIS EXISTS TO SEPARATE TWO THINGS frameRate = 0 TURNS OFF TOGETHER. A blending-only
+    // artifact can live in the blended VALUES or in what an extra render fails to redraw --
+    // it re-enters gpl_sceneRender alone, paints the world over a frame that already had its
+    // 2D in it, and gplvr puts back only the HUD, the cursor and the VR ray. Testing against
+    // frameRate = 0 cannot tell those apart, because it removes both at once; the 2026-10-09
+    // run did exactly that and came back "artifact absent", which fits either.
+    //
+    // With this at 0 and frameRate unchanged: an artifact that survives is in the values, one
+    // that goes is in the redraw. The `extra:` line says `SUPPRESSED on purpose` so a log can
+    // never be read as if the renders merely failed to find room.
+    int   vrExtraRenders = 1;
+
+    // WHERE THE WORLD WALK IS CENTRED is no longer a setting. `fixEyeSegment` chose between
+    // GPL's own lookup (0), report 84's containment fallback (1), the segment table on the
+    // interpolated dlong (2) and mode 1 plus one answer a frame and a self-consistency test (3);
+    // 3 cleared every artifact and is what walkLookupBody does unconditionally since 2026-10-19.
+
+    // Toggle `frameRate` between 0 and whatever the ini asked for, live. The A/B for anything
+    // that might be the blend's: 0 is vanilla pacing with no blend and no extra frames, and
+    // both `blendingEnabled()` and FlatFrames' `extraLimit()` read the option per call, so
+    // nothing has to be reinstalled. '7' is the key report 85 told people to use for this
+    // before the two options became one. 0 = off.
+    int frameRateKey = '7';
 
 
     // THE RESOLVED OpenGL swap interval: 0 and up is the value to pass to
@@ -377,6 +416,24 @@ struct Options {
     // two copies stay identical.
     float vrHudDepth = 0.0f;
 
+    // HOW FAR IN FROM THE EYE'S EDGES GPL'S OWN 2D IS PULLED, as a fraction of the half
+    // extent, about the eye's centre. 1.0 keeps the layout GPL computed, which is the only
+    // value that preserves every relative position exactly; 0.6 brings a corner item to 20%
+    // in from the edge.
+    //
+    // Below 1.0 this scales POSITIONS and not the art drawn at them, so a dense group
+    // compresses while its pieces keep their authored size: the replay control band is ten
+    // buttons at a 37-pixel step, which at 0.6 becomes a 22-pixel step and collides. The
+    // tool for bringing a whole group into the comfortable cone is moving the group in its
+    // own layout (Letterbox.cpp), not this. Use this for the sparse in-race HUD.
+    float vrHudInset = 1.0f;
+
+    // THE MIRROR GLASSES ARE NOT AN OPTION. They are read out of the car the game loaded
+    // (MirrorGeometry.h), each is given a region of mirror.mip of its own by moving its UVs
+    // (MirrorUv.h), and a car the walk refuses falls back to the hardcoded 1967 table and the two
+    // halves. That was mirrorGeometry and mirrorUvSplit until 2026-10-12; mirrorTextures, a
+    // texture per glass, could never work and went with them.
+
     // Where pribluda's overlay hangs in the headset: 0 not at all, 1 a panel that follows
     // the head, 2 a panel fixed to the seat -- still while you look around, so it is read
     // by looking at it, in the sharp middle of the lens.
@@ -433,14 +490,71 @@ struct Options {
     // was `vrHudEye`, which could put it in one eye only; that is not something to configure
     // once the depth is right, and the text is being rerouted onto a layer of its own anyway.
 
-    // Move each eye to where it will be when its frame is actually displayed.
+    // WHO DRAWS GPL'S STAMPED TEXT IN VR, and the only switch that changes anything about it.
     //
-    // GPL's frame follows its sim tick, not the headset, so a frame reaches a display one
-    // or two periods after the one its pose was predicted for, varying frame to frame. The
-    // runtime reprojects orientation but not position, so near geometry steps as the head
-    // moves sideways. With this on, the presenter publishes the head's velocity and its
-    // display clock, and each eye is moved by its velocity over the displays in between.
-    bool vrPredictPosition = true;
+    // 0 leaves it exactly where it is today: roglv2 blits each glyph with glDrawPixels into
+    // whatever framebuffer is bound, which in VR is the off-screen eye target, at the
+    // coordinates GPL computed for a 2560x1440 monitor. That puts the notices in the left eye's
+    // periphery at zero disparity, and nothing can move them: the destination handle decides
+    // WHERE IN A SURFACE a glyph lands, not which framebuffer receives it, so re-issuing a call
+    // against an eye surface moves the pixels nowhere at all (measured 2026-10-07; Hud.cpp's
+    // destinationCanSplit is why it declines).
+    //
+    // GPL'S FPS COUNTER AND LAP TIMES ARE OUT OF REACH OF BOTH VALUES, and that is a fact about
+    // where GPL draws them rather than a gap here: both go through drawDebugText to
+    // screenGetBackBuffer(), the back buffer is not what the presenter hands the headset, and so
+    // the headset holds no copy of them to place or to enlarge. They are on the monitor only.
+    //
+    // 1 hands the stampDraw global to the fast text path, which already reads the glyph out of
+    // roglv2's own font data and draws it from a GPU atlas as a quad of its own. A quad has a
+    // size and a position we choose, so vrGplTextScale and vrGplTextInset below become
+    // possible -- and a quad goes through the same transform the raster position did, so at
+    // scale 1 and inset 1 it lands on the pixels roglv2 would have written.
+    //
+    // FLAT MODE IS NOT THIS SETTING. There the fast text path installs because it is faster
+    // (103 us a glyph becomes one batched draw) and GPL's layout is left alone, which is what
+    // a monitor wants. This decides the VR case only, and the placement below is VR-only.
+    int vrGplText = 0;
+
+    // HOW MUCH BIGGER GPL'S STAMPED GLYPHS ARE DRAWN, as a whole-number multiple.
+    //
+    // Whole numbers only, and that is the format's doing rather than a simplification: the
+    // atlas holds roglv2's own 8-bit COLOUR INDICES and the shader takes the top nibble, so a
+    // texel cannot be interpolated with its neighbour -- an index halfway between two palette
+    // rows is not a colour halfway between them. Nearest sampling at an integer multiple
+    // reproduces each source texel as an n-by-n block, which is what enlarging a bitmap font
+    // means; a fractional multiple would drop and double rows unevenly along a line of text.
+    //
+    // Needs vrGplText = 1. 1 is the size GPL authored.
+    int vrGplTextScale = 1;
+
+    // HOW FAR IN FROM THE EYE'S EDGES GPL'S STAMPED TEXT IS PULLED, about the eye's centre,
+    // as a fraction of the half extent. The same quantity vrHudInset names for the per-eye
+    // re-issue path, applied where it can actually take effect.
+    //
+    // THE DELTA IS IN GPL'S OWN PIXELS, and this is how much of it survives. A run's anchor is
+    // measured from the centre of GPL's layout, multiplied by this, and laid off from the
+    // centre of the eye; 0 would be dead centre and 1.0 keeps GPL's offsets at their authored
+    // size. 1.0 is already well inside the eye rather than at its edge, because the eye is
+    // bigger than the layout it was authored for -- 3172x3172 against 2560x1440 on the install
+    // this was measured on, so a corner item lands about 10% in. Turn it down from there.
+    //
+    // It went through FRACTIONS until 2026-10-08 -- a fraction of the layout re-read as the
+    // same fraction of the eye -- and the two rects are not the same shape, so that stretched
+    // x by 1.24 and y by 2.20 while no glyph size followed.
+    //
+    // It moves a RUN's anchor and not the glyphs within it, so the spacing inside a line of
+    // text is exactly GPL's whatever this says -- which is the difference between this and
+    // vrHudInset, whose per-glyph scaling collapsed the replay band's 37-pixel button step.
+    // A run is recognised across frames by its stamp set and the baseline GPL asked for, so its
+    // extent is known from the frame before and a line is centred as a line.
+    //
+    // Needs vrGplText = 1.
+    float vrGplTextInset = 1.0f;
+
+    // `vrPredictPosition` was here and is gone as of 2026-10-05: it moved each eye to where it
+    // would be when the frame was displayed, and measured `mean eye shift 0.00 mm` in 189
+    // windows across two installs. VrCamera.cpp records what it did and why it was zero.
 
     // HOW OFTEN THE GAME DRAWS A PICTURE, and THE ONLY FRAME-RATE SETTING THERE IS: vsync is
     // derived from it in loadOptions, in both modes, so the two cannot disagree. `vr` already
@@ -563,35 +677,32 @@ struct Options {
     // see, worth 2-3 ms of CPU and GPU. It went on 2026-09-27 because the answer is to put
     // that text somewhere it IS seen rather than to decide which of it to bin, and the rule
     // for "unseen" was four conditions deep and had to be kept true by hand.
+    //
+    // THE MOUSE POINTER is always drawn into the VR image while Windows says it is showing
+    // (CursorOverlay.h); `vrCursor` chose that, off, or always until 2026-10-19.
 
-    // Draw the mouse pointer into the VR image.
-    //
-    //   0  off
-    //   1  draw it while Windows says the pointer is showing
-    //   2  draw it always, whatever Windows says
-    //
-    // Windows composites the pointer onto the DESKTOP, never into the game's back
-    // buffer, so the picture the presenter copies has no cursor in it and GPL's whole
-    // front end is unusable in a headset -- the menus answer a pointer nobody can see.
-    //
-    // 1 is the useful setting: it follows the game's own ShowCursor, so nothing is
-    // painted over the driving view. 2 exists because it has NOT been verified that GPL
-    // leaves CURSOR_SHOWING set in its menus, and if it does not then the whole feature
-    // would silently do nothing. Which of the two happened is in gplvr.log either way,
-    // so the answer is one ini digit rather than a rebuild.
-    //
-    // The parser default is 0: new behaviour does not arrive on somebody's existing ini
-    // without them asking for it. The ini shipped alongside this has it on.
-    //
-    // What is drawn is the real HCURSOR -- the user's own arrow, their size, their
-    // theme -- and it follows the shape as it changes. A cursor whose pixels cannot be
-    // read draws nothing and says so in the log; there is no stand-in shape.
-    int vrCursor = 0;
+    // What the headset is given while GPL shows its "no signal" static (gpl_drivingViewWidgetDraw
+    // found no view to render: a camera or driver switch, a cut). GPL draws the static over the
+    // surface of the camera bound last -- on the replay screen the 3D view's, the window's size at
+    // the frame's top left -- so published as a stereo pair it is noise in one eye over the
+    // previous picture.
+    //   0  published as before: as a pair, with no head pose
+    //   1  in a race, nothing is published and the headset keeps showing the last frame for the
+    //      first kNoSignalHoldMs of a spell of static, then the static fills both eyes as one
+    //      flat image filling the eye; on the replay screen it goes out that way at once
+    int vrNoSignal = 1;
 };
 
 extern Options g_options;
 
 void loadOptions(const char* fileName);
+
+// How many frames have been presented. It advances once per frame in both modes, in the
+// present hook, which is BETWEEN scene renders -- so every pass of one frame (two eyes and
+// the mirror pass with them) reads the same value, and it changes between frames. That makes
+// it the key for anything that must answer a question once per frame and give every pass the
+// same answer; `walkLookupBody`'s per-frame cache uses it for exactly that.
+unsigned hooksFrameCount();
 
 // Write the HUD panel's eight placement keys back to gplvr.ini, where the panel tweak mode
 // left them. The panel has no file of its own the way the mirror aim and the HUD layout do,
@@ -606,10 +717,13 @@ bool hudPlacementSave();
 // this window's client area, and that is only meaningful for exactly this HWND.
 HWND gameWindow();
 
-// Leave mirror tweak mode if it is on, saving a changed aim to the viewed car's section of
-// gplvr_mirrors.ini. `why` is appended to the log line. HUD tweak mode calls it on entering, since the two share the
-// arrows and Page Up/Down.
-void mirrorTweakExit(const char* why);
+// Leave mirror tweak mode if it is on. `save` writes a changed aim to the viewed car's section
+// of gplvr_mirrors.ini; without it the aim goes back to what the file holds. `why` is appended
+// to the log line.
+//
+// Only the tweak key itself passes true. HUD tweak mode calls this on entering -- the two share
+// the arrows and Page Up/Down -- and that is somebody switching tools, not somebody saving.
+void mirrorTweakExit(const char* why, bool save);
 
 // True while the KEYBOARD mirror tweak mode holds the aim. The semantic tweak API refuses
 // while it does: the headset's mirror mode edits the same three numbers, and two owners of
@@ -667,6 +781,10 @@ bool keepDrawingWhileUnfocused();
 void patchDisplaySettingsImports(HMODULE module);
 
 void patchDisplaySettingsImportsEverywhere();
+
+// Clear GPL's "roll the credits on the way out" flag, when skipCredits asks for it. Flat mode
+// too. One byte; no hook, so there is nothing to survive a mode change.
+void creditsSkipInstall();
 
 // Redirect ONE named import of ONE module, keeping the original in `original`.
 //

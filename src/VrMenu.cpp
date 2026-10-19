@@ -1,5 +1,6 @@
 #include "VrMenu.h"
 
+#include "DataRebase.h"
 #include "Hooks.h"
 #include "Interpolation.h"
 #include "Log.h"
@@ -8,6 +9,7 @@
 #include "Paths.h"
 #include "Pribluda.h"
 #include "RenderTarget.h"
+#include "ReplayPanel.h"
 #include "Stereo.h"
 #include "TweakApi.h"
 #include "VrCamera.h"
@@ -307,7 +309,18 @@ struct MenuRow {
     float       high;
     float       step;
     const char* help;
+    // Whether the row belongs on the page at all, asked every time the page is laid out.
+    // Null is yes, which is what every row that always applies leaves it as. A row this
+    // refuses takes no band, cannot be highlighted and is not drawn -- the rows below it
+    // move up and the ones that are left share the height.
+    bool (*offered)();
 };
+
+// pribluda's rows. The overlay is a separate mod and a GEM+ patch, so an install can
+// perfectly well not have it -- the 2020 demo does not -- and six rows that cannot do
+// anything are worse than six rows missing: each one reads as a setting that is being
+// ignored.
+bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 
 // The root page. Every row here changes a live value and nothing else; "Save settings" is
 // what writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
@@ -326,9 +339,9 @@ MenuRow g_rows[] = {
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
      "aim the rear-view glasses and set how wide they see"},
     {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "arrange the elements on pribluda's panel"},
+     "arrange the elements on pribluda's panel", pribludaRowOffered},
     {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "move the whole panel, and set how far away and how wide it hangs"},
+     "move the whole panel, and set how far away and how wide it hangs", pribludaRowOffered},
     {"Recentre", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
      "this pose becomes the seat -- also on a face button or a stick click at any time with "
      "the menu closed, which is how to use it mid-lap"},
@@ -337,7 +350,8 @@ MenuRow g_rows[] = {
     {"Head-locked Pribluda", kRowToggleInt, kCommandNone, nullptr, &g_options.vrHudLayer,
      nullptr, 1, 2, 1,
      "on, the panel stays in front of you wherever you look; off, it is fixed to the seat "
-     "and you look down at it"},
+     "and you look down at it",
+     pribludaRowOffered},
     {"Per-eye mirrors", kRowToggleBool, kCommandNone, &g_options.perEyeMirror, nullptr,
      nullptr, 0, 1, 1,
      "on, each eye renders both glasses from its own viewpoint, so the reflection has depth "
@@ -347,7 +361,8 @@ MenuRow g_rows[] = {
     {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
      "off skips the HUD pass entirely -- the panel goes from the headset and the monitor, "
      "and its cost goes with it. Runtime only: nothing is written and it is back on next "
-     "time the game starts"},
+     "time the game starts",
+     pribludaRowOffered},
     {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateRate,
      nullptr, 0, 4, 1,
      "render the mirror on one frame in N and keep the last image on the rest -- the "
@@ -365,12 +380,8 @@ MenuRow g_rows[] = {
      &g_options.pribludaUpdateRate, nullptr, 1, 4, 1,
      "redraw the panel on one frame in N. The last image stays up in between, so a lower "
      "rate costs nothing but the age of the numbers. No off here -- that is the Pribluda "
-     "HUD row above"},
-    {"Predict head position", kRowToggleBool, kCommandNone, &g_options.vrPredictPosition,
-     nullptr, nullptr, 0, 1, 1,
-     "move each eye to where it will be when the frame is actually shown, from the head's "
-     "own velocity. Different from the world blend, which moves the WORLD to that instant; "
-     "this moves the viewpoint. It waits quietly if the runtime publishes no velocity"},
+     "HUD row above",
+     pribludaRowOffered},
     {"Render scale", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrRenderScale, 0.5f, 2.0f, 0.05f,
      "NOTE: NEEDS A RESTART. Multiplies the runtime's recommended per-eye size, clamped to "
@@ -384,7 +395,29 @@ MenuRow g_rows[] = {
      "Takes effect as you move it"},
     {"Pribluda opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
-     "how much of the world the panel's boxes hide. 0 is clear glass, 1 is solid"},
+     "how much of the world the panel's boxes hide. 0 is clear glass, 1 is solid",
+     pribludaRowOffered},
+    // Both rows need vrGplText = 1, which is read when the game starts and is not a row: it
+    // decides which module takes GPL's stampDraw global at install time, and a switch that
+    // cannot act until the next run does not belong on a page whose other rows act as you move
+    // them. With it off these two move nothing, and the help says so rather than leaving a
+    // driver to work out why a slider does nothing.
+    {"GPL text size", kRowChoiceInt, kCommandNone, nullptr, &g_options.vrGplTextScale, nullptr,
+     1, 4, 1,
+     "how much bigger GPL's own text is drawn -- the pause prompt, the F1 help line, \"car "
+     "must be stopped\". Not its fps counter, which GPL draws onto the window and the headset "
+     "never sees. Whole steps, because the letters are tiny bitmaps and 2 makes each dot a 2x2 "
+     "block while a half step would come out ragged. Needs vrGplText = 1 in gplvr.ini; with "
+     "that off GPL draws its own text and nothing here reaches it"},
+    {"GPL text inset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrGplTextInset, 0.1f, 1.0f, 0.05f,
+     "how much of GPL's own distance from the middle survives. 1.00 keeps it at the size GPL "
+     "authored, which is already about 10% in from the edge because your eye sees more than "
+     "the monitor layout it was drawn for; 0.40 brings a corner line most of the way in. It "
+     "moves the line and not the letters in it, so the spacing stays GPL's, and a line that "
+     "would land on the one above it is moved down until it clears. Turn it down as you turn "
+     "the size up -- a line too big to fit in one eye is dropped rather than spilling into "
+     "the other. Needs vrGplText = 1"},
     {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
      2.0f, 0.05f, "lifts the mid-tones in the headset"},
     {"Horizon lock", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrHorizonLock,
@@ -405,6 +438,43 @@ MenuRow g_rows[] = {
 };
 
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
+
+// -- which rows are on the page -----------------------------------------------------------
+//
+// A row keeps its index in g_rows for as long as the process lives, and that index is what
+// `hovered` and `pressed` hold, what resetRow takes and what Reset-all walks. What a refused
+// row loses is its SLOT: its place in the column of bands the page is divided into. So the
+// layout, the hit test, the stick and the draw all count in slots and convert, and nothing
+// that remembers a row has to be told the page changed shape.
+
+bool rowOffered(int row) {
+    if (row < 0 || row >= kRowCount) return false;
+    return !g_rows[row].offered || g_rows[row].offered();
+}
+
+int offeredCount() {
+    int count = 0;
+    for (int row = 0; row < kRowCount; ++row)
+        if (rowOffered(row)) ++count;
+    return count;
+}
+
+int slotRow(int slot) {
+    if (slot < 0) return -1;
+    for (int row = 0; row < kRowCount; ++row) {
+        if (!rowOffered(row)) continue;
+        if (slot-- == 0) return row;
+    }
+    return -1;
+}
+
+int rowSlot(int row) {
+    if (!rowOffered(row)) return -1;
+    int slot = 0;
+    for (int i = 0; i < row; ++i)
+        if (rowOffered(i)) ++slot;
+    return slot;
+}
 
 // -- what the footer is saying ------------------------------------------------------------
 //
@@ -599,6 +669,13 @@ struct State {
     // happens between polls: the menu opening, the race starting, the controller being
     // put down. Without this the button stays held for the rest of the session.
     bool frontEndButtonDown = false;
+    // Over the replay panel: the hand driving the pointer, and where its ray last met the panel.
+    // The aiming ray is drawn from these, so a driver can see where the hand points when it is
+    // off the panel as well as on it.
+    int   replayHand = -1;
+    bool  replayHitOn = false;
+    float replayHitU = 0.0f;
+    float replayHitV = 0.0f;
     // Which side of the front-end boundary the last poll was on, so the crossing can be
     // acted on once rather than tested for every frame by everything that cares.
     bool wasFrontEnd = false;
@@ -1032,18 +1109,18 @@ void canvasSizeFor(int& width, int& height) {
 
 float helpFooterHeight(int slot, int lines);
 
-// The title takes the first row's worth of what the footer leaves, so there are kRowCount + 1
-// bands above a reservation that never changes size. The pointer reads the layout from the
-// same two numbers the draw does, so a row is where it looks.
+// The title takes the first slot's worth of what the footer leaves, so there are
+// offeredCount() + 1 bands above a reservation that never changes size. The pointer reads the
+// layout from the same two numbers the draw does, so a row is where it looks.
 float rowBand() {
     const float footer =
         helpFooterHeight(kVrTextSmall, kHelpLines) / static_cast<float>(kMenuCanvasHeight);
-    return (1.0f - footer) / static_cast<float>(kRowCount + 1);
+    const int slots = offeredCount();
+    return (1.0f - footer) / static_cast<float>((slots > 0 ? slots : 1) + 1);
 }
 
 int rowAt(float v) {
-    const int row = static_cast<int>(v / rowBand()) - 1;
-    return (row >= 0 && row < kRowCount) ? row : -1;
+    return slotRow(static_cast<int>(v / rowBand()) - 1);
 }
 
 // The names a kRowNamedInt's values go by. Keyed on the option the row points at rather than
@@ -1341,10 +1418,11 @@ void saveSettings() {
     writeInt("mirrorUpdateRate", g_options.mirrorUpdateRate);
     writeInt("frameRate", g_options.frameRate);
     writeInt("pribludaUpdateRate", g_options.pribludaUpdateRate);
-    writeInt("vrPredictPosition", g_options.vrPredictPosition ? 1 : 0);
     writeFloat("vrRenderScale", g_options.vrRenderScale);
     writeFloat("vrMenuScale", g_options.vrMenuScale);
     writeFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
+    writeInt("vrGplTextScale", g_options.vrGplTextScale);
+    writeFloat("vrGplTextInset", g_options.vrGplTextInset);
     writeFloat("vrGamma", g_options.vrGamma);
     writeFloat("vrHorizonLock", g_options.vrHorizonLock);
     writeFloat("vrWorldScale", g_options.vrWorldScale);
@@ -1352,20 +1430,20 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 12 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 13 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
     notice("saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudLayer=%d perEyeMirror=%d mirrorUpdateRate=%d "
-         "frameRate=%d pribludaUpdateRate=%d vrPredictPosition=%d vrRenderScale=%.3f "
-         "vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGamma=%.3f "
-         "vrHorizonLock=%.3f vrWorldScale=%.3f",
+         "frameRate=%d pribludaUpdateRate=%d vrRenderScale=%.3f "
+         "vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d vrGplTextInset=%.3f "
+         "vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f",
          path, g_options.vrHudLayer, g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
-         g_options.frameRate, g_options.pribludaUpdateRate,
-         g_options.vrPredictPosition ? 1 : 0, g_options.vrRenderScale, g_options.vrMenuScale,
-         g_options.vrHudBackdropOpacity, g_options.vrGamma,
-         g_options.vrHorizonLock, g_options.vrWorldScale);
+         g_options.frameRate, g_options.pribludaUpdateRate, g_options.vrRenderScale,
+         g_options.vrMenuScale, g_options.vrHudBackdropOpacity, g_options.vrGplTextScale,
+         g_options.vrGplTextInset, g_options.vrGamma, g_options.vrHorizonLock,
+         g_options.vrWorldScale);
 }
 
 // Every write to a row's option goes through one of these two, so a rule about what a setting
@@ -1442,12 +1520,13 @@ void dragRow(int row, float u) {
 void navigateWithStick(const VrHandInput& hand) {
     const int step = stickDetent(hand.stickY, g_state.navDetent, g_state.navRepeatAt,
                                  qpcNow(), g_state.frequency);
-    if (!step || kRowCount <= 0) return;
+    const int slots = offeredCount();
+    if (!step || slots <= 0) return;
 
-    int row = g_state.hovered;
-    if (row < 0) row = 0;
-    row = ((row - step) % kRowCount + kRowCount) % kRowCount;
-    g_state.hovered = row;
+    int slot = rowSlot(g_state.hovered);
+    if (slot < 0) slot = 0;
+    slot = ((slot - step) % slots + slots) % slots;
+    g_state.hovered = slotRow(slot);
     // The pointer no longer owns the highlight: a driver who has just moved it with the
     // stick must not have it snatched back by a ray that is still lying across the panel.
     g_state.stickOwnsHighlight = true;
@@ -1545,6 +1624,9 @@ struct TweakSnapshot {
     int         indices = 0;
     bool        exists[kSnapshotIndices][kSnapshotAxes] = {};
     float       value[kSnapshotIndices][kSnapshotAxes] = {};
+    // For the mirror: which car the values are of. They are indexed by glass, and the same
+    // index on another car is another glass.
+    unsigned    mirrorGeneration = 0;
 };
 
 TweakSnapshot g_snapshot;
@@ -1552,6 +1634,7 @@ TweakSnapshot g_snapshot;
 void snapshotTake(TweakTarget target) {
     g_snapshot = TweakSnapshot();
     if (target == TweakTarget::None) return;
+    g_snapshot.mirrorGeneration = mirrorConfigGeneration();
 
     int32_t count = tweakIndexCount(target);
     if (count < 0) count = 0;
@@ -1569,10 +1652,21 @@ void snapshotTake(TweakTarget target) {
     g_snapshot.valid = true;
 }
 
+// THE BASELINE FOLLOWS THE CAR. Changing the viewed car discards its unsaved aim (MirrorConfig),
+// so what the new car shows IS what its file holds -- which is the baseline for it. Without this
+// the old car's values stayed the baseline: Discard wrote them onto the new car's glasses by
+// index, and "changed" compared one car against another.
+void snapshotFollowCar() {
+    if (!g_snapshot.valid || g_snapshot.target != TweakTarget::Mirror) return;
+    if (g_snapshot.mirrorGeneration == mirrorConfigGeneration()) return;
+    snapshotTake(TweakTarget::Mirror);
+}
+
 // How many axes now read differently from what the mode found. Compared with a tolerance in
 // the axis's own units, a thousandth of its range, so a float that came back through a clamp
 // and a divide does not read as an edit.
 int snapshotChanged() {
+    snapshotFollowCar();
     if (!g_snapshot.valid) return 0;
     int changed = 0;
     for (int index = 0; index < g_snapshot.indices; ++index)
@@ -1590,6 +1684,7 @@ int snapshotChanged() {
 }
 
 void snapshotRestore() {
+    snapshotFollowCar();
     if (!g_snapshot.valid) return;
     for (int index = 0; index < g_snapshot.indices; ++index)
         for (int axis = 1; axis < kSnapshotAxes; ++axis) {
@@ -1652,6 +1747,8 @@ bool axisValue(const VrHandInput& hand, TweakInputAxis axis, float& value) {
 void applyBindings(Mode mode, const VrHandInput& hand, float seconds) {
     const TweakTarget target = targetOf(mode);
     if (target == TweakTarget::None) return;
+    // Before any edit of this poll, so an edit made on the new car is measured against it.
+    snapshotFollowCar();
 
     int32_t             count = 0;
     const TweakBinding* bindings = tweakDefaultBindings(target, count);
@@ -1739,8 +1836,10 @@ void applyBindings(Mode mode, const VrHandInput& hand, float seconds) {
 // The one-line readout a tweak mode's strip shows.
 void tweakSummary(Mode mode, char* out, size_t size) {
     switch (mode) {
+        // Which glass the stick is moving, since that is the one thing the glasses themselves
+        // do not show.
         case Mode::MirrorTweak:
-            _snprintf_s(out, size, _TRUNCATE, "Mirror setup");
+            _snprintf_s(out, size, _TRUNCATE, "Mirror setup: %s", mirrorConfigSelectedName());
             break;
         // WHAT IS BEING ADJUSTED, not what it currently reads. The numbers were there from
         // the keyboard modes, where there was nothing else to look at; in the headset the
@@ -1850,7 +1949,8 @@ void enterMode(Mode mode, int hand) {
         case Mode::MirrorTweak:
             logf("vr menu: mirror aim from the %s hand -- %s",
                  hand == kHandLeft ? "left" : "right",
-                 "stick aims, trigger+stick widens, stick click resets, menu leaves");
+                 "stick aims, trigger+stick widens, face buttons pick a glass, stick click "
+                 "resets, menu leaves");
             break;
         case Mode::HudTweak:
             logf("vr menu: HUD layout from the %s hand -- %s",
@@ -2190,19 +2290,53 @@ void smoothPointer(float rawU, float rawV, float& outU, float& outV) {
     outV = state.smoothV;
 }
 
+void frontEndPointerRelease(const char* why);
+
+// THE REPLAY SCREEN IS CLICKABLE AND IS NOT THE FRONT END.
+//
+// menuScaleClientRect only answers for the scaled 640x480 front end. In a replay the controls
+// are on the replay panel (ReplayPanel.h), a quad of their own in the seat's frame, so the ray is
+// tested against that quad and the hit is turned back into the window point GPL drew it at.
+// Mapping the ray onto the whole client area instead put the pointer somewhere unrelated to
+// where the buttons could be seen, and none of them could be pressed.
+Surface replayPanelSurface() {
+    Surface surface;
+    float   centre[3];
+    float   orientation[4];
+    float   width = 0.0f;
+    float   height = 0.0f;
+    replayPanelPlacement(centre, orientation, width, height);
+    fillSurface(surface, {centre[0], centre[1], centre[2]},
+                {orientation[0], orientation[1], orientation[2], orientation[3]}, width, height);
+    return surface;
+}
+
 void pollFrontEndPointer() {
-    // The scaled front end is the only thing this maps onto: it is what knows where the
-    // 640x480 menu sits inside the window. Without it there is no rect to map into, and
+    // The scaled front end is what knows where the 640x480 menu sits inside the window; the
+    // replay panel knows where its bands are. Without either there is nothing to map into, and
     // that is a silent nothing unless it says so once.
     static bool reportedNoRect = false;
+    static bool reportedReplay = false;
     RECT        rect = {};
+    bool        onPanel = false;
     if (!menuScaleClientRect(rect)) {
-        if (!reportedNoRect) {
-            reportedNoRect = true;
-            logf("vr menu: the front end is not being scaled (MenuScale is off or its "
-                 "framebuffer did not build), so the controller cannot drive its pointer");
+        onPanel = !windowInFrontEnd() && replayPanelShown();
+        if (!onPanel) {
+            if (!reportedNoRect) {
+                reportedNoRect = true;
+                logf("vr menu: the front end is not being scaled (MenuScale is off or its "
+                     "framebuffer did not build) and the replay panel is not up, so the "
+                     "controller cannot drive a pointer");
+            }
+            // A button pressed over the panel is still let go when the panel goes.
+            if (g_state.frontEndButtonDown) frontEndPointerRelease("the replay panel went away");
+            return;
         }
-        return;
+        if (!reportedReplay) {
+            reportedReplay = true;
+            logf("vr menu: a replay is being watched, so the controller's ray drives the pointer "
+                 "over the replay panel");
+        }
     }
     reportedNoRect = false;
 
@@ -2231,6 +2365,11 @@ void pollFrontEndPointer() {
 
         const Vec3 direction = rotate(quatOf(hand.aimPose), {0.0f, 0.0f, -1.0f});
         const bool awake = pointerAwake(hand, direction);
+        if (onPanel) {
+            // The ray follows this hand while it is awake, on the panel or not.
+            g_state.replayHand = awake ? order[i] : -1;
+            if (!awake) g_state.replayHitOn = false;
+        }
         if (!awake && g_state.pointerHasMouse) {
             g_state.pointerHasMouse = false;
             g_state.smoothValid = false;
@@ -2245,21 +2384,43 @@ void pollFrontEndPointer() {
         // refuses to move it falls through to the click below instead of returning, or a
         // ray that goes bad between the trigger going down and coming up would leave the
         // left button held for the rest of the session.
-        if (awake && width > 0 && height > 0) {
-            const float aspect = static_cast<float>(width) / static_cast<float>(height);
-            float       rawU = 0.0f;
-            float       rawV = 0.0f;
-            if (frontEndRay(head, hand.aimPose, aspect, rawU, rawV)) {
+        bool onTarget = false;
+        if (awake && (onPanel || (width > 0 && height > 0))) {
+            const float aspect =
+                onPanel ? 1.0f : static_cast<float>(width) / static_cast<float>(height);
+            float rawU = 0.0f;
+            float rawV = 0.0f;
+            // The replay panel is a quad in the seat's frame, so the ray goes there too; the
+            // front end's plane is head-locked.
+            SharedPose aimSeat = {};
+            bool       hit = onPanel ? poseInSeat(hand.aimPose, aimSeat) &&
+                                     rayToSurface(replayPanelSurface(), aimSeat, rawU, rawV)
+                                     : frontEndRay(head, hand.aimPose, aspect, rawU, rawV);
+            if (onPanel) g_state.replayHitOn = hit;
+            if (!hit) {
+                // Off the panel the filter has nothing to carry forward, as with the menu's.
+                if (onPanel) g_state.smoothValid = false;
+            } else {
                 float u = rawU;
                 float v = rawV;
                 smoothPointer(rawU, rawV, u, v);
+                if (onPanel) {
+                    g_state.replayHitU = u;
+                    g_state.replayHitV = v;
+                }
 
                 POINT point;
-                point.x = rect.left + static_cast<LONG>(u * static_cast<float>(width));
-                point.y = rect.top + static_cast<LONG>(v * static_cast<float>(height));
+                bool  placed = true;
+                if (onPanel) {
+                    placed = replayPanelClientPoint(u, v, point);
+                } else {
+                    point.x = rect.left + static_cast<LONG>(u * static_cast<float>(width));
+                    point.y = rect.top + static_cast<LONG>(v * static_cast<float>(height));
+                }
 
                 HWND window = gameWindow();
-                if (window && ClientToScreen(window, &point)) {
+                if (placed && window && ClientToScreen(window, &point)) {
+                    onTarget = true;
                     // Only when the whole pixel changed. A sub-pixel difference would
                     // still be a SetCursorPos every frame, and the pointer would sit on a
                     // boundary and flicker between two positions -- which is the shake,
@@ -2274,12 +2435,17 @@ void pollFrontEndPointer() {
 
                     if (!g_state.pointerHasMouse) {
                         g_state.pointerHasMouse = true;
-                        logf("vr menu: the %s controller now drives the front end's "
-                             "pointer -- an aim ray onto a %.2f x %.2f m plane %.1f m "
-                             "ahead, biased %.2f m up",
-                             order[i] == kHandLeft ? "left" : "right",
-                             kFrontEndHalfWidth * 2.0f, kFrontEndHalfWidth * 2.0f / aspect,
-                             kFrontEndDistance, kFrontEndUpwardBias);
+                        if (onPanel)
+                            logf("vr menu: the %s controller now drives the pointer over the "
+                                 "replay panel",
+                                 order[i] == kHandLeft ? "left" : "right");
+                        else
+                            logf("vr menu: the %s controller now drives the front end's "
+                                 "pointer -- an aim ray onto a %.2f x %.2f m plane %.1f m "
+                                 "ahead, biased %.2f m up",
+                                 order[i] == kHandLeft ? "left" : "right",
+                                 kFrontEndHalfWidth * 2.0f, kFrontEndHalfWidth * 2.0f / aspect,
+                                 kFrontEndDistance, kFrontEndUpwardBias);
                     }
                 }
             }
@@ -2293,13 +2459,18 @@ void pollFrontEndPointer() {
         // The down is REMEMBERED. Whatever happens between this poll and the release --
         // the menu opening on the other hand, the race starting, the controller going to
         // sleep -- frontEndPointerRelease finds the button still down and lets it go.
-        if (hand.triggerHeld.pressed || hand.triggerHeld.released) {
+        //
+        // Over the replay panel a press counts only when the ray is on the panel: the pointer
+        // stays where it last was when the ray leaves, and a press aimed at the world would
+        // click whichever button that is. The release always goes.
+        bool press = hand.triggerHeld.pressed && (!onPanel || onTarget);
+        bool release = hand.triggerHeld.released && g_state.frontEndButtonDown;
+        if (press || release) {
             INPUT click = {};
             click.type = INPUT_MOUSE;
-            click.mi.dwFlags =
-                hand.triggerHeld.pressed ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            click.mi.dwFlags = press ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
             SendInput(1, &click, sizeof(click));
-            g_state.frontEndButtonDown = hand.triggerHeld.pressed;
+            g_state.frontEndButtonDown = press;
         }
         return;
     }
@@ -2688,7 +2859,7 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
             }
             gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
             canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f,
-                       (choice == kConfirmSave && !canSave) ? "Keep" : kConfirmLabel[choice]);
+                       kConfirmLabel[choice]);
         }
         drawCanvasCursor(gl, w, h);
         return;
@@ -2753,7 +2924,8 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     HelpBlock block;
     buildHelpBlock(block, kVrTextSmall, w - kHelpMargin * 2.0f);
     float footer = helpFooterHeight(kVrTextSmall, kHelpLines);
-    float band = (h - footer) / static_cast<float>(kRowCount + 1);
+    int   slots = offeredCount();
+    float band = (h - footer) / static_cast<float>((slots > 0 ? slots : 1) + 1);
 
     gl.color4f(0.88f, 0.91f, 0.97f, 1.0f);
     canvasText(gl, kVrTextBody, 20.0f, band * 0.5f, "GPLVR");
@@ -2774,8 +2946,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     const float trackRight = w * 0.94f;
 
     char value[64] = {};
-    for (int row = 0; row < kRowCount; ++row) {
-        const float top = band * static_cast<float>(row + 1);
+    for (int slot = 0; slot < slots; ++slot) {
+        const int   row = slotRow(slot);
+        const float top = band * static_cast<float>(slot + 1);
         const float centre = top + band * 0.5f;
 
         if (row == g_state.hovered) {
@@ -2903,8 +3076,11 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
     }
 
     int used = written;
-    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|",
-                        footer);
+    // offeredCount() goes in because it is what the bands are divided from: a row that stops
+    // being offered moves every row below it without changing any value, and the canvas has
+    // to be rebuilt for that alone.
+    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|%d|",
+                        footer, offeredCount());
 
     char value[64] = {};
     for (int row = 0; row < kRowCount && used > 0 && static_cast<size_t>(used) + 40 < size;
@@ -2986,6 +3162,19 @@ void vrMenuPoll() {
         // the stick click are free.
         pollQuickRecentre();
         return;
+    }
+
+    // A WATCHED REPLAY GETS THE POINTER TOO, without taking the world-mode poll away from the
+    // rest of this function. The replay screen's controls are clicked with the same mechanism
+    // the front end's are, and the block above is reached only in the front end -- which is why
+    // the controller was dead over the replay band however well the band was placed.
+    // Leaving the replay -- "live", or the session ending -- with the trigger held lets the button
+    // go; the poll that would have sent the release does not run outside a replay.
+    if (!frontEnd && state.mode == Mode::Closed) {
+        if (gplReplayScreenShown())
+            pollFrontEndPointer();
+        else
+            frontEndPointerRelease("the replay ended");
     }
 
     const float seconds = vrInputSeconds();
@@ -3178,7 +3367,10 @@ void vrMenuPoll() {
         }
     }
     if (!editing) navigateWithStick(hand);
-    if (state.hovered < 0 && kRowCount > 0) state.hovered = 0;
+    // A row that stops being offered while the page is open takes the highlight with it, so
+    // the clamp asks whether the highlighted row is still on the page rather than only
+    // whether it is in range.
+    if (!rowOffered(state.hovered)) state.hovered = slotRow(0);
 
     // A STICK CLICK PUTS THE HIGHLIGHTED ROW BACK, which is what it already means inside
     // every tweak mode. Same control, same meaning, wherever the driver happens to be.
@@ -3225,8 +3417,11 @@ void vrMenuUpdate(const GlFunctions& gl) {
             state.canvasSignatureValid = false;
             presenterMenuHide();
         }
+        // The layer is free while the menu is closed, and in a replay GPL's controls go on it.
+        replayPanelUpdate(gl, true);
         return;
     }
+    replayPanelUpdate(gl, false);
 
     if (!gl.begin || !gl.end || !gl.vertex2f || !gl.color4f || !gl.loadIdentity ||
         !gl.ortho || !gl.matrixMode || !gl.pushMatrix || !gl.popMatrix || !gl.pushAttrib ||
@@ -3383,16 +3578,25 @@ void vrMenuNoteRayNeedsOffscreen() { noteRayRefusal(kRayNoOffscreen); }
 
 bool vrMenuPribludaHidden() { return !g_pribludaOn; }
 
-bool vrMenuRayWanted() {
+// The hand the ray comes from: the menu's owner, or over the replay panel the hand driving the
+// pointer while it is awake. -1 when there is no ray to draw.
+int rayHand() {
     const State& state = g_state;
-    if (state.mode == Mode::Closed) return false;
-    if (state.hand < 0 || state.hand >= kHands) return false;
-    return vrInputHand(state.hand).present;
+    int hand = state.hand;
+    if (state.mode == Mode::Closed) {
+        if (!replayPanelShown() || windowInFrontEnd()) return -1;
+        hand = state.replayHand;
+    }
+    if (hand < 0 || hand >= kHands) return -1;
+    return vrInputHand(hand).present ? hand : -1;
 }
+
+bool vrMenuRayWanted() { return rayHand() >= 0; }
 
 void vrMenuDrawRay(const GlFunctions& gl) {
     State& state = g_state;
-    if (!vrMenuRayWanted()) return;
+    int    handIndex = rayHand();
+    if (handIndex < 0) return;
 
     // WHY THIS ONE IS NOT A COMPOSITION LAYER, when the panel is.
     //
@@ -3427,7 +3631,7 @@ void vrMenuDrawRay(const GlFunctions& gl) {
         return;
     }
 
-    const VrHandInput& hand = vrInputHand(state.hand);
+    const VrHandInput& hand = vrInputHand(handIndex);
     SharedPose         aim = {};
     if (!poseInSeat(hand.aimPose, aim)) {
         noteRayRefusal(kRayNoSeat);
@@ -3444,10 +3648,16 @@ void vrMenuDrawRay(const GlFunctions& gl) {
     // Where it ends. On the panel when it is pointing at it -- the hit the poll already
     // worked out, so the ray and the crosshair cannot disagree -- and at a fixed length
     // otherwise, which reads as pointing at nothing rather than as the ray vanishing.
-    const Surface drawn = drawnSurface();
+    // With the menu closed the ray is the replay panel's, and ends where the pointer poll last
+    // found it on that panel.
+    const bool    replay = state.mode == Mode::Closed;
+    const Surface drawn = replay ? replayPanelSurface() : drawnSurface();
+    const bool    on = replay ? state.replayHitOn : state.pointerOn;
+    const float   onU = replay ? state.replayHitU : state.pointerU;
+    const float   onV = replay ? state.replayHitV : state.pointerV;
     Vec3          farPoint;
-    if (state.pointerOn && drawn.valid) {
-        farPoint = surfacePoint(drawn, state.pointerU, state.pointerV);
+    if (on && drawn.valid) {
+        farPoint = surfacePoint(drawn, onU, onV);
     } else {
         farPoint = add(origin, scale(direction, kRayMissLength));
     }

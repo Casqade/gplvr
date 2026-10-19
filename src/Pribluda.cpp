@@ -222,6 +222,17 @@ Binding g_prib;
 bool    g_examined = false;  // the module is tested once, not once a frame
 bool    g_reportedNoGl = false;
 
+// Whether this install has pribluda at all, settled on the render thread and read from
+// anywhere. gpl_rasterBegin loads pribluda.dll while it brings the rasterizer up, which is
+// long before the first present, so a present hook that has run and still finds no module
+// is looking at an install without it -- gplc67 without the GEM+ pribluda patch, or the
+// 2020 demo. The margin below is frames, not a guess at the load order: it costs a second
+// and it means a slow first frame cannot make the answer wrong.
+PribludaPresence g_presence = kPribludaUnknown;
+unsigned         g_presenceFrames = 0;
+
+constexpr unsigned kPresenceFrames = 60;
+
 // The monitor HUD redirect: prib_sampleFps, and whether the monitor draw's call now lands in
 // pribludaMonitorDraw.
 SampleFpsFn g_sampleFps = nullptr;
@@ -237,12 +248,27 @@ bool     g_reportedPanelRate = false;
 // and the readout is calls per second. prib_paintLetterboxBars' flag stays raised until a
 // monitor draw runs again, which is the draw it is meant for. Every other frame calls
 // prib_hudDraw exactly as the hook did.
+//
+// PRIBLUDA'S OWN DRAW GOES BACK INSIDE A PUSH/POP. Its text routine (0x100066B0) pushes only
+// GL_LIST_BIT and its box routine (0x10006760) only GL_COLOR_BUFFER_BIT, so it leaves
+// GL_TEXTURE_2D off after an untextured box, depth testing off, and its own texture bound.
+// roglv2 keeps a copy of the texture-2D enable and the bound texture (display +0x36/+0x38) and
+// calls glEnable/glBindTexture only when its copy says the state is wrong; the copy is reset
+// only at a mode change. With GL off and the copy on, the next flush draws every opaque
+// textured polygon untextured -- the white left eye on the first frames of a race, before
+// gplvr takes this draw over, when the next flush is eye 0's.
 unsigned __cdecl pribludaMonitorDraw(void* config, void* session, void* context) {
     if (presenterMonitorHudTaken()) {
         g_sampleFps();
         return 0;
     }
-    return g_prib.draw(config, session, context);
+    static GlFunctions gl;
+    static bool        haveGl = glResolve(gl) && gl.pushAttrib && gl.popAttrib;
+    if (!haveGl) return g_prib.draw(config, session, context);
+    gl.pushAttrib(GL_ENABLE_BIT | GL_TEXTURE_BIT | GL_DEPTH_BUFFER_BIT);
+    unsigned result = g_prib.draw(config, session, context);
+    gl.popAttrib();
+    return result;
 }
 
 Layout g_layout;
@@ -517,6 +543,32 @@ bool bind() {
 
     redirectMonitorDraw(module);
     return true;
+}
+
+// Settle whether pribluda exists, called once a frame from the present hook ahead of every
+// option gate -- including vrHudLayer, because the menu's own row for it has to stay
+// reachable on an install that has pribluda and has the panel switched off.
+void settlePresence() {
+    if (g_presence == kPribludaPresent) return;
+    ++g_presenceFrames;
+
+    if (g_prib.draw) {
+        g_presence = kPribludaPresent;
+        return;
+    }
+    if (GetModuleHandleA("pribluda")) {
+        // Loaded. bind() is the only thing that can say whether it is a build gplvr knows,
+        // and it has already said why in the log if it refused.
+        if (g_examined && g_presence == kPribludaUnknown) g_presence = kPribludaAbsent;
+        return;
+    }
+    if (g_presence != kPribludaUnknown || g_presenceFrames < kPresenceFrames) return;
+
+    g_presence = kPribludaAbsent;
+    logf("pribluda: not loaded -- %u frames have been presented and pribluda.dll is not in "
+         "this process, so this install does not have it. Its rows are left out of the VR "
+         "menu and the HUD panel stays empty; nothing else changes.",
+         g_presenceFrames);
 }
 
 bool inRace() {
@@ -844,17 +896,32 @@ void enterTweak() {
              "and placed by %s", g_layoutPath);
         return;
     }
-    mirrorTweakExit(" -- HUD tweak mode entered");
+    mirrorTweakExit(" -- HUD tweak mode entered", false);
     g_tweak.active = true;
     logf("pribluda: HUD tweak mode on, %s selected -- arrows move it, Page Up/Down select "
          "another, key 0x%02X again saves",
          kElements[g_tweak.selected].name, g_options.vrHudTweakKey);
 }
 
-void exitTweak(const char* why) {
+// ONLY THE TWEAK KEY WRITES THE FILE. Leaving the race, switching to the mirror tweak, or
+// anything else that ends tweak mode without being asked to save leaves the layout exactly where
+// it was put -- in memory, unwritten. A save key that is also what happens when you walk away is
+// not a save key.
+//
+// It does NOT revert. The layout is one global arrangement with nothing it can stop belonging
+// to, so the same rule the VR menu's settings follow applies: an edit lives until it is saved or
+// the process ends. Reverting on the way out of a race would throw away work the player is in
+// the middle of merely because they looked at the standings.
+void exitTweak(const char* why, bool save) {
     g_tweak.active = false;
-    logf("pribluda: HUD tweak mode off%s", why);
-    saveLayout();
+    if (save) {
+        logf("pribluda: HUD tweak mode off%s", why);
+        saveLayout();
+        return;
+    }
+    logf("pribluda: HUD tweak mode off%s -- NOT saved. The layout stays where you left it for "
+         "the rest of this run; %s is unchanged, so a restart brings back what is in the file.",
+         why, g_layoutPath);
 }
 
 // A line loop a few texels outside the selected element, after pribluda's passes, in the
@@ -905,6 +972,7 @@ void drawTweakOutline(const GlFunctions& gl, int width, int height) {
 }  // namespace
 
 void pribludaDrawHud() {
+    settlePresence();
     if (!g_options.vr || g_options.vrHudLayer == 0) return;
     if (!bind()) return;
     if (*g_prib.rasterizerKind != kRasterizerRoglv2) return;
@@ -1095,12 +1163,13 @@ void pribludaPollTweak() {
         return;
     }
     if (!live) {
-        exitTweak(" -- the panel is no longer drawn");
+        exitTweak(" -- the panel is no longer drawn", false);
         return;
     }
     if (!focused) return;
     if (togglePressed) {
-        exitTweak("");
+        // The key IS the save. Nothing else writes.
+        exitTweak("", true);
         return;
     }
 
@@ -1312,9 +1381,11 @@ bool pribludaTweakSwallowsKey(unsigned virtualKey) {
 }
 
 void pribludaTweakExit(const char* why) {
-    if (g_tweak.active) exitTweak(why);
+    if (g_tweak.active) exitTweak(why, false);
 }
 
 bool pribludaMonitorDrawRedirected() { return g_monitorRedirected; }
+
+PribludaPresence pribludaPresence() { return g_presence; }
 
 }  // namespace gplvr

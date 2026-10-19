@@ -21,10 +21,13 @@
 #include "Interpolation.h"
 #include "Letterbox.h"
 #include "MenuScale.h"
+#include "MirrorDriverArms.h"
+#include "NoSignal.h"
 #include "Paths.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "SimRing.h"
+#include "SkidFlood.h"
 #include "Stereo.h"
 #include "Log.h"
 #include "Window.h"
@@ -138,6 +141,14 @@ DWORD WINAPI installThread(LPVOID) {
     // sim, not part of the VR render path. Still in the front end here, where no contact
     // search is running while its bytes are rewritten.
     crashGuardInstall();
+    // Flat mode too, and here for the same reason: in the front end no skid mark is being laid
+    // while the three immediates are rewritten.
+    skidFloodInstall();
+    // Flat mode too, and nothing downstream depends on it: one data byte, read only on the way
+    // out of the game.
+    creditsSkipInstall();
+    // Flat mode too: one option byte, and the yellow square it removes is in vanilla GPL.
+    mirrorDriverArmsInstall();
     // Flat mode too: a stock overflow in the render walk (report 53). The patch stays on the
     // stock list until the next clear, so it may go in with a pass under way.
     drawnMarksInstall();
@@ -159,8 +170,11 @@ DWORD WINAPI installThread(LPVOID) {
         hudBind(binding);
         billboardInstall(binding);
     }
-    // The flat-mode fast text path takes the same seven 2D globals Hud.cpp takes in VR, so it
-    // declines to install when they are already spoken for.
+    // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
+    // Hud.cpp has not touched. In VR it takes stampDraw alone and only with vrGplText = 1 --
+    // Hud.cpp has already read the same option and left that one slot for it, so there is
+    // exactly one owner per slot and neither module can adopt the other's thunk as "the
+    // original". With vrGplText = 0 this declines and says so, and GPL's text stays roglv2's.
     fastTextBind(binding);
 
     // Before the first menu-to-race transition, which is the moment the screenBegin
@@ -172,6 +186,7 @@ DWORD WINAPI installThread(LPVOID) {
     // After windowInstall, which is what resolves the engine's mode: the layout thunks
     // size the middle panel from it the first time a race is entered.
     letterboxInstall();
+    noSignalInstall();
 
     // The driver thunks go in here: roglv2 is loaded by now, because discovery keys off
     // its entry points.

@@ -160,8 +160,18 @@ void mirrorTargetAfterBind(void* camera, const SceneParams* params) {
     int width = mirrorWidth < viewport[2] ? mirrorWidth : viewport[2];
     int height = viewport[3];
 
-    if (!s.framebuffer || width != s.width || height != s.height) {
-        if (!create(width, height)) {
+    // THE TARGET ONLY EVER GROWS. The panes are not all the same size once each glass has its
+    // own region of mirror.mip -- 254, 258 and 512 wide on the 330P4 -- and rebuilding whenever
+    // the width changed tore down and rebuilt a 10 MB renderbuffer pair two or three times a
+    // FRAME, once per pane, logging each time. A target wider than the pane costs nothing: what is drawn is
+    // bounded by the viewport the pass sets inside it, which is why the height has always been
+    // the display's rather than the mirror's. A height change is a mode change and still
+    // rebuilds, which also resets the width.
+    int want = width;
+    if (s.framebuffer && height == s.height && s.width > want) want = s.width;
+
+    if (!s.framebuffer || want != s.width || height != s.height) {
+        if (!create(want, height)) {
             s.gaveUp = true;
             logf("mirror: the mirror stays in the frame's top-left corner");
             return;

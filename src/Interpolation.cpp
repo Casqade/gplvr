@@ -1668,6 +1668,23 @@ bool interpolationViewDlong(float& metres, bool& snapped) {
     return true;
 }
 
+// THE SAME QUANTITY THE BLEND STARTED FROM. interpolationViewDlong reads the live record, which
+// the blend has already written, so it is the blended value by definition -- and there was no
+// way to ask what it would have been without the blend. The newest latched copy is that value:
+// the view history's words[1] is the record as the sim last left it, base 0 (pushView copies
+// from offset 0), and 60 is the same field.
+//
+// This pair is the only honest test of "the artifact needs blending on". Comparing the camera
+// against the VIEWED CAR's dlong is not: that one is blended too, and a chase or trackside
+// camera sits metres from the car, so the two differ on every frame of a parked session. A
+// walk-trace column built on it read 182 of 182 passes "moved by blending" at a standstill.
+bool interpolationViewDlongAtTick(float& metres) {
+    State& s = g_state;
+    if (!s.installed || s.view.copies < 1) return false;
+    metres = floatAt(s.view.words[1], 0, 60);
+    return true;
+}
+
 bool interpolationViewedCarDlong(float& metres) {
     State& s = g_state;
     if (!s.installed || s.viewedSlot < 0) return false;

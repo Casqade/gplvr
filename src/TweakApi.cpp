@@ -68,22 +68,38 @@ bool resolveScalar(const TweakCommand& command, const TweakRange& range, float& 
 }
 
 // -- the mirror ---------------------------------------------------------------------------
+//
+// ONE GLASS OR ALL OF THEM. An index names a glass (a pane, in MirrorConfig's order); -1 is
+// whatever tweak mode has selected, and the selection may itself be -1, every glass together.
+// Together, yaw moves each glass by its side -- the left one way, the right the other, a centre
+// glass not at all -- because a stored yaw is the same way round on every glass and "all" means
+// the symmetric adjustment the single car-wide aim always made.
 
-float* mirrorSlot(TweakAxis axis) {
+int mirrorGlass(int32_t index) {
+    return index >= 0 ? static_cast<int>(index) : mirrorConfigSelected();
+}
+
+float* mirrorField(MirrorAim& aim, TweakAxis axis) {
     switch (axis) {
-        case TweakAxis::Yaw: return &g_mirrorAim.yaw;
-        case TweakAxis::Pitch: return &g_mirrorAim.pitch;
-        case TweakAxis::Fov: return &g_mirrorAim.fovScale;
+        case TweakAxis::Yaw: return &aim.yaw;
+        case TweakAxis::Pitch: return &aim.pitch;
+        case TweakAxis::Fov: return &aim.fovScale;
         default: return nullptr;
     }
 }
 
-TweakRange mirrorRange(TweakAxis axis) {
+// The axis of one glass. For "all" there is no single value to report, so it answers for the
+// first glass, which is what a slider would have to show anyway.
+TweakRange mirrorRange(TweakAxis axis, int32_t index) {
     TweakRange range;
-    const float* slot = mirrorSlot(axis);
-    if (!slot) return range;
+    int glass = mirrorGlass(index);
+    if (glass < 0) glass = 0;
+    if (glass >= mirrorConfigGlassCount()) return range;
+    MirrorAim    aim = mirrorAimFor(glass);
+    const float* field = mirrorField(aim, axis);
+    if (!field) return range;
     range.exists = true;
-    range.current = *slot;
+    range.current = *field;
     switch (axis) {
         case TweakAxis::Yaw:
         case TweakAxis::Pitch:
@@ -116,43 +132,86 @@ bool applyMirror(const TweakCommand& command) {
         clearRefusal();
         return true;
     }
+    if (command.action == TweakAction::Toggle)
+        return refuse("the mirror has no on/off axis to toggle");
+
+    int glasses = mirrorConfigGlassCount();
+    if (glasses < 1)
+        return refuse("no glasses have been laid out for this car yet -- the mirror panes have "
+                      "not run, so there is nothing to aim");
+
     if (command.action == TweakAction::Select ||
         command.action == TweakAction::SelectNext ||
         command.action == TweakAction::SelectPrevious) {
-        // Both glasses are aimed by one pair of angles -- gpl_mirrorViewCompute builds the
-        // two panes from one view -- so there is nothing to select between.
-        return refuse("the mirror has one aim and nothing to select between");
-    }
-    if (command.action == TweakAction::Reset) {
         bool changed = false;
-        const TweakAxis axes[3] = {TweakAxis::Yaw, TweakAxis::Pitch, TweakAxis::Fov};
-        for (TweakAxis axis : axes) {
-            if (command.axis != TweakAxis::None && command.axis != axis) continue;
-            float* slot = mirrorSlot(axis);
-            TweakRange range = mirrorRange(axis);
-            if (!slot || *slot == range.defaultValue) continue;
-            *slot = range.defaultValue;
-            changed = true;
+        if (command.action == TweakAction::Select) {
+            if (command.index < -1 || command.index >= glasses)
+                return refuse("there is no glass with that index");
+            changed = mirrorConfigSelect(static_cast<int>(command.index));
+        } else {
+            int before = mirrorConfigSelected();
+            changed = mirrorConfigSelectStep(command.action == TweakAction::SelectNext ? 1 : -1) !=
+                      before;
         }
         if (changed) {
-            mirrorConfigMarkEdited();
-            logf("mirror: reset to yaw %.2f pitch %.2f fovScale %.3f", g_mirrorAim.yaw,
-                 g_mirrorAim.pitch, g_mirrorAim.fovScale);
+            logf("mirror: now aiming %s", mirrorConfigSelectedName());
             clearRefusal();
         }
         return changed;
     }
-    if (command.action == TweakAction::Toggle)
-        return refuse("the mirror has no on/off axis to toggle");
 
-    float*     slot = mirrorSlot(command.axis);
-    TweakRange range = mirrorRange(command.axis);
-    if (!slot || !range.exists)
+    int glass = mirrorGlass(command.index);
+    if (glass >= glasses) return refuse("there is no glass with that index");
+    int first = glass < 0 ? 0 : glass;
+    int last = glass < 0 ? glasses - 1 : glass;
+
+    if (command.action == TweakAction::Reset) {
+        bool            changed = false;
+        const TweakAxis axes[3] = {TweakAxis::Yaw, TweakAxis::Pitch, TweakAxis::Fov};
+        for (int i = first; i <= last; ++i)
+            for (TweakAxis axis : axes) {
+                if (command.axis != TweakAxis::None && command.axis != axis) continue;
+                TweakRange range = mirrorRange(axis, i);
+                if (!range.exists || range.current == range.defaultValue) continue;
+                MirrorAim* aim = mirrorAimSlot(i);
+                float*     field = aim ? mirrorField(*aim, axis) : nullptr;
+                if (!field) continue;
+                *field = range.defaultValue;
+                changed = true;
+            }
+        if (changed) {
+            mirrorConfigMarkEdited();
+            char aims[512];
+            mirrorConfigFormatAims(aims, sizeof(aims));
+            logf("mirror: %s reset -- %s", mirrorConfigSelectedName(), aims);
+            clearRefusal();
+        }
+        return changed;
+    }
+
+    if (!mirrorRange(command.axis, first).exists)
         return refuse("the mirror has no such axis -- check the binding table");
 
-    float value = range.current;
-    if (!resolveScalar(command, range, value)) return false;
-    *slot = value;
+    bool changed = false;
+    for (int i = first; i <= last; ++i) {
+        TweakCommand one = command;
+        // Every glass together turns each by its side, so the pair moves symmetrically and a
+        // glass on the centreline keeps its yaw.
+        if (glass < 0 && command.axis == TweakAxis::Yaw) {
+            int side = mirrorConfigGlassSide(i);
+            if (!side) continue;
+            one.value *= static_cast<float>(side);
+        }
+        TweakRange range = mirrorRange(command.axis, i);
+        float      value = range.current;
+        if (!resolveScalar(one, range, value)) continue;
+        MirrorAim* aim = mirrorAimSlot(i);
+        float*     field = aim ? mirrorField(*aim, command.axis) : nullptr;
+        if (!field) continue;
+        *field = value;
+        changed = true;
+    }
+    if (!changed) return false;
     mirrorConfigMarkEdited();
     clearRefusal();
     return true;
@@ -521,7 +580,13 @@ const TweakBinding kMirrorBindings[] = {
      "stick forward and back tilts the glasses"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::StickClick,
      TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
-     "stick click puts the aim back to straight and 1x"},
+     "stick click puts the selected glass -- or all of them -- back to straight and 1x"},
+    {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Primary,
+     TweakInputButton::None, TweakAxis::None, TweakAction::SelectNext, TweakMode::Absolute,
+     1.0f, "the primary face button steps to the next glass: all, then each one in turn"},
+    {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Secondary,
+     TweakInputButton::None, TweakAxis::None, TweakAction::SelectPrevious, TweakMode::Absolute,
+     1.0f, "the secondary face button steps back a glass"},
 };
 
 const TweakBinding kHudElementBindings[] = {
@@ -599,7 +664,7 @@ bool tweakApply(const TweakCommand& command) {
 
 TweakRange tweakRange(TweakTarget target, TweakAxis axis, int32_t index) {
     switch (target) {
-        case TweakTarget::Mirror: return mirrorRange(axis);
+        case TweakTarget::Mirror: return mirrorRange(axis, index);
         case TweakTarget::HudElement: return hudElementRange(axis, index);
         case TweakTarget::HudPanel: return panelRange(axis);
         default: return TweakRange{};
@@ -632,7 +697,7 @@ const char* tweakAxisName(TweakAxis axis) {
 int32_t tweakIndexCount(TweakTarget target) {
     switch (target) {
         case TweakTarget::HudElement: return pribludaElementCount();
-        case TweakTarget::Mirror:
+        case TweakTarget::Mirror: return mirrorConfigGlassCount();
         case TweakTarget::HudPanel: return 1;
         default: return 0;
     }
@@ -641,18 +706,21 @@ int32_t tweakIndexCount(TweakTarget target) {
 const char* tweakIndexName(TweakTarget target, int32_t index) {
     if (target == TweakTarget::HudElement)
         return pribludaElementName(static_cast<int>(index));
+    if (target == TweakTarget::Mirror) return mirrorConfigGlassName(static_cast<int>(index));
     return tweakTargetName(target);
 }
 
 int32_t tweakSelected(TweakTarget target) {
     if (target == TweakTarget::HudElement) return pribludaElementSelected();
-    if (target == TweakTarget::Mirror || target == TweakTarget::HudPanel) return 0;
+    if (target == TweakTarget::Mirror) return mirrorConfigSelected();
+    if (target == TweakTarget::HudPanel) return 0;
     return -1;
 }
 
 bool tweakIndexUsable(TweakTarget target, int32_t index) {
     if (target == TweakTarget::HudElement)
         return pribludaElementUsable(static_cast<int>(index));
+    if (target == TweakTarget::Mirror) return index >= 0 && index < mirrorConfigGlassCount();
     return index == 0 && tweakIndexCount(target) == 1;
 }
 

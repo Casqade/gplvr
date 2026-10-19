@@ -73,8 +73,10 @@ void vrMenuUpdate(const GlFunctions& gl);
 // and means nothing to somebody watching the flat window, which keeps the panel and the
 // hit marker it already has.
 //
-// True from vrMenuRayWanted when a mode is open and the owning hand is tracked, so the
-// caller can decide whether the reordering the draw needs is worth doing this frame.
+// True from vrMenuRayWanted when a mode is open and the owning hand is tracked -- or, with the
+// menu closed, while the replay panel is up and a hand is pointing, so the driver can see where
+// it points off the panel as well as on it -- so the caller can decide whether the reordering
+// the draw needs is worth doing this frame.
 bool vrMenuRayWanted();
 
 // True while the menu's "Hide pribluda HUD" row is on: skip the HUD pass entirely.

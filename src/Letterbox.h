@@ -19,8 +19,9 @@
 // 0,0 10x10 and a band test hides the picture band along with the bars. The walk is now an
 // inventory that hides nothing.
 //
-// This file is the one place gplvr writes into gplc67's own vtables, and it is worth
-// being explicit about why that is allowed here. The three slots are the `+0x6C` "lay
+// This file and NoSignal.cpp (one observing thunk on the driving view's draw) are the places
+// gplvr writes into gplc67's own vtables, and it is worth being explicit about why that is
+// allowed here. The three slots are the `+0x6C` "lay
 // this screen out" virtual of the three screen vtables, all in .rdata, each guarded by
 // requiring the stock target before anything is written. The alternative -- patching the
 // peer's SetPosition/SetSize slots -- is not available: those two are the BASE

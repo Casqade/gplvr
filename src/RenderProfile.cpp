@@ -1228,6 +1228,8 @@ void renderProfileNoteFrame(long long presentBegin, long long presentEnd) {
     g_sceneFirstBegin = 0;
 }
 
+int renderProfilePolysDrawn() { return g_polysDrawn ? g_polysDrawn() : -1; }
+
 void renderProfileAfterRender() {
     if (!profilingWorkWait()) return;
 
