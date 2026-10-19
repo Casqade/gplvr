@@ -1,6 +1,7 @@
 #include "VrMenu.h"
 
 #include "DataRebase.h"
+#include "HeadAudio.h"
 #include "Hooks.h"
 #include "Interpolation.h"
 #include "Log.h"
@@ -427,6 +428,12 @@ MenuRow g_rows[] = {
      "so this is the comfort setting to reach for first"},
     {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
      0.5f, 2.0f, 0.02f, "metres per world unit; moves the eye separation with it"},
+    {"Head audio width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
+     "how hard the cockpit's sound pans between your ears as you turn your head. 0 is GPL's own "
+     "gentle panning, 1 makes a car 30 degrees off to one side clearly louder in that ear, 2 is "
+     "close to hard left and right. Takes effect as you move it",
+     headAudioWidthAdjustable},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr, 0,
      3, 1,
      "what the game window on the monitor shows: both eyes side by side, one eye, or off. Off "
@@ -1438,12 +1445,13 @@ void saveSettings() {
     writeFloat("vrGamma", g_options.vrGamma);
     writeFloat("vrHorizonLock", g_options.vrHorizonLock);
     writeFloat("vrWorldScale", g_options.vrWorldScale);
+    writeFloat("vrHeadAudioWidth", g_options.vrHeadAudioWidth);
     writeInt("vrMonitorEye", g_options.vrMonitorEye);
 
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 14 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 15 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
@@ -1451,12 +1459,13 @@ void saveSettings() {
     logf("vr menu: saved to %s -- vrHudLayer=%d perEyeMirror=%d mirrorUpdateRate=%d "
          "frameRate=%d pribludaUpdateRate=%d vrRenderScale=%.3f "
          "vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d vrGplTextInset=%.3f "
-         "vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f vrMonitorEye=%d",
+         "vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f vrHeadAudioWidth=%.3f "
+         "vrMonitorEye=%d",
          path, g_options.vrHudLayer, g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
          g_options.frameRate, g_options.pribludaUpdateRate, g_options.vrRenderScale,
          g_options.vrMenuScale, g_options.vrHudBackdropOpacity, g_options.vrGplTextScale,
          g_options.vrGplTextInset, g_options.vrGamma, g_options.vrHorizonLock,
-         g_options.vrWorldScale, g_options.vrMonitorEye);
+         g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
 }
 
 // Every write to a row's option goes through one of these two, so a rule about what a setting

@@ -42,6 +42,25 @@ constexpr size_t kRecordSize = 0xA0;
 constexpr size_t kRecordPosition = 0;
 constexpr size_t kRecordOrientation = 84;
 
+// gpl_sndComputePitchPan 0x4E6B60 (emitter, listener slot, &pitch, &pan), __cdecl. Its only two
+// callers, both inside the scheduler: the new-voice pass and gpl_sndVoiceRetarget 0x4E6CD0.
+struct StockCall {
+    uintptr_t     site;
+    unsigned char bytes[5];
+};
+constexpr StockCall kPitchPanCalls[2] = {{0x004E678C, {0xE8, 0xCF, 0x03, 0x00, 0x00}},
+                                         {0x004E6CE8, {0xE8, 0x73, 0xFE, 0xFF, 0xFF}}};
+
+// An emitter (gpl_sndEmitterCreate 0x4E6100) points at its position at +4.
+constexpr size_t kEmitterData = 4;
+
+// The widened pan (vrHeadAudioWidth). The louder side never goes fully silent: at most
+// kMaxSeparation of the way to a hard pan, which leaves the quieter ear about -26 dB under Miles'
+// pan law. A source this close to the head is pulled toward the centre by half, where GPL's own
+// curve uses 2 m and so centres the car's own engine at the driver's seat.
+constexpr float kMaxSeparation = 0.95f;
+constexpr float kNearField = 0.5f;
+
 // A pose older than this is not applied: the front end, a load, anything that stops the render
 // thread drawing tracked frames.
 constexpr double kStaleSeconds = 0.2;
@@ -54,6 +73,9 @@ constexpr double kSummarySeconds = 60.0;
 struct Pose {
     float     rotation[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // the head, in the view record's axes
     float     centre[3] = {0, 0, 0};                     // the head's centre, the same axes
+    // vrHeadAudioWidth as the render thread saw it. The VR menu changes the option on that
+    // thread, so it reaches the sim thread here, under the same lock as the pose.
+    float     width = 0.0f;
     long long qpc = 0;
     bool      valid = false;
 };
@@ -78,11 +100,17 @@ const char* const kOutcomeName[kOutcomeCount] = {
     "applied", "no pose", "stale", "not the cockpit", "no listener", "slot not the view's"};
 
 using SchedulerFn = void(__cdecl*)();
+using PitchPanFn = int(__cdecl*)(void* emitter, unsigned char* listener, float* pitch, float* pan);
 
 struct State {
     // Set by the install thread, read by the render thread's publish.
     std::atomic<bool> installed{false};
     SchedulerFn       scheduler = nullptr;
+
+    // GPL's pan function. Null when the two calls could not be taken, and then GPL's own pan
+    // stands whatever the width. `panInstalled` is read by the VR menu.
+    PitchPanFn        pitchPan = nullptr;
+    std::atomic<bool> panInstalled{false};
 
     uintptr_t cameraMode = 0;
     uintptr_t listenerSlot = 0;
@@ -97,7 +125,8 @@ struct State {
     alignas(16) unsigned char shadow[kRecordSize] = {};
 
     unsigned  counts[kOutcomeCount] = {};
-    unsigned  busy = 0;  // ticks that reused the previous pose because the lock was held
+    unsigned  busy = 0;     // ticks that reused the previous pose because the lock was held
+    unsigned  widened = 0;  // pans replaced by the wider curve
     Outcome   last = kOutcomeCount;
     int       transitionReports = 64;
     long long summaryAt = 0;
@@ -248,13 +277,15 @@ void note(State& s, Outcome outcome) {
         return;
     s.summaryAt = t;
     logf("head audio: %u ticks in the last %.0f s -- applied %u, no pose %u, stale %u, not the "
-         "cockpit %u, no listener %u, slot not the view's %u; the previous pose reused %u times",
+         "cockpit %u, no listener %u, slot not the view's %u; the previous pose reused %u times; "
+         "%u pans widened",
          s.counts[kApplied] + s.counts[kNoPose] + s.counts[kStale] + s.counts[kNotCockpit] +
              s.counts[kNoListener] + s.counts[kNotTheView],
          kSummarySeconds, s.counts[kApplied], s.counts[kNoPose], s.counts[kStale],
-         s.counts[kNotCockpit], s.counts[kNoListener], s.counts[kNotTheView], s.busy);
+         s.counts[kNotCockpit], s.counts[kNoListener], s.counts[kNotTheView], s.busy, s.widened);
     std::memset(s.counts, 0, sizeof(s.counts));
     s.busy = 0;
+    s.widened = 0;
 }
 
 // Stands in for the scheduler call, on the sim thread.
@@ -272,6 +303,69 @@ void __cdecl schedulerHook() {
     std::memcpy(slot + kSlotData, &shadow, sizeof(shadow));
     s.scheduler();
     std::memcpy(slot + kSlotData, &s.viewRecord, sizeof(s.viewRecord));
+}
+
+// The pan for a source at `local` (the listener's axes: +X forward, +Y left) `distance` away.
+//
+// GPL's own curve is linear in the angle, 0.5 - angle * 0.9/pi, and Miles turns a pan into
+// "the far side at 2 x pan of full", so a source 30 degrees off centre leaves the far ear only 3 dB
+// down and 45 degrees 5 dB. This one follows the sine of the angle instead, scaled by the width:
+// at a width of 1, 30 degrees is about 6 dB, 45 about 10 and 90 about 26. Front and back stay
+// folded, as GPL's are: a stereo pan cannot tell them apart.
+float widePan(const float local[3], float distance, float width) {
+    float across = std::sqrt(local[0] * local[0] + local[1] * local[1]);
+    float side = across > 1e-6f ? local[1] / across : 0.0f;  // sin of the angle, + left
+    float separation = side * width;
+    if (separation > 1.0f) separation = 1.0f;
+    if (separation < -1.0f) separation = -1.0f;
+    float centring = kNearField / (distance + kNearField);
+    return 0.5f - 0.5f * kMaxSeparation * separation * (1.0f - centring);
+}
+
+// Stands in for gpl_sndComputePitchPan at both its calls. GPL's own result is kept -- the Doppler
+// pitch always, and the pan for any listener but the head, or at a width of 0 -- and only the
+// head's pan is replaced. Called inside the scheduler, so on the sim thread, while schedulerHook
+// has the head's copy in place and s.pose is this tick's.
+int __cdecl pitchPanHook(void* emitter, unsigned char* listener, float* pitch, float* pan) {
+    State& s = g_state;
+    int    result = s.pitchPan(emitter, listener, pitch, pan);
+    if (s.pose.width <= 0.0f) return result;
+
+    uintptr_t data = 0;
+    std::memcpy(&data, listener + kSlotData, sizeof(data));
+    if (data != reinterpret_cast<uintptr_t>(s.shadow)) return result;
+
+    auto source = *reinterpret_cast<const float* const*>(static_cast<unsigned char*>(emitter) +
+                                                           kEmitterData);
+    float position[3];
+    float orientation[9];
+    std::memcpy(position, s.shadow + kRecordPosition, sizeof(position));
+    std::memcpy(orientation, s.shadow + kRecordOrientation, sizeof(orientation));
+
+    float toSource[3] = {source[0] - position[0], source[1] - position[1],
+                         source[2] - position[2]};
+    float distance = std::sqrt(toSource[0] * toSource[0] + toSource[1] * toSource[1] +
+                               toSource[2] * toSource[2]);
+    float local[3];
+    applyTransposed(orientation, toSource, local);
+    *pan = widePan(local, distance, s.pose.width);
+    ++s.widened;
+    return result;
+}
+
+float clampWidth(float width) {
+    if (width < 0.0f) return 0.0f;
+    return width > 2.0f ? 2.0f : width;
+}
+
+// The far ear's level for a source `degrees` off centre and far away, under Miles' pan law,
+// for the install line.
+float farEarDb(float degrees, float width) {
+    float radians = degrees / 57.29578f;
+    float local[3] = {std::cos(radians), std::sin(radians), 0.0f};
+    float pan = widePan(local, 1000.0f, width);
+    float gain = 2.0f * (pan < 0.5f ? pan : 1.0f - pan);
+    return gain > 1e-4f ? 20.0f * std::log10(gain) : -80.0f;
 }
 
 uintptr_t callTarget(uintptr_t site) {
@@ -341,6 +435,45 @@ void headAudioInstall() {
          "%08X, listener slot pointer %08X",
          static_cast<unsigned>(kSchedulerCallSite), static_cast<unsigned>(s.viewRecord),
          static_cast<unsigned>(s.listenerSlot));
+
+    // The wider pan. Both calls or neither, so a voice cannot be started on one curve and
+    // retargeted on the other. Taken whatever the width: the VR menu can raise it from 0 later.
+    for (const StockCall& call : kPitchPanCalls) {
+        auto site = reinterpret_cast<const uint8_t*>(call.site);
+        if (std::memcmp(site, call.bytes, sizeof(call.bytes)) != 0) {
+            logf("head audio: %08X does not hold its stock `call gpl_sndComputePitchPan` (%02X %02X "
+                 "%02X %02X %02X) -- GPL's own pan curve",
+                 static_cast<unsigned>(call.site), site[0], site[1], site[2], site[3], site[4]);
+            return;
+        }
+    }
+    // Set before either call is redirected: the sim thread may reach one straight away.
+    s.pitchPan = reinterpret_cast<PitchPanFn>(callTarget(kPitchPanCalls[0].site));
+    if (!redirect(kPitchPanCalls[0].site, reinterpret_cast<uintptr_t>(&pitchPanHook))) {
+        logf("head audio: could not redirect the pan call at %08X -- GPL's own pan curve",
+             static_cast<unsigned>(kPitchPanCalls[0].site));
+        return;
+    }
+    if (!redirect(kPitchPanCalls[1].site, reinterpret_cast<uintptr_t>(&pitchPanHook))) {
+        redirect(kPitchPanCalls[0].site, reinterpret_cast<uintptr_t>(s.pitchPan));
+        logf("head audio: could not redirect the pan call at %08X -- GPL's own pan curve",
+             static_cast<unsigned>(kPitchPanCalls[1].site));
+        return;
+    }
+    s.panInstalled.store(true, std::memory_order_release);
+    float width = clampWidth(g_options.vrHeadAudioWidth);
+    if (width <= 0.0f)
+        logf("head audio: vrHeadAudioWidth = 0 -- GPL's own pan curve until the VR menu raises it");
+    else
+        logf("head audio: the head's pan is widened, vrHeadAudioWidth %.2f -- a distant source 30 "
+             "/ 45 / 60 / 90 deg off centre leaves the far ear %.1f / %.1f / %.1f / %.1f dB down "
+             "(GPL's own: -3.1 / -5.2 / -8.0 / -20.0)",
+             width, farEarDb(30.0f, width), farEarDb(45.0f, width), farEarDb(60.0f, width),
+             farEarDb(90.0f, width));
+}
+
+bool headAudioWidthAdjustable() {
+    return g_state.panInstalled.load(std::memory_order_acquire);
 }
 
 void headAudioPublish(const float car[9], const float levelled[9], const VrEye eyes[2]) {
@@ -361,6 +494,7 @@ void headAudioPublish(const float car[9], const float levelled[9], const VrEye e
     float levelledCentre[3];
     apply(levelled, centre, levelledCentre);
     applyTransposed(car, levelledCentre, pose.centre);
+    pose.width = clampWidth(g_options.vrHeadAudioWidth);
     pose.qpc = now();
     pose.valid = true;
 

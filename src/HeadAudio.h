@@ -23,6 +23,11 @@
 //
 // Pan only, as GPL computes it: front and back are folded together and height is ignored, so a
 // turned head moves sounds between the ears and nothing sounds behind or above.
+//
+// GPL's pan curve is too gentle for a head turn to be heard -- 3 dB at 30 degrees under Miles'
+// pan law -- so both calls of gpl_sndComputePitchPan are redirected too, and while
+// vrHeadAudioWidth is above 0 the head's listener alone has its pan replaced by a sine curve
+// with a smaller near field. GPL's Doppler pitch, and every other listener's pan, are left as GPL computed them.
 
 #include "VrCamera.h"
 
@@ -38,6 +43,11 @@ void headAudioInstall();
 // `levelled`, then expressed in the view's own axes, so the sim thread can apply them to the view
 // of whatever tick it is on.
 void headAudioPublish(const float car[9], const float levelled[9], const VrEye eyes[2]);
+
+// True when the pan calls are taken, so vrHeadAudioWidth does something. The VR menu offers
+// its row only then. The width itself is read on the render thread at each publish and travels
+// to the sim thread inside the pose, so the menu changes it as the slider moves.
+bool headAudioWidthAdjustable();
 
 // Render thread, on a frame with no tracked head. The sound goes back to the driver's eye until
 // the next publish.

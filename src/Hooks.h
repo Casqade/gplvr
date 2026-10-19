@@ -381,6 +381,13 @@ struct Options {
     // sounds behind or above. TV cameras and replays keep GPL's own. VR only. See HeadAudio.h.
     bool vrHeadAudio = true;
 
+    // How hard the head's sound pans, 0 to 2. GPL's own curve leaves the far ear only 3 dB down
+    // for a car 30 degrees off centre, so a head turn is barely heard. 1 follows the sine of the
+    // angle (30 deg about 6 dB, 45 about 10, 90 about 26) and pulls near sources to the centre far
+    // less; above 1 is steeper still. 0 keeps GPL's curve. Needs vrHeadAudio. Also a VR menu
+    // row: the render thread reads it at every head publish (HeadAudio.h).
+    float vrHeadAudioWidth = 1.0f;
+
     // GPL world units per metre.
     //
     // Every angle in this mod has now been measured and is correct, and the distortion

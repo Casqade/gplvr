@@ -2603,6 +2603,8 @@ void loadOptions(const char* fileName) {
     GetPrivateProfileStringA("gplvr", "vrHorizonLock", "0.0", text, sizeof(text), path);
     g_options.vrHorizonLock = static_cast<float>(atof(text));
     g_options.vrHeadAudio = GetPrivateProfileIntA("gplvr", "vrHeadAudio", 1, path) != 0;
+    GetPrivateProfileStringA("gplvr", "vrHeadAudioWidth", "1.0", text, sizeof(text), path);
+    g_options.vrHeadAudioWidth = static_cast<float>(atof(text));
     GetPrivateProfileStringA("gplvr", "vrWorldScale", "1.0", text, sizeof(text), path);
     g_options.vrWorldScale = static_cast<float>(atof(text));
     g_options.windowWidth = GetPrivateProfileIntA("gplvr", "windowWidth", 0, path);
@@ -2817,8 +2819,9 @@ void loadOptions(const char* fileName) {
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
          g_options.vrMenuScale, g_options.vrGamma, g_options.vrHudDepth,
          g_options.vrRenderScale, g_options.vrRecentreKey, g_options.vrMonitorEye);
-    logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d", g_options.vrHorizonLock,
-         g_options.vrWorldScale, g_options.vrHeadAudio ? 1 : 0);
+    logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d vrHeadAudioWidth=%.2f",
+         g_options.vrHorizonLock, g_options.vrWorldScale, g_options.vrHeadAudio ? 1 : 0,
+         g_options.vrHeadAudioWidth);
     logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f vrHudInset=%.2f (%s)",
          g_options.vrHudLayer, g_options.vrHudBackdropOpacity, g_options.vrHudInset,
          g_options.vrHudInset >= 0.999f
