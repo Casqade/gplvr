@@ -9,6 +9,7 @@
 #include "MirrorConfig.h"
 #include "Paths.h"
 #include "Pribluda.h"
+#include "QuickMenu.h"
 #include "RenderTarget.h"
 #include "ReplayPanel.h"
 #include "Stereo.h"
@@ -390,7 +391,7 @@ MenuRow g_rows[] = {
      kTabHeadset},
     {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
      2.0f, 0.05f, "lifts the mid-tones in the headset", kTabHeadset},
-    {"Head audio width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+    {"Audio stereo width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
      "how hard the cockpit's sound pans between your ears as you turn your head. 0 is GPL's own "
      "gentle panning, 1 makes a car 30 degrees off to one side clearly louder in that ear, 2 is "
@@ -3451,10 +3452,14 @@ void vrMenuPoll() {
     if (state.mode == Mode::Closed) {
         const int hand = openingHand();
         if (hand >= 0) {
+            // The grip still opens the menu over an open quick menu, which closes unfired and
+            // hands the controller over first.
+            quickMenuCancel("the VR menu opened");
             enterMode(Mode::Menu, hand);
             return;
         }
-        pollQuickRecentre();
+        // While the quick menu is open the stick is its own, and so is the rest of the hand.
+        if (!quickMenuOpen()) pollQuickRecentre();
         return;
     }
 
@@ -3700,8 +3705,10 @@ void vrMenuUpdate(const GlFunctions& gl) {
             state.canvasSignatureValid = false;
             presenterMenuHide();
         }
-        // The layer is free while the menu is closed, and in a replay GPL's controls go on it.
-        replayPanelUpdate(gl, true);
+        // The layer is free while the menu is closed: the quick menu has it while the trigger
+        // holds it open, and otherwise, in a replay or under a GPL dialog, GPL's own 2D does.
+        bool quick = quickMenuUpdate(gl);
+        replayPanelUpdate(gl, !quick);
         return;
     }
     replayPanelUpdate(gl, false);
@@ -4103,6 +4110,7 @@ bool vrMenuActive() { return g_state.mode != Mode::Closed; }
 
 void vrMenuReleaseGl(const GlFunctions& gl, bool contextAlive) {
     vrTextRelease(gl, contextAlive);
+    quickMenuReleaseGl();
     // The layer's texture belongs to the context that is going, and Producer releases it
     // with the rest. Forgetting the signature is what makes the next frame rebuild the
     // image into the new one rather than deciding nothing has changed.

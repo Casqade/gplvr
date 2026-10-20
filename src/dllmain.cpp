@@ -25,6 +25,7 @@
 #include "MirrorDriverArms.h"
 #include "NoSignal.h"
 #include "Paths.h"
+#include "QuickMenu.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "SimRing.h"
@@ -171,6 +172,8 @@ DWORD WINAPI installThread(LPVOID) {
         hudBind(binding);
         billboardInstall(binding);
         headAudioInstall();
+        // Patches nothing: it checks the functions and globals the radial calls and reads.
+        quickMenuInstall();
     }
     // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
     // Hud.cpp has not touched. In VR it takes stampDraw alone and only with vrGplText = 1 --

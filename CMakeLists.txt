@@ -107,6 +107,7 @@ else()
         src/Pe.cpp
         src/PostProfile.cpp
         src/Pribluda.cpp
+        src/QuickMenu.cpp
         src/RenderPacing.cpp
         src/RenderProfile.cpp
         src/RenderTarget.cpp
