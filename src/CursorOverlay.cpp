@@ -3,6 +3,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "ReplayPanel.h"
+#include "ReplayQuickMenu.h"
 #include "Stereo.h"
 
 #include <windows.h>
@@ -753,8 +754,9 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
         return;
     }
     // GPL's replay controls are on a panel of their own, and a pointer drawn into the eyes at
-    // window coordinates would sit somewhere unrelated to them.
-    if (replayPanelShown()) {
+    // window coordinates would sit somewhere unrelated to them. The replay radial borrows that
+    // panel's layer while it is up, and the pointer stays off the eyes then too.
+    if (replayPanelShown() || replayQuickMenuOpen()) {
         noteRefusal(Refusal::ReplayPanel);
         return;
     }

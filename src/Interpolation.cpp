@@ -323,6 +323,7 @@ struct Window {
     unsigned  pitBoardBlended = 0;
     unsigned  pitBoardSnaps = 0;  // also in snaps[]
     unsigned  viewCarCoupled = 0;  // frames where the view and the viewed car were snapped together
+    unsigned  viewMirrorCoupled = 0;  // the same for the view and the mirror record
     long long costTicks = 0;
 
 };
@@ -1301,6 +1302,15 @@ void __stdcall afterLatch() {
         //
         // The pit board is already coupled to the view this way; this does the same for the car
         // the view is attached to, in both directions.
+        //
+        // The mirror record joins the same decision (below and after the car's coupling), so a
+        // mirror that snapped on its own takes the view with it, and the view then takes its car.
+        bool mirrorPair = s.mirrorLatched && s.mirror.copies == 2;
+        if (mirrorPair && s.view.copies == 2 && s.mirror.snapped && !s.view.snapped) {
+            s.view.snapped = true;
+            ++w.snaps[kSnapCamera];
+            ++w.viewMirrorCoupled;
+        }
         int viewedSlot = viewedCarSlot(s, identity[1], identity[2] != 0);
         s.viewedSlot = viewedSlot;
         if (viewedSlot >= 0) {
@@ -1314,6 +1324,22 @@ void __stdcall afterLatch() {
             }
             // The older pair needs no coupling here: applyBlend decides it once for the frame and
             // every record honours that decision or none does.
+        }
+
+        // THE MIRROR AND THE VIEW MUST BE AT THE SAME TICK TOO (report 101).
+        //
+        // GPL computes both from the same car in the same call -- gpl_viewUpdate 0x454350 runs
+        // gpl_viewCompute and then gpl_mirrorViewCompute 0x454E30 -- and Stereo.cpp aims every
+        // glass by putting the eye, taken from the view record, into the car frame it rebuilds
+        // from the mirror record. A view snapped to the newest tick against a mirror blended
+        // towards the older one puts the eye a tick's travel ahead of or behind the seat in that
+        // frame, and the glasses are aimed from there: a replay step while paused moves every car
+        // past 3x its last step, the viewed car snaps, the view follows it above, and the mirror
+        // was drawn from the wrong place for the rest of that tick -- the flick on each step.
+        if (mirrorPair && s.view.snapped && !s.mirror.snapped) {
+            s.mirror.snapped = true;
+            ++w.snaps[kSnapCamera];
+            ++w.viewMirrorCoupled;
         }
 
         // A board hidden in this latch starts a new history when it shows again.
@@ -1726,7 +1752,8 @@ bool interpolationFormat(char* out, size_t size) {
             "were the view's), target held back %u "
             "| the drawn instant stepped %.2f to %.2f ms over %u frames "
             "| snaps first %u identity %u tick gap %u "
-            "jump %u camera %u nonfinite %u (%u of them the view and its car coupled) | view tick "
+            "jump %u camera %u nonfinite %u (%u of them the view and its car coupled, %u the view "
+            "and its mirror) | view tick "
             "gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
             "| view blended %u, mirror %u, pit board %u (snapped %u) | rotation: %u matrix "
             "fallbacks | blend left the pair %u times, worst %.2f m | display time from the "
@@ -1738,7 +1765,8 @@ bool interpolationFormat(char* out, size_t size) {
             w.sampledView, w.alphas, w.targetHeldBack, w.steadyMin, w.steadyMax,
             w.steadySteps, w.snaps[kSnapFirst],
             w.snaps[kSnapIdentity], w.snaps[kSnapGap], w.snaps[kSnapJump], w.snaps[kSnapCamera],
-            w.snaps[kSnapNonFinite], w.viewCarCoupled, w.gaps[0], w.gaps[1], w.gaps[2],
+            w.snaps[kSnapNonFinite], w.viewCarCoupled, w.viewMirrorCoupled, w.gaps[0],
+            w.gaps[1], w.gaps[2],
             w.gaps[3],
             static_cast<double>(w.carsBlended) / w.frames, w.viewBlended, w.mirrorBlended,
             w.pitBoardBlended, w.pitBoardSnaps, g_rotationFallbacks, g_blendOutOfRange,

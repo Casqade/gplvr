@@ -21,6 +21,7 @@
 #include "PostProfile.h"
 #include "Pribluda.h"
 #include "QuickMenu.h"
+#include "ReplayQuickMenu.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "ReplayPanel.h"
@@ -561,6 +562,8 @@ void reportOncePerSecond() {
     if (vrMenuFormatStatus(menu, sizeof(menu))) logf("%s", menu);
     char quick[640] = {};
     if (quickMenuFormatStatus(quick, sizeof(quick))) logf("%s", quick);
+    char replay[1000] = {};
+    if (replayQuickMenuFormatStatus(replay, sizeof(replay))) logf("%s", replay);
 
     // After every line that reads them, and on every path -- a window that printed nothing
     // must still be drained, or its counts land in the next one.
@@ -832,6 +835,10 @@ void pollToggle() {
     // After the VR menu, so a grip tap that opened it this poll is already seen and the radial
     // stays shut; and on this, GPL's fg thread, which is where its in-car posts belong.
     quickMenuPoll();
+    // The replay's stick and radial: after the VR menu for the same reason, and after the
+    // replay pointer, which has already clicked if this press was on GPL's panel. Its posts
+    // belong on the fg thread too.
+    replayQuickMenuPoll();
 
     // Per-eye mirrors on and off. The pass loop reads perEyeMirror every frame and the main
     // world walk redirect is installed whichever way it started, so the two swap freely.

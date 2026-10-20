@@ -108,10 +108,12 @@ else()
         src/PostProfile.cpp
         src/Pribluda.cpp
         src/QuickMenu.cpp
+        src/Radial.cpp
         src/RenderPacing.cpp
         src/RenderProfile.cpp
         src/RenderTarget.cpp
         src/ReplayPanel.cpp
+        src/ReplayQuickMenu.cpp
         src/SimRing.cpp
         src/SkidFlood.cpp
         src/Stereo.cpp

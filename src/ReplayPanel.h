@@ -84,8 +84,8 @@ void replayPanelNoteScene();
 
 // Once a frame from the VR menu's update, on the render thread with the game's context
 // current, after GPL's 2D for the frame. `layerFree` is true while the VR menu is closed and its
-// quad layer is unused; the panel then publishes its image there, and hides the layer again
-// when the replay ends or the dialog closes.
+// quad layer is unused -- no quick menu's radial on it either; the panel then publishes its image
+// there, and hides the layer again when the replay ends or the dialog closes.
 void replayPanelUpdate(const GlFunctions& gl, bool layerFree);
 
 // True while the replay panel is on the layer, so the pointer is tested against it and the cursor

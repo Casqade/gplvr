@@ -97,6 +97,15 @@ void vrMenuNoteRayNeedsOffscreen();
 // also acting on whatever the driver is doing.
 bool vrMenuActive();
 
+// True when `hand`'s aim ray meets the replay panel this poll -- the same test the replay
+// pointer applies before it clicks, so a press it is true for belongs to GPL's widgets and one it
+// is false for is never turned into a click. False when the panel is not up.
+bool vrMenuReplayPanelHit(int hand);
+
+// True while the replay pointer holds GPL's left button down: a click on the panel is in
+// progress, and the replay radial does not open over it.
+bool vrMenuReplayClickHeld();
+
 // The GL context is going away: forget the font's display lists.
 void vrMenuReleaseGl(const GlFunctions& gl, bool contextAlive);
 

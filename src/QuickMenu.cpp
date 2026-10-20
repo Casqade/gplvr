@@ -4,12 +4,12 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "Pribluda.h"
+#include "Radial.h"
 #include "ReplayPanel.h"
+#include "ReplayQuickMenu.h"
 #include "VrInput.h"
 #include "VrMenu.h"
-#include "VrText.h"
 #include "Window.h"
-#include "presenter/Producer.h"
 
 #include <windows.h>
 
@@ -236,32 +236,13 @@ const unsigned    kSliceNeed[kSliceCount] = {kNeedReset, kNeedPits, kNeedReplay,
 // right, Pause left.
 const float kSliceAngle[kSliceCount] = {90.0f, 270.0f, 0.0f, 180.0f};
 
-// The hand turned this far from where it pointed at the press selects. The stick selects at
-// this deflection. Whichever is further along its own scale wins, so a hand that drifts while
-// the stick is pushed cannot override the stick, nor the reverse.
-constexpr float kSelectDegrees = 15.0f;
-constexpr float kStickSelect = 0.5f;
-// Once a slice is selected it stays so until the deflection falls under this fraction of the
-// threshold, and the boundary between two slices is widened by kSectorHysteresis on the side of
-// the one already selected: a hand resting on a boundary would otherwise flicker between them.
-constexpr float kReleaseLevel = 0.75f;
-constexpr float kSectorHysteresis = 10.0f;
+// Four quarters. The boundary between two slices is widened by 10 degrees on the side of the
+// one already selected: a hand resting on a boundary would otherwise flicker between them. The
+// slices are wide enough that no label is ever broken.
+const RadialLayout kLayout = {kSliceCount, kSliceAngle, 45.0f, 10.0f, 1000.0f};
+
 // Back to pits in a race: the slice must have been held this long before a release fires it.
 constexpr double kDwellSeconds = 0.5;
-
-// The panel: head-locked, a little below the line of sight, square.
-constexpr int   kCanvasSize = 640;
-constexpr float kPanelMetres = 0.30f;
-constexpr float kPanelAhead = 0.62f;
-constexpr float kPanelDrop = 0.06f;
-constexpr float kInnerRadius = 96.0f;
-constexpr float kOuterRadius = 300.0f;
-constexpr float kLabelRadius = 196.0f;
-constexpr float kSliceGapDegrees = 1.5f;
-// The same two sizes the VR menu uses, so switching between them rebuilds no font.
-constexpr int kBodyPixels = 30;
-constexpr int kSmallPixels = 19;
-constexpr LONGLONG kRebuildHz = 45;
 
 // -- the pause rule -------------------------------------------------------------------------
 
@@ -340,12 +321,7 @@ struct EscDecision {
     bool chatKnown = true;
 };
 
-struct SliceView {
-    bool        enabled = false;
-    bool        dwell = false;
-    const char* label = "";
-    char        reason[40] = {};
-};
+using SliceView = RadialSlice;
 
 struct Pause {
     bool     player = false;     // the driver chose Pause on the radial
@@ -370,8 +346,6 @@ struct Counts {
     unsigned pressRefused[kGateCount] = {};
     unsigned claimRefused = 0;
     unsigned handLost = 0;
-    unsigned drawRefused = 0;
-    unsigned layersBuilt = 0;
     unsigned pauseRequests = 0;
     unsigned unpauseRequests = 0;
     unsigned pauseNeverLanded = 0;
@@ -403,27 +377,14 @@ struct State {
     uintptr_t sessionState = 0;
     uintptr_t subState = 0;
 
-    // The radial.
+    // The radial: its steering and its layer.
     bool     open = false;
     int      hand = -1;
-    float    pressDirection[3] = {0.0f, 0.0f, -1.0f};
-    float    pressRight[3] = {1.0f, 0.0f, 0.0f};
-    float    pressUp[3] = {0.0f, 1.0f, 0.0f};
-    int      selected = kSliceNone;
-    LONGLONG selectedAt = 0;
-    float    level = 0.0f;      // the winning deflection, 1 at the selection threshold
-    float    direction = 0.0f;  // its angle, degrees anticlockwise from the right
-    bool     usedStick = false;
+    Radial   radial;
     SliceView view[kSliceCount];
     EscDecision esc;
     Snapshot snap;
     int      lastPressRefusal = -1;
-
-    // The layer.
-    bool     layerVisible = false;
-    bool     signatureValid = false;
-    char     signature[384] = {};
-    LONGLONG lastBuild = 0;
 
     Pause  pause;
     Counts counts;
@@ -604,10 +565,7 @@ bool pausedNow(const Snapshot& snap) {
     return (gplPaused(snap) && !p.unpausing) || (p.ours && !p.landed);
 }
 
-void setReason(SliceView& view, const char* text) {
-    view.enabled = false;
-    _snprintf_s(view.reason, sizeof(view.reason), _TRUNCATE, "%s", text);
-}
+void setReason(SliceView& view, const char* text) { radialSetReason(view, text); }
 
 // Every slice's state for this poll, from exactly the predicates GPL applies.
 void evaluate(const Snapshot& snap, SliceView views[kSliceCount], EscDecision& esc) {
@@ -677,7 +635,8 @@ Gate gateFor(const Snapshot& snap, int hand) {
     if (!g_options.vr || !vrInputAvailable()) return kGateNoInput;
     if (windowInFrontEnd()) return kGateFrontEnd;
     if (!snap.vtableOk) return kGateUnsupported;
-    if (snap.replayScreen || replayPanelShown()) return kGateReplay;
+    // The replay has a radial of its own; the two are never up together.
+    if (snap.replayScreen || replayPanelShown() || replayQuickMenuOpen()) return kGateReplay;
     if (!snap.driveCurrent) return kGateNotDriving;
     if (snap.latched != 4 && snap.latched != 5) return kGateNotRunning;
     if (snap.help) return kGateHelp;
@@ -953,25 +912,16 @@ void fire(int slice, const Snapshot& snap) {
             break;
         }
         case kSliceReplay: {
-            HWND window = gameWindow();
-            BOOL down = FALSE;
-            BOOL up = FALSE;
-            if (window) {
-                // A real press's lParam: repeat 1 and the scan code; the release also carries
-                // "previously down" and "transition up".
-                auto press = static_cast<LPARAM>((kReplayScanCode << 16) | 1u);
-                auto lift = static_cast<LPARAM>((kReplayScanCode << 16) | 1u | (1u << 30) |
-                                                (1u << 31));
-                down = PostMessageA(window, WM_KEYDOWN, VK_F2, press);
-                up = PostMessageA(window, WM_KEYUP, VK_F2, lift);
-            }
+            int  down = 0;
+            int  up = 0;
+            bool window = quickMenuPostKey(VK_F2, kReplayScanCode, down, up);
             if (!down) ++s.counts.postRefused;
-            s.replayTrip = down != FALSE;
+            s.replayTrip = down != 0;
             s.replaySeen = false;
             s.replayFiredAt = qpcNow();
             logf("quick menu: FIRED replay -- %s; F2 posted to the game window %s (down %d, up "
                  "%d)",
-                 text, window ? "" : "-- THERE IS NO GAME WINDOW", down ? 1 : 0, up ? 1 : 0);
+                 text, window ? "" : "-- THERE IS NO GAME WINDOW", down, up);
             break;
         }
         case kSlicePause: {
@@ -1009,121 +959,14 @@ void fire(int slice, const Snapshot& snap) {
     watchStart(slice, snap);
 }
 
-// -- the radial's controls ------------------------------------------------------------------
-
-void rotate(const SharedPose& pose, const float v[3], float out[3]) {
-    float qx = pose.orientationX, qy = pose.orientationY, qz = pose.orientationZ,
-          qw = pose.orientationW;
-    float tx = 2.0f * (qy * v[2] - qz * v[1]);
-    float ty = 2.0f * (qz * v[0] - qx * v[2]);
-    float tz = 2.0f * (qx * v[1] - qy * v[0]);
-    out[0] = v[0] + qw * tx + (qy * tz - qz * ty);
-    out[1] = v[1] + qw * ty + (qz * tx - qx * tz);
-    out[2] = v[2] + qw * tz + (qx * ty - qy * tx);
-}
-
-float dot3(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
-
-void cross3(const float a[3], const float b[3], float out[3]) {
-    out[0] = a[1] * b[2] - a[2] * b[1];
-    out[1] = a[2] * b[0] - a[0] * b[2];
-    out[2] = a[0] * b[1] - a[1] * b[0];
-}
-
-bool normalise3(float v[3]) {
-    float length = std::sqrt(dot3(v, v));
-    if (!(length > 1e-6f)) return false;
-    v[0] /= length;
-    v[1] /= length;
-    v[2] /= length;
-    return true;
-}
-
-// The aim ray's direction, in the presenter's LOCAL space, whose +Y is up.
-void aimDirection(const VrHandInput& hand, float out[3]) {
-    float forward[3] = {0.0f, 0.0f, -1.0f};
-    rotate(hand.aimPose, forward, out);
-    normalise3(out);
-}
-
-// The frame the hand's turn is measured in: the press direction, and right and up across it
-// with up as near the world's as the direction allows. Measured against the world's up rather
-// than the controller's, so "up" is up however the wrist happened to be rolled at the press.
-void capturePressFrame(const VrHandInput& hand) {
-    State& s = g_state;
-    aimDirection(hand, s.pressDirection);
-    float worldUp[3] = {0.0f, 1.0f, 0.0f};
-    cross3(s.pressDirection, worldUp, s.pressRight);
-    if (!normalise3(s.pressRight)) {
-        float handRight[3] = {1.0f, 0.0f, 0.0f};
-        rotate(hand.aimPose, handRight, s.pressRight);
-        normalise3(s.pressRight);
-    }
-    cross3(s.pressRight, s.pressDirection, s.pressUp);
-    normalise3(s.pressUp);
-}
-
-float angleDistance(float a, float b) {
-    float d = std::fmod(std::fabs(a - b), 360.0f);
-    return d > 180.0f ? 360.0f - d : d;
-}
-
-// The slice the deflection points into, keeping the current one through kSectorHysteresis.
-int sliceAt(float degrees, int current) {
-    if (current != kSliceNone &&
-        angleDistance(degrees, kSliceAngle[current]) <= 45.0f + kSectorHysteresis)
-        return current;
-    int best = kSliceNone;
-    float bestDistance = 1e9f;
-    for (int i = 0; i < kSliceCount; ++i) {
-        float distance = angleDistance(degrees, kSliceAngle[i]);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = i;
-        }
-    }
-    return best;
-}
-
-void steer(const VrHandInput& hand, LONGLONG now) {
-    State& s = g_state;
-
-    float d[3];
-    aimDirection(hand, d);
-    float along = dot3(d, s.pressDirection);
-    float across = dot3(d, s.pressRight);
-    float upward = dot3(d, s.pressUp);
-    float turned = std::atan2(std::sqrt(across * across + upward * upward), along) * 57.29578f;
-    float rayLevel = turned / kSelectDegrees;
-    float rayAngle = std::atan2(upward, across) * 57.29578f;
-
-    float stickLength = std::sqrt(hand.stickX * hand.stickX + hand.stickY * hand.stickY);
-    float stickLevel = stickLength / kStickSelect;
-    float stickAngle = std::atan2(hand.stickY, hand.stickX) * 57.29578f;
-
-    s.usedStick = stickLevel > rayLevel;
-    s.level = s.usedStick ? stickLevel : rayLevel;
-    s.direction = s.usedStick ? stickAngle : rayAngle;
-    if (s.direction < 0.0f) s.direction += 360.0f;
-
-    int next = s.selected;
-    if (s.level >= 1.0f)
-        next = sliceAt(s.direction, s.selected);
-    else if (s.level < kReleaseLevel)
-        next = kSliceNone;
-    if (next != s.selected) {
-        s.selected = next;
-        s.selectedAt = now;
-    }
-}
+// -- the radial's controls (Radial.cpp steers and draws it) ---------------------------------
 
 void closeRadial(const char* why) {
     State& s = g_state;
     if (!s.open) return;
     s.open = false;
     s.hand = -1;
-    s.selected = kSliceNone;
-    s.level = 0.0f;
+    radialEnd(s.radial);
     vrInputRelease("the quick menu");
     if (why) logf("quick menu: closed -- %s", why);
 }
@@ -1137,12 +980,7 @@ void openRadial(int hand, const Snapshot& snap, LONGLONG now) {
     }
     s.open = true;
     s.hand = hand;
-    s.selected = kSliceNone;
-    s.selectedAt = now;
-    s.level = 0.0f;
-    s.usedStick = false;
-    s.signatureValid = false;
-    capturePressFrame(vrInputHand(hand));
+    radialBegin(s.radial, vrInputHand(hand), now);
     evaluate(snap, s.view, s.esc);
     ++s.counts.opened;
     s.used = true;
@@ -1161,7 +999,7 @@ void openRadial(int hand, const Snapshot& snap, LONGLONG now) {
 // The trigger has come up: fire what is selected, if it may fire.
 void release(const Snapshot& snap, LONGLONG now) {
     State& s = g_state;
-    int    slice = s.selected;
+    int    slice = s.radial.selected;
     if (slice == kSliceNone) {
         ++s.counts.cancelled;
         closeRadial("released in the centre, nothing fired");
@@ -1176,13 +1014,13 @@ void release(const Snapshot& snap, LONGLONG now) {
         closeRadial(text);
         return;
     }
-    if (view.dwell && secondsSince(s.selectedAt, now) < kDwellSeconds) {
+    if (view.dwell && secondsSince(s.radial.selectedAt, now) < kDwellSeconds) {
         ++s.counts.dwellShort;
         char text[128];
         _snprintf_s(text, sizeof(text), _TRUNCATE,
                     "released on back to pits after %.2f s of the %.1f s hold a race asks for -- "
                     "nothing fired",
-                    secondsSince(s.selectedAt, now), kDwellSeconds);
+                    secondsSince(s.radial.selectedAt, now), kDwellSeconds);
         closeRadial(text);
         return;
     }
@@ -1289,7 +1127,7 @@ void quickMenuPoll() {
             s.used = true;
             closeRadial("the hand stopped being tracked, nothing fired");
         } else {
-            steer(hand, now);
+            radialSteer(s.radial, kLayout, hand, now);
             evaluate(snap, s.view, s.esc);
             if (!hand.triggerHeld.down) release(snap, now);
         }
@@ -1320,6 +1158,21 @@ void quickMenuPoll() {
     pausePoll(snap, now);
 }
 
+bool quickMenuPostKey(UINT vk, UINT scanCode, int& down, int& up) {
+    down = 0;
+    up = 0;
+    HWND window = gameWindow();
+    if (!window) return false;
+    // A real press's lParam: repeat 1 and the scan code; the release also carries "previously
+    // down" and "transition up". GPL's pump runs TranslateMessage on what it takes from the
+    // queue, so a key that has a character (Esc's is 27) arrives as WM_CHAR too, as typed.
+    auto press = static_cast<LPARAM>((scanCode << 16) | 1u);
+    auto lift = static_cast<LPARAM>((scanCode << 16) | 1u | (1u << 30) | (1u << 31));
+    down = PostMessageA(window, WM_KEYDOWN, vk, press) ? 1 : 0;
+    up = PostMessageA(window, WM_KEYUP, vk, lift) ? 1 : 0;
+    return true;
+}
+
 bool quickMenuOpen() { return g_state.open; }
 
 void quickMenuCancel(const char* why) {
@@ -1334,287 +1187,26 @@ void quickMenuCancel(const char* why) {
 
 namespace {
 
-// -- drawing --------------------------------------------------------------------------------
-
-constexpr float kCentre = static_cast<float>(kCanvasSize) * 0.5f;
-
-void pointAt(float degrees, float radius, float& x, float& y) {
-    float radians = degrees / 57.29578f;
-    x = kCentre + radius * std::cos(radians);
-    y = kCentre - radius * std::sin(radians);
-}
-
-// An annular sector from `from` to `to` degrees, anticlockwise.
-void drawSector(const GlFunctions& gl, float from, float to, float inner, float outer) {
-    int steps = static_cast<int>((to - from) / 4.0f) + 1;
-    gl.begin(GL_TRIANGLE_STRIP);
-    for (int i = 0; i <= steps; ++i) {
-        float degrees = from + (to - from) * static_cast<float>(i) / static_cast<float>(steps);
-        float x = 0.0f;
-        float y = 0.0f;
-        pointAt(degrees, inner, x, y);
-        gl.vertex2f(x, y);
-        pointAt(degrees, outer, x, y);
-        gl.vertex2f(x, y);
-    }
-    gl.end();
-}
-
-void drawDisc(const GlFunctions& gl, float cx, float cy, float radius) {
-    gl.begin(GL_TRIANGLE_FAN);
-    gl.vertex2f(cx, cy);
-    for (int i = 0; i <= 48; ++i) {
-        float radians = 6.2831853f * static_cast<float>(i) / 48.0f;
-        gl.vertex2f(cx + radius * std::cos(radians), cy - radius * std::sin(radians));
-    }
-    gl.end();
-}
-
-// Centred on (x, centreY), the cap height straddling it.
-void centredText(const GlFunctions& gl, int slot, float x, float centreY, const char* text) {
-    if (!text || !text[0]) return;
-    float width = static_cast<float>(vrTextWidth(slot, text));
-    vrTextDraw(gl, slot, x - width * 0.5f,
-               centreY + static_cast<float>(vrTextAscent(slot)) * 0.5f, text);
-}
-
+// The hold Back to pits wants in a race, 0 to 1, or -1 when the selected slice wants none.
 float dwellProgress(LONGLONG now) {
     const State& s = g_state;
-    if (s.selected == kSliceNone || !s.view[s.selected].dwell || !s.view[s.selected].enabled)
+    int          selected = s.radial.selected;
+    if (selected == kSliceNone || !s.view[selected].dwell || !s.view[selected].enabled)
         return -1.0f;
-    double progress = secondsSince(s.selectedAt, now) / kDwellSeconds;
+    double progress = secondsSince(s.radial.selectedAt, now) / kDwellSeconds;
     return progress > 1.0 ? 1.0f : static_cast<float>(progress);
-}
-
-// Where the deflection marker sits: the centre at rest, the centre disc's edge at the selection
-// threshold, out into the slices beyond it.
-void markerPosition(float& x, float& y) {
-    const State& s = g_state;
-    float level = s.level;
-    float radius = level <= 1.0f ? level * kInnerRadius
-                                 : kInnerRadius + (level - 1.0f) * (kOuterRadius - kInnerRadius);
-    if (radius > kOuterRadius - 24.0f) radius = kOuterRadius - 24.0f;
-    pointAt(s.direction, radius, x, y);
-}
-
-void buildSignature(char* out, size_t size, LONGLONG now) {
-    const State& s = g_state;
-    float x = 0.0f;
-    float y = 0.0f;
-    markerPosition(x, y);
-    float progress = dwellProgress(now);
-    int   written = _snprintf_s(out, size, _TRUNCATE, "%d|%d|%d|%d|", s.selected,
-                                static_cast<int>(progress * 24.0f), static_cast<int>(x / 6.0f),
-                                static_cast<int>(y / 6.0f));
-    for (int i = 0; i < kSliceCount && written > 0 && static_cast<size_t>(written) < size; ++i) {
-        int more = _snprintf_s(out + written, size - written, _TRUNCATE, "%d%s%s|",
-                               s.view[i].enabled ? 1 : 0, s.view[i].label, s.view[i].reason);
-        if (more < 0) break;
-        written += more;
-    }
-}
-
-void drawRadial(const GlFunctions& gl, LONGLONG now) {
-    const State& s = g_state;
-
-    // The backdrop: one dark disc the slices sit on, so the gaps read against any scene.
-    gl.color4f(0.05f, 0.06f, 0.09f, 0.70f);
-    drawDisc(gl, kCentre, kCentre, kOuterRadius + 8.0f);
-
-    for (int i = 0; i < kSliceCount; ++i) {
-        const SliceView& view = s.view[i];
-        bool             selected = i == s.selected;
-        if (selected && view.enabled)
-            gl.color4f(0.20f, 0.46f, 0.86f, 0.95f);
-        else if (selected)
-            gl.color4f(0.42f, 0.18f, 0.15f, 0.92f);
-        else if (view.enabled)
-            gl.color4f(0.17f, 0.20f, 0.27f, 0.92f);
-        else
-            gl.color4f(0.10f, 0.11f, 0.13f, 0.85f);
-        drawSector(gl, kSliceAngle[i] - 45.0f + kSliceGapDegrees,
-                   kSliceAngle[i] + 45.0f - kSliceGapDegrees, kInnerRadius, kOuterRadius);
-    }
-
-    // The hold a race asks for on Back to pits: a ring filling along the slice's outer edge.
-    float progress = dwellProgress(now);
-    if (progress >= 0.0f) {
-        float from = kSliceAngle[kSlicePits] + 45.0f - kSliceGapDegrees;
-        float span = 90.0f - 2.0f * kSliceGapDegrees;
-        gl.color4f(0.25f, 0.25f, 0.28f, 0.95f);
-        drawSector(gl, from - span, from, kOuterRadius - 16.0f, kOuterRadius - 4.0f);
-        if (progress > 0.0f) {
-            gl.color4f(0.98f, 0.84f, 0.25f, 1.0f);
-            drawSector(gl, from - span * progress, from, kOuterRadius - 16.0f,
-                       kOuterRadius - 4.0f);
-        }
-    }
-
-    // The centre: release here to cancel.
-    gl.color4f(0.03f, 0.04f, 0.06f, 0.90f);
-    drawDisc(gl, kCentre, kCentre, kInnerRadius - 6.0f);
-
-    for (int i = 0; i < kSliceCount; ++i) {
-        const SliceView& view = s.view[i];
-        float            x = 0.0f;
-        float            y = 0.0f;
-        pointAt(kSliceAngle[i], kLabelRadius, x, y);
-        if (view.enabled)
-            gl.color4f(0.96f, 0.97f, 1.0f, 1.0f);
-        else
-            gl.color4f(0.50f, 0.52f, 0.57f, 1.0f);
-        float lineHeight = static_cast<float>(vrTextHeight(kVrTextBody));
-        bool  second = !view.enabled || view.dwell;
-        centredText(gl, kVrTextBody, x, second ? y - lineHeight * 0.45f : y, view.label);
-        if (!view.enabled) {
-            if (i == s.selected)
-                gl.color4f(1.0f, 0.78f, 0.30f, 1.0f);
-            else
-                gl.color4f(0.62f, 0.60f, 0.52f, 1.0f);
-            centredText(gl, kVrTextSmall, x, y + lineHeight * 0.55f, view.reason);
-        } else if (view.dwell) {
-            gl.color4f(0.75f, 0.80f, 0.90f, 1.0f);
-            centredText(gl, kVrTextSmall, x, y + lineHeight * 0.55f, "hold to confirm");
-        }
-    }
-
-    // What letting go now would do.
-    const char* hint = "cancel";
-    if (s.selected != kSliceNone) {
-        const SliceView& view = s.view[s.selected];
-        if (!view.enabled)
-            hint = "can't";
-        else if (progress >= 0.0f && progress < 1.0f)
-            hint = "hold...";
-        else
-            hint = "release";
-    }
-    gl.color4f(0.70f, 0.74f, 0.82f, 1.0f);
-    centredText(gl, kVrTextSmall, kCentre, kCentre, hint);
-
-    // Where the hand or the stick is pushing.
-    float mx = 0.0f;
-    float my = 0.0f;
-    markerPosition(mx, my);
-    gl.color4f(0.0f, 0.0f, 0.0f, 0.8f);
-    drawDisc(gl, mx, my, 11.0f);
-    gl.color4f(1.0f, 0.88f, 0.20f, 1.0f);
-    drawDisc(gl, mx, my, 7.0f);
 }
 
 }  // namespace
 
 bool quickMenuUpdate(const GlFunctions& gl) {
-    State& s = g_state;
-    if (!s.open) {
-        if (s.layerVisible) {
-            s.layerVisible = false;
-            s.signatureValid = false;
-            presenterMenuHide();
-        }
-        return false;
-    }
-
-    if (!gl.begin || !gl.end || !gl.vertex2f || !gl.color4f || !gl.loadIdentity || !gl.ortho ||
-        !gl.matrixMode || !gl.pushMatrix || !gl.popMatrix || !gl.pushAttrib || !gl.popAttrib ||
-        !gl.getIntegerv || !gl.disable || !gl.enable || !gl.blendFunc || !gl.colorMask ||
-        !gl.polygonMode) {
-        ++s.counts.drawRefused;
-        return true;
-    }
-    if (!vrTextEnsure(gl, kVrTextBody, kBodyPixels) ||
-        !vrTextEnsure(gl, kVrTextSmall, kSmallPixels)) {
-        ++s.counts.drawRefused;
-        return true;
-    }
-
+    State&   s = g_state;
     LONGLONG now = qpcNow();
-    char     signature[sizeof(s.signature)] = {};
-    buildSignature(signature, sizeof(signature), now);
-    bool changed = !s.signatureValid || std::strcmp(signature, s.signature) != 0;
-    bool due = !s.lastBuild || !s.frequency || now - s.lastBuild >= s.frequency / kRebuildHz;
-    if (s.layerVisible && (!changed || !due)) return true;
-
-    GLint savedMatrixMode = GL_PROJECTION;
-    gl.getIntegerv(GL_MATRIX_MODE, &savedMatrixMode);
-    gl.pushAttrib(static_cast<GLbitfield>(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT |
-                                          GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT | GL_SCISSOR_BIT |
-                                          GL_TEXTURE_BIT | GL_PIXEL_MODE_BIT | GL_VIEWPORT_BIT |
-                                          GL_LINE_BIT));
-    gl.disable(GL_TEXTURE_2D);
-    gl.disable(GL_TEXTURE_1D);
-    gl.disable(GL_ALPHA_TEST);
-    gl.disable(GL_DEPTH_TEST);
-    gl.disable(GL_STENCIL_TEST);
-    gl.disable(GL_SCISSOR_TEST);
-    gl.disable(GL_CULL_FACE);
-    gl.disable(GL_LIGHTING);
-    gl.disable(GL_FOG);
-    gl.disable(GL_COLOR_LOGIC_OP);
-    gl.polygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    int actualWidth = 0;
-    int actualHeight = 0;
-    if (!presenterMenuBegin(kCanvasSize, kCanvasSize, actualWidth, actualHeight)) {
-        gl.popAttrib();
-        gl.matrixMode(static_cast<GLenum>(savedMatrixMode));
-        ++s.counts.drawRefused;
-        return true;
-    }
-
-    gl.matrixMode(GL_PROJECTION);
-    gl.pushMatrix();
-    gl.loadIdentity();
-    // The layout is in kCanvasSize pixels, origin top-left; a texture of another size is scaled.
-    gl.ortho(0.0, static_cast<double>(kCanvasSize), static_cast<double>(kCanvasSize), 0.0, -1.0,
-             1.0);
-    gl.matrixMode(GL_MODELVIEW);
-    gl.pushMatrix();
-    gl.loadIdentity();
-
-    drawRadial(gl, now);
-
-    gl.matrixMode(GL_MODELVIEW);
-    gl.popMatrix();
-    gl.matrixMode(GL_PROJECTION);
-    gl.popMatrix();
-
-    presenterMenuEnd();
-    gl.popAttrib();
-    gl.matrixMode(static_cast<GLenum>(savedMatrixMode));
-
-    // Head-locked, in the view's space: it is up only while the trigger is held, it is chosen
-    // from by the hand's turn rather than by pointing, and it must be in view wherever the head
-    // happens to be. The quad's +Z faces the viewer with an identity orientation.
-    SharedPose pose;
-    pose.positionX = 0.0f;
-    pose.positionY = -kPanelDrop;
-    pose.positionZ = -kPanelAhead;
-    pose.orientationX = 0.0f;
-    pose.orientationY = 0.0f;
-    pose.orientationZ = 0.0f;
-    pose.orientationW = 1.0f;
-    if (!presenterMenuPublish(pose, kMenuSpaceView, kPanelMetres, kPanelMetres)) {
-        ++s.counts.drawRefused;
-        return true;
-    }
-
-    s.layerVisible = true;
-    s.lastBuild = now;
-    _snprintf_s(s.signature, sizeof(s.signature), _TRUNCATE, "%s", signature);
-    s.signatureValid = true;
-    ++s.counts.layersBuilt;
-    return true;
+    return radialUpdate(s.radial, kLayout, s.view, s.open, s.open ? dwellProgress(now) : -1.0f,
+                        now, s.frequency, gl);
 }
 
-void quickMenuReleaseGl() {
-    g_state.signatureValid = false;
-    g_state.layerVisible = false;
-    g_state.lastBuild = 0;
-}
+void quickMenuReleaseGl() { radialReleaseGl(g_state.radial); }
 
 bool quickMenuFormatStatus(char* out, size_t size) {
     State& s = g_state;
@@ -1643,11 +1235,13 @@ bool quickMenuFormatStatus(char* out, size_t size) {
                 closed, closed ? " -- mostly " : "", closed ? kGateName[closedWorst] : "",
                 c.handLost, refused, refused ? " -- mostly " : "",
                 refused ? kGateName[refusedWorst] : "", c.claimRefused, c.postRefused,
-                c.layersBuilt, c.drawRefused, p.player ? "on" : "off", p.ours ? "yes" : "no",
-                p.ours && !p.landed ? " (not landed yet)" : "", c.pauseRequests,
-                c.unpauseRequests, c.pauseNeverLanded, c.pauseTakenBack);
+                s.radial.layersBuilt, s.radial.drawRefused, p.player ? "on" : "off",
+                p.ours ? "yes" : "no", p.ours && !p.landed ? " (not landed yet)" : "",
+                c.pauseRequests, c.unpauseRequests, c.pauseNeverLanded, c.pauseTakenBack);
 
     s.counts = Counts();
+    s.radial.layersBuilt = 0;
+    s.radial.drawRefused = 0;
     s.used = false;
     return true;
 }

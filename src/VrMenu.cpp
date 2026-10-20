@@ -12,6 +12,7 @@
 #include "QuickMenu.h"
 #include "RenderTarget.h"
 #include "ReplayPanel.h"
+#include "ReplayQuickMenu.h"
 #include "Stereo.h"
 #include "TweakApi.h"
 #include "VrCamera.h"
@@ -2195,12 +2196,14 @@ int openingHand() {
 // panel to reach it defeats the point. Any of the two face buttons or the stick click, on a
 // hand that is tracked, while nothing is open. Inside a mode those same controls belong to the
 // mode -- the stick click is Reset in all three binding tables -- so this only looks when the
-// menu is closed, which is also the only time it is called.
-void pollQuickRecentre() {
+// menu is closed, which is also the only time it is called. `stickClick` false leaves the stick
+// click to the replay controls, whose play/pause it is.
+void pollQuickRecentre(bool stickClick) {
     for (int hand = 0; hand < kHands; ++hand) {
         const VrHandInput& input = vrInputHand(hand);
         if (!input.present) continue;
-        if (!input.primary.pressed && !input.secondary.pressed && !input.stick.pressed)
+        if (!input.primary.pressed && !input.secondary.pressed &&
+            !(stickClick && input.stick.pressed))
             continue;
         vrRequestRecentre();
         logf("vr menu: recentred from the controller, with the menu closed");
@@ -3430,7 +3433,7 @@ void vrMenuPoll() {
         // Setting the seat from out here is worth having: it is where a driver puts the
         // headset on, and the trigger is the front end's click, so the face buttons and
         // the stick click are free.
-        pollQuickRecentre();
+        pollQuickRecentre(true);
         return;
     }
 
@@ -3440,11 +3443,20 @@ void vrMenuPoll() {
     // the controller was dead over the replay band however well the band was placed.
     // Leaving the replay -- "live", or the session ending -- with the trigger held lets the button
     // go; the poll that would have sent the release does not run outside a replay.
+    //
+    // While the replay radial is open the pointer stays where it was: the hand that holds the
+    // trigger is choosing a slice, and its aim is not meant for GPL's widgets. The radial opens
+    // only on a press whose ray is off the panel, which this poll never turns into a click, and
+    // refuses while a click is held -- so the button is not down here; if it ever were, it is
+    // let go rather than left held behind the radial.
     if (!frontEnd && state.mode == Mode::Closed) {
-        if (gplReplayScreenShown())
+        if (replayQuickMenuOpen()) {
+            if (state.frontEndButtonDown) frontEndPointerRelease("the replay radial opened");
+        } else if (gplReplayScreenShown()) {
             pollFrontEndPointer();
-        else
+        } else {
             frontEndPointerRelease("the replay ended");
+        }
     }
 
     const float seconds = vrInputSeconds();
@@ -3455,11 +3467,14 @@ void vrMenuPoll() {
             // The grip still opens the menu over an open quick menu, which closes unfired and
             // hands the controller over first.
             quickMenuCancel("the VR menu opened");
+            replayQuickMenuCancel("the VR menu opened");
             enterMode(Mode::Menu, hand);
             return;
         }
-        // While the quick menu is open the stick is its own, and so is the rest of the hand.
-        if (!quickMenuOpen()) pollQuickRecentre();
+        // While a quick menu is open the stick is its own, and so is the rest of the hand. On the
+        // replay screen the stick click is play/pause; the face buttons still recentre.
+        if (!quickMenuOpen() && !replayQuickMenuOpen())
+            pollQuickRecentre(!replayControlsHaveStick());
         return;
     }
 
@@ -3705,10 +3720,13 @@ void vrMenuUpdate(const GlFunctions& gl) {
             state.canvasSignatureValid = false;
             presenterMenuHide();
         }
-        // The layer is free while the menu is closed: the quick menu has it while the trigger
-        // holds it open, and otherwise, in a replay or under a GPL dialog, GPL's own 2D does.
+        // The layer is free while the menu is closed: a quick menu has it while the trigger
+        // holds it open -- the car's or the replay's, never both -- and otherwise, in a replay or
+        // under a GPL dialog, GPL's own 2D does. The replay panel yields it to the replay radial
+        // and publishes again, from scratch, the frame the radial lets it go.
         bool quick = quickMenuUpdate(gl);
-        replayPanelUpdate(gl, !quick);
+        bool replayRadial = replayQuickMenuUpdate(gl);
+        replayPanelUpdate(gl, !quick && !replayRadial);
         return;
     }
     replayPanelUpdate(gl, false);
@@ -4108,9 +4126,25 @@ void vrMenuDrawRay(const GlFunctions& gl) {
 
 bool vrMenuActive() { return g_state.mode != Mode::Closed; }
 
+bool vrMenuReplayPanelHit(int hand) {
+    if (hand < 0 || hand >= kHands) return false;
+    if (windowInFrontEnd() || !replayPanelShown()) return false;
+    const VrHandInput& input = vrInputHand(hand);
+    if (!input.present) return false;
+    // The pointer's own test, on the raw ray: it clicks only where this is true.
+    SharedPose aimSeat = {};
+    float      u = 0.0f;
+    float      v = 0.0f;
+    return poseInSeat(input.aimPose, aimSeat) &&
+           rayToSurface(replayPanelSurface(), aimSeat, u, v);
+}
+
+bool vrMenuReplayClickHeld() { return g_state.frontEndButtonDown; }
+
 void vrMenuReleaseGl(const GlFunctions& gl, bool contextAlive) {
     vrTextRelease(gl, contextAlive);
     quickMenuReleaseGl();
+    replayQuickMenuReleaseGl();
     // The layer's texture belongs to the context that is going, and Producer releases it
     // with the rest. Forgetting the signature is what makes the next frame rebuild the
     // image into the new one rather than deciding nothing has changed.

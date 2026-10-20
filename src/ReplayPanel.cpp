@@ -689,12 +689,13 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
     }
 
     if (!layerFree) {
-        // The VR menu has opened over it and owns the layer now; when it closes, the panel is
-        // published again from scratch.
+        // The VR menu or a radial has opened over it and owns the layer now; when it closes, the
+        // panel is published again from scratch.
         if (p.published) {
             p.published = false;
             p.cursorOn = false;
-            logf("replay panel: the VR menu opened, and has the layer until it closes");
+            logf("replay panel: the VR menu or the replay radial opened, and has the layer until "
+                 "it closes");
         }
         return;
     }

@@ -26,6 +26,7 @@
 #include "NoSignal.h"
 #include "Paths.h"
 #include "QuickMenu.h"
+#include "ReplayQuickMenu.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "SimRing.h"
@@ -174,6 +175,8 @@ DWORD WINAPI installThread(LPVOID) {
         headAudioInstall();
         // Patches nothing: it checks the functions and globals the radial calls and reads.
         quickMenuInstall();
+        // Likewise for the replay's stick and radial.
+        replayQuickMenuInstall();
     }
     // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
     // Hud.cpp has not touched. In VR it takes stampDraw alone and only with vrGplText = 1 --

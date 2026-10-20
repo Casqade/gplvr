@@ -57,6 +57,12 @@ void quickMenuPoll();
 // then: the stick is the radial's.
 bool quickMenuOpen();
 
+// A key press and its release, posted to the game window's queue, so GPL's keyboard proc sees
+// them on the main thread its key ring belongs to (see "threads" above). The replay menu's Back
+// uses it for Esc. `down` and `up` are 1 for each post Windows took; false when there is no game
+// window, and nothing was posted.
+bool quickMenuPostKey(UINT vk, UINT scanCode, int& down, int& up);
+
 // Close it without firing, releasing the controller. Safe when it is closed.
 void quickMenuCancel(const char* why);
 
