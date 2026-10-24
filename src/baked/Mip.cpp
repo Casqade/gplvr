@@ -50,7 +50,8 @@ size_t MipImage::bytes() const {
     return total;
 }
 
-bool parseMip(const uint8_t* data, size_t size, MipImage& out, std::string& error) {
+bool parseMip(const uint8_t* data, size_t size, MipImage& out, std::string& error,
+              bool keepIndices) {
     out = MipImage{};
     if (size < 12 || !tagIs(data, "PIM ")) {
         error = "not a MIP file";
@@ -124,9 +125,28 @@ bool parseMip(const uint8_t* data, size_t size, MipImage& out, std::string& erro
             MipLevel level;
             level.width = static_cast<int>(width);
             level.height = static_cast<int>(height);
-            if (bpp == 4) {
+            if (bpp == 4 && !palette && keepIndices) {
+                if (out.expanded) {
+                    error = "palette levels with and without CMAP";
+                    return false;
+                }
+                level.data.resize(static_cast<size_t>(width) * height);
+                for (uint32_t y = 0; y < height; ++y) {
+                    const uint8_t* row = pixels->body + static_cast<size_t>(pitch) * y;
+                    uint8_t*       outRow = level.data.data() + static_cast<size_t>(width) * y;
+                    for (uint32_t x = 0; x < width; ++x) {
+                        uint8_t byte = row[x >> 1];
+                        outRow[x] = (x & 1) ? (byte & 0x0F) : (byte >> 4);
+                    }
+                }
+                out.indexed = true;
+            } else if (bpp == 4) {
                 if (!palette) {
                     error = "palette level without CMAP";
+                    return false;
+                }
+                if (out.indexed) {
+                    error = "palette levels with and without CMAP";
                     return false;
                 }
                 // High nibble is the left pixel (report 28 3.3). CMAP entries are B, G, R, A.

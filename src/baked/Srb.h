@@ -24,8 +24,8 @@ struct SrbSprite {
 };
 
 // Parses a whole .srb into its header and its embedded texture. False with a reason for a file
-// the sprite cannot be drawn from.
+// the sprite cannot be drawn from. `keepIndices` as parseMip's.
 bool parseSrb(const uint8_t* data, size_t size, SrbSprite& out, MipImage& image,
-              std::string& error);
+              std::string& error, bool keepIndices = false);
 
 }  // namespace baked

@@ -29,6 +29,11 @@ struct MipImage {
     uint8_t flags = 0;
     // True when the palette levels were expanded, so `data` is BGRA8 whatever pixfmt says.
     bool expanded = false;
+    // True when 4-bit levels without a CMAP were kept as their palette indices, one byte a texel
+    // (parseMip's keepIndices): the colours come from a palette the drawer supplies at run time,
+    // as roglv2 takes the current colormap for a mip that has none of its own (the flagmen,
+    // report 105 section 4.13).
+    bool indexed = false;
     std::vector<MipLevel> levels;
 
     int  blendClass() const { return pixfmt % 3; }
@@ -37,6 +42,9 @@ struct MipImage {
     size_t bytes() const;
 };
 
-bool parseMip(const uint8_t* data, size_t size, MipImage& out, std::string& error);
+// `keepIndices`: a 4-bit level with no CMAP keeps its indices (MipImage::indexed) instead of
+// failing to parse.
+bool parseMip(const uint8_t* data, size_t size, MipImage& out, std::string& error,
+              bool keepIndices = false);
 
 }  // namespace baked

@@ -2,6 +2,7 @@
 
 #include "baked_gpl/CarBake.h"
 #include "baked_gpl/CarWalk.h"
+#include "baked_gpl/Flagmen.h"
 #include "baked_gpl/ResidualDepth.h"
 #include "baked_gpl/UvOverlay.h"
 #include "baked_gpl/TrackBake.h"
@@ -157,6 +158,14 @@ struct CarSecond {
     unsigned tableFull = 0;
     uint64_t dynamicVertices = 0;
     uint64_t dynamicDraws = 0;
+    // The flagmen's lists in the same passes (CarPassStats), drawn or hidden by view 7 alike.
+    uint64_t flagmanLists = 0;
+    uint64_t flagmanCommands = 0;
+    uint64_t flagmanRuns = 0;
+    uint64_t flagmanRunsDrawn = 0;
+    uint64_t paletteRows = 0;
+    unsigned flagmanOwnColours = 0;
+    unsigned indexedWithoutPalette = 0;
     float    maxRotationError = 0.0f;
     float    maxTranslationError = 0.0f;
     double   prepareMicroseconds = 0.0;
@@ -178,6 +187,7 @@ struct State {
     bool installed = false;
 
     const baked::Scene* scene = nullptr;  // the scene the renderer holds, owned by TrackBake
+    uint32_t sceneGeneration = 0;         // its trackBakeSceneGeneration(); stale once that moves
 
     baked::GlApi    gl;
     bool            glFilled = false;
@@ -739,7 +749,8 @@ void reportSecond(State& s) {
              "sprite ranges %.0f, walk-order ranges %.0f in %.0f draws (%.3f ms), repeat "
              "dispatches %.1f, draw cpu %.2f ms per pass, %s depth",
              passes / seconds, s.fogPasses, s.visible / passes,
-             s.scene ? s.scene->items.size() : 0u, s.ranges / passes, s.draws / passes,
+             trackBakeScene() ? trackBakeScene()->items.size() : 0u, s.ranges / passes,
+             s.draws / passes,
              s.decalRanges / passes, s.overlayRanges / passes, s.overlayLevels / passes,
              s.debugView == baked::kDebugOverlaysUnlayered
                  ? "debug view 11: one colour run for all, depth after"
@@ -790,6 +801,8 @@ void reportSecond(State& s) {
         }
         char residual[1000];
         if (residualFormat(residual, sizeof(residual), s.passes)) logf("baked: %s", residual);
+        char flagmen[1024];
+        if (flagmenFormat(flagmen, sizeof(flagmen), s.passes)) logf("baked flagmen: %s", flagmen);
         char overlay[256];
         if (uvOverlayFormat(overlay, sizeof(overlay)))
             logf("baked: %s; the baked cars drew with it in %u passes", overlay,
@@ -847,6 +860,17 @@ void reportSecond(State& s) {
              static_cast<unsigned long long>(c.walkRuns),
              static_cast<unsigned long long>(c.walkRunsAtEnd),
              c.walkVisibleSum ? static_cast<double>(c.walkSlotSum) / c.walkVisibleSum : 0.0);
+        if (c.flagmanLists || c.indexedWithoutPalette)
+            logf("baked: flagmen drawn -- %.2f lists a pass, %llu commands, walk-order runs %llu "
+                 "drawn of %llu (contract: equal; in view 7 too); %.2f palette rows a pass; "
+                 "sprites with a colormap of their own %u; refused: car sprites of palette "
+                 "indices without a palette %u",
+                 static_cast<double>(c.flagmanLists) / passes,
+                 static_cast<unsigned long long>(c.flagmanCommands),
+                 static_cast<unsigned long long>(c.flagmanRunsDrawn),
+                 static_cast<unsigned long long>(c.flagmanRuns),
+                 static_cast<double>(c.paletteRows) / passes, c.flagmanOwnColours,
+                 c.indexedWithoutPalette);
     }
     s.carSecond = CarSecond{};
     if (s.refusedNoScene || s.refusedRenderer || s.refusedUpload || s.refusedRect)
@@ -909,7 +933,10 @@ void bakedPassBind(const Binding& binding) {
                  "(%s); GPL draws the cars",
                  rebaseSummary());
     }
-    if (s.bound) carWalkInstall();
+    if (s.bound) {
+        carWalkInstall();
+        flagmenInstall();
+    }
 }
 
 bool bakedPassBegin(void* sceneParams) {
@@ -919,6 +946,17 @@ bool bakedPassBegin(void* sceneParams) {
     if (!params->camera) return false;
     if (!installFilter(s)) return false;
     reportSecond(s);
+    // A track reload drops the scene before the next one is baked: its GPU copy goes now, so the
+    // driver's share of the address space is free while that bake runs.
+    // ensureRenderer starts it again for the next scene: it takes a forgotten context as a new one.
+    if (s.scene && !trackBakeScene()) {
+        s.renderer.release(s.context && s.wglGetCurrentContext() == s.context);
+        s.scene = nullptr;
+        s.ready = false;
+        s.context = nullptr;
+        logf("baked: the track's scene was dropped (GPL loaded a track again) -- its GPU copy is "
+             "released");
+    }
     if (!s.drawEnabled) return false;
 
     const baked::Scene* scene = trackBakeScene();
@@ -932,10 +970,12 @@ bool bakedPassBegin(void* sceneParams) {
         ++s.refusedRenderer;
         return false;
     }
-    if (scene != s.scene) {
+    uint32_t generation = trackBakeSceneGeneration();
+    if (scene != s.scene || generation != s.sceneGeneration) {
         // A new track: the GPU copy of the old one goes before anything of the new one is drawn.
         if (s.scene) s.renderer.release(true);
         s.scene = scene;
+        s.sceneGeneration = generation;
         s.ready = false;
         s.context = nullptr;
         if (!ensureRenderer(s)) {
@@ -1011,6 +1051,7 @@ bool bakedPassBegin(void* sceneParams) {
     // Stage 2b: the car hook draws a car itself only while this is set, from lists in a fresh
     // arena that bakedPassEnd hands to the car renderer.
     carWalkPassBegin();
+    flagmenPassBegin();
     bool cars = g_options.bakedCars == 3 && s.cars.initialised();
     s.renderer.setSolidHook(cars ? &s.cars : nullptr);
     g_carsReady = cars ? 1 : 0;
@@ -1033,10 +1074,14 @@ void bakedPassEnd(void* sceneParams) {
     residualWalkEnd();
     uint32_t                  carListCount = 0;
     const baked::CarDrawList* carLists = cars ? carWalkPassLists(carListCount) : nullptr;
+    uint32_t                  flagmanCount = 0;
+    const baked::CarDrawList* flagmanLists = cars ? flagmenPassLists(flagmanCount) : nullptr;
+    uint32_t                  listCount = carListCount + flagmanCount;
     auto params = static_cast<SceneParams*>(sceneParams);
     if (!params || !params->camera || !s.scene) {
-        // GPL skipped the bodies of these cars in the walk, and they will not be drawn.
-        if (carListCount) ++s.carSecond.notDrawn;
+        // GPL skipped the bodies of these cars and these flagmen in the walk, and they will not
+        // be drawn.
+        if (listCount) ++s.carSecond.notDrawn;
         return;
     }
 
@@ -1058,14 +1103,14 @@ void bakedPassEnd(void* sceneParams) {
     // The probe's baked half: the second frame of a capture, its first main pass.
     bool probe = s.capture == 2 && !s.probeBakedReady;
     s.renderer.setProbe(probe);
-    if (carListCount) {
+    if (listCount) {
         baked::CarLighting lighting;
         lighting.on = readValue<uint8_t>(s.at.lightingOn) != 0;
         lighting.specular = readValue<uint8_t>(s.at.specularOn) != 0;
         lighting.ambient = readValue<float>(s.at.ambient);
         lighting.diffuse = readValue<float>(s.at.diffuse);
-        s.cars.prepare(carBakeScene(), carBakeGeneration(), carLists, carListCount, view,
-                       lighting);
+        s.cars.prepare(carBakeScene(), carBakeGeneration(), carLists, carListCount, flagmanLists,
+                       flagmanCount, view, lighting);
         std::string check = s.cars.takeFrameCheck();
         if (!check.empty())
             logf("baked cars: dispatch frame check (once) -- lighting %s, specular %s, ka %.3f, "
@@ -1094,10 +1139,17 @@ void bakedPassEnd(void* sceneParams) {
         residualArm(pass);
         if (s.markCount < 2) std::memcpy(s.markRects[s.markCount++], s.rect, sizeof(s.rect));
     }
-    if (carListCount) {
+    if (listCount) {
         baked::CarPassStats c = s.cars.finishPass();
         CarSecond&          t = s.carSecond;
         ++t.passes;
+        t.flagmanLists += c.flagmanLists;
+        t.flagmanCommands += c.flagmanCommands;
+        t.flagmanRuns += c.flagmanRuns;
+        t.flagmanRunsDrawn += c.flagmanRunsDrawn;
+        t.paletteRows += c.paletteRows;
+        t.flagmanOwnColours += c.flagmanOwnColours;
+        t.indexedWithoutPalette += c.indexedWithoutPalette;
         if (c.hidden)
             ++t.hidden;
         else if (!c.drawn && c.listDraws)
@@ -1205,8 +1257,13 @@ void bakedPassPollKey() {
                 "OVERLAYS UNLAYERED: normal, except the overlay phase draws the colour of every "
                 "level before any overlay depth, so overlays are tested against the base "
                 "surfaces only and a later level paints over a nearer earlier one (before report "
-                "105 section 4.10)"};
+                "105 section 4.10)",
+                "FLAGMEN BY GPL: normal, except the flagmen and the starter are drawn by GPL as "
+                "before report 105 section 4.13, and each of GPL's draws of them is checked "
+                "against what gplvr would have drawn (the `baked flagmen:` line's DEBUG VIEW 12 "
+                "part)"};
             g_withoutGpl = s.debugView == baked::kDebugWithoutGpl;
+            flagmenSetGplDraws(s.debugView == baked::kDebugFlagmenByGpl);
             uvOverlaySet(s.renderer.uvCheckerTexture(), s.debugView == baked::kDebugUvChecker);
             logf("baked: debug view %d -- %s", s.debugView, kNames[s.debugView]);
         }
@@ -1281,7 +1338,7 @@ void writeItems(const char* path, const std::vector<uint32_t>& items, const bake
 
 void bakedProbeWrite(unsigned number) {
     State& s = g_state;
-    if (!s.scene) return;
+    if (!s.scene || !trackBakeScene() || s.sceneGeneration != trackBakeSceneGeneration()) return;
     char path[MAX_PATH];
     if (s.probeVanillaReady) {
         sprintf_s(path, "%sgplvr-capture%u-vanilla-items.txt", pathsOwnDirectory(), number);
@@ -1391,6 +1448,9 @@ extern "C" void* __cdecl gplvrBakedNodeFilter(const unsigned char* node) {
             }
         }
     }
+    // The flagmen: the track bake leaves their XFORMs to GPL, and gplvr draws them from there
+    // (Flagmen.h).
+    if (inside && (type == 0x0D || type == 0x13) && flagmanDispatch(node, stock)) return nullptr;
     if (g_withoutGpl && !g_cockpitDraw) return nullptr;
     ++g_stockCalls[inside ? 0 : 1][type];
     return stock;

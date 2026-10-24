@@ -2789,6 +2789,7 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "bakedGrooveLayers", 1, path) == 2 ? 2 : 1;
     g_options.bakedCars = GetPrivateProfileIntA("gplvr", "bakedCars", 0, path);
     if (g_options.bakedCars < 0 || g_options.bakedCars > 3) g_options.bakedCars = 0;
+    g_options.bakedFlagmen = GetPrivateProfileIntA("gplvr", "bakedFlagmen", 1, path) != 0 ? 1 : 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2926,6 +2927,12 @@ void loadOptions(const char* fileName) {
              ? "stage 1: every car GPL draws is also walked by gplvr and its polygon count "
                "checked against GPL's; GPL still draws them"
              : "off: GPL draws the cars");
+    logf("options: bakedFlagmen=%d (%s)", g_options.bakedFlagmen,
+         !g_options.bakedFlagmen ? "off: GPL draws the flagmen"
+         : g_options.bakedRenderer && g_options.bakedCars == 3
+             ? "gplvr draws the flagmen in the baked main passes, in GPL's colours and walk order"
+             : "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3; GPL draws the "
+               "flagmen");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");

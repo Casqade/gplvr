@@ -1192,7 +1192,10 @@ bool Baker::emitNode(int32_t modelIndex, uint32_t node, const Mat34& worldFromLo
         // gpl_trackScanBindFlagmen 0x481E50 finds, at track load, every SUBOBJECT whose object
         // has a HAND entry named exactly "flagger" or "starter" and replaces the child of the
         // XFORM above it with a marshal object of its own (gpl_flagmanInitRenderObj), whose flag
-        // follows the race. The object in the file is never drawn, so the item stays GPL's.
+        // follows the race. The object in the file is never drawn, so the item stays GPL's; the
+        // host draws the marshal itself from that XFORM's dispatch (baked_gpl/Flagmen.cpp). In
+        // all eleven stock tracks the item is that XFORM, under a SORTGROUP, and this SUBOBJECT
+        // alone (report 105 section 4.13), so the refusal leaves nothing else to GPL.
         for (size_t h = 0; h + 1 < target.handles.size(); h += 2) {
             const char* handle = target.string(target.handles[h]);
             if (handle && (std::strcmp(handle, "flagger") == 0 || std::strcmp(handle, "starter") == 0))

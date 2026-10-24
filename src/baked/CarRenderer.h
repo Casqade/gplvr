@@ -17,6 +17,9 @@
 //      literal alpha), blended and not written, inside the track's walk-order phase at the
 //      place GPL's walk dispatched the car, so the track's sprites and cutouts GPL drew after
 //      the car paint over it and those it drew before lie under it (report 105 section 4.8).
+// The flagmen (report 105 section 4.13) are lists of the same kind, one sprite each, painted whole
+// in phase 2's place (CarDrawList::flagman) with their colours looked up per texel from a
+// 16-colour palette row, so they need nothing a car does not have but that lookup.
 // Within one car each draw moves its depth towards the eye by its place in GPL's walk, so a
 // coplanar decal drawn after its base by GPL's walk wins over it as it does in GPL's painter's
 // order (report 103 section 9). A per-car painter's order was tried and reverted (report 105
@@ -84,6 +87,17 @@ struct CarPassStats {
     float    maxTranslationError = 0.0f;  // |eyeFromRoot translation + eye|, metres
     double   prepareMicroseconds = 0.0;
     double   drawMicroseconds = 0.0;
+    // The flagmen (CarDrawList::flagman; report 105 section 4.13), also counted in the totals
+    // above: their lists and commands, their walk-order runs prepared and drawn, the palette rows
+    // uploaded, sprites of theirs drawn with the colormap their own .srb carries, and sprites
+    // refused because their texture kept palette indices and the list has no palette (a car's).
+    uint32_t flagmanLists = 0;
+    uint32_t flagmanCommands = 0;
+    uint32_t flagmanRuns = 0;
+    uint32_t flagmanRunsDrawn = 0;
+    uint32_t paletteRows = 0;
+    uint32_t flagmanOwnColours = 0;
+    uint32_t indexedWithoutPalette = 0;
 };
 
 // Since the last takeTotals.
@@ -115,9 +129,10 @@ public:
     // Before the pass is drawn: uploads what the lists use that is not on the GPU yet and builds
     // the pass's tables. `generation` changes when the host drops the scene (a new car set).
     // `light` is the world-space direction GPL lights with, as the first list's dispatch frame
-    // holds it.
+    // holds it. `more` are further lists drawn the same way after `lists` (the flagmen).
     void prepare(const CarScene& scene, uint32_t generation, const CarDrawList* lists,
-                 uint32_t count, const ViewInputs& view, const CarLighting& lighting);
+                 uint32_t count, const CarDrawList* more, uint32_t moreCount,
+                 const ViewInputs& view, const CarLighting& lighting);
     // The SolidHook: phase 0 of the prepared pass, every car's core with depth.
     void drawSolid(const SolidHookContext& context) override;
     // And phase 1, a run per car of what lies below the core (glass, soft edges), drawn inside
@@ -144,6 +159,10 @@ private:
         uint64_t handle = 0;
         uint32_t average = 0xFFFFFFFFu;  // ARGB, the MPHD average colour, opaque
         bool     tried = false;
+        // An R8 texture of palette indices (MipImage::indexed); `opaque` for pixfmt 0, whose
+        // palette alpha roglv2 ignores as Mip.cpp does.
+        bool     indexed = false;
+        bool     opaque = false;
     };
     struct GpuObject {
         uint32_t baseVertex = 0;
@@ -194,6 +213,7 @@ private:
     GLint  uWalkSlot_ = -1;
     GLint  uFog_ = -1;
     GLint  uFogColour_ = -1;
+    GLint  uPaletteLinear_ = -1;
 
     GLuint vertexArray_ = 0;
     GLuint vertexBuffer_ = 0;
@@ -218,19 +238,27 @@ private:
     CarUploadTotals         totals_;
 
     // The prepared pass.
+    std::vector<const CarDrawList*> passLists_;  // the cars', then the flagmen's
     std::vector<float>    frames_;    // 16 floats a frame: three rows, then the half vector
-    std::vector<uint32_t> draws_;     // 8 words a draw
+    // 8 words a draw, then the flagmen's palettes, 16 words (four texels) each.
+    std::vector<uint32_t> draws_;
+    std::vector<uint32_t> paletteWords_;   // the pass's palette rows, before they join draws_
+    std::vector<uint32_t> paletteFixups_;  // draws_ words holding a row number to make a texel
     std::vector<Command>  commands_;
     std::vector<uint32_t> listOrder_;  // lists far to near
-    // Per car, far to near: its commands, consecutive in commands_.
+    // Per car or flagman, far to near: its commands, consecutive in commands_.
     struct CarRange {
         uint32_t first;
         uint32_t count;
         uint32_t slot;  // CarDrawList::walkSlot
+        bool     flagman;
     };
     std::vector<CarRange> carRanges_;
     // carRanges_ by slot, far to near among equal slots: the walk-order runs.
     std::vector<CarRange> walkRuns_;
+    // drawSolid ran this pass, so the walk-order runs may be drawn (in debug view 7 too, where
+    // only the flagmen's are left).
+    bool runsReady_ = false;
     float                 light_[3] = {0.0f, 0.0f, 1.0f};
     CarLighting           lighting_;
     bool                  framesChecked_ = false;

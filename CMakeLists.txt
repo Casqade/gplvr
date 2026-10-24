@@ -142,6 +142,7 @@ else()
         src/baked_gpl/BakedPass.cpp
         src/baked_gpl/CarBake.cpp
         src/baked_gpl/CarWalk.cpp
+        src/baked_gpl/Flagmen.cpp
         src/baked_gpl/ResidualDepth.cpp
         src/baked_gpl/TrackBake.cpp
         src/baked_gpl/UvOverlay.cpp

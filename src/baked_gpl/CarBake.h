@@ -50,6 +50,7 @@ struct CarBakeTotals {
     uint32_t folderUnique = 0;
     uint32_t folderByLoadOrder = 0;
     uint32_t folderAmbiguous = 0;
+    uint32_t folderObjs = 0;  // in no folder of the car set, found in <home>\objs (the flagmen)
     double   bakeMilliseconds = 0.0;  // object bakes, with the files their MATERIALs name
     double   fileMilliseconds = 0.0;  // every texture and sprite file read and parsed
 };

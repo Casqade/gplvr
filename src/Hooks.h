@@ -658,6 +658,11 @@ struct Options {
     // only its blob shadow; mirror passes and the cockpit stay GPL's, counted but not walked (1
     // and 2 verify every draw). Needs bakedRenderer = 1.
     int bakedCars = 0;
+    // The flagmen and the starter (report 105 section 4.13). 1: in the baked main passes gplvr
+    // draws them itself (Flagmen.cpp, through the car renderer, so it needs bakedCars = 3), each
+    // sprite in the 16 colours GPL sets for it and at its place in GPL's walk; whatever it cannot
+    // resolve stays GPL's. 0: GPL draws them, as before.
+    int bakedFlagmen = 1;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

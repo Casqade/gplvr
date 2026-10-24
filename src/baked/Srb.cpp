@@ -13,7 +13,7 @@ uint32_t u32(const uint8_t* p) {
 }  // namespace
 
 bool parseSrb(const uint8_t* data, size_t size, SrbSprite& out, MipImage& image,
-              std::string& error) {
+              std::string& error, bool keepIndices) {
     out = SrbSprite{};
     error.clear();
     if (size < 12 || std::memcmp(data, " BRS", 4) != 0) {
@@ -56,7 +56,7 @@ bool parseSrb(const uint8_t* data, size_t size, SrbSprite& out, MipImage& image,
         if (error.empty()) error = "no SRHD chunk";
         return false;
     }
-    if (!parseMip(data + mipAt, size - mipAt, image, error)) {
+    if (!parseMip(data + mipAt, size - mipAt, image, error, keepIndices)) {
         error = "embedded MIP: " + error;
         return false;
     }

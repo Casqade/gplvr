@@ -92,6 +92,7 @@ struct Job {
     std::unique_ptr<baked::Scene> scene;
     std::string                   result;
     double                        milliseconds = 0.0;
+    size_t                        freedBytes = 0;  // the previous scene's, added to the budget
 };
 
 bool samplesMatch(const std::vector<float>& vertices, const std::vector<float>& samples,
@@ -142,7 +143,7 @@ void bakeOneTrack(const std::shared_ptr<Job>& job) {
         logf("baked: loading %s from %s", name.c_str(), assets.directory().c_str());
         baked::BakeOptions options;
         options.decalClasses = kDecalSurfaceClasses;
-        options.memoryBudgetBytes = bakeMemoryBudget();
+        options.memoryBudgetBytes = bakeMemoryBudget() + job->freedBytes;
         if (!baked::bakeTrack(assets, name + ".3do", options, *scene, error, &job->cancel)) {
             job->result = name + ": " + error;
             continue;
@@ -196,6 +197,7 @@ struct State {
 
     std::shared_ptr<Job>          job;
     std::unique_ptr<baked::Scene> scene;
+    uint32_t                      generation = 0;  // scenes landed so far
 };
 
 State g_state;
@@ -220,10 +222,23 @@ void bind(State& s) {
          s.season.empty() ? "not installed" : s.season.c_str());
 }
 
-void resetScene(State& s) {
+// What a scene holds in the heap: its textures' pixels and its vertex and index arrays.
+size_t sceneBytes(const baked::Scene& scene) {
+    size_t bytes = scene.vertices.capacity() * sizeof(scene.vertices[0]) +
+                   scene.indices.capacity() * sizeof(scene.indices[0]);
+    for (const baked::Texture& texture : scene.textures) bytes += texture.image.bytes();
+    return bytes;
+}
+
+// Returns the bytes the dropped scene held. Most of its blocks stay in the CRT heap's segments
+// once freed, which GlobalMemoryStatusEx does not count as available, yet the next bake reuses
+// them: a second race on spa67 measured 423 MiB against 611 at the first and refused itself.
+size_t resetScene(State& s) {
     if (s.job) s.job->cancel.store(true);
     s.job.reset();
+    size_t freed = s.scene ? sceneBytes(*s.scene) : 0;
     s.scene.reset();
+    return freed;
 }
 
 void logBake(const Job& job, const baked::Scene& scene) {
@@ -312,7 +327,7 @@ void trackBakeMainWalk(void* sceneParams) {
     auto vertexCount = readValue<uint32_t>(at + kObjXyzsCount);
 
     if (object != s.trackObject || prim != s.prim || primSize != s.primSize) {
-        resetScene(s);
+        size_t freed = resetScene(s);
         s.trackObject = object;
         s.prim = prim;
         s.primSize = primSize;
@@ -336,6 +351,7 @@ void trackBakeMainWalk(void* sceneParams) {
         job->season = s.season;
         job->primSize = primSize;
         job->vertexCount = vertexCount;
+        job->freedBytes = freed;
         job->samples.resize(kVertexSamples * 6);
         for (int i = 0; i < kVertexSamples; ++i) {
             std::memcpy(job->samples.data() + i * 3,
@@ -346,8 +362,9 @@ void trackBakeMainWalk(void* sceneParams) {
                         12);
         }
         logf("baked: new track object %p (PRIM %u bytes, %u vertices) -- finding and baking its "
-             "file on a worker thread; the game draws the track meanwhile",
-             object, primSize, vertexCount);
+             "file on a worker thread; the game draws the track meanwhile (the previous scene's "
+             "%.0f MiB freed and added to the budget)",
+             object, primSize, vertexCount, freed / 1048576.0);
         s.job = job;
         std::thread(runJob, job).detach();
         return;
@@ -362,10 +379,13 @@ void trackBakeMainWalk(void* sceneParams) {
         return;
     }
     s.scene = std::move(job->scene);
+    ++s.generation;
     logBake(*job, *s.scene);
 }
 
 const baked::Scene* trackBakeScene() { return g_state.scene.get(); }
+
+uint32_t trackBakeSceneGeneration() { return g_state.generation; }
 
 bool trackBakePrim(const unsigned char*& prim, unsigned& size) {
     if (!g_state.scene) return false;

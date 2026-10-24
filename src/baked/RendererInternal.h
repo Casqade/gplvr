@@ -45,6 +45,7 @@ struct TextureFormat {
 
 // The GL upload format of a .mip's levels, as they lie in MipImage.
 inline TextureFormat textureFormatFor(const MipImage& image) {
+    if (image.indexed) return {gl::kR8, gl::kRed, gl::kUnsignedByte, 1};
     if (image.expanded) return {gl::kRgba8, gl::kBgra, gl::kUnsignedByte, 4};
     switch (image.pixfmt) {
     case 3: return {gl::kRgb5, gl::kRgb, gl::kUnsignedShort565, 2};

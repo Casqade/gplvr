@@ -7,6 +7,8 @@
 // tracks\<dir>\<dir>.3do whose PRIM size and vertex count match the object GPL draws is a
 // candidate, and the first whose baked vertices also match GPL's first and last 64 is the track.
 
+#include <cstdint>
+
 namespace baked {
 struct Scene;
 }
@@ -20,6 +22,10 @@ void trackBakeMainWalk(void* sceneParams);
 
 // The scene for the track GPL is drawing, or null while it is baking or when it failed.
 const baked::Scene* trackBakeScene();
+
+// Bumped each time a scene lands. A new scene can be allocated where the freed one was, so a
+// holder tells them apart by this, never by the pointer.
+uint32_t trackBakeSceneGeneration();
 
 // The track's PRIM payload as GPL holds it, which the scene's item keys are offsets into. False
 // when there is no scene.

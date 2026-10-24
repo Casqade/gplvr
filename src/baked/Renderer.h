@@ -86,7 +86,10 @@ enum DebugView : uint8_t {
     // Normal, except the overlay phase draws every level's colour before any of its depth, so an
     // overlay is tested against the base surfaces only (before report 105 section 4.10).
     kDebugOverlaysUnlayered = 11,
-    kDebugViewCount = 12,
+    // Normal, except the host hands the flagmen back to GPL and checks GPL's polygon count
+    // against what it would have drawn (baked_gpl/Flagmen.cpp); the renderer draws as normal.
+    kDebugFlagmenByGpl = 12,
+    kDebugViewCount = 13,
 };
 
 // What a host draws inside a pass with the renderer's own depth and order target (CarRenderer):

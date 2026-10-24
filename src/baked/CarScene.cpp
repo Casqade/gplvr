@@ -270,7 +270,9 @@ int32_t CarScene::addSprite(const std::string& name, const uint8_t* data, size_t
     CarSprite sprite;
     Texture   texture;
     texture.name = name;
-    if (!parseSrb(data, size, sprite.srb, texture.image, error)) return -1;
+    // A 4-bit sprite with no colormap of its own takes the palette its draw supplies (the
+    // flagmen's frames, report 105 section 4.13); CarRenderer refuses it in a draw without one.
+    if (!parseSrb(data, size, sprite.srb, texture.image, error, true)) return -1;
     sprite.texture = static_cast<int32_t>(textures.size());
     textures.push_back(std::move(texture));
     sprites.push_back(sprite);

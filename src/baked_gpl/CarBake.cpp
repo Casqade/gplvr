@@ -134,6 +134,9 @@ struct State {
     std::string gameDirectory;
     std::string carset;
     std::vector<Folder> folders;
+    // <home>\objs, loose then objs.dat: where gpl_flagmanLoadModels 0x482190 loads the flagmen's
+    // frames and their sprites from. Looked in only for a name no folder of the car set holds.
+    Folder objs;
 
     std::vector<RawEntry>   raw;
     std::vector<CacheEntry> cache;  // newest first
@@ -195,9 +198,23 @@ void openFolders(State& s, const std::string& carset) {
         }
         s.folders.push_back(std::move(folder));
     }
+    std::string objs = s.gameDirectory + "\\objs";
+    s.objs = Folder{};
+    s.objs.assets.open(objs, std::string());
+    s.objs.name = s.objs.assets.name();
+    HANDLE files = FindFirstFileA((objs + "\\*").c_str(), &found);
+    if (files != INVALID_HANDLE_VALUE) {
+        do {
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            s.objs.loose.insert(baked::lowerCase(found.cFileName));
+        } while (FindNextFileA(files, &found));
+        FindClose(files);
+    }
     logf("baked cars: car set %s -- %zu folders (the set's own and its team folders) to read "
-         "textures and sprites from",
-         carset.c_str(), s.folders.size());
+         "textures and sprites from, then objs for names none of them holds (the flagmen's "
+         "sprites; objs.dat %s)",
+         carset.c_str(), s.folders.size(),
+         s.objs.assets.inArchive("wav1.srb") ? "holds wav1.srb" : "does NOT hold wav1.srb");
 }
 
 // Everything baked belongs to one car set; another set loads other objects at other addresses.
@@ -335,11 +352,15 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
         namedMiss(s, kind, handle, std::string(), "not in GPL's resource cache");
     } else {
         const std::string& name = s.cache[entry->second].name;
-        int folder = resolveFolder(s, entry->second);
-        if (folder < 0) {
-            namedMiss(s, kind, handle, name, "in no folder of the car set");
+        int           folder = resolveFolder(s, entry->second);
+        const Folder* from = folder >= 0               ? &s.folders[static_cast<size_t>(folder)]
+                             : folderHolds(s.objs, name) ? &s.objs
+                                                         : nullptr;
+        if (folder < 0 && from) ++s.totals.folderObjs;
+        if (!from) {
+            namedMiss(s, kind, handle, name, "in no folder of the car set, nor in objs");
         } else {
-            std::string key = s.folders[static_cast<size_t>(folder)].name + "|" + name;
+            std::string key = from->name + "|" + name;
             std::unordered_map<std::string, int32_t>& byFile =
                 sprite ? s.spriteByFile : s.textureByFile;
             auto file = byFile.find(key);
@@ -352,11 +373,11 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
                 std::vector<uint8_t> bytes;
                 std::string          where;
                 std::string          error = "could not be read";
-                const Folder&        from = s.folders[static_cast<size_t>(folder)];
-                if (from.assets.read(name, bytes, &where))
+                if (from->assets.read(name, bytes, &where))
                     result = sprite ? s.scene.addSprite(name, bytes.data(), bytes.size(), error)
                                     : s.scene.addTexture(name, bytes.data(), bytes.size(), error);
-                if (result < 0) namedMiss(s, kind, handle, from.name + "\\" + name, error.c_str());
+                if (result < 0)
+                    namedMiss(s, kind, handle, from->name + "\\" + name, error.c_str());
                 byFile.emplace(key, result);
                 QueryPerformanceCounter(&end);
                 s.totals.fileMilliseconds += 1000.0 *

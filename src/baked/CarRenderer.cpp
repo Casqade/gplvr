@@ -39,8 +39,13 @@ constexpr size_t   kInitialIndices = 262144;
 constexpr uint32_t kInitialDrawIndices = 4096;
 
 // Per draw in the table: x, y the texture handle, z the frame, w the colour (ARGB, a sprite's
-// live colour word); then the texture's average colour (ARGB), the specular exponent, the
-// specular factor's bits, and textured | rank << 8.
+// live colour word); then the texture's average colour (ARGB) -- for a palette sprite instead the
+// texel of the table where its palette row starts --, the specular exponent, the specular factor's
+// bits, and textured | kWalkOnly | kPaletteDraw | kPaletteOpaque | rank << 8.
+constexpr uint32_t kWalkOnlyBit = 2u;
+constexpr uint32_t kPaletteDrawBit = 4u;
+constexpr uint32_t kPaletteOpaqueBit = 8u;
+constexpr uint32_t kPaletteTexels = 4;  // 16 ARGB words a palette
 const char* const kCarVertexHead = R"(#version 400
 #extension GL_ARB_bindless_texture : require
 layout(location = 0) in vec3 a_position;
@@ -71,6 +76,8 @@ noperspective out vec3 v_secondary;
 noperspective out float v_fogW;
 flat out uvec2 v_texture;
 flat out float v_rank;
+flat out int v_palette;   // the palette row's first texel in u_draws, -1 for none
+flat out uint v_drawBits;  // d1.w & 14: walk-order only, palette, palette alpha ignored
 const uint kSprite = 1u;
 const uint kLit = 2u;
 const uint kTextured = 4u;
@@ -100,6 +107,8 @@ void main() {
     bool textured = (d1.w & 1u) != 0u && (sprite || (a_flags & kTextured) != 0u);
     v_texture = textured ? d0.xy : uvec2(0u);
     v_rank = float(d1.w >> 8);
+    v_palette = (d1.w & 4u) != 0u ? int(d1.x) : -1;
+    v_drawBits = d1.w & 14u;
     v_uv = a_uv;
     v_secondary = vec3(0.0);
     if ((a_flags & kInvisible) != 0u) {
@@ -168,7 +177,15 @@ noperspective in vec3 v_secondary;
 noperspective in float v_fogW;
 flat in uvec2 v_texture;
 flat in float v_rank;
+flat in int v_palette;
+flat in uint v_drawBits;
 uniform int u_phase;
+// A palette sprite (the flagmen): its texture holds palette indices, its palette row is in the
+// draw table. roglv2 expands such a mip with the current colormap and samples the result with
+// its own filter (mag LINEAR, one level LINEAR when TrilinearFiltering, else NEAREST), so the
+// four indices of the bilinear footprint are each looked up and the colours blended.
+uniform usamplerBuffer u_draws;
+uniform int u_paletteLinear;
 uniform vec2 u_fog;
 uniform vec3 u_fogColour;
 // x: +1 where nearer is a larger depth (reversed-Z), -1 where smaller; y: 1 when depth is
@@ -186,13 +203,35 @@ uniform int u_walkSlot;
 layout(location = 0) out vec4 o_colour;
 layout(location = 1) out uint o_order;
 const float kCoreAlpha = 0.99;  // RendererInternal.h kCoreAlpha
+vec4 paletteColour(float index) {
+    uint i = uint(index * 255.0 + 0.5) & 15u;
+    uvec4 texel = texelFetch(u_draws, v_palette + int(i >> 2));
+    uint lane = i & 3u;
+    uint word = lane == 0u ? texel.x : lane == 1u ? texel.y : lane == 2u ? texel.z : texel.w;
+    vec4 c = vec4(float((word >> 16) & 255u), float((word >> 8) & 255u), float(word & 255u),
+                  float(word >> 24)) / 255.0;
+    if ((v_drawBits & 8u) != 0u) c.a = 1.0;
+    return c;
+}
+vec4 paletteTexel(sampler2D indices) {
+    vec2 size = vec2(textureSize(indices, 0));
+    vec4 gathered = textureGather(indices, v_uv);  // (i0,j1) (i1,j1) (i1,j0) (i0,j0)
+    vec2 f = fract(v_uv * size - 0.5);
+    if (u_paletteLinear == 0) f = step(0.5, f);
+    vec4 below = mix(paletteColour(gathered.w), paletteColour(gathered.z), f.x);
+    vec4 above = mix(paletteColour(gathered.x), paletteColour(gathered.y), f.x);
+    return mix(below, above, f.y);
+}
 void main() {
     vec4 colour = (v_texture.x | v_texture.y) == 0u ? v_primary
                 : u_uvChecker != 0 ? texture(u_checker, v_uv) * v_primary
+                : v_palette >= 0   ? paletteTexel(sampler2D(v_texture)) * v_primary
                                    : texture(sampler2D(v_texture), v_uv) * v_primary;
     colour.rgb = min(colour.rgb + v_secondary, vec3(1.0));
-    bool keep = u_phase == 0 ? colour.a >= kCoreAlpha
-                             : colour.a >= 1.0 / 255.0 && colour.a < kCoreAlpha;
+    // A walk-order-only draw (a flagman) has no core: all of it is painted in phase 1.
+    bool walkOnly = (v_drawBits & 2u) != 0u;
+    bool keep = u_phase == 0 ? !walkOnly && colour.a >= kCoreAlpha
+                             : colour.a >= 1.0 / 255.0 && (walkOnly || colour.a < kCoreAlpha);
     if (!keep) discard;
     float z = gl_FragCoord.z;
     float biased = z + u_depthBias.x * v_rank * u_depthBias.z * (u_depthBias.y > 0.5 ? z : 1.0 - z);
@@ -219,6 +258,9 @@ void main() {
 )";
 
 static_assert(kCoreAlpha == 0.99f, "kCarFragmentShader repeats kCoreAlpha");
+static_assert(kWalkOnlyBit == 2u && kPaletteDrawBit == 4u && kPaletteOpaqueBit == 8u &&
+                  kPaletteTexels == 4u,
+              "both car shaders repeat the draw bits and the palette layout");
 static_assert(kHookOrder == 0x80000000u, "kCarFragmentShader repeats kHookOrder");
 static_assert(sizeof(CarVertex) == 36, "the attribute offsets below assume the 36-byte vertex");
 static_assert(kCarLeafSprite == 1 && kCarLeafLit == 2 && kCarLeafTextured == 4 &&
@@ -416,6 +458,7 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     uWalkSlot_ = gl_.getUniformLocation(program_, "u_walkSlot");
     uFog_ = gl_.getUniformLocation(program_, "u_fog");
     uFogColour_ = gl_.getUniformLocation(program_, "u_fogColour");
+    uPaletteLinear_ = gl_.getUniformLocation(program_, "u_paletteLinear");
 
     SavedBindings saved;
     saveBindings(gl_, saved);
@@ -634,13 +677,19 @@ void CarRenderer::uploadTexture(const Texture& texture, GpuTexture& out) {
     GLenum minFilter = levels > 1 ? (filter_.trilinear ? gl::kLinearMipmapLinear
                                                        : gl::kNearestMipmapLinear)
                                   : (filter_.trilinear ? gl::kLinear : gl::kNearest);
+    // Palette indices are never blended with each other: the shader gathers the four of the
+    // footprint and blends their colours (kCarFragmentShader, paletteTexel), from level 0.
+    out.indexed = image.indexed;
+    out.opaque = image.indexed && image.pixfmt == 0;
+    if (out.indexed) minFilter = gl::kNearest;
     gl_.texParameteri(gl::kTexture2D, gl::kTextureMinFilter, static_cast<GLint>(minFilter));
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter, gl::kLinear);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter,
+                      out.indexed ? gl::kNearest : gl::kLinear);
     gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapS,
                       (image.flags & 1) ? gl::kClampToEdge : gl::kRepeat);
     gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT,
                       (image.flags & 2) ? gl::kClampToEdge : gl::kRepeat);
-    if (anisotropy_ > 1)
+    if (anisotropy_ > 1 && !out.indexed)
         gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxAnisotropy, anisotropy_);
     out.handle = gl_.getTextureHandle(out.name);
     if (out.handle) gl_.makeTextureHandleResident(out.handle);
@@ -711,11 +760,17 @@ std::string CarRenderer::takeFrameCheck() {
 }
 
 void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarDrawList* lists,
-                          uint32_t count, const ViewInputs& view, const CarLighting& lighting) {
+                          uint32_t listCount, const CarDrawList* more, uint32_t moreCount,
+                          const ViewInputs& view, const CarLighting& lighting) {
     auto start = std::chrono::steady_clock::now();
     pass_ = CarPassStats{};
     commands_.clear();
+    runsReady_ = false;
     if (!initialised_) return;
+    passLists_.clear();
+    for (uint32_t l = 0; l < listCount; ++l) passLists_.push_back(lists + l);
+    for (uint32_t l = 0; l < moreCount; ++l) passLists_.push_back(more + l);
+    auto count = static_cast<uint32_t>(passLists_.size());
     pass_.prepared = true;
     pass_.lists = count;
     lighting_ = lighting;
@@ -746,8 +801,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     for (uint32_t l = 0; l < count; ++l) {
         dynamicVertexBase[l] = static_cast<uint32_t>(dynamicVertices);
         dynamicIndexBase[l] = static_cast<uint32_t>(dynamicIndices);
-        dynamicVertices += lists[l].dynamicVertices.size();
-        dynamicIndices += lists[l].dynamicIndices.size();
+        dynamicVertices += passLists_[l]->dynamicVertices.size();
+        dynamicIndices += passLists_[l]->dynamicIndices.size();
     }
     auto uploadStart = std::chrono::steady_clock::now();
     size_t objectsBefore = objects_.size();
@@ -756,7 +811,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         totals_.milliseconds += microsecondsSince(uploadStart) / 1000.0;
     if (dynamicVertices) {
         for (uint32_t l = 0; l < count; ++l) {
-            const CarDrawList& list = lists[l];
+            const CarDrawList& list = *passLists_[l];
             if (!list.dynamicVertices.empty()) {
                 gl_.bindBuffer(gl::kArrayBuffer, vertexBuffer_);
                 gl_.bufferSubData(
@@ -785,7 +840,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     std::vector<float>    distance(count, 0.0f);
     bool haveLight = false;
     for (uint32_t l = 0; l < count; ++l) {
-        const CarDrawList& list = lists[l];
+        const CarDrawList& list = *passLists_[l];
         // world - eye = R camera = R MV root.
         const float* r = view.orientation;
         const float* mv = list.rootModelView;
@@ -874,11 +929,16 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     std::stable_sort(listOrder_.begin(), listOrder_.end(),
                      [&](uint32_t a, uint32_t b) { return distance[a] > distance[b]; });
     carRanges_.clear();
-    uint32_t maxDraws = static_cast<uint32_t>(maxTextureBufferSize_) / 2;
+    paletteWords_.clear();
+    paletteFixups_.clear();
+    uint32_t maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
     uint32_t maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
     for (uint32_t l : listOrder_) {
-        const CarDrawList& list = lists[l];
+        const CarDrawList& list = *passLists_[l];
         auto carFirst = static_cast<uint32_t>(commands_.size());
+        // The list's palette row, appended the first time one of its draws needs it.
+        int32_t listPalette = -1;
+        if (list.flagman) ++pass_.flagmanLists;
         for (size_t d = 0; d < list.draws.size(); ++d) {
             const CarDraw& draw = list.draws[d];
             bool dynamic = draw.object == kDynamicCarObject;
@@ -896,7 +956,9 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                 continue;
             }
             uint32_t frame = frameBase[l] + draw.frame;
-            if (commands_.size() >= maxDraws || frame >= maxFrames) {
+            auto     palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
+            if ((commands_.size() + 1) * 2 + (palettes + 1) * kPaletteTexels > maxTexels ||
+                frame >= maxFrames) {
                 ++pass_.tableFull;
                 continue;
             }
@@ -905,6 +967,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             uint64_t handle = 0;
             uint32_t average = 0xFFFFFFFFu;
             bool     textured = false;
+            uint32_t bits = list.flagman ? kWalkOnlyBit : 0u;
             if (sprite) {
                 int32_t index = draw.sprite >= 0 &&
                                         static_cast<size_t>(draw.sprite) < scene.sprites.size()
@@ -914,6 +977,23 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                 if (!gpu || !gpu->handle) {
                     ++pass_.badSprite;
                     continue;
+                }
+                if (gpu->indexed) {
+                    // roglv2 colours a mip without a colormap of its own from the current one,
+                    // which only a flagman's MATERIAL sets.
+                    if (!list.flagman) {
+                        ++pass_.indexedWithoutPalette;
+                        continue;
+                    }
+                    if (listPalette < 0) {
+                        listPalette = static_cast<int32_t>(palettes);
+                        paletteWords_.insert(paletteWords_.end(), list.palette, list.palette + 16);
+                    }
+                    paletteFixups_.push_back(static_cast<uint32_t>(draws_.size() + 4));
+                    average = static_cast<uint32_t>(listPalette);
+                    bits |= kPaletteDrawBit | (gpu->opaque ? kPaletteOpaqueBit : 0u);
+                } else if (list.flagman) {
+                    ++pass_.flagmanOwnColours;
                 }
                 handle = gpu->handle;
                 textured = true;
@@ -939,7 +1019,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                                           average,
                                           static_cast<uint32_t>(material.specularExponent),
                                           floatBits(material.specular),
-                                          (textured ? 1u : 0u) | (rank << 8)};
+                                          (textured ? 1u : 0u) | bits | (rank << 8)};
             draws_.insert(draws_.end(), words, words + kDrawWords);
             Command command;
             command.count = draw.indexCount;
@@ -959,8 +1039,18 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             commands_.push_back(command);
         }
         auto carCount = static_cast<uint32_t>(commands_.size()) - carFirst;
-        if (carCount) carRanges_.push_back(CarRange{carFirst, carCount, list.walkSlot});
+        if (carCount)
+            carRanges_.push_back(CarRange{carFirst, carCount, list.walkSlot, list.flagman});
+        if (list.flagman) {
+            pass_.flagmanCommands += carCount;
+            if (carCount) ++pass_.flagmanRuns;
+        }
     }
+    // The palette rows follow the draws; each palette draw names its row's first texel.
+    auto paletteBase = static_cast<uint32_t>(draws_.size() / 4);
+    for (uint32_t word : paletteFixups_) draws_[word] = paletteBase + draws_[word] * kPaletteTexels;
+    draws_.insert(draws_.end(), paletteWords_.begin(), paletteWords_.end());
+    pass_.paletteRows = static_cast<uint32_t>(paletteWords_.size() / 16);
     // Phase 1's runs in the order of the walk; carRanges_ is far to near, which a stable sort
     // keeps between cars dispatched at one place.
     walkRuns_ = carRanges_;
@@ -992,9 +1082,14 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
 
 void CarRenderer::drawSolid(const SolidHookContext& context) {
     if (!pass_.prepared || commands_.empty()) return;
-    if (context.debug == kDebugWithoutCars) {
+    // Debug view 7 hides the cars; the flagmen's runs stay, and they need the uniforms below.
+    bool withoutCars = context.debug == kDebugWithoutCars;
+    if (withoutCars) {
         pass_.hidden = true;
-        return;
+        walkRuns_.erase(std::remove_if(walkRuns_.begin(), walkRuns_.end(),
+                                       [](const CarRange& run) { return !run.flagman; }),
+                        walkRuns_.end());
+        if (walkRuns_.empty()) return;
     }
     auto start = std::chrono::steady_clock::now();
     const ViewInputs&  view = *context.view;
@@ -1021,6 +1116,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.uniform2f(uFog_, frame.fog.on ? (frame.fog.squared ? 2.0f : 1.0f) : 0.0f,
                   frame.fog.density);
     gl_.uniform3f(uFogColour_, frame.fog.colour[0], frame.fog.colour[1], frame.fog.colour[2]);
+    gl_.uniform1i(uPaletteLinear_, filter_.trilinear ? 1 : 0);
     gl_.uniform3f(uDepthBias_, context.reversedZ ? 1.0f : -1.0f, context.reversedZ ? 1.0f : 0.0f,
                   kRankDepthStep);
     // The checker is on its own unit, bound by the track renderer for this pass (Renderer::draw).
@@ -1043,25 +1139,30 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
 
     auto drawCount = static_cast<GLsizei>(commands_.size());
-    // Phase 0: the cores, with depth and the car mark in the order attachment.
-    GLenum solid[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
-    gl_.drawBuffers(2, solid);
-    gl_.depthMask(1);
-    gl_.uniform1i(uPhase_, 0);
-    gl_.multiDrawElementsIndirect(gl::kTriangles, gl::kUnsignedInt, nullptr, drawCount,
-                                  sizeof(Command));
+    // Phase 0: the cores, with depth and the car mark in the order attachment. The flagmen's
+    // draws discard everything here (kWalkOnlyBit).
+    if (!withoutCars) {
+        GLenum solid[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
+        gl_.drawBuffers(2, solid);
+        gl_.depthMask(1);
+        gl_.uniform1i(uPhase_, 0);
+        gl_.multiDrawElementsIndirect(gl::kTriangles, gl::kUnsignedInt, nullptr, drawCount,
+                                      sizeof(Command));
+        pass_.multiDraws = 1;
+    }
     gl_.uniform1i(uPhase_, 1);
-    pass_.multiDraws = 1;
     restoreBindings(gl_, saved);
 
+    runsReady_ = true;
+    pass_.drawMicroseconds = microsecondsSince(start);
+    if (withoutCars) return;
     pass_.drawn = true;
     pass_.commands = static_cast<uint32_t>(commands_.size());
-    pass_.cars = static_cast<uint32_t>(carRanges_.size());
-    pass_.drawMicroseconds = microsecondsSince(start);
+    pass_.cars = static_cast<uint32_t>(carRanges_.size()) - pass_.flagmanRuns;
 }
 
 uint32_t CarRenderer::walkOrderRuns() const {
-    return pass_.drawn ? static_cast<uint32_t>(walkRuns_.size()) : 0u;
+    return runsReady_ ? static_cast<uint32_t>(walkRuns_.size()) : 0u;
 }
 
 uint32_t CarRenderer::walkOrderSlot(uint32_t run) const { return walkRuns_[run].slot; }
@@ -1089,6 +1190,7 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t position,
 
     ++pass_.multiDraws;
     ++pass_.walkRunsDrawn;
+    if (car.flagman) ++pass_.flagmanRunsDrawn;
     if (position >= context.orderedCount) ++pass_.walkRunsAtEnd;
     pass_.walkSlotSum += car.slot;
     pass_.walkVisibleSum += context.visibleCount;
@@ -1099,6 +1201,7 @@ CarPassStats CarRenderer::finishPass() {
     CarPassStats out = pass_;
     pass_ = CarPassStats{};
     commands_.clear();
+    runsReady_ = false;
     return out;
 }
 

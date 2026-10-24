@@ -204,6 +204,12 @@ struct CarDrawList {
     // Where GPL's walk dispatched the car: the number of entries the track renderer's visible
     // list had at its first call this pass (Renderer::visible), for its walk-order phase.
     uint32_t walkSlot = 0;
+    // A flagman (report 105 section 4.13), not a car: every draw of it is painted in the
+    // walk-order phase at walkSlot, cores included, as the track's own sprites are, and a sprite
+    // whose texture kept its palette indices (MipImage::indexed) takes `palette`: the 16 colours
+    // GPL set in the flagman's colormap, ARGB as roglv2's colormapSetColor stores them.
+    bool     flagman = false;
+    uint32_t palette[16] = {};
     std::vector<CarFrame>    frames;
     std::vector<CarMaterial> materials;
     std::vector<CarDraw>     draws;
