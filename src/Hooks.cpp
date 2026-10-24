@@ -1,6 +1,8 @@
 #include "Hooks.h"
 
 #include "fast_text/FastText.h"
+#include "baked_gpl/BakedPass.h"
+#include "baked_gpl/TrackBake.h"
 #include "DataRebase.h"
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
@@ -348,7 +350,11 @@ bool                g_mirrorDistanceScaleSaid = false;
 void __cdecl mainWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7,
                                 int a8) {
     if (stereoMirrorOnlyPass()) return;
+    trackBakeMainWalk(g_lastSceneParams);
+    bakedPassBegin(g_lastSceneParams);
     reinterpret_cast<WorldWalkFn>(kWorldWalk)(a1, a2, a3, a4, a5, a6, a7, a8);
+    // Always: it also ends the capture probe's watch of a pass GPL drew alone.
+    bakedPassEnd(g_lastSceneParams);
 }
 
 unsigned g_sceneMirrorOnlyCalls = 0;  // mirror-only renders, counted apart from the eyes
@@ -764,6 +770,8 @@ void mirrorTweakExit(const char* why, bool save) {
 namespace {
 
 void pollToggle() {
+    bakedPassPollKey();
+
     // Armed here, taken at publish time -- the key is polled on the game thread and the
     // read has to happen where the frame is complete and still bound.
     if (g_options.dumpEyesKey) {
@@ -1314,6 +1322,11 @@ int __cdecl screenDisplayHook(void* surface) {
     // it, black on the two without). That black is what a static past kNoSignalHoldMs published
     // to both eyes.
     if (g_options.vrNoSignal && noSignalDrawnThisFrame()) rasterFlushPending();
+
+    // bakedCaptureKey: while the frame is still bound, so its own flush lands in it. The baked
+    // renderer's mark goes on after the capture has read the frame.
+    bakedCaptureFrameEnd();
+    bakedMarkFrameEnd();
 
     // The off-screen frame has to stop being the draw target before the presenter
     // reads it and before the game presents: glCopyTexSubImage2D reads the READ
@@ -2512,6 +2525,9 @@ void hotkeyCollisionReport() {
         {"vrMirrorModeKey", g_options.vrMirrorModeKey},
         {"dumpEyesKey", g_options.dumpEyesKey},
         {"frameRateKey", g_options.frameRateKey},
+        {"bakedRendererKey", g_options.bakedRenderer ? g_options.bakedRendererKey : 0},
+        {"bakedCaptureKey", g_options.bakedRenderer ? g_options.bakedCaptureKey : 0},
+        {"bakedDebugKey", g_options.bakedRenderer ? g_options.bakedDebugKey : 0},
         {"vrRecentreKey", g_options.vrRecentreKey},
         {"vrMouseLookKey", g_options.vrMouseLookKey},
         {"vrHudLayerKey", g_options.vrHudLayerKey},
@@ -2762,6 +2778,17 @@ void loadOptions(const char* fileName) {
     }
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
     if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
+    g_options.bakedRenderer = GetPrivateProfileIntA("gplvr", "bakedRenderer", 0, path);
+    if (g_options.bakedRenderer < 0 || g_options.bakedRenderer > 1) g_options.bakedRenderer = 0;
+    g_options.bakedRendererKey = GetPrivateProfileIntA("gplvr", "bakedRendererKey", '5', path);
+    g_options.bakedCaptureKey = GetPrivateProfileIntA("gplvr", "bakedCaptureKey", '8', path);
+    g_options.bakedDebugKey = GetPrivateProfileIntA("gplvr", "bakedDebugKey", '9', path);
+    g_options.bakedMergedDraws =
+        GetPrivateProfileIntA("gplvr", "bakedMergedDraws", 1, path) != 0 ? 1 : 0;
+    g_options.bakedGrooveLayers =
+        GetPrivateProfileIntA("gplvr", "bakedGrooveLayers", 1, path) == 2 ? 2 : 1;
+    g_options.bakedCars = GetPrivateProfileIntA("gplvr", "bakedCars", 0, path);
+    if (g_options.bakedCars < 0 || g_options.bakedCars > 3) g_options.bakedCars = 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2874,6 +2901,31 @@ void loadOptions(const char* fileName) {
              ? "the sim thread publishes each tick and the ring is verified against GPL's own "
                "latch; nothing drawn changes"
              : "off: the sim and the render thread exchange state through GPL's latch alone");
+    logf("options: bakedRenderer=%d (%s), bakedRendererKey=0x%02X, bakedCaptureKey=0x%02X, "
+         "bakedDebugKey=0x%02X, bakedMergedDraws=%d (%s), bakedGrooveLayers=%d, bakedCars=%d (%s)",
+         g_options.bakedRenderer,
+         g_options.bakedRenderer
+             ? "the track is baked on a worker thread, then drawn from the bake with real depth "
+               "in every main pass; GPL draws the rest, tested against that depth"
+             : "off: GPL draws everything",
+         g_options.bakedRendererKey, g_options.bakedCaptureKey, g_options.bakedDebugKey,
+         g_options.bakedMergedDraws,
+         g_options.bakedMergedDraws ? "one multi-draw a phase, bindless textures, when the "
+                                      "driver has them"
+                                    : "batch by batch",
+         g_options.bakedGrooveLayers, g_options.bakedCars,
+         g_options.bakedCars >= 3
+             ? "stage 2b: in the baked main passes gplvr draws the other cars itself from its "
+               "draw lists, with real depth, and GPL draws only their blob shadows; mirrors and "
+               "the cockpit stay GPL's, counted but not walked (levels 1 and 2 verify them)"
+         : g_options.bakedCars == 2
+             ? "stage 2a: every car GPL draws is also walked by gplvr, its polygon count checked "
+               "against GPL's, and a draw list of baked leaves filled and checked against the "
+               "walk; GPL still draws them"
+         : g_options.bakedCars == 1
+             ? "stage 1: every car GPL draws is also walked by gplvr and its polygon count "
+               "checked against GPL's; GPL still draws them"
+             : "off: GPL draws the cars");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
@@ -3027,8 +3079,10 @@ void requestSceneRenderHook(const Binding& binding) {
     // Per-pane mirrors (VR) need this call redirected so a mirror-only render can skip it. The
     // sceneRender found by discovery must be the one the fixed call site lives in.
     // Not conditional on the mirror being ON: mirrorUpdateRate can go to 0 and back from the
-    // menu at any time, and the redirect is installed once at bind.
-    g_mainWalkPending = g_options.vr && binding.sceneRender == 0x00487620;
+    // menu at any time, and the redirect is installed once at bind. The baked renderer needs it
+    // in flat mode as well: the main walk is where it finds the track and, later, draws it.
+    g_mainWalkPending =
+        (g_options.vr || g_options.bakedRenderer) && binding.sceneRender == 0x00487620;
 
     g_sceneHookPending = true;
     logf("requestSceneRenderHook: queued %zu sceneRender and %zu cameraBind call site(s); "

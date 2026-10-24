@@ -9,6 +9,7 @@
 // us, and the GPU driver roglv2 loads needed exports we had not provided. Injection
 // has no such shared namespace.
 
+#include "baked_gpl/BakedPass.h"
 #include "Billboard.h"
 #include "CrashGuard.h"
 #include "DataRebase.h"
@@ -166,6 +167,9 @@ DWORD WINAPI installThread(LPVOID) {
         return 0;
     }
     requestSceneRenderHook(binding);
+    // Flat mode too; does nothing unless bakedRenderer is on. Its patches go in on the render
+    // thread, at the first baked main walk.
+    bakedPassBind(binding);
 
     // Headset only. The per-eye HUD thunks and the billboard fix change what the game
     // draws, and flat mode is the vanilla game in a borderless window.

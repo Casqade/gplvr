@@ -126,10 +126,25 @@ else()
         src/VrText.cpp
         src/Window.cpp
         src/presenter/Producer.cpp
-        # The fast text path (fastText = 1): GPL's stamped glyphs drawn from a GPU atlas
-        # instead of one roglv2 glDrawPixels each.
         src/fast_text/FastText.cpp
         src/fast_text/TextDraw.cpp
+        src/baked/Assets.cpp
+        src/baked/BakedLog.cpp
+        src/baked/CarRenderer.cpp
+        src/baked/CarScene.cpp
+        src/baked/Mip.cpp
+        src/baked/Piff.cpp
+        src/baked/Renderer.cpp
+        src/baked/RendererMerged.cpp
+        src/baked/Scene.cpp
+        src/baked/Srb.cpp
+        src/baked_gpl/BakedCapture.cpp
+        src/baked_gpl/BakedPass.cpp
+        src/baked_gpl/CarBake.cpp
+        src/baked_gpl/CarWalk.cpp
+        src/baked_gpl/ResidualDepth.cpp
+        src/baked_gpl/TrackBake.cpp
+        src/baked_gpl/UvOverlay.cpp
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
     target_include_directories(gplvr PRIVATE src)

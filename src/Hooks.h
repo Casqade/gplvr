@@ -622,6 +622,43 @@ struct Options {
     // stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
     int simRing = 0;
 
+    // The baked renderer (src/baked, src/baked_gpl; docs/audit-2026-09-18/105-baked-renderer-
+    // rewrite.md). 0 off: GPL draws everything. 1 bakes the track GPL loads on a worker thread,
+    // then draws it from the bake with real depth in every main pass; GPL draws the rest -- the
+    // horizon, cars, cockpit, flagmen, particles, lit polygons, the mirrors -- tested against
+    // that depth. Flat mode and VR.
+    int bakedRenderer = 0;
+    // Baked drawing off and on in the same session, for an A/B against GPL's own. 0 disables.
+    int bakedRendererKey = '5';
+    // An A/B capture: the next frame drawn by GPL alone and the one after it from the bake,
+    // each main pass written as gplvr-captureN-{vanilla,baked}.tga beside gplvr.dll with its
+    // camera and track position in the log. 0 disables.
+    int bakedCaptureKey = '8';
+    // Cycles what the baked draw shows: normal; the walk-order phase (sprites, lines, translucent
+    // polygons, standing and object cutouts) without its test; without the walk-order phase; the
+    // walk-order phase tested by depth alone, without GPL's order between items; two timing views
+    // of the walk-order phase, with its state calls but no draw calls, and with no GL calls.
+    // Tells a wrong order from content the solid surfaces hide. 0 disables.
+    int bakedDebugKey = '9';
+    // 1: the baked renderer draws each phase as one multi-draw, every texture through a bindless
+    // handle (needs ARB_bindless_texture; without it, as 0). 0: batch by batch, binding each
+    // batch's texture and state.
+    int bakedMergedDraws = 1;
+    // How many times the baked renderer blends the racing groove (surface class 20) over each
+    // pixel: 1 as GPL's kernel and roglv2 do, 2 as if twice. Vanilla measured once at two spots
+    // of spa67 and as twice at a third (report 68's top update); no mechanism for twice is known.
+    int bakedGrooveLayers = 1;
+    // Baked cars (report 105 section 4, R2). 0: GPL draws every car. 1, stage 1: every car GPL
+    // draws is also walked by gplvr's own control walk (CarWalk.cpp) with the same register, gate,
+    // selector and cull decisions, and its polygon count is checked against GPL's own counter for
+    // that draw; the picture does not change. 2, stage 2a: as 1, and the walk also fills a draw
+    // list per car draw from car objects baked out of GPL's memory (CarBake.cpp), checked against
+    // the walk's count; still nothing drawn from it. 3, stage 2b: in the baked main passes gplvr
+    // draws the cars itself from those lists (CarRenderer.cpp) and GPL's draw of each car keeps
+    // only its blob shadow; mirror passes and the cockpit stay GPL's, counted but not walked (1
+    // and 2 verify every draw). Needs bakedRenderer = 1.
+    int bakedCars = 0;
+
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //
     // 1.0 keeps the recommendation, which for a Pico 4 is around 3172x3172. Below 1.0
