@@ -1,7 +1,10 @@
 #include "baked/Scene.h"
 
 #include "baked/BakedLog.h"
+#include "baked/SceneMemory.h"
+#include "baked/SegmentReach.h"
 #include "baked/Srb.h"
+#include "baked/TwoSided.h"
 
 #include <algorithm>
 #include <array>
@@ -206,21 +209,9 @@ struct CutPiece {
     int32_t    base;
 };
 
-// std::vector grows geometrically, so a big track's arrays ask the allocator for a block twice
-// the size of the one they already hold, and both are live during the move. In a 32-bit host that
-// fails long before the memory runs out: at Isle of Man the bake died with 1.2 GB on the heap and
-// no free region above 45.9 MB (report 60 section 10). Growing by a fixed step instead keeps the
-// transient cost of a move at one step, and the pre-flight reserve of Baker::run means the common
-// case never moves at all.
-template <class T>
-void growBy(std::vector<T>& target, size_t extra, size_t floorStep) {
-    size_t want = target.size() + extra;
-    if (want <= target.capacity()) return;
-    target.reserve(want + std::max(floorStep, target.capacity() / 4));
-}
-
-// The floors only matter while an array is small; past that the step is a quarter of what is
-// held, so the block asked for is never more than about 1.25 times the one already there.
+// growBy's floors (SceneMemory.h). They only matter while an array is small; past that the step
+// is a quarter of what is held, so the block asked for is never more than about 1.25 times the
+// one already there.
 constexpr size_t kVertexStep = 1u << 16;    // corners, 2 MiB
 constexpr size_t kTriangleStep = 1u << 16;  // 1.5 MiB
 constexpr size_t kPolyStep = 1u << 14;
@@ -239,20 +230,22 @@ public:
 
     bool run(const std::string& trackFile, std::string& error);
 
+    // What the scene has committed so far, against BakeOptions::memoryBudgetBytes, and where the
+    // bake is (SceneMemory.h). The first state over the budget and the peak are kept for the log.
+    BakeMemory memory() const;
+
 private:
     // The walk polls this at every node, so an exhausted budget unwinds it the same way a cancel
     // does and the caller reports which of the two it was.
     bool cancelled() const { return overBudget_ || (cancel_ && cancel_->load()); }
 
-    // What the scene has committed so far, against BakeOptions::memoryBudgetBytes. Capacities,
-    // not sizes: a reserve is memory the process is holding.
-    size_t committedBytes() const {
-        return modelBytes_ + textureBytes_ + scene_.vertices.capacity() * sizeof(Vertex) +
-               triangles_.capacity() * sizeof(Triangle) + polys_.capacity() * sizeof(PolyRecord) +
-               scene_.indices.capacity() * sizeof(uint32_t);
-    }
     bool checkBudget() {
-        if (!overBudget_ && committedBytes() > options_.memoryBudgetBytes) overBudget_ = true;
+        BakeMemory now = memory();
+        if (now.held() > peak_.held()) peak_ = now;
+        if (!overBudget_ && now.held() > options_.memoryBudgetBytes) {
+            overBudget_ = true;
+            overAt_ = now;
+        }
         return !overBudget_;
     }
 
@@ -385,6 +378,7 @@ private:
                       float areaLater);
     void assignOverlayLevels();
     void assignDecalLevels();
+    void findTwoSided();
     // The item paths, the eye samples and the edges, once nothing needs them any more.
     void dropAncestry();
     void finish();
@@ -411,6 +405,8 @@ private:
     std::vector<PolyRecord>           polys_;
     std::vector<double>               pieceSums_;  // x, y, z, count per piece
     std::vector<uint32_t>             itemSegments_;  // per item, the segment GROUP or kNoSegment
+    // Which segments GPL never draws in one pass: neither covers nor carries the other's decals.
+    SegmentReach                      reach_;
 
     // The path each item was reached by, from its segment GROUP (or the root, for an item under
     // none) down to the item node. `pathWords_[k]` is the word index of `pathNodes_[k]` that
@@ -427,6 +423,8 @@ private:
     std::vector<OverlayEdge> overlayEdges_;
     // Decal over decal, in GPL's draw order; they order the decal pass (assignDecalLevels).
     std::vector<OverlayEdge> decalEdges_;
+    // Opposite faces of one item lying on each other, earlier then later (findTwoSided).
+    std::vector<OverlayEdge> twinPairs_;
     // The near-horizontal surfaces, indexed by their x/y footprint: what the coverage rule counts
     // as cover and where the cut looks for a decal's road. Built twice (reports 61 and 63) and
     // dropped with the rest of the bake's scratch.
@@ -439,11 +437,16 @@ private:
     std::map<uint32_t, std::array<double, 7>> segmentBoxes_;  // min xyz, max xyz, count
     std::unordered_map<uint32_t, int32_t>   sweepCache_;  // node -> 1 front, 0 back, -1 mixed
 
-    // Memory accounting (report 60 section 10). Updated wherever the bake commits something big:
-    // a model load, a texture decode and every polygon's growth step.
-    size_t modelBytes_ = 0;    // the .3do payloads held
-    size_t textureBytes_ = 0;  // the decoded mip pyramids held
-    bool   overBudget_ = false;
+    // Memory accounting (report 60 section 10, report 105 section 4.15). Checked wherever the
+    // bake commits something big: a model load, a texture decode and every polygon's growth step.
+    size_t      modelBytes_ = 0;     // the .3do payloads held
+    size_t      texturePixels_ = 0;  // the decoded mip pyramids, dropped once read (not held)
+    bool        overBudget_ = false;
+    BakeMemory  overAt_;
+    BakeMemory  peak_;
+    const char* phase_ = "the walk";
+    uint32_t    trackPolygons_ = 0;
+    uint32_t    itemKey_ = 0;  // the item being baked
 
     // The item being built.
     const char*                                   refusal_ = nullptr;
@@ -517,7 +520,9 @@ int32_t Baker::textureIndex(const char* name) {
             logf("baked: texture %s: %s", where.c_str(), error.c_str());
         ++scene_.stats.texturesMissing;
     } else {
-        textureBytes_ += texture.image.bytes();
+        texture.file = fileName;
+        texture.pixelBytes = dropPixels(texture.image);
+        texturePixels_ += texture.pixelBytes;
         index = static_cast<int32_t>(scene_.textures.size());
         scene_.textures.push_back(std::move(texture));
         checkBudget();
@@ -549,7 +554,9 @@ int32_t Baker::spriteIndex(const char* name) {
         sprite.upLow = srb.upLow;
         sprite.aspect = srb.aspect;
         sprite.facing = srb.facing;
-        textureBytes_ += texture.image.bytes();
+        texture.file = fileName;
+        texture.pixelBytes = dropPixels(texture.image);
+        texturePixels_ += texture.pixelBytes;
         sprite.texture = static_cast<int32_t>(scene_.textures.size());
         scene_.textures.push_back(std::move(texture));
         index = static_cast<int32_t>(sprites_.size());
@@ -595,29 +602,22 @@ bool Baker::applyMaterial(const Model3do& model, uint32_t node, MaterialState& s
     return true;
 }
 
-// The loader's own linear sweep of the PRIM payload (Piff primTiles), counting the polygon nodes
-// in the file. Every track polygon is emitted at most once, so this is the exact size of the
-// track's own geometry; object instances add their models' polygons on top, which is why the
-// arrays still grow by a step afterwards.
-void countPrimPolygons(const Model3do& model, uint64_t& polygons, uint64_t& corners) {
-    polygons = 0;
-    corners = 0;
-    uint32_t offset = 4;
-    while (offset < model.primSize()) {
-        uint32_t size = primNodeSize(model, offset);
-        if (!size) return;
-        uint8_t type = model.type(offset);
-        if (type == kNodePolyF || type == kNodePolyFC || type == kNodePolyT ||
-            type == kNodePolyTC) {
-            bool     familyB = type == kNodePolyT || type == kNodePolyTC;
-            uint32_t count = model.word(offset, familyB ? 3 : 2);
-            if (count >= 3 && count <= kMaxPolygonCorners) {
-                ++polygons;
-                corners += count;
-            }
-        }
-        offset += size;
-    }
+BakeMemory Baker::memory() const {
+    BakeMemory held;
+    held.models = modelBytes_;
+    held.modelFiles = static_cast<uint32_t>(models_.size());
+    held.vertices = scene_.vertices.capacity() * sizeof(Vertex);
+    held.triangles = triangles_.capacity() * sizeof(Triangle);
+    held.polygons = polys_.capacity() * sizeof(PolyRecord);
+    held.indices = scene_.indices.capacity() * sizeof(uint32_t);
+    held.texturePixels = texturePixels_;
+    held.textures = static_cast<uint32_t>(scene_.textures.size());
+    held.phase = phase_;
+    held.items = static_cast<uint32_t>(scene_.items.size());
+    held.polygonsBaked = scene_.stats.polygons;
+    held.trackPolygons = trackPolygons_;
+    held.itemKey = itemKey_;
+    return held;
 }
 
 bool Baker::run(const std::string& trackFile, std::string& error) {
@@ -635,11 +635,13 @@ bool Baker::run(const std::string& trackFile, std::string& error) {
     // two on the way to it, and refuse a track whose geometry alone would not fit.
     uint64_t polygons = 0;
     uint64_t corners = 0;
-    countPrimPolygons(model, polygons, corners);
-    uint64_t geometry = corners * sizeof(Vertex) + corners * sizeof(Triangle) +
+    countPrimPolygons(model, kMaxPolygonCorners, polygons, corners);
+    trackPolygons_ = static_cast<uint32_t>(polygons);
+    uint64_t triangles = corners - 2 * polygons;  // an n-corner polygon is n - 2 fan triangles
+    uint64_t geometry = corners * sizeof(Vertex) + triangles * sizeof(Triangle) +
                         polygons * sizeof(PolyRecord);
     logf("baked: %s -- PRIM %u bytes, %llu polygon nodes, %llu corners; about %.0f MiB of "
-         "geometry before textures, budget %.0f MiB",
+         "geometry reserved (texture pixels are not held), budget %.0f MiB",
          scene_.trackName.c_str(), model.primSize(), static_cast<unsigned long long>(polygons),
          static_cast<unsigned long long>(corners), geometry / 1048576.0,
          options_.memoryBudgetBytes / 1048576.0);
@@ -648,11 +650,12 @@ bool Baker::run(const std::string& trackFile, std::string& error) {
         return false;
     }
     scene_.vertices.reserve(static_cast<size_t>(corners));
-    triangles_.reserve(static_cast<size_t>(corners));
+    triangles_.reserve(static_cast<size_t>(triangles));
     polys_.reserve(static_cast<size_t>(polygons));
 
     walkTop(model.root(), -1, 0, kBandNone, kNoSegment);
     if (overBudget_) {
+        logBakeMemory(scene_.trackName, "OVER THE BUDGET", overAt_, options_.memoryBudgetBytes);
         error = "too large for this process -- the bake passed its memory budget";
         return false;
     }
@@ -664,12 +667,25 @@ bool Baker::run(const std::string& trackFile, std::string& error) {
     // part in the overlay layering; the road under each one can only be cut out afterwards,
     // because an overlay needs its level first, and it is found by the item paths the pairing
     // also uses.
+    phase_ = "the overlays and the decal cut";
+    std::string reachError;
+    OverlayStats& overlay = scene_.stats.overlay;
+    overlay.reachKnown = reach_.build(model, reachError);
+    overlay.reachSegments = reach_.segments();
+    overlay.reachLapMetres = static_cast<float>(reach_.lapMetres());
+    overlay.reachMetres = static_cast<float>(reach_.reachMetres());
+    if (!overlay.reachKnown)
+        logf("baked: %s -- segment reach UNKNOWN (%s): the coverage rule and the road search "
+             "take surfaces from every segment, as before report 105 section 4.16",
+             scene_.trackName.c_str(), reachError.c_str());
     detectDecals();
     findOverlays();
     if (options_.sinkObjectSkirts) sinkObjectSkirts();
     cutDecals();
+    findTwoSided();
     dropAncestry();
     if (overBudget_) {
+        logBakeMemory(scene_.trackName, "OVER THE BUDGET", overAt_, options_.memoryBudgetBytes);
         error = "too large for this process -- the bake passed its memory budget";
         return false;
     }
@@ -678,6 +694,7 @@ bool Baker::run(const std::string& trackFile, std::string& error) {
         return false;
     }
     finish();
+    logBakeMemory(scene_.trackName, "peak", peak_, options_.memoryBudgetBytes);
     return true;
 }
 
@@ -838,6 +855,7 @@ bool Baker::tryItem(uint32_t node, int32_t context, bool countRefusal, uint8_t b
     size_t termStart = scene_.terms.size();
     size_t leafStart = scene_.orderLeaves.size();
 
+    itemKey_ = node;
     refusal_ = nullptr;
     termStack_.clear();
     pieceByTerms_.clear();
@@ -1138,7 +1156,7 @@ bool Baker::emitNode(int32_t modelIndex, uint32_t node, const Mat34& worldFromLo
         return underTerm(gateTerm(gate, true), 2) && underTerm(gateTerm(gate, false), 3);
     }
     // The splitting nodes also open a node of the order tree, so the renderer can put their
-    // children in the order the eye's side gives (splitDrawRank). BSP3 and BSP2 draw every child
+    // children in the order the eye's side gives (orderDrawRank). BSP3 and BSP2 draw every child
     // from both sides, so their plane is a gate for that order only, never a term.
     case kNodeBsp4: {
         uint32_t gate = addGate(model, model.word(node, 1), itemFromLocal);
@@ -1735,28 +1753,26 @@ uint64_t cellKey(int32_t x, int32_t y) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) | static_cast<uint32_t>(y);
 }
 
-// Where a splitting node's child, held in word `wordIndex`, comes in the order GPL draws that
-// node's children with the eye on the given side. -1 when it is not drawn from that side.
-// PROVEN from the node handlers: SIDEPICK 0x4D77C0, BSP4 0x4D76B0, BSP3_ASYM 0x4D75A0,
-// BSP3 0x4D7480, BSP2 0x4D73A0.
-int32_t splitDrawRank(uint8_t type, bool front, uint32_t wordIndex) {
-    if (wordIndex < 2 || wordIndex > 5) return -1;
-    size_t slot = wordIndex - 2;
-    // rows: words 2, 3, 4, 5
-    static const int8_t kSidePick[2][4] = {{0, -1, -1, -1}, {-1, 0, -1, -1}};
-    static const int8_t kBsp4[2][4] = {{2, 1, -1, 0}, {0, -1, 1, 2}};
-    static const int8_t kBsp3Asym[2][4] = {{2, 1, 0, -1}, {0, -1, 1, -1}};
-    static const int8_t kBsp3[2][4] = {{2, 1, 0, -1}, {0, 1, 2, -1}};
-    static const int8_t kBsp2[2][4] = {{1, 0, -1, -1}, {0, 1, -1, -1}};
-    size_t side = front ? 0 : 1;
-    switch (type) {
-    case kNodeSidePick: return kSidePick[side][slot];
-    case kNodeBsp4: return kBsp4[side][slot];
-    case kNodeBsp3Asym: return kBsp3Asym[side][slot];
-    case kNodeBsp3: return kBsp3[side][slot];
-    case kNodeBsp2: return kBsp2[side][slot];
-    default: return -1;
-    }
+// The two-sided panel pairs findOverlays met (TwoSided.h), with what the decision needs of each
+// face. After the decal cut, which replaces the faces it cuts.
+void Baker::findTwoSided() {
+    std::vector<TwinFace> faces;
+    for (const OverlayEdge& pair : twinPairs_)
+        for (uint32_t index : {pair.base, pair.overlay}) {
+            const PolyRecord& poly = polys_[index];
+            const Triangle&   triangle = triangles_[poly.firstTriangle];
+            const BatchKey&   key = batchKeys_[triangle.batch];
+            bool identity = poly.item < scene_.items.size() && scene_.items[poly.item].identity;
+            // Baker::finish's split of what roglv2 paints without depth.
+            bool walkOrdered =
+                !key.decal && (key.kind != kBatchPolygons || key.pass == kPassTranslucent ||
+                               (key.pass == kPassCutout && (key.upright || !identity)));
+            faces.push_back(TwinFace{poly.item, triangle.leaf, triangle.piece, poly.firstVertex,
+                                     poly.count, {poly.normal[0], poly.normal[1], poly.normal[2]},
+                                     poly.decal, walkOrdered, triangle.dead != 0});
+        }
+    twinPairs_ = std::vector<OverlayEdge>();
+    resolveTwoSided(scene_, faces);
 }
 
 // The eye positions the splitting-plane sweep tests: for every segment, the corners and the
@@ -1899,8 +1915,8 @@ void Baker::classifyPair(uint32_t earlier, uint32_t later, bool contained, float
                     if (!eyeAlwaysInFront(node, front)) {
                         rejected = &stats.viewDependent;
                     } else {
-                        int32_t rankA = splitDrawRank(type, front, wordA);
-                        int32_t rankB = splitDrawRank(type, front, wordB);
+                        int32_t rankA = orderDrawRank(type, front, wordA);
+                        int32_t rankB = orderDrawRank(type, front, wordB);
                         if (rankA < 0 || rankB < 0 || rankA == rankB) {
                             rejected = &stats.neverTogether;
                         } else {
@@ -2067,6 +2083,9 @@ void Baker::findOverlays() {
                 if (std::abs(here - there) * std::abs(n[dropped]) > separation) return;
             }
 
+            if (cosine < 0.0f && base.item == poly.item &&
+                overlapArea >= kTwinCover * std::max(mineArea, otherArea))
+                twinPairs_.push_back(OverlayEdge{earlier, static_cast<uint32_t>(index)});
             classifyPair(earlier, static_cast<uint32_t>(index), contained, otherArea, mineArea);
         };
 
@@ -2773,6 +2792,11 @@ void Baker::detectDecals() {
 
     std::vector<float>    area(polys_.size(), 0.0f);
     std::vector<float>    cover(polys_.size(), 0.0f);
+    // Overlap with surfaces of segments GPL never draws in one pass with the polygon's own: not
+    // cover. Monza 10k's road course and banking lie on each other half a lap apart, and counted
+    // as cover they made decals of its road, grass and banking: 4,257 polygons, every coverage
+    // decal it had (report 105 section 4.16). Kept only to count the polygons it would decide.
+    std::vector<float>    apart(polys_.size(), 0.0f);
     std::vector<uint32_t> stamp(polys_.size(), 0);
     std::vector<Point2>   mine, other, overlap, scratch;
     uint32_t              stampValue = 0;
@@ -2824,10 +2848,12 @@ void Baker::detectDecals() {
                 float there = planeHeight(base, point.u + originX, point.v + originY);
                 if (std::abs(here - there) > kBaseWindow) return;
             }
+            std::vector<float>& credit =
+                reach_.apart(itemSegments_[base.item], itemSegments_[poly.item]) ? apart : cover;
             if (area[earlier] > area[index])
-                cover[index] += overlapArea;
+                credit[index] += overlapArea;
             else
-                cover[earlier] += overlapArea;
+                credit[earlier] += overlapArea;
         };
         visitSurfaceCells(surfaceFine_, surfaceCoarse_, box, test);
     }
@@ -2844,7 +2870,11 @@ void Baker::detectDecals() {
     for (size_t index = 0; index < polys_.size(); ++index) {
         PolyRecord& poly = polys_[index];
         if (poly.decal || area[index] <= 0.0f) continue;
-        if (cover[index] < kDecalCoverage * area[index]) continue;
+        if (cover[index] < kDecalCoverage * area[index]) {
+            if (cover[index] + apart[index] >= kDecalCoverage * area[index])
+                ++stats.coverageApart;
+            continue;
+        }
         makeDecal(poly);
         ++stats.coverageDecals;
     }
@@ -2943,15 +2973,22 @@ void Baker::cutDecals() {
         surfacesNear(box, nearby);
         ancestry.clear();
         geometry.clear();
+        bool roadApart = false;
         for (uint32_t base : nearby) {
             bool overlayRoad = polys_[base].level != 0;
             if (base == painted || (overlayRoad && !poly.decal) || !baseUnder(painted, base))
                 continue;
+            // A road of a segment GPL never draws with this one's is never under it on screen.
+            if (reach_.apart(itemSegments_[polys_[base].item], itemSegments_[poly.item])) {
+                roadApart = true;
+                continue;
+            }
             bool before = drawnBefore(base, painted);
             if (overlayRoad && !before) continue;
             geometry.push_back(base);
             if (before) ancestry.push_back(base);
         }
+        if (roadApart) ++stats.roadsApart;
         std::vector<uint32_t>& bases = ancestry.empty() ? geometry : ancestry;
         if (!ancestry.empty()) {
             ++stats.baseAncestry;
@@ -3380,9 +3417,16 @@ bool bakeTrack(const TrackAssets& assets, const std::string& trackFile, const Ba
     // address space back before the host logs the refusal.
     try {
         Baker baker(assets, options, scene, cancel);
-        if (!baker.run(trackFile, error)) {
-            scene = Scene{};
-            return false;
+        try {
+            if (!baker.run(trackFile, error)) {
+                scene = Scene{};
+                return false;
+            }
+        } catch (const std::bad_alloc&) {
+            // What was held and where, while the baker still holds it: a failed allocation under
+            // the budget is the address space's largest free piece, not the total.
+            logBakeMemory(trackFile, "OUT OF MEMORY", baker.memory(), options.memoryBudgetBytes);
+            throw;
         }
     } catch (const std::bad_alloc&) {
         scene = Scene{};
@@ -3398,16 +3442,13 @@ bool bakeTrack(const TrackAssets& assets, const std::string& trackFile, const Ba
         return false;
     }
     scene.trackSource = trackFile;
+    scene.assets = assets;
     for (const auto& refusal : scene.stats.refused)
         logf("baked: left to the game's renderer -- %u x %s", refusal.second,
              refusal.first.c_str());
     if (scene.stats.refused.empty())
         logf("baked: left to the game's renderer -- no item of the track");
     return true;
-}
-
-int32_t orderDrawRank(uint8_t type, bool front, uint32_t wordIndex) {
-    return splitDrawRank(type, front, wordIndex);
 }
 
 }  // namespace baked

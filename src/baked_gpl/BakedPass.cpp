@@ -100,6 +100,11 @@ constexpr uintptr_t kDiffuse = 0x00580808;     // float, kd (0.3 from 0x55D4BC)
 constexpr unsigned kCameraProjection = 0x3D;
 
 constexpr size_t kUploadBytesPerPass = 48u << 20;
+// The upload stops, and gives its GPU copy back, rather than take the process's free address space
+// below this: GPL and the GL driver allocate in it too, and a failed allocation in GPL is a crash
+// (report 105 section 4.15). Checked before each upload call, which adds at most
+// kUploadBytesPerPass of pixels plus what the driver keeps of them.
+constexpr uint64_t kUploadAddressFloor = 256ull << 20;
 
 // The decals that keep the author's position and have their depth moved onto the road: class 10,
 // the start grid and the s/f line, up to 38.5 mm under their road, which a lift would slide half
@@ -262,11 +267,15 @@ struct State {
     int64_t       drawTicks = 0;
     uint64_t      repeatDispatches = 0;
     // Passes the baked drawing was wanted for and could not do, by reason: no scene yet, the
-    // renderer not up, the upload still running, no rectangle.
+    // renderer not up, the upload still running, the upload stopped for this scene, no rectangle.
     unsigned refusedNoScene = 0;
     unsigned refusedRenderer = 0;
     unsigned refusedUpload = 0;
+    unsigned refusedStopped = 0;
     unsigned refusedRect = 0;
+    // The scene generation (trackBakeSceneGeneration) whose upload was stopped, 0 for none: its
+    // GPU copy is released and GPL draws that track until another scene lands.
+    uint32_t stoppedGeneration = 0;
 };
 
 State g_state;
@@ -873,11 +882,12 @@ void reportSecond(State& s) {
                  c.indexedWithoutPalette);
     }
     s.carSecond = CarSecond{};
-    if (s.refusedNoScene || s.refusedRenderer || s.refusedUpload || s.refusedRect)
+    if (s.refusedNoScene || s.refusedRenderer || s.refusedUpload || s.refusedStopped ||
+        s.refusedRect)
         logf("baked: passes not baked in %.1f s -- no scene yet %u, renderer not up %u, upload "
-             "running %u, no rectangle %u%s",
-             seconds, s.refusedNoScene, s.refusedRenderer, s.refusedUpload, s.refusedRect,
-             s.drawEnabled ? "" : " (drawing is toggled off)");
+             "running %u, upload stopped %u, no rectangle %u%s",
+             seconds, s.refusedNoScene, s.refusedRenderer, s.refusedUpload, s.refusedStopped,
+             s.refusedRect, s.drawEnabled ? "" : " (drawing is toggled off)");
     std::memset(g_stockCalls, 0, sizeof(g_stockCalls));
     s.windowStart = now;
     s.passes = s.fogPasses = 0;
@@ -889,7 +899,19 @@ void reportSecond(State& s) {
     s.evaluateMicroseconds = s.solidMicroseconds = s.compositeMicroseconds = 0;
     s.repeatDispatches = 0;
     s.drawTicks = 0;
-    s.refusedNoScene = s.refusedRenderer = s.refusedUpload = s.refusedRect = 0;
+    s.refusedNoScene = s.refusedRenderer = s.refusedUpload = s.refusedStopped = s.refusedRect = 0;
+}
+
+// Ends the scene's upload for good: its GPU copy goes, and the context is forgotten so the next
+// scene restarts the renderer (as when a scene drops). GPL draws this track.
+void stopUpload(State& s, const char* why) {
+    s.renderer.release(s.context && s.wglGetCurrentContext() == s.context);
+    s.ready = false;
+    s.context = nullptr;
+    s.stoppedGeneration = trackBakeSceneGeneration();
+    logf("baked: the GPU upload STOPPED -- %s; its GPU copy is released and the game draws this "
+         "track (%.0f MiB of address space free now)",
+         why, trackBakeFreeAddressSpace() / 1048576.0);
 }
 
 }  // namespace
@@ -966,6 +988,10 @@ bool bakedPassBegin(void* sceneParams) {
         ++s.refusedNoScene;
         return false;
     }
+    if (s.stoppedGeneration && s.stoppedGeneration == trackBakeSceneGeneration()) {
+        ++s.refusedStopped;
+        return false;
+    }
     if (!ensureRenderer(s)) {
         ++s.refusedRenderer;
         return false;
@@ -998,11 +1024,33 @@ bool bakedPassBegin(void* sceneParams) {
             logf("baked: texture filter %s -- trilinear %s, anisotropy %d (driver gives %d)",
                  found ? "from roglv2's RasterV2 settings" : "roglv2's defaults (settings not found)",
                  filter.trilinear ? "on" : "off", filter.anisotropy, s.renderer.anisotropy());
+            logf("baked: GPU upload starting -- %.0f MiB of address space free; it stops below "
+                 "%.0f MiB",
+                 trackBakeFreeAddressSpace() / 1048576.0, kUploadAddressFloor / 1048576.0);
+        }
+        uint64_t freeBytes = trackBakeFreeAddressSpace();
+        if (freeBytes && freeBytes < kUploadAddressFloor) {
+            char why[160];
+            std::snprintf(why, sizeof(why),
+                          "%.0f MiB of address space free, below the %.0f MiB the game keeps "
+                          "(%.1f MiB of textures were up)",
+                          freeBytes / 1048576.0, kUploadAddressFloor / 1048576.0,
+                          s.renderer.uploadedTextureBytes() / 1048576.0);
+            stopUpload(s, why);
+            ++s.refusedStopped;
+            return false;
         }
         if (!s.renderer.upload(*scene, kUploadBytesPerPass)) {
+            if (s.renderer.uploadFailed()) {
+                stopUpload(s, "a texture could not be read again (the line above)");
+                ++s.refusedStopped;
+                return false;
+            }
             ++s.refusedUpload;
             return false;
         }
+        logf("baked: GPU upload done -- %.0f MiB of address space free",
+             trackBakeFreeAddressSpace() / 1048576.0);
         s.ready = true;
         bool verticalFacesEye = false;
         bool screenFacesEye = false;
@@ -1261,7 +1309,14 @@ void bakedPassPollKey() {
                 "FLAGMEN BY GPL: normal, except the flagmen and the starter are drawn by GPL as "
                 "before report 105 section 4.13, and each of GPL's draws of them is checked "
                 "against what gplvr would have drawn (the `baked flagmen:` line's DEBUG VIEW 12 "
-                "part)"};
+                "part)",
+                "UNCLIPPED: normal, except the merged draws do not clip at GPL's near plane, so "
+                "colour, alpha and fog are interpolated over the whole triangle and extrapolated "
+                "past the eye where a corner lies behind it (before report 105 section 4.16; the "
+                "black groove at monza10k's braking zones)",
+                "TWO-SIDED: normal, except the merged draws show both faces of a two-sided panel "
+                "and its overlay levels decide between them, so a back face can cover the advert "
+                "(before report 105 section 4.17; monza10k's blue banner showing its back)"};
             g_withoutGpl = s.debugView == baked::kDebugWithoutGpl;
             flagmenSetGplDraws(s.debugView == baked::kDebugFlagmenByGpl);
             uvOverlaySet(s.renderer.uvCheckerTexture(), s.debugView == baked::kDebugUvChecker);

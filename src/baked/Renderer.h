@@ -89,7 +89,14 @@ enum DebugView : uint8_t {
     // Normal, except the host hands the flagmen back to GPL and checks GPL's polygon count
     // against what it would have drawn (baked_gpl/Flagmen.cpp); the renderer draws as normal.
     kDebugFlagmenByGpl = 12,
-    kDebugViewCount = 13,
+    // Normal, except the merged program does not clip at GPL's near plane: colour, alpha and fog
+    // are interpolated over the whole triangle, which the GPU extrapolates past the eye when a
+    // corner lies behind it (before report 105 section 4.16).
+    kDebugUnclipped = 13,
+    // Normal, except the merged program draws the faces of two-sided panels from both sides, so
+    // the overlay levels alone decide between them (before report 105 section 4.17).
+    kDebugTwoSided = 14,
+    kDebugViewCount = 15,
 };
 
 // What a host draws inside a pass with the renderer's own depth and order target (CarRenderer):
@@ -232,9 +239,13 @@ public:
     GLuint uvCheckerTexture() const { return checker_; }
 
     // Uploads the scene incrementally: geometry first, then textures until `byteBudget` bytes
-    // have gone this call (at least one texture). True once everything is on the GPU.
+    // have gone this call (at least one texture). True once everything is on the GPU. A track
+    // scene's texture pixels are read from its files here, one texture at a time (SceneMemory.h);
+    // one that cannot be read stops the upload for good: uploadFailed() says why.
     bool upload(const Scene& scene, size_t byteBudget);
     bool uploadComplete() const { return uploadComplete_; }
+    bool uploadFailed() const { return !uploadError_.empty(); }
+    const std::string& uploadError() const { return uploadError_; }
     size_t uploadedGeometryBytes() const { return geometryBytes_; }
     size_t uploadedTextureBytes() const { return textureBytes_; }
 
@@ -320,12 +331,16 @@ private:
         GLint twoLayerClasses = -1;
         GLint fog = -1;
         GLint fogColour = -1;
+        GLint nearClip = -1;
+        GLint twoSided = -1;
         OrderUniforms order;
     };
 
     bool buildProgram(std::string& error);
     GLuint linkProgram(const char* vertexSource, std::string& error);
-    GLuint linkSources(const char* vertexSource, const char* fragmentSource, std::string& error);
+    GLuint linkSources(const char* vertexSource, const char* fragmentSource, std::string& error,
+                       const char* geometrySource = nullptr);
+    void findMergedUniforms(GLuint program, MergedUniforms& uniforms);
     // RendererMerged.cpp: the merged program, the per-batch table its shaders read, and the
     // phases drawn with them.
     bool buildMergedProgram(std::string& error);
@@ -354,7 +369,7 @@ private:
     void timerMark(TimerMark mark);
     // Reads back every query set whose results are available, without waiting.
     void harvestTimers();
-    bool uploadTexture(const Texture& texture, GLuint& name, size_t& bytes);
+    bool uploadTexture(const Scene& scene, size_t index, GLuint& name, size_t& bytes);
     void evaluate(const Scene& scene, const ViewInputs& view, const FrameInputs& frame);
     // Appends the runs under order node `node` of `item` to ordered_, in GPL's order for this
     // pass: gate sides and piece results are the item's, just evaluated.
@@ -376,11 +391,13 @@ private:
     bool          screenFacesEye_ = false;
     SolidHook*    solidHook_ = nullptr;
     GLuint        checker_ = 0;
-    // Per program: u_uvChecker (on or off) and u_checker (its unit): batch, sprite, merged.
-    GLint         uUvChecker_[3] = {-1, -1, -1};
-    GLint         uChecker_[3] = {-1, -1, -1};
+    // Per program: u_uvChecker (on or off) and u_checker (its unit): batch, sprite, merged,
+    // merged lines.
+    GLint         uUvChecker_[4] = {-1, -1, -1, -1};
+    GLint         uChecker_[4] = {-1, -1, -1, -1};
     void          buildUvChecker();
-    // Sets the checker uniforms of `program` (0 batch, 1 sprite, 2 merged), in use.
+    // Sets the checker uniforms of `program` (0 batch, 1 sprite, 2 merged, 3 merged lines), in
+    // use.
     void          setUvCheckerUniforms(int program);
 
     GLuint program_ = 0;
@@ -420,14 +437,18 @@ private:
     OrderUniforms order_;
     OrderUniforms spriteOrder_;
 
-    // Merged draws: the driver's bindless support, the program, every texture's resident handle,
+    // Merged draws: the driver's bindless support, the programs, every texture's resident handle,
     // and per batch (RGBA32UI): the handle's two halves, surface class + 1, and
-    // pass | kind << 8 | decal << 16.
+    // pass | kind << 8 | decal << 16. The two programs share their vertex and fragment shaders;
+    // their geometry shaders clip triangles and lines at GPL's near plane (report 105 section
+    // 4.16), and a draw takes the one for its primitive.
     bool                  bindless_ = false;
     bool                  mergedWanted_ = true;
     bool                  mergedReady_ = false;
     GLuint                mergedProgram_ = 0;
+    GLuint                mergedLineProgram_ = 0;
     MergedUniforms        merged_;
+    MergedUniforms        mergedLine_;
     std::vector<uint64_t> textureHandles_;
     GLuint                batchTableBuffer_ = 0;
     GLuint                batchTableTexture_ = 0;
@@ -460,6 +481,11 @@ private:
     bool   uploadComplete_ = false;
     size_t geometryBytes_ = 0;
     size_t textureBytes_ = 0;
+    // Reading the track's texture pixels again at upload: the time it took in all, the most in
+    // one upload call, and the first texture that could not be read.
+    double      readMilliseconds_ = 0.0;
+    double      readWorstCall_ = 0.0;
+    std::string uploadError_;
 
     GLuint framebuffer_ = 0;
     GLuint colourBuffer_ = 0;

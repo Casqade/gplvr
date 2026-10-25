@@ -1,4 +1,5 @@
-// Merged draws: one program for polygons, sprites and lines, every texture through a bindless
+// Merged draws: one program for polygons and sprites and its twin for lines (they differ only in
+// the geometry shader that clips at GPL's near plane), every texture through a bindless
 // handle, and each batch's state in a table the shaders read. Nothing changes between two batches,
 // so each phase of Renderer::draw is one multi-draw (one more for lines): the batch-by-batch path
 // paid about half a microsecond a draw, nearly all of it in front of a draw that followed a
@@ -30,7 +31,8 @@ layout(location = 4) in vec3 a_normal;
 layout(location = 5) in float a_gap;
 layout(location = 6) in uint a_item;
 layout(location = 7) in vec2 a_offset;
-layout(location = 8) in uint a_batchLevel;  // batch | overlay level << 24
+// batch | overlay level << 24, and the one-sided bits kTagOneSided and kTagFlipped
+layout(location = 8) in uint a_batchLevel;
 uniform mat4 u_clipFromView;
 uniform vec3 u_eye;
 // x: 1 when the depth row follows w (the 24-bit path), 0 for reversed-Z; y: the near plane.
@@ -50,29 +52,41 @@ uniform usamplerBuffer u_itemOrder;
 // Per batch: the texture handle's two halves (0 untextured), surface class + 1 (0 none), and
 // pass | kind << 8 | decal << 16.
 uniform usamplerBuffer u_batches;
-out vec2 v_uv;
-noperspective out vec4 v_colour;  // as Renderer.cpp's: roglv2 interpolates it across the screen
-out vec4 v_flat;
-noperspective out float v_fogW;
-flat out uint v_order;
-flat out uvec2 v_texture;
-flat out uint v_flags;  // pass | kind << 8 | (surface class + 1) << 16
-flat out uint v_level;
+// 1 in debug view 14: the faces of two-sided panels drawn from both sides.
+uniform int u_twoSided;
+// To the geometry shader (kMergedTriangleClip, kMergedLineClip), which hands them on as v_*.
+out vec2 g_uv;
+noperspective out vec4 g_colour;  // as Renderer.cpp's: roglv2 interpolates it across the screen
+out vec4 g_flat;
+noperspective out float g_fogW;  // the view depth, before any decal bias: what GPL clips by
+flat out uint g_order;
+flat out uvec2 g_texture;
+flat out uint g_flags;  // pass | kind << 8 | (surface class + 1) << 16
+flat out uint g_level;
+// Above 0 for a face of a two-sided panel turned away from the eye: kMergedTriangleClip drops it.
+flat out float g_away;
 void main() {
     uvec4 batch = texelFetch(u_batches, int(a_batchLevel & 0xFFFFFFu));
     int surfaceClass = int(batch.z) - 1;
     uint kind = (batch.w >> 8) & 0xFFu;
-    v_texture = batch.xy;
-    v_flags = (batch.w & 0xFFFFu) | (batch.z << 16);
-    v_level = a_batchLevel >> 24;
-    v_order = a_item < uint(textureSize(u_itemOrder)) ? texelFetch(u_itemOrder, int(a_item)).r : 0u;
-    v_uv = a_uv;
-    v_colour = a_colour;
+    g_texture = batch.xy;
+    g_flags = (batch.w & 0xFFFFu) | (batch.z << 16);
+    g_level = (a_batchLevel >> 24) & 0xFu;
+    // The eye's distance behind the face's plane: every corner of the polygon gives the same.
+    g_away = 0.0;
+    if ((a_batchLevel & 0x10000000u) != 0u && u_twoSided == 0) {
+        vec3 face = (a_batchLevel & 0x20000000u) != 0u ? -a_normal : a_normal;
+        g_away = dot(face, a_position - u_eye);
+    }
+    g_order = a_item < uint(textureSize(u_itemOrder)) ? texelFetch(u_itemOrder, int(a_item)).r : 0u;
+    g_uv = a_uv;
+    g_colour = a_colour;
     if (surfaceClass >= 0 && ((uint(u_classVisible) >> uint(surfaceClass)) & 1u) == 0u) {
-        // A surface class the host does not draw: every corner outside the clip volume.
+        // A surface class the host does not draw: every corner outside the clip volume, and
+        // behind the near plane for the geometry shader.
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-        v_flat = vec4(0.0);
-        v_fogW = 0.0;
+        g_flat = vec4(0.0);
+        g_fogW = 0.0;
         return;
     }
     if (kind == 1u) {
@@ -97,8 +111,8 @@ void main() {
         }
         vec3 relative = toSprite + (left * a_offset.x + up * a_offset.y) * u_offsetStep;
         gl_Position = u_clipFromView * vec4(relative, 1.0);
-        v_fogW = gl_Position.w;
-        v_flat = vec4(1.0);
+        g_fogW = gl_Position.w;
+        g_flat = vec4(1.0);
         return;
     }
     bool bias = u_decalOn != 0 && surfaceClass >= 0 &&
@@ -108,7 +122,7 @@ void main() {
     vec3 relative = a_position - u_eye;
     relative.z += gap * lift;
     vec4 clip = u_clipFromView * vec4(relative, 1.0);
-    v_fogW = clip.w;
+    g_fogW = clip.w;
     float depthBias = 0.0;
     if (bias) {
         float facing = max(abs(dot(a_normal, relative)), 1e-4);
@@ -121,7 +135,122 @@ void main() {
                     clip.w - depthBias);
     }
     gl_Position = clip;
-    v_flat = a_flat;
+    g_flat = a_flat;
+}
+)";
+
+// GPL clips every polygon at its near plane before roglv2 interpolates colour linearly across
+// the screen (gpl_clipEdgeNear, report 55; report 105 sections 4.7 and 4.12): a corner past the
+// plane is replaced by the points where its edges cross it, their colour, UV and fog taken
+// linearly along the edge. A GPU interpolating `noperspective` over the unclipped triangle
+// instead extrapolates once a corner lies behind the eye: monza10k's 125 m groove quads fade
+// from alpha 0 behind the car to 126 ahead, and the groove came out black (report 105 section
+// 4.16). The four screen sides GPL also clips at are left to the GPU (section 4.12). The strip
+// keeps the triangle's winding; flat outputs are the provoking (last) corner's, as without a
+// geometry shader.
+const char* const kMergedClipCommon = R"(
+in vec2 g_uv[];
+noperspective in vec4 g_colour[];
+in vec4 g_flat[];
+noperspective in float g_fogW[];
+flat in uint g_order[];
+flat in uvec2 g_texture[];
+flat in uint g_flags[];
+flat in uint g_level[];
+uniform vec2 u_depth;    // y: the near plane, GPL's camera's
+uniform int u_nearClip;  // 0 in debug view 13: every primitive as it comes
+out vec2 v_uv;
+noperspective out vec4 v_colour;
+out vec4 v_flat;
+noperspective out float v_fogW;
+flat out uint v_order;
+flat out uvec2 v_texture;
+flat out uint v_flags;
+flat out uint v_level;
+// The point a fraction t of the way from corner a to corner b.
+void emitAt(int a, int b, float t, int provoking) {
+    v_uv = mix(g_uv[a], g_uv[b], t);
+    v_colour = mix(g_colour[a], g_colour[b], t);
+    v_flat = mix(g_flat[a], g_flat[b], t);
+    v_fogW = mix(g_fogW[a], g_fogW[b], t);
+    v_order = g_order[provoking];
+    v_texture = g_texture[provoking];
+    v_flags = g_flags[provoking];
+    v_level = g_level[provoking];
+    gl_Position = mix(gl_in[a].gl_Position, gl_in[b].gl_Position, t);
+    EmitVertex();
+}
+float crossing(int a, int b) {
+    return (u_depth.y - g_fogW[a]) / (g_fogW[b] - g_fogW[a]);
+}
+)";
+
+// Each geometry shader is kMergedClipVersion, its layout, kMergedClipCommon and its main: the
+// input layout has to come before the unsized input arrays.
+const char* const kMergedClipVersion = "#version 400\n";
+const char* const kMergedTriangleLayout =
+    "layout(triangles) in;\nlayout(triangle_strip, max_vertices = 4) out;\n";
+const char* const kMergedLineLayout =
+    "layout(lines) in;\nlayout(line_strip, max_vertices = 2) out;\n";
+
+const char* const kMergedTriangleClip = R"(
+flat in float g_away[];
+void main() {
+    if (g_away[2] > 0.0) return;
+    bool kept[3];
+    int  count = 0;
+    for (int i = 0; i < 3; ++i) {
+        kept[i] = g_fogW[i] >= u_depth.y;
+        if (kept[i]) ++count;
+    }
+    if (u_nearClip == 0 || count == 3) {
+        for (int i = 0; i < 3; ++i) emitAt(i, i, 0.0, 2);
+        return;
+    }
+    if (count == 0) return;
+    // The triangle cut by the plane, corners in order: three or four of them.
+    ivec2 ends[4];
+    float along[4];
+    int   corners = 0;
+    for (int i = 0; i < 3; ++i) {
+        int j = (i + 1) % 3;
+        if (kept[i]) {
+            ends[corners] = ivec2(i, i);
+            along[corners] = 0.0;
+            ++corners;
+        }
+        if (kept[i] != kept[j]) {
+            ends[corners] = ivec2(i, j);
+            along[corners] = crossing(i, j);
+            ++corners;
+        }
+    }
+    // A strip of corners 0, 1, 3, 2 is the quad 0, 1, 2, 3.
+    emitAt(ends[0].x, ends[0].y, along[0], 2);
+    emitAt(ends[1].x, ends[1].y, along[1], 2);
+    if (corners == 4) emitAt(ends[3].x, ends[3].y, along[3], 2);
+    emitAt(ends[2].x, ends[2].y, along[2], 2);
+}
+)";
+
+const char* const kMergedLineClip = R"(
+void main() {
+    bool kept0 = g_fogW[0] >= u_depth.y;
+    bool kept1 = g_fogW[1] >= u_depth.y;
+    if (u_nearClip == 0 || (kept0 && kept1)) {
+        emitAt(0, 0, 0.0, 1);
+        emitAt(1, 1, 0.0, 1);
+        return;
+    }
+    if (!kept0 && !kept1) return;
+    float t = crossing(0, 1);
+    if (kept0) {
+        emitAt(0, 0, 0.0, 1);
+        emitAt(0, 1, t, 1);
+    } else {
+        emitAt(0, 1, t, 1);
+        emitAt(1, 1, 0.0, 1);
+    }
 }
 )";
 
@@ -200,36 +329,59 @@ void main() {
 )";
 
 static_assert(kCoreAlpha == 0.99f, "kMergedFragmentShader repeats kCoreAlpha");
+static_assert(kTagOneSided == 0x10000000u && kTagFlipped == 0x20000000u,
+              "kMergedVertexShader repeats the one-sided tag bits");
 
 }  // namespace
 
 bool Renderer::buildMergedProgram(std::string& error) {
-    mergedProgram_ = linkSources(kMergedVertexShader, kMergedFragmentShader, error);
+    std::string triangles = std::string(kMergedClipVersion) + kMergedTriangleLayout +
+                            kMergedClipCommon + kMergedTriangleClip;
+    std::string lines = std::string(kMergedClipVersion) + kMergedLineLayout + kMergedClipCommon +
+                        kMergedLineClip;
+    mergedProgram_ =
+        linkSources(kMergedVertexShader, kMergedFragmentShader, error, triangles.c_str());
     if (!mergedProgram_) return false;
-    GLuint p = mergedProgram_;
-    merged_.clipFromView = gl_.getUniformLocation(p, "u_clipFromView");
-    merged_.eye = gl_.getUniformLocation(p, "u_eye");
-    merged_.depth = gl_.getUniformLocation(p, "u_depth");
-    merged_.decalOn = gl_.getUniformLocation(p, "u_decalOn");
-    merged_.biasClasses = gl_.getUniformLocation(p, "u_biasClasses");
-    merged_.decalStep = gl_.getUniformLocation(p, "u_decalStep");
-    merged_.classVisible = gl_.getUniformLocation(p, "u_classVisible");
-    merged_.classTextured = gl_.getUniformLocation(p, "u_classTextured");
-    merged_.viewForward = gl_.getUniformLocation(p, "u_viewForward");
-    merged_.viewLeft = gl_.getUniformLocation(p, "u_viewLeft");
-    merged_.viewUp = gl_.getUniformLocation(p, "u_viewUp");
-    merged_.faceEye = gl_.getUniformLocation(p, "u_faceEye");
-    merged_.offsetStep = gl_.getUniformLocation(p, "u_offsetStep");
-    merged_.batches = gl_.getUniformLocation(p, "u_batches");
-    merged_.gouraud = gl_.getUniformLocation(p, "u_gouraud");
-    merged_.alphaPart = gl_.getUniformLocation(p, "u_alphaPart");
-    merged_.twoLayerClasses = gl_.getUniformLocation(p, "u_twoLayerClasses");
-    merged_.fog = gl_.getUniformLocation(p, "u_fog");
-    merged_.fogColour = gl_.getUniformLocation(p, "u_fogColour");
-    uUvChecker_[2] = gl_.getUniformLocation(p, "u_uvChecker");
-    uChecker_[2] = gl_.getUniformLocation(p, "u_checker");
-    findOrderUniforms(p, merged_.order);
+    mergedLineProgram_ =
+        linkSources(kMergedVertexShader, kMergedFragmentShader, error, lines.c_str());
+    if (!mergedLineProgram_) {
+        error = "lines: " + error;
+        gl_.deleteProgram(mergedProgram_);
+        mergedProgram_ = 0;
+        return false;
+    }
+    findMergedUniforms(mergedProgram_, merged_);
+    uUvChecker_[2] = gl_.getUniformLocation(mergedProgram_, "u_uvChecker");
+    uChecker_[2] = gl_.getUniformLocation(mergedProgram_, "u_checker");
+    findMergedUniforms(mergedLineProgram_, mergedLine_);
+    uUvChecker_[3] = gl_.getUniformLocation(mergedLineProgram_, "u_uvChecker");
+    uChecker_[3] = gl_.getUniformLocation(mergedLineProgram_, "u_checker");
     return true;
+}
+
+void Renderer::findMergedUniforms(GLuint p, MergedUniforms& u) {
+    u.clipFromView = gl_.getUniformLocation(p, "u_clipFromView");
+    u.eye = gl_.getUniformLocation(p, "u_eye");
+    u.depth = gl_.getUniformLocation(p, "u_depth");
+    u.decalOn = gl_.getUniformLocation(p, "u_decalOn");
+    u.biasClasses = gl_.getUniformLocation(p, "u_biasClasses");
+    u.decalStep = gl_.getUniformLocation(p, "u_decalStep");
+    u.classVisible = gl_.getUniformLocation(p, "u_classVisible");
+    u.classTextured = gl_.getUniformLocation(p, "u_classTextured");
+    u.viewForward = gl_.getUniformLocation(p, "u_viewForward");
+    u.viewLeft = gl_.getUniformLocation(p, "u_viewLeft");
+    u.viewUp = gl_.getUniformLocation(p, "u_viewUp");
+    u.faceEye = gl_.getUniformLocation(p, "u_faceEye");
+    u.offsetStep = gl_.getUniformLocation(p, "u_offsetStep");
+    u.batches = gl_.getUniformLocation(p, "u_batches");
+    u.gouraud = gl_.getUniformLocation(p, "u_gouraud");
+    u.alphaPart = gl_.getUniformLocation(p, "u_alphaPart");
+    u.twoLayerClasses = gl_.getUniformLocation(p, "u_twoLayerClasses");
+    u.fog = gl_.getUniformLocation(p, "u_fog");
+    u.fogColour = gl_.getUniformLocation(p, "u_fogColour");
+    u.nearClip = gl_.getUniformLocation(p, "u_nearClip");
+    u.twoSided = gl_.getUniformLocation(p, "u_twoSided");
+    findOrderUniforms(p, u.order);
 }
 
 // Every texture made resident once, after the upload: a handle fixes the texture's state, and
@@ -286,10 +438,11 @@ void Renderer::releaseMerged(bool contextAlive) {
         if (batchTableTexture_) gl_.deleteTextures(1, &batchTableTexture_);
         if (batchTableBuffer_) gl_.deleteBuffers(1, &batchTableBuffer_);
         if (mergedProgram_) gl_.deleteProgram(mergedProgram_);
+        if (mergedLineProgram_) gl_.deleteProgram(mergedLineProgram_);
     }
     textureHandles_.clear();
     batchTableTexture_ = batchTableBuffer_ = 0;
-    mergedProgram_ = 0;
+    mergedProgram_ = mergedLineProgram_ = 0;
     mergedReady_ = false;
 }
 
@@ -302,37 +455,63 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
                                          std::chrono::steady_clock::now() - start)
                                          .count());
     };
+    // The pass's uniforms, the same in both programs.
+    auto setPassUniforms = [&](GLuint program, const MergedUniforms& u, int checkerSlot) {
+        gl_.useProgram(program);
+        gl_.uniformMatrix4fv(u.clipFromView, 1, 0, clipFromView);
+        gl_.uniform3f(u.eye, view.eye[0], view.eye[1], view.eye[2]);
+        gl_.uniform2f(u.depth, reversedZ_ ? 0.0f : 1.0f, view.nearPlane);
+        gl_.uniform1i(u.decalOn, 0);
+        gl_.uniform1i(u.biasClasses, static_cast<GLint>(biasClasses_));
+        gl_.uniform2f(u.decalStep, kDecalBiasMargin, kVertexGapStep);
+        gl_.uniform1i(u.classVisible, static_cast<GLint>(frame.classVisible));
+        gl_.uniform1i(u.classTextured, static_cast<GLint>(frame.classTextured));
+        // Camera to world: its columns are the camera's forward, left and up axes.
+        gl_.uniform3f(u.viewForward, view.orientation[0], view.orientation[3],
+                      view.orientation[6]);
+        gl_.uniform3f(u.viewLeft, view.orientation[1], view.orientation[4], view.orientation[7]);
+        gl_.uniform3f(u.viewUp, view.orientation[2], view.orientation[5], view.orientation[8]);
+        gl_.uniform2f(u.faceEye, verticalFacesEye_ ? 1.0f : 0.0f, screenFacesEye_ ? 1.0f : 0.0f);
+        gl_.uniform1f(u.offsetStep, kSpriteOffsetStep);
+        gl_.uniform1i(u.gouraud, frame.gouraud ? 1 : 0);
+        gl_.uniform1i(u.alphaPart, 1);
+        gl_.uniform1i(u.twoLayerClasses, static_cast<GLint>(twoLayerClasses_));
+        gl_.uniform2f(u.fog, frame.fog.on ? (frame.fog.squared ? 2.0f : 1.0f) : 0.0f,
+                      frame.fog.density);
+        gl_.uniform3f(u.fogColour, frame.fog.colour[0], frame.fog.colour[1],
+                      frame.fog.colour[2]);
+        gl_.uniform1i(u.batches, static_cast<GLint>(kBatchTableUnit - gl::kTexture0));
+        gl_.uniform1i(u.nearClip, debug_ == kDebugUnclipped ? 0 : 1);
+        gl_.uniform1i(u.twoSided, debug_ == kDebugTwoSided ? 1 : 0);
+        setUvCheckerUniforms(checkerSlot);
+        gl_.uniform1i(u.order.itemOrder, static_cast<GLint>(kItemOrderUnit - gl::kTexture0));
+        gl_.uniform1i(u.order.solidOrder, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
+        gl_.uniform1i(u.order.solidDepth, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
+        gl_.uniform1i(u.order.test, 0);
+        gl_.uniform4f(u.order.depth, reversedZ_ ? 1.0f : -1.0f, kOverlayOffsetFactor,
+                      kOverlayOffsetUnits, reversedZ_ ? 1.0f : 0.0f);
+    };
+    setPassUniforms(mergedLineProgram_, mergedLine_, 3);
+    setPassUniforms(mergedProgram_, merged_, 2);
     const MergedUniforms& u = merged_;
-    gl_.useProgram(mergedProgram_);
     gl_.bindVertexArray(vertexArray_);
-    gl_.uniformMatrix4fv(u.clipFromView, 1, 0, clipFromView);
-    gl_.uniform3f(u.eye, view.eye[0], view.eye[1], view.eye[2]);
-    gl_.uniform2f(u.depth, reversedZ_ ? 0.0f : 1.0f, view.nearPlane);
-    gl_.uniform1i(u.decalOn, 0);
-    gl_.uniform1i(u.biasClasses, static_cast<GLint>(biasClasses_));
-    gl_.uniform2f(u.decalStep, kDecalBiasMargin, kVertexGapStep);
-    gl_.uniform1i(u.classVisible, static_cast<GLint>(frame.classVisible));
-    gl_.uniform1i(u.classTextured, static_cast<GLint>(frame.classTextured));
-    // Camera to world: its columns are the camera's forward, left and up axes.
-    gl_.uniform3f(u.viewForward, view.orientation[0], view.orientation[3], view.orientation[6]);
-    gl_.uniform3f(u.viewLeft, view.orientation[1], view.orientation[4], view.orientation[7]);
-    gl_.uniform3f(u.viewUp, view.orientation[2], view.orientation[5], view.orientation[8]);
-    gl_.uniform2f(u.faceEye, verticalFacesEye_ ? 1.0f : 0.0f, screenFacesEye_ ? 1.0f : 0.0f);
-    gl_.uniform1f(u.offsetStep, kSpriteOffsetStep);
-    gl_.uniform1i(u.gouraud, frame.gouraud ? 1 : 0);
-    gl_.uniform1i(u.alphaPart, 1);
-    gl_.uniform1i(u.twoLayerClasses, static_cast<GLint>(twoLayerClasses_));
-    gl_.uniform2f(u.fog, frame.fog.on ? (frame.fog.squared ? 2.0f : 1.0f) : 0.0f,
-                  frame.fog.density);
-    gl_.uniform3f(u.fogColour, frame.fog.colour[0], frame.fog.colour[1], frame.fog.colour[2]);
-    gl_.uniform1i(u.batches, static_cast<GLint>(kBatchTableUnit - gl::kTexture0));
-    setUvCheckerUniforms(2);
-    gl_.uniform1i(u.order.itemOrder, static_cast<GLint>(kItemOrderUnit - gl::kTexture0));
-    gl_.uniform1i(u.order.solidOrder, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
-    gl_.uniform1i(u.order.solidDepth, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
-    gl_.uniform1i(u.order.test, 0);
-    gl_.uniform4f(u.order.depth, reversedZ_ ? 1.0f : -1.0f, kOverlayOffsetFactor,
-                  kOverlayOffsetUnits, reversedZ_ ? 1.0f : 0.0f);
+    // The three uniforms the phases change, set on the triangle program, which stays bound, and
+    // handed to the line program before each of its draws.
+    GLint decalOn = 0;
+    GLint alphaPart = 1;
+    GLint orderTest = 0;
+    auto setDecalOn = [&](GLint value) {
+        decalOn = value;
+        gl_.uniform1i(u.decalOn, value);
+    };
+    auto setAlphaPart = [&](GLint value) {
+        alphaPart = value;
+        gl_.uniform1i(u.alphaPart, value);
+    };
+    auto setOrderTest = [&](GLint value) {
+        orderTest = value;
+        gl_.uniform1i(u.order.test, value);
+    };
     gl_.activeTexture(kBatchTableUnit);
     gl_.bindTexture(gl::kTextureBuffer, batchTableTexture_);
 
@@ -349,9 +528,18 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
     };
     auto submit = [&](DrawList& list, GLenum mode) {
         if (list.counts.empty()) return;
-        if (submitDraws)
+        if (submitDraws) {
+            bool lines = mode == gl::kLines;
+            if (lines) {
+                gl_.useProgram(mergedLineProgram_);
+                gl_.uniform1i(mergedLine_.decalOn, decalOn);
+                gl_.uniform1i(mergedLine_.alphaPart, alphaPart);
+                gl_.uniform1i(mergedLine_.order.test, orderTest);
+            }
             gl_.multiDrawElements(mode, list.counts.data(), gl::kUnsignedInt, list.offsets.data(),
                                   static_cast<GLsizei>(list.counts.size()));
+            if (lines) gl_.useProgram(mergedProgram_);
+        }
         ++stats.draws;
         list.clear();
     };
@@ -409,8 +597,8 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         gl_.enable(gl::kPolygonOffsetFill);
         gl_.polygonOffset(reversedZ_ ? kOverlayOffsetFactor : -kOverlayOffsetFactor,
                           reversedZ_ ? kOverlayOffsetUnits : -kOverlayOffsetUnits);
-        gl_.uniform1i(u.decalOn, 1);
-        gl_.uniform1i(u.alphaPart, 0);
+        setDecalOn(1);
+        setAlphaPart(0);
         for (uint64_t entry : decals_) {
             const Range& range = scene.ranges[static_cast<uint32_t>(entry & 0x0FFFFFFFu)];
             addOrdered(range);
@@ -432,10 +620,10 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         gl_.enable(gl::kPolygonOffsetFill);
         gl_.polygonOffset(reversedZ_ ? kOverlayOffsetFactor : -kOverlayOffsetFactor,
                           reversedZ_ ? kOverlayOffsetUnits : -kOverlayOffsetUnits);
-        gl_.uniform1i(u.decalOn, 1);
+        setDecalOn(1);
         auto depthRun = [&](size_t firstEntry, size_t endEntry) {
             setWrites(false, true);
-            gl_.uniform1i(u.alphaPart, 1);
+            setAlphaPart(1);
             for (size_t e = firstEntry; e < endEntry; ++e) {
                 const Range& range =
                     scene.ranges[static_cast<uint32_t>(overlays_[e] & 0x0FFFFFFFu)];
@@ -445,7 +633,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         };
         auto colourRun = [&](size_t firstEntry, size_t endEntry) {
             setWrites(true, false);
-            gl_.uniform1i(u.alphaPart, 0);
+            setAlphaPart(0);
             for (size_t e = firstEntry; e < endEntry; ++e) {
                 const Range& range =
                     scene.ranges[static_cast<uint32_t>(overlays_[e] & 0x0FFFFFFFu)];
@@ -470,7 +658,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
                 first = end;
             }
         }
-        gl_.uniform1i(u.decalOn, 0);
+        setDecalOn(0);
         gl_.disable(gl::kPolygonOffsetFill);
         setWrites(true, true);
         stats.overlayDraws = stats.draws - drawsBefore;
@@ -482,7 +670,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
     // The soft edges of the cutouts, blended over everything solid, without depth.
     setWrites(true, false);
     uint32_t fringeDrawsBefore = stats.draws;
-    gl_.uniform1i(u.alphaPart, 2);
+    setAlphaPart(2);
     drawBase(true);
     stats.fringeDraws = stats.draws - fringeDrawsBefore;
 
@@ -516,10 +704,10 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         gl_.bindTexture(gl::kTexture2D, orderTexture_);
         gl_.activeTexture(kSolidDepthUnit);
         gl_.bindTexture(gl::kTexture2D, depthTexture_);
-        gl_.uniform1i(u.order.test, debug_ == kDebugWalkOrderOverAll   ? 0
-                                    : debug_ == kDebugWalkOrderByDepth ? 2
-                                                                       : 1);
-        gl_.uniform1i(u.alphaPart, 0);
+        setOrderTest(debug_ == kDebugWalkOrderOverAll   ? 0
+                     : debug_ == kDebugWalkOrderByDepth ? 2
+                                                        : 1);
+        setAlphaPart(0);
         submitDraws = debug_ != kDebugWalkOrderNoDraws && debug_ != kDebugWalkOrderNoGl;
         for (size_t at = 0; trackRuns && at < ordered_.size(); ++at) {
             drawHookRuns(at);
@@ -536,7 +724,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         stats.orderedMicroseconds = microsecondsSince(orderedStart);
         stats.orderedDraws = stats.draws - orderedDrawsBefore;
         timerMark(kMarkOrdered);
-        gl_.uniform1i(u.order.test, 0);
+        setOrderTest(0);
         if (probe_) {
             GLenum colourOnly = gl::kColorAttachment0;
             gl_.drawBuffers(1, &colourOnly);

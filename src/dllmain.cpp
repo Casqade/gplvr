@@ -15,6 +15,7 @@
 #include "DataRebase.h"
 #include "Discovery.h"
 #include "DrawnMarks.h"
+#include "FlagmanReplay.h"
 #include "FlatFrames.h"
 #include "HeadAudio.h"
 #include "Hooks.h"
@@ -148,6 +149,9 @@ DWORD WINAPI installThread(LPVOID) {
     // Flat mode too, and here for the same reason: in the front end no skid mark is being laid
     // while the three immediates are rewritten.
     skidFloodInstall();
+    // Flat mode too, and here for the same reason: in the front end no replay is playing while
+    // the handler and the two reads are rewritten.
+    flagmanReplayInstall();
     // Flat mode too, and nothing downstream depends on it: one data byte, read only on the way
     // out of the game.
     creditsSkipInstall();
@@ -277,6 +281,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // Before the log closes, and before this module's code stops being callable.
         windowProcUnchain();
         crashGuardLogSummary();
+        flagmanReplayLogSummary();
         drawnMarksLogSummary();
         simRingLogSummary();
         logf("detaching");

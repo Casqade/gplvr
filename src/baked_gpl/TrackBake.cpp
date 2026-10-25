@@ -42,17 +42,34 @@ constexpr uint32_t kDecalSurfaceClasses = (1u << 20) | (1u << 10);
 
 // How much of the process's own address space the bake may commit. What failed at Isle of Man was
 // contiguity, not total free bytes, so half of what is free when the bake starts is the honest
-// share (report 60 section 10). gplc67.exe is /LARGEADDRESSAWARE since 2026-09-18.
-size_t bakeMemoryBudget() {
-    MEMORYSTATUSEX status = {};
-    status.dwLength = sizeof(status);
-    if (!GlobalMemoryStatusEx(&status)) return 512u << 20;
-    uint64_t half = status.ullAvailVirtual / 2;
+// share (report 60 section 10). How much that is depends on gplc67.exe being /LARGEADDRESSAWARE,
+// which a regenerated executable loses (report 105 section 4.15); logAddressSpace logs the total.
+size_t bakeMemoryBudget(uint64_t available) {
+    if (!available) return 512u << 20;
+    uint64_t half = available / 2;
     uint64_t ceiling = static_cast<uint64_t>(SIZE_MAX);
     if (half > ceiling) half = ceiling;
     size_t budget = static_cast<size_t>(half);
     if (budget < (256u << 20)) budget = 256u << 20;
     return budget;
+}
+
+// The largest free region of the address space: what a big array's one block must fit in. Report
+// 60 section 10's crash had 243 MB free in all and 45.9 MB in one piece.
+uint64_t largestFreeRegion() {
+    SYSTEM_INFO system = {};
+    GetSystemInfo(&system);
+    auto     at = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    auto     end = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    uint64_t largest = 0;
+    MEMORY_BASIC_INFORMATION info = {};
+    while (at < end && VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) {
+        if (info.State == MEM_FREE && info.RegionSize > largest) largest = info.RegionSize;
+        uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (next <= at) break;
+        at = next;
+    }
+    return largest;
 }
 
 bool readable(const void* address, size_t bytes) {
@@ -93,6 +110,9 @@ struct Job {
     std::string                   result;
     double                        milliseconds = 0.0;
     size_t                        freedBytes = 0;  // the previous scene's, added to the budget
+    uint64_t                      freeAtStart = 0;  // address space, when the last bake started
+    uint64_t                      largestAtStart = 0;  // its largest free region then
+    size_t                        budget = 0;
 };
 
 bool samplesMatch(const std::vector<float>& vertices, const std::vector<float>& samples,
@@ -143,7 +163,10 @@ void bakeOneTrack(const std::shared_ptr<Job>& job) {
         logf("baked: loading %s from %s", name.c_str(), assets.directory().c_str());
         baked::BakeOptions options;
         options.decalClasses = kDecalSurfaceClasses;
-        options.memoryBudgetBytes = bakeMemoryBudget() + job->freedBytes;
+        job->freeAtStart = trackBakeFreeAddressSpace();
+        job->largestAtStart = largestFreeRegion();
+        job->budget = bakeMemoryBudget(job->freeAtStart) + job->freedBytes;
+        options.memoryBudgetBytes = job->budget;
         if (!baked::bakeTrack(assets, name + ".3do", options, *scene, error, &job->cancel)) {
             job->result = name + ": " + error;
             continue;
@@ -152,6 +175,8 @@ void bakeOneTrack(const std::shared_ptr<Job>& job) {
             job->result = name + ": sizes match but the vertices differ from GPL's";
             continue;
         }
+        // Read by nothing once the track is identified: 4.3 MiB at Isle of Man.
+        std::vector<float>().swap(scene->trackVertices);
         job->scene = std::move(scene);
         job->result = name;
         break;
@@ -222,12 +247,11 @@ void bind(State& s) {
          s.season.empty() ? "not installed" : s.season.c_str());
 }
 
-// What a scene holds in the heap: its textures' pixels and its vertex and index arrays.
+// What a scene holds in the heap: its vertex and index arrays. Texture pixels are not held
+// (baked/SceneMemory.h).
 size_t sceneBytes(const baked::Scene& scene) {
-    size_t bytes = scene.vertices.capacity() * sizeof(scene.vertices[0]) +
-                   scene.indices.capacity() * sizeof(scene.indices[0]);
-    for (const baked::Texture& texture : scene.textures) bytes += texture.image.bytes();
-    return bytes;
+    return scene.vertices.capacity() * sizeof(scene.vertices[0]) +
+           scene.indices.capacity() * sizeof(scene.indices[0]);
 }
 
 // Returns the bytes the dropped scene held. Most of its blocks stay in the CRT heap's segments
@@ -251,7 +275,7 @@ void logBake(const Job& job, const baked::Scene& scene) {
         if (batch.pass == baked::kPassCutout) ++cutout;
         if (batch.pass == baked::kPassTranslucent) ++translucent;
     }
-    for (const baked::Texture& texture : scene.textures) textureBytes += texture.image.bytes();
+    for (const baked::Texture& texture : scene.textures) textureBytes += texture.pixelBytes;
     logf("baked: track %s matched and baked in %.0f ms -- items %u (track %u, object instances "
          "%u), polygons %u, corners %u, batches %zu (opaque %zu, cutout %zu, translucent %zu, of "
          "them decal %zu, upright cutout %zu), textures %zu (%.1f MiB, missing %u), objects %u",
@@ -275,6 +299,15 @@ void logBake(const Job& job, const baked::Scene& scene) {
              overlay.otherAncestor + overlay.smallArea,
          overlay.viewDependent, overlay.neverTogether, overlay.crossSegment, overlay.crossBand,
          overlay.otherAncestor, overlay.smallArea, overlay.overlayPolygons, overlay.maxLevel);
+    logf("baked: overlays -- two-sided panels: %u pairs of opposite faces of one item lying on "
+         "each other; %u pairs (%u polygons) drawn one-sided, each face only while it faces the "
+         "eye, because GPL orders them by the eye's side of their splitting node and paints the "
+         "face turned to the eye last; left as before: %u in GPL's walk order already, %u with a "
+         "decal, %u cut onto a road, %u never drawn together, %u in one order from everywhere, "
+         "%u under a splitting plane not theirs, %u where GPL paints the face turned away last",
+         overlay.twinPairs, overlay.twinOneSided, overlay.twinPolygons, overlay.twinWalkOrdered,
+         overlay.twinDecal, overlay.twinCut, overlay.twinNever, overlay.twinFixed,
+         overlay.twinOffPlane, overlay.twinAway);
     logf("baked: decals -- classes %08X: %u polygons in %u ranges, %u found by coverage, %u "
          "translucent object polygons on the track (shadows), %u decal levels; road under %u "
          "ground polygons: by GROUP child order %u, by the geometric search only %u, none %u; "
@@ -289,6 +322,15 @@ void logBake(const Job& job, const baked::Scene& scene) {
          overlay.pieces, overlay.trianglesAfter, overlay.trianglesBefore, overlay.gapMinMm,
          overlay.gapMedianMm, overlay.gapP99Mm, overlay.gapMaxMm, overlay.gapPositive,
          overlay.gapVertices, overlay.sunkSkirts, overlay.sunkArea);
+    if (overlay.reachKnown)
+        logf("baked: decals -- segment reach: %u segments over %.0f m, GPL draws at most %.0f m "
+             "ahead or behind its camera, so segments over %.0f m apart along the lap are never in "
+             "one pass: %u polygons kept as surfaces that their cover from such segments would "
+             "have made decals, %u decals and overlays lost a road of such a segment",
+             overlay.reachSegments, overlay.reachLapMetres, overlay.reachMetres,
+             2.0f * overlay.reachMetres, overlay.coverageApart, overlay.roadsApart);
+    else
+        logf("baked: decals -- segment reach UNKNOWN: cover and roads taken from every segment");
 
     const baked::ObjectStats& objects = stats.objects;
     logf("baked: objects -- %u sprites (%u sized by the node, %u tinted, %u screen-aligned) from "
@@ -308,6 +350,23 @@ void logBake(const Job& job, const baked::Scene& scene) {
     }
     for (const auto& refusal : stats.refused)
         logf("baked: refused %u items -- %s (left to GPL)", refusal.second, refusal.first.c_str());
+}
+
+// The address space around the bake, so a refusal or a later shortage reads against it
+// (report 105 section 4.15). `scene` is null when nothing was baked.
+void logAddressSpace(const Job& job, const baked::Scene* scene) {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    GlobalMemoryStatusEx(&status);
+    logf("baked: address space -- the process has %.0f MiB (4096 when gplc67.exe is "
+         "/LARGEADDRESSAWARE, 2048 when not); %.0f MiB free when the bake started, %.0f in one "
+         "piece (budget %.0f MiB: half of the free, at least 256, plus %.0f MiB credited for the "
+         "previous scene); %.0f MiB free now, %.0f in one piece; the scene keeps %.1f MiB of "
+         "vertices and indices and no texture pixels",
+         status.ullTotalVirtual / 1048576.0, job.freeAtStart / 1048576.0,
+         job.largestAtStart / 1048576.0, job.budget / 1048576.0, job.freedBytes / 1048576.0,
+         status.ullAvailVirtual / 1048576.0, largestFreeRegion() / 1048576.0,
+         scene ? sceneBytes(*scene) / 1048576.0 : 0.0);
 }
 
 }  // namespace
@@ -376,11 +435,13 @@ void trackBakeMainWalk(void* sceneParams) {
         s.trackFailed = true;
         logf("baked: nothing baked after %.0f ms -- %s; left to the game's own renderer",
              job->milliseconds, job->result.c_str());
+        logAddressSpace(*job, nullptr);
         return;
     }
     s.scene = std::move(job->scene);
     ++s.generation;
     logBake(*job, *s.scene);
+    logAddressSpace(*job, s.scene.get());
 }
 
 const baked::Scene* trackBakeScene() { return g_state.scene.get(); }
@@ -392,6 +453,13 @@ bool trackBakePrim(const unsigned char*& prim, unsigned& size) {
     prim = g_state.prim;
     size = g_state.primSize;
     return true;
+}
+
+uint64_t trackBakeFreeAddressSpace() {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) return 0;
+    return status.ullAvailVirtual;
 }
 
 }  // namespace gplvr

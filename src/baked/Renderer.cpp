@@ -2,6 +2,7 @@
 
 #include "baked/BakedLog.h"
 #include "baked/RendererInternal.h"
+#include "baked/SceneMemory.h"
 
 #include <algorithm>
 #include <chrono>
@@ -328,7 +329,9 @@ GLuint compileShader(const GlApi& gl, GLenum type, const char* source, std::stri
         char    log[1024] = {};
         GLsizei length = 0;
         gl.getShaderInfoLog(shader, sizeof(log) - 1, &length, log);
-        error = std::string(type == gl::kVertexShader ? "vertex" : "fragment") +
+        error = std::string(type == gl::kVertexShader     ? "vertex"
+                            : type == gl::kGeometryShader ? "geometry"
+                                                          : "fragment") +
                 " shader: " + log;
         gl.deleteShader(shader);
         return 0;
@@ -489,8 +492,10 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     const char* merged = "OFF: the driver has no ARB_bindless_texture";
     std::string mergedError;
     if (bindless_) {
-        merged = buildMergedProgram(mergedError) ? "ready once the textures are up"
-                                                 : "OFF: the merged program did not build";
+        merged = buildMergedProgram(mergedError)
+                     ? "ready once the textures are up; triangles and lines clipped at GPL's near "
+                       "plane before the screen-linear colour (geometry shaders)"
+                     : "OFF: the merged program did not build";
     }
 
     timersOn_ = gl_.genQueries && gl_.deleteQueries && gl_.queryCounter &&
@@ -514,19 +519,30 @@ GLuint Renderer::linkProgram(const char* vertexSource, std::string& error) {
 }
 
 GLuint Renderer::linkSources(const char* vertexSource, const char* fragmentSource,
-                             std::string& error) {
+                             std::string& error, const char* geometrySource) {
     GLuint vertex = compileShader(gl_, gl::kVertexShader, vertexSource, error);
     if (!vertex) return 0;
+    GLuint geometry = 0;
+    if (geometrySource) {
+        geometry = compileShader(gl_, gl::kGeometryShader, geometrySource, error);
+        if (!geometry) {
+            gl_.deleteShader(vertex);
+            return 0;
+        }
+    }
     GLuint fragment = compileShader(gl_, gl::kFragmentShader, fragmentSource, error);
     if (!fragment) {
         gl_.deleteShader(vertex);
+        if (geometry) gl_.deleteShader(geometry);
         return 0;
     }
     GLuint program = gl_.createProgram();
     gl_.attachShader(program, vertex);
+    if (geometry) gl_.attachShader(program, geometry);
     gl_.attachShader(program, fragment);
     gl_.linkProgram(program);
     gl_.deleteShader(vertex);
+    if (geometry) gl_.deleteShader(geometry);
     gl_.deleteShader(fragment);
 
     GLint ok = 0;
@@ -696,13 +712,30 @@ void Renderer::release(bool contextAlive) {
     uploadComplete_ = false;
     geometryBytes_ = 0;
     textureBytes_ = 0;
+    readMilliseconds_ = readWorstCall_ = 0.0;
+    uploadError_.clear();
     framebuffer_ = colourBuffer_ = depthTexture_ = orderTexture_ = orderFramebuffer_ = 0;
     walkOrderTexture_ = 0;
     targetWidth_ = targetHeight_ = 0;
 }
 
-bool Renderer::uploadTexture(const Texture& texture, GLuint& name, size_t& bytes) {
-    const MipImage& image = texture.image;
+bool Renderer::uploadTexture(const Scene& scene, size_t index, GLuint& name, size_t& bytes) {
+    // A track scene keeps each texture's header only; its pixels are read again here and freed
+    // when this returns (SceneMemory.h).
+    const Texture& texture = scene.textures[index];
+    MipImage       read;
+    if (!texture.file.empty()) {
+        auto        start = std::chrono::steady_clock::now();
+        std::string error;
+        bool        ok = readPixels(scene, index, read, error);
+        readMilliseconds_ += std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start).count();
+        if (!ok) {
+            uploadError_ = "texture " + std::to_string(index) + " " + texture.file + ": " + error;
+            return false;
+        }
+    }
+    const MipImage& image = texture.file.empty() ? texture.image : read;
     TextureFormat   format = textureFormatFor(image);
 
     // Skip levels above the driver's limit; the pyramid below them is complete by construction.
@@ -748,7 +781,7 @@ int Renderer::anisotropy() const {
 }
 
 bool Renderer::upload(const Scene& scene, size_t byteBudget) {
-    if (!initialised_) return false;
+    if (!initialised_ || uploadFailed()) return false;
     if (uploadComplete_) return true;
 
     SavedState saved;
@@ -795,6 +828,21 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
         };
         for (const Range& range : scene.ranges) tag(range);
         for (const Range& range : scene.orderRuns) tag(range);
+        uint32_t oneSidedVertices = 0;
+        uint32_t oneSidedOutside = 0;
+        for (const OneSidedSpan& span : scene.oneSided) {
+            if (static_cast<size_t>(span.firstVertex) + span.count > scene.vertices.size()) {
+                ++oneSidedOutside;
+                continue;
+            }
+            for (uint32_t v = span.firstVertex; v < span.firstVertex + span.count; ++v)
+                vertexTags[v * 2 + 1] |= kTagOneSided | (span.flipped ? kTagFlipped : 0u);
+            oneSidedVertices += span.count;
+        }
+        logf("baked: one-sided -- %zu faces of two-sided panels (%u vertices) drawn only while "
+             "they face the eye by the merged draws; debug view 14 and the batch-by-batch "
+             "fallback draw them from both sides; %u past the vertices (a bake fault, must be 0)",
+             scene.oneSided.size() - oneSidedOutside, oneSidedVertices, oneSidedOutside);
         gl_.genBuffers(1, &itemBuffer_);
         gl_.bindBuffer(gl::kArrayBuffer, itemBuffer_);
         gl_.bufferData(gl::kArrayBuffer,
@@ -904,25 +952,31 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
     gl_.pixelStorei(gl::kUnpackSkipRows, 0);
     gl_.pixelStorei(gl::kUnpackSkipPixels, 0);
     size_t spent = 0;
+    double readBefore = readMilliseconds_;
     while (nextTexture_ < scene.textures.size()) {
         if (spent > 0 && spent >= byteBudget) break;
-        uploadTexture(scene.textures[nextTexture_], textures_[nextTexture_], spent);
+        if (!uploadTexture(scene, nextTexture_, textures_[nextTexture_], spent)) break;
         ++nextTexture_;
     }
+    readWorstCall_ = std::max(readWorstCall_, readMilliseconds_ - readBefore);
     textureBytes_ += spent;
     gl_.pixelStorei(gl::kUnpackSkipPixels, skipPixels);
     gl_.pixelStorei(gl::kUnpackSkipRows, skipRows);
     gl_.pixelStorei(gl::kUnpackRowLength, rowLength);
     gl_.pixelStorei(gl::kUnpackAlignment, unpack);
 
-    uploadComplete_ = nextTexture_ >= scene.textures.size();
+    uploadComplete_ = !uploadFailed() && nextTexture_ >= scene.textures.size();
     if (uploadComplete_ && mergedProgram_) buildBatchTable(scene);
     restoreState(gl_, clipControl_, saved);
+    if (uploadFailed())
+        logf("baked: GPU upload STOPPED at texture %zu of %zu -- %s", nextTexture_,
+             textures_.size(), uploadError_.c_str());
     if (uploadComplete_) {
         GLenum error = gl_.getError();
-        logf("baked: GPU upload complete -- %.1f MiB geometry, %.1f MiB textures (%zu)%s",
+        logf("baked: GPU upload complete -- %.1f MiB geometry, %.1f MiB textures (%zu)%s; the "
+             "pixels read again from the track's files in %.0f ms, at most %.0f ms in one call",
              geometryBytes_ / 1048576.0, textureBytes_ / 1048576.0, textures_.size(),
-             error ? ", a GL error was pending" : "");
+             error ? ", a GL error was pending" : "", readMilliseconds_, readWorstCall_);
     }
     return uploadComplete_;
 }

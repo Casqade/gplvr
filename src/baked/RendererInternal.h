@@ -111,4 +111,10 @@ constexpr float kDecalBiasMargin = 0.02f;
 // filtered alpha is 1 exactly away from its edge, so the core loses nothing.
 constexpr float kCoreAlpha = 0.99f;
 
+// Vertex tag bits above batch | level << 24 (Renderer::upload): a face of a two-sided panel,
+// drawn by the merged program only while it faces the eye, and whether its face points the other
+// way from its stored normal, which faces up (Scene::oneSided, report 105 section 4.17).
+constexpr uint32_t kTagOneSided = 0x10000000u;
+constexpr uint32_t kTagFlipped = 0x20000000u;
+
 }  // namespace baked

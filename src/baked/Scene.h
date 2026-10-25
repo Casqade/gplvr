@@ -82,10 +82,10 @@ struct BakeOptions {
     // One bit per surface class 0..31. A polygon of such a class is painted onto the surface
     // below it and needs no pairing and no level: it is drawn in the decal pass.
     uint32_t decalClasses = 0;
-    // The bake refuses a track whose geometry and textures would pass this, and says so, rather
-    // than allocating until something throws. The host should set it from the address space its
-    // process actually has; the default is only a floor for a caller that does not
-    // (docs/audit-2026-09-18/60-groove-pass.md section 10).
+    // The bake refuses a track whose models and geometry would pass this, and says so, rather
+    // than allocating until something throws (texture pixels are not held: SceneMemory.h). The
+    // host should set it from the address space its process actually has; the default is only a
+    // floor for a caller that does not (docs/audit-2026-09-18/60-groove-pass.md section 10).
     size_t memoryBudgetBytes = 512u << 20;
     // Report 69 B: sink the part of an object's terrain skirt that crosses the track road just
     // under it (Baker::sinkObjectSkirts).
@@ -230,6 +230,11 @@ struct Item {
 struct Texture {
     std::string name;
     MipImage    image;
+    // A track scene's texture keeps only its header in `image`, each level's size and no pixels;
+    // the renderer reads them again from `file` (a .mip, or the .srb a sprite's MIP is embedded
+    // in) at upload (SceneMemory.h). Empty where `image` holds the pixels (CarScene).
+    std::string file;
+    size_t      pixelBytes = 0;  // the decoded pyramid, as parseMip builds it
 };
 
 // How each candidate overlay pair was classified against the node graph. Report 59.
@@ -247,6 +252,15 @@ struct OverlayStats {
                                    // lies wholly on the larger one, so it is a decal on it
     uint32_t coverageDecals = 0;   // polygons the per-polygon coverage rule called decals although
                                    // no decal class named them (report 61 section 3)
+    // Report 105 section 4.16: segments GPL never draws in one pass (SegmentReach).
+    bool     reachKnown = false;      // the segment and far-distance tables read
+    uint32_t reachSegments = 0;       // segments in the table
+    float    reachLapMetres = 0.0f;   // the lap, by the last segment's end
+    float    reachMetres = 0.0f;      // the furthest the walk draws ahead or behind its camera
+    uint32_t coverageApart = 0;       // polygons left surfaces that cover from such segments
+                                      // would have made coverage decals
+    uint32_t roadsApart = 0;          // decal and overlay polygons that lost a road candidate of
+                                      // such a segment in the cut's search
     uint32_t objectDecals = 0;     // translucent object polygons lying on the track: the shadow
                                    // quads under posts, sandbags and trees (report 64)
     uint32_t overlayPolygons = 0;  // polygons with a level above 0
@@ -263,6 +277,19 @@ struct OverlayStats {
     // such pair is an edge and the decal pass draws by these levels.
     uint32_t decalOverDecal = 0;
     uint32_t decalMaxLevel = 0;
+
+    // Report 105 section 4.17 (TwoSided.h): opposite faces of one item each covering kTwinCover
+    // of the other. Every pair is counted once, by the first reason that applies.
+    uint32_t twinPairs = 0;
+    uint32_t twinOneSided = 0;     // drawn one-sided: each face only while it faces the eye
+    uint32_t twinPolygons = 0;     // the distinct polygons of those pairs (Scene::oneSided)
+    uint32_t twinWalkOrdered = 0;  // left: a face painted in GPL's walk order, as GPL does
+    uint32_t twinDecal = 0;        // left: a face is a decal
+    uint32_t twinCut = 0;          // left: a face was cut onto a road or sunk under it
+    uint32_t twinNever = 0;        // left: never drawn in one pass
+    uint32_t twinFixed = 0;        // left: GPL paints them in one order from everywhere
+    uint32_t twinOffPlane = 0;     // left: the splitting node's plane is not theirs
+    uint32_t twinAway = 0;         // left: GPL paints the face turned away from the eye last
 
     // The road under each decal and overlay polygon (report 63). The contract is GROUP child order:
     // the road a decal is painted on is an earlier non-decal child of the same GROUP. The geometric
@@ -321,6 +348,14 @@ struct ObjectStats {
     uint32_t orderTriangles = 0;
 };
 
+// A polygon drawn only while it faces the eye: one face of a two-sided panel (TwoSided.h). Its
+// vertices' normals face up (Vertex::normal); `flipped` says the face itself points down.
+struct OneSidedSpan {
+    uint32_t firstVertex = 0;
+    uint16_t count = 0;
+    uint8_t  flipped = 0;
+};
+
 struct BakeStats {
     uint32_t trackItems = 0;
     uint32_t instanceItems = 0;
@@ -340,7 +375,8 @@ struct Scene {
     std::string trackSource;
     uint32_t    trackPrimSize = 0;
     uint32_t    decalClasses = 0;  // the BakeOptions the scene was baked with
-    std::vector<float> trackVertices;  // the track model's XYZS, for the host to compare
+    std::vector<float> trackVertices;  // the track model's XYZS, for the host to compare and free
+    TrackAssets        assets;         // where the textures' pixels are read from (Texture::file)
 
     std::vector<Vertex>   vertices;
     std::vector<uint32_t> indices;
@@ -360,6 +396,8 @@ struct Scene {
     std::vector<OrderChild> orderChildren;
     std::vector<OrderLeaf>  orderLeaves;
     std::vector<Range>      orderRuns;
+    // Sorted by first vertex.
+    std::vector<OneSidedSpan> oneSided;
 
     BakeStats stats;
 

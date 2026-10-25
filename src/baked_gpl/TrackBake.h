@@ -31,4 +31,8 @@ uint32_t trackBakeSceneGeneration();
 // when there is no scene.
 bool trackBakePrim(const unsigned char*& prim, unsigned& size);
 
+// The process's free address space now (GlobalMemoryStatusEx's ullAvailVirtual); 0 when the call
+// fails.
+uint64_t trackBakeFreeAddressSpace();
+
 }  // namespace gplvr

@@ -275,6 +275,7 @@ constexpr GLenum kExp2 = 0x0801;
 
 constexpr GLenum kVertexShader = 0x8B31;
 constexpr GLenum kFragmentShader = 0x8B30;
+constexpr GLenum kGeometryShader = 0x8DD9;
 constexpr GLenum kCompileStatus = 0x8B81;
 constexpr GLenum kLinkStatus = 0x8B82;
 constexpr GLenum kCurrentProgram = 0x8B8D;

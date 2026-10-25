@@ -82,6 +82,7 @@ else()
         src/DataRebase.cpp
         src/Discovery.cpp
         src/DrawnMarks.cpp
+        src/FlagmanReplay.cpp
         src/FlatFrames.cpp
         src/FrameBudget.cpp
         src/GlApi.cpp
@@ -137,7 +138,10 @@ else()
         src/baked/Renderer.cpp
         src/baked/RendererMerged.cpp
         src/baked/Scene.cpp
+        src/baked/SceneMemory.cpp
+        src/baked/SegmentReach.cpp
         src/baked/Srb.cpp
+        src/baked/TwoSided.cpp
         src/baked_gpl/BakedCapture.cpp
         src/baked_gpl/BakedPass.cpp
         src/baked_gpl/CarBake.cpp
