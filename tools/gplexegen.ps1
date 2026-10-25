@@ -3,7 +3,8 @@
   Build a patched GPL executable by calling the real GPLPatchDLL.dll.
 
 .DESCRIPTION
-  Exe in, exe out. Nothing else.
+  Exe in, exe out. Nothing else -- except the /LARGEADDRESSAWARE flag, set after the save
+  unless -NoLargeAddressAware.
 
   This is the exe-generation half of GEM+ and nothing more. It does not read or write
   core.ini, App.ini, player setups, carsets, pictures, the registry, or any game
@@ -62,6 +63,13 @@
 .PARAMETER DryRun
   Print the plan and exit without creating anything.
 
+.PARAMETER NoLargeAddressAware
+  Leave the COFF Characteristics as the DLL saved them. By default the finished exe is marked
+  /LARGEADDRESSAWARE (bit 0x20), giving GPL 4 GiB of address space on 64-bit Windows instead
+  of 2. No XML can set it, so before this every regenerated exe silently lost it (2026-10-11
+  to 2026-10-25: Isle of Man stopped baking in GPLVR). Reported before/after, and recorded in
+  the manifest as largeAddressAware.
+
 .EXAMPLE
   .\gplexegen.ps1 -Source 'H:\[Games]\GrandPrixLegends\gpl.exe' -XmlDir 'H:\[Games]\GrandPrixLegends\Mods\GEM+\gpl67' -Out 'C:\work\gplc67.exe'
 #>
@@ -77,6 +85,7 @@ param(
     [string]   $Dll = (Join-Path $env:SystemRoot 'SysWOW64\GPLPatchDLL.dll'),
     [switch]   $Force,
     [switch]   $DryRun,
+    [switch]   $NoLargeAddressAware,
     # internal: set only by the 32-bit re-exec below, never by a caller
     [string]   $ArgsFile
 )
@@ -360,6 +369,33 @@ if ($carry.Count -gt 0) {
     [IO.File]::WriteAllBytes($building, $bytes)
 }
 
+# ---------------------------------------------------------------- large address aware ----
+# IMAGE_FILE_LARGE_ADDRESS_AWARE (0x20) in the COFF header's Characteristics, which no XML can
+# reach: GPLPatchDLL maps an XML's VirtualAddress through the section table, so the headers are
+# out of its range. Without it the 32-bit process has 2 GiB instead of 4 on 64-bit Windows.
+# The PE checksum is left as it is: the loader does not check it for an exe.
+$laaReport = $null
+if (-not $NoLargeAddressAware) {
+    $bytes = [IO.File]::ReadAllBytes($building)
+    $pe = if ($bytes.Length -ge 0x40) { [BitConverter]::ToInt32($bytes, 0x3C) } else { -1 }
+    if ($pe -lt 0 -or ($pe + 24) -gt $bytes.Length -or
+        [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) {
+        Remove-Item -LiteralPath $building -Force
+        Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+        Die "the produced exe has no PE header at the offset 0x3C names -- no output was written."
+    }
+    $at = $pe + 22
+    $before = [BitConverter]::ToUInt16($bytes, $at)
+    $after = $before -bor 0x20
+    $bytes[$at] = [byte]($after -band 0xFF)
+    $bytes[$at + 1] = [byte]($after -shr 8)
+    [IO.File]::WriteAllBytes($building, $bytes)
+    Write-Host ("      large address aware: Characteristics 0x{0:X4} -> 0x{1:X4} (file offset 0x{2:X})" -f $before, $after, $at)
+    $laaReport = [pscustomobject]@{ Offset = $at; Before = ('0x{0:X4}' -f $before); After = ('0x{0:X4}' -f $after) }
+} else {
+    Write-Host "      large address aware: left as the DLL saved it (-NoLargeAddressAware)" -ForegroundColor Yellow
+}
+
 # ---------------------------------------------------------------- finish ----
 if (Test-Path -LiteralPath $OutFull) { Remove-Item -LiteralPath $OutFull -Force }
 Move-Item -LiteralPath $building -Destination $OutFull
@@ -403,6 +439,7 @@ if ($Manifest) {
         sourceSize   = $srcSize
         xml          = $records
         carry        = $carryReport
+        largeAddressAware = $laaReport
         output       = $OutFull
         outputSha256 = $outHash
         outputSize   = $outSize

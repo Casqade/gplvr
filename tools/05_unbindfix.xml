@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Fix for GEM+ 05.xml's flagman limit. Apply right after 05.xml.
+
+  05.xml raises GPL's flagman limit from 55 to 127 by moving two arrays of the flagman
+  manager: the SUBOBJECTs to +0xEEA and the XFORMs they hang from to +0x10E6
+  (gpl_trackBindFlagmen 0x481C73 / 0x481C79, the unbind's base at 0x481DF5). It leaves the
+  unbind, gpl_flagmanUnbindAll 0x481DE0, reading each XFORM at the stock distance from its
+  SUBOBJECT:
+
+      0x481E0B  8B 86 DC 00 00 00   mov eax, [esi+0DCh]
+      0x481E21  8B 86 DC 00 00 00   mov eax, [esi+0DCh]
+
+  so XFORM i is taken from SUBOBJECT slot 55 + i. Those slots are 0 until a track with more
+  than 55 flagmen fills them (Isle of Man has 79); from then on, leaving any track writes
+  through that track's freed pointers: a crash at 0x481E29 leaving monza10k after Isle of
+  Man (dump of 2026-10-25, GPLVR report 105 section 4.14). It also means the unbind never
+  restored any XFORM's child before.
+
+  Both displacements become 0x10E6 - 0xEEA = 0x1FC. The unbind runs before the track object
+  is freed (sub_4A58E0), so the restoring writes land in the live track.
+
+  Only for an exe built with 05.xml: on a stock exe the arrays are 0xDC apart and these
+  bytes are already right.
+-->
+<GPLPatch>
+
+  <BinaryPatch>
+    <VirtualAddress>0x00481E0D</VirtualAddress>
+    <Data>fc010000</Data>
+  </BinaryPatch>
+
+  <BinaryPatch>
+    <VirtualAddress>0x00481E23</VirtualAddress>
+    <Data>fc010000</Data>
+  </BinaryPatch>
+
+</GPLPatch>

@@ -12,6 +12,8 @@
   and for -Rate 36 the exe alone, gplc67[-prib]-<link>.exe: GEM's 21 numbered XMLs on the
   base, then the optional XMLs below in a fixed order -- carset names (-GemExtras), the rate
   XML, the FFB preferences, enablepribluda.xml (-Pribluda), gplvr-load.xml (-LoadGplvr).
+  05_unbindfix.xml (ours) follows 05.xml in every build. Every exe comes out
+  /LARGEADDRESSAWARE (gplexegen sets it after the save; checked here).
 
   THE PATCH IS SELF-CONTAINED. Nothing third-party is applied: no 77G, no 60FPSv2
   scaffolding. gplrategen emits the rate, timer and sound-callback registrations, the
@@ -209,6 +211,12 @@ function HasPribluda([string]$path) {
     $b = [IO.File]::ReadAllBytes($path)
     return [Text.Encoding]::ASCII.GetString($b, 0x4C4FD5 - 0x400C00, 8) -eq 'pribluda'
 }
+# IMAGE_FILE_LARGE_ADDRESS_AWARE in the COFF Characteristics: 4 GiB for GPL instead of 2.
+function IsLargeAddressAware([string]$path) {
+    $b = [IO.File]::ReadAllBytes($path)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    return ([BitConverter]::ToUInt16($b, $pe + 22) -band 0x20) -ne 0
+}
 
 if ((LinkOf $source) -ne $Link) {
     throw ("{0} is the {1} link, not {2}: pass -Base with a {2} gpl.exe, or -Link {1}." -f
@@ -275,8 +283,14 @@ $gem = @(
     '05.xml','09.xml','10.xml','15.xml','20.xml','21.xml','22.xml','23.xml','24.xml',
     '25.xml','26.xml','30.xml','31.xml','32.xml','33.xml','40.xml','45.xml','50.xml',
     '60.xml','90.xml','95.xml')
+# 05_unbindfix.xml (ours) right after 05.xml: 05.xml raises the flagman limit to 127 and leaves
+# the unbind reading at the stock 55 spacing, a crash leaving a track after one with more than
+# 55 flagmen (see the file).
 $xmlList = @(
-    $gem | ForEach-Object { Join-Path $gpl67 $_ }
+    $gem | ForEach-Object {
+        Join-Path $gpl67 $_
+        if ($_ -eq '05.xml') { Join-Path $tools '05_unbindfix.xml' }
+    }
 ) + $(if ($GemExtras) { @(Join-Path $tools 'gpl67-carset-names.xml') } else { @() }
 ) + $(if (-not $stock36) { @($aiXml) } else { @() }
 ) + $(if ($FfbNoSpringDamper) { @($ffbCondXml) } else { @() }
@@ -294,6 +308,7 @@ if ($carry) { $genArgs.CarryBytes = $carry }
 if ($LASTEXITCODE) { throw "gplexegen.ps1 failed ($LASTEXITCODE)" }
 if ((LinkOf $outExe) -ne $Link) { throw "$outExe came out as the $(LinkOf $outExe) link" }
 if ((HasPribluda $outExe) -ne [bool]$Pribluda) { throw "$outExe pribluda state is not what was asked" }
+if (-not (IsLargeAddressAware $outExe)) { throw "$outExe is not /LARGEADDRESSAWARE (gplexegen sets it)" }
 
 Write-Host "`nDone."
 Write-Host "  exe : $outExe   -> copy over $gplDir\gplc67.exe"
