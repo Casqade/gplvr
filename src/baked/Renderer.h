@@ -96,7 +96,30 @@ enum DebugView : uint8_t {
     // Normal, except the merged program draws the faces of two-sided panels from both sides, so
     // the overlay levels alone decide between them (before report 105 section 4.17).
     kDebugTwoSided = 14,
-    kDebugViewCount = 15,
+    // Normal main passes, and the mirror passes drawn by GPL as before report 105 section 4.18:
+    // the host hands every mirror walk back to GPL and checks its mirror cars against GPL's own
+    // polygon count. The renderer draws as normal.
+    kDebugMirrorsByGpl = 15,
+    // Normal, except the second eye walks every car itself instead of taking the first eye's
+    // draw list (bakedCarShare, baked_gpl/CarShare.cpp; report 105 section 4.21). The renderer
+    // draws as normal.
+    kDebugCarsUnshared = 16,
+    // Normal, except the first eye decides every gate of a car's walk itself, so its draw list
+    // holds only what it draws and the second eye walks the car again wherever a gate differs
+    // (bakedCarUnion off, report 105 section 4.22). The renderer draws as normal.
+    kDebugCarsUnconditioned = 17,
+    // Normal, except no car list is kept across frames or passes (bakedCarProgram off,
+    // baked_gpl/CarProgram.cpp; report 105 section 4.23): the first eye walks every car again
+    // each frame, as in section 4.22. The renderer draws as normal.
+    kDebugCarsUnkept = 18,
+    kDebugViewCount = 19,
+};
+
+// The passes the GPU times are kept apart for (Renderer::setPassClass).
+enum PassClass : int {
+    kPassMain = 0,
+    kPassMirror = 1,
+    kPassClassCount = 2,
 };
 
 // What a host draws inside a pass with the renderer's own depth and order target (CarRenderer):
@@ -176,6 +199,28 @@ struct GpuPassTimes {
     double   solidMs = 0.0;  // the copy in, the clears, the batched passes and the soft edges
     double   orderedMs = 0.0;  // the walk-order phase with its order test
     double   copyOutMs = 0.0;  // the copy back into the frame
+
+    // The same passes span by span. Every pass ends with a glFlush, so its commands reach the GPU
+    // by the end of the pass: without it the driver held the cars' draws and the GPU idled inside
+    // the cars' span until a later flush (report 105 section 4.25.1).
+    enum Span : int {
+        kSpanCopyIn,     // the copy into the private target
+        kSpanClears,     // depth and order cleared
+        kSpanTrack,      // evaluate, the opaque ranges, decals and overlays
+        kSpanCars,       // the solid hook: the cars' cores
+        kSpanEdges,      // the soft edges of the cutouts
+        kSpanWalkOrder,  // the walk-order phase
+        kSpanCopyOut,    // the copy back
+        kSpanCount
+    };
+    double spanMs[kSpanCount] = {};
+    // The part of each span the GPU cannot have spent waiting for the CPU: the span less the time
+    // from the GPU reaching its start to the CPU issuing its end, when that is positive. It
+    // assumes commands reach the GPU as they are issued, which holds up to the pass's flush.
+    double   busyMs[kSpanCount] = {};
+    double   issueMs = 0.0;  // CPU time from the pass's first mark to its last
+    double   lagMs = 0.0;    // from the CPU issuing the first mark to the GPU reaching it
+    uint32_t queued = 0;     // passes the GPU began after the CPU had issued all of them
 };
 
 // Texture sampling, as the host renderer configures it (roglv2: RasterV2 TrilinearFiltering and
@@ -283,8 +328,17 @@ public:
     bool drawComposited(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
                         const int rect[4], DrawStats& stats);
 
-    // The GPU times gathered so far, and a reset. False when the context has no timer queries.
-    bool takeGpuTimes(GpuPassTimes& out);
+    // The GPU times gathered so far for passes of `passClass`, and a reset. False when the
+    // context has no timer queries.
+    bool takeGpuTimes(GpuPassTimes& out, int passClass = kPassMain);
+    // Which class the next drawComposited's GPU time is kept under.
+    void setPassClass(int passClass) {
+        passClass_ = passClass >= 0 && passClass < kPassClassCount ? passClass : kPassMain;
+    }
+    // On: the private target only grows, and a pass smaller than it draws in its lower left
+    // corner, so passes of two sizes in one frame (the mirror's and the eye's) do not rebuild it
+    // each time. Off: it is rebuilt at every change of size.
+    void setKeepLargerTarget(bool keep) { keepLargerTarget_ = keep; }
 
     // The capture probe: while on, each pass also keeps, per pixel, the order number of the
     // topmost walk-order fragment, for readProbe.
@@ -299,8 +353,21 @@ public:
     const std::vector<uint32_t>& visible() const { return visible_; }
 
 private:
-    enum TimerMark : uint8_t { kMarkStart, kMarkSolid, kMarkOrdered, kMarkEnd, kMarkCount };
-    static constexpr int kTimerSets = 8;
+    // In pass order; mark n and n + 1 bound GpuPassTimes span n.
+    enum TimerMark : uint8_t {
+        kMarkStart,
+        kMarkCopiedIn,
+        kMarkCleared,
+        kMarkCarsBegin,
+        kMarkCarsEnd,
+        kMarkSolid,
+        kMarkOrdered,
+        kMarkEnd,
+        kMarkCount
+    };
+    static_assert(GpuPassTimes::kSpanCount == kMarkCount - 1, "one span between two marks");
+    // Room for two frames of VR with baked mirrors: two eyes and up to four mirror panes each.
+    static constexpr int kTimerSets = 16;
     // The fragment shader's order test (Renderer::draw), in both programs.
     struct OrderUniforms {
         GLint itemOrder = -1;
@@ -502,12 +569,23 @@ private:
     bool         timersOn_ = false;
     GLuint       timerQueries_[kTimerSets][kMarkCount] = {};
     bool         timerPending_[kTimerSets] = {};
+    int          timerClass_[kTimerSets] = {};  // the PassClass each pending set was timed for
     int          timerNext_ = 0;
     int          timerSet_ = -1;  // the set this pass writes, -1 when untimed
     uint8_t      timerMarks_ = 0;  // the marks this pass has written, one bit each
-    GpuPassTimes gpuTimes_;
+    // When the CPU issued each mark, on the GL clock: GL_TIMESTAMP read once at the start mark,
+    // the later marks placed from it by the CPU clock.
+    int64_t      timerIssued_[kTimerSets][kMarkCount] = {};
+    int64_t      timerGlAtStart_ = 0;
+    std::chrono::steady_clock::time_point timerCpuAtStart_;
+    int          passClass_ = kPassMain;
+    GpuPassTimes gpuTimes_[kPassClassCount];
     int    targetWidth_ = 0;
     int    targetHeight_ = 0;
+    bool   keepLargerTarget_ = false;
+    // The rect size of the last drawComposited, the part of the target it drew (readProbe).
+    int    passWidth_ = 0;
+    int    passHeight_ = 0;
 
     std::vector<uint32_t> stamps_;
     uint32_t              passStamp_ = 0;

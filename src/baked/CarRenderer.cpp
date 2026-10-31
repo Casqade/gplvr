@@ -46,6 +46,13 @@ constexpr uint32_t kWalkOnlyBit = 2u;
 constexpr uint32_t kPaletteDrawBit = 4u;
 constexpr uint32_t kPaletteOpaqueBit = 8u;
 constexpr uint32_t kPaletteTexels = 4;  // 16 ARGB words a palette
+
+// The kept programs' rows (report 105 sections 4.26, 4.27, 4.29): at most this many programs held
+// (CarProgram keeps at most 256); an entry no prepare has used for kCacheIdlePrepares (about a
+// second of four passes a frame at 90 Hz) is dropped.
+constexpr size_t   kCacheLists = 256;
+constexpr uint32_t kCacheIdlePrepares = 360;
+
 const char* const kCarVertexHead = R"(#version 400
 #extension GL_ARB_bindless_texture : require
 layout(location = 0) in vec3 a_position;
@@ -566,6 +573,7 @@ void CarRenderer::release(bool contextAlive) {
     totals_.vertexBytes = totals_.textureBytes = 0;
     pass_ = CarPassStats{};
     commands_.clear();
+    clearCache();
 }
 
 // A new car set: every object and texture goes; the buffers keep their size.
@@ -576,6 +584,7 @@ void CarRenderer::resetScene() {
     }
     textures_.clear();
     objects_.clear();
+    clearCache();
     verticesUsed_ = indicesUsed_ = 0;
     totals_.vertexBytes = totals_.textureBytes = 0;
 }
@@ -615,6 +624,8 @@ bool CarRenderer::uploadObjects(const CarScene& scene, size_t extraVertices, siz
         gl_.bindBuffer(gl::kArrayBuffer, indexBuffer_);
         gl_.bufferData(gl::kArrayBuffer, static_cast<GLsizeiptr>(indexCapacity_ * sizeof(uint32_t)),
                        nullptr, gl::kStaticDraw);
+        // The objects go up again in the same order from 0, at the same bases, so the cached rows'
+        // commands stay valid.
         first = 0;
         objects_.clear();
         verticesUsed_ = indicesUsed_ = 0;
@@ -759,6 +770,351 @@ std::string CarRenderer::takeFrameCheck() {
     return out;
 }
 
+bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const CarDraw& draw,
+                          uint32_t rank, CarPassStats& stats, uint32_t* words, Command& command,
+                          bool& dynamic, bool& palette) {
+    dynamic = draw.object == kDynamicCarObject;
+    palette = false;
+    if (dynamic ? draw.firstIndex + draw.indexCount > list.dynamicIndices.size()
+                : draw.object >= objects_.size() || draw.object >= scene.objects.size()) {
+        ++stats.badObject;
+        return false;
+    }
+    if (draw.frame >= list.frames.size()) {
+        ++stats.badFrame;
+        return false;
+    }
+    if (draw.material >= list.materials.size()) {
+        ++stats.badMaterial;
+        return false;
+    }
+    const CarMaterial& material = list.materials[draw.material];
+    bool     sprite = (draw.flags & kCarLeafSprite) != 0;
+    uint64_t handle = 0;
+    uint32_t average = 0xFFFFFFFFu;
+    bool     textured = false;
+    uint32_t bits = list.flagman ? kWalkOnlyBit : 0u;
+    if (sprite) {
+        int32_t index = draw.sprite >= 0 && static_cast<size_t>(draw.sprite) < scene.sprites.size()
+                            ? scene.sprites[static_cast<size_t>(draw.sprite)].texture
+                            : -1;
+        const GpuTexture* gpu = texture(scene, index);
+        if (!gpu || !gpu->handle) {
+            ++stats.badSprite;
+            return false;
+        }
+        if (gpu->indexed) {
+            // roglv2 colours a mip without a colormap of its own from the current one, which only
+            // a flagman's MATERIAL sets.
+            if (!list.flagman) {
+                ++stats.indexedWithoutPalette;
+                return false;
+            }
+            palette = true;
+            bits |= kPaletteDrawBit | (gpu->opaque ? kPaletteOpaqueBit : 0u);
+        } else if (list.flagman) {
+            ++stats.flagmanOwnColours;
+        }
+        handle = gpu->handle;
+        textured = true;
+    } else if (material.texture >= 0) {
+        const GpuTexture* gpu = texture(scene, material.texture);
+        if (gpu) {
+            average = gpu->average;
+            handle = gpu->handle;
+        }
+        textured = material.textured && handle != 0;
+    }
+    if (!sprite && material.textured && (draw.flags & kCarLeafTextured) && !handle)
+        ++stats.withoutTexture;
+    uint32_t colour = 0xFFFFFFFFu;
+    if (sprite) colour = (draw.flags & kCarLeafPalette) ? 0xFF808080u : draw.colour;
+
+    words[0] = static_cast<uint32_t>(handle);
+    words[1] = static_cast<uint32_t>(handle >> 32);
+    words[2] = draw.frame;
+    words[3] = colour;
+    words[4] = average;
+    words[5] = static_cast<uint32_t>(material.specularExponent);
+    words[6] = floatBits(material.specular);
+    words[7] = (textured ? 1u : 0u) | bits | (rank << 8);
+    command.count = draw.indexCount;
+    command.instanceCount = 1;
+    command.baseInstance = 0;
+    if (dynamic) {
+        command.firstIndex = draw.firstIndex;
+        command.baseVertex = 0;
+    } else {
+        const GpuObject& object = objects_[draw.object];
+        command.firstIndex = object.firstIndex + draw.firstIndex;
+        command.baseVertex = static_cast<int32_t>(object.baseVertex);
+    }
+    return true;
+}
+
+bool CarRenderer::buildCached(const CarScene& scene, const CarDrawList& list, CachedList& out) {
+    size_t count = list.draws.size();
+    out.draws = list.draws;
+    out.words.assign(count * kDrawWords, 0);
+    out.commands.assign(count, Command{});
+    out.kinds.assign(count, 0);
+    CarPassStats stats;
+    for (size_t d = 0; d < count; ++d) {
+        bool     dynamic = false;
+        bool     palette = false;
+        uint32_t flat = stats.withoutTexture;
+        if (!drawRow(scene, list, list.draws[d], 0, stats, &out.words[d * kDrawWords],
+                     out.commands[d], dynamic, palette) ||
+            palette)
+            return false;
+        out.kinds[d] = static_cast<uint8_t>((dynamic ? kCachedDynamic : 0) |
+                                            (stats.withoutTexture != flat ? kCachedWithoutTexture : 0));
+    }
+    out.frames = static_cast<uint32_t>(list.frames.size());
+    return true;
+}
+
+namespace {
+
+// Whether two cached programs' draws are the same, field by field.
+bool sameDraws(const std::vector<CarDraw>& a, const std::vector<CarDraw>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const CarDraw& x = a[i];
+        const CarDraw& y = b[i];
+        if (x.object != y.object || x.firstIndex != y.firstIndex || x.indexCount != y.indexCount ||
+            x.polygons != y.polygons || x.frame != y.frame || x.material != y.material ||
+            x.colour != y.colour || x.flags != y.flags || x.sprite != y.sprite ||
+            x.condition != y.condition)
+            return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
+                               uint32_t vertexBase, uint32_t indexBase) {
+    if (!list.contentKey || !list.conditionOn.empty() || list.flagman) return false;
+    ++pass_.keyedLists;
+    auto        frames = static_cast<uint32_t>(list.frames.size());
+    CachedList* held = findCached(list.contentKey, frames);
+    CachedList* entry = held;
+    if (list.drawsElided) {
+        // Its draws are not here to build from: the pinned rows are the only way to draw it.
+        ++pass_.elidedLists;
+        if (!entry || entry->commands.size() != list.elidedDraws) {
+            ++pass_.elidedLost;
+            return false;
+        }
+    } else if (entry && list.contentCheck) {
+        ++pass_.cacheChecked;
+        CachedList fresh;
+        bool       same = buildCached(scene, list, fresh) && fresh.words == entry->words &&
+                    fresh.kinds == entry->kinds && sameDraws(fresh.draws, entry->draws) &&
+                    fresh.commands.size() == entry->commands.size() &&
+                    (fresh.commands.empty() ||
+                     std::memcmp(fresh.commands.data(), entry->commands.data(),
+                                 fresh.commands.size() * sizeof(Command)) == 0);
+        if (!same) {
+            ++pass_.cacheMismatched;
+            eraseCached(list.contentKey);
+            return false;
+        }
+    } else if (!entry) {
+        CachedList fresh;
+        if (!buildCached(scene, list, fresh)) {
+            ++pass_.cacheRefused;
+            return false;
+        }
+        entry = storeCached(list.contentKey, std::move(fresh));
+        if (!entry) {
+            ++pass_.cacheRefused;
+            return false;
+        }
+    }
+    auto maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
+    auto maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
+    auto palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
+    if ((commands_.size() + list.drawOrder.size()) * 2 + (palettes + 1) * kPaletteTexels >
+            maxTexels ||
+        frameBase + entry->frames > maxFrames) {
+        ++(list.drawsElided ? pass_.elidedLost : pass_.cacheRefused);
+        return false;
+    }
+    CachedList& cached = *entry;
+    cached.lastUsed = prepares_;
+
+    // This drawOrder's rows as emitted for an earlier list, else emitted now into the least
+    // recently used slot.
+    Emitted* emitted = nullptr;
+    if (list.orderKey)
+        for (Emitted& e : cached.emitted)
+            if (e.orderKey == list.orderKey) emitted = &e;
+    Emitted scratch;
+    if (emitted) {
+        ++pass_.ordersReused;
+    } else {
+        emitted = &scratch;
+        if (list.orderKey) {
+            emitted = &cached.emitted[0];
+            for (Emitted& e : cached.emitted)
+                if (e.lastUsed < emitted->lastUsed) emitted = &e;
+        }
+        emitOrder(cached, list, *emitted);
+    }
+    emitted->lastUsed = prepares_;
+    // A whole list also checks what is copied against rows built from its own draws, as a list
+    // without a key is drawn, so a fault common to the cache and its emissions shows too.
+    if (list.contentCheck) {
+        Emitted reference;
+        if (!emitFromDraws(scene, list, reference) || reference.words != emitted->words ||
+            reference.dynamic != emitted->dynamic ||
+            reference.withoutTexture != emitted->withoutTexture ||
+            reference.commands.size() != emitted->commands.size() ||
+            (!reference.commands.empty() &&
+             std::memcmp(reference.commands.data(), emitted->commands.data(),
+                         reference.commands.size() * sizeof(Command)) != 0)) {
+            ++pass_.cacheMismatched;
+            eraseCached(list.contentKey);
+            return false;
+        }
+    }
+
+    auto   row = static_cast<uint32_t>(commands_.size());
+    size_t wordAt = draws_.size();
+    draws_.insert(draws_.end(), emitted->words.begin(), emitted->words.end());
+    for (size_t w = wordAt + 2; w < draws_.size(); w += kDrawWords) draws_[w] += frameBase;
+    commands_.insert(commands_.end(), emitted->commands.begin(), emitted->commands.end());
+    for (size_t c = row; c < commands_.size(); ++c) commands_[c].baseInstance += row;
+    for (uint32_t c : emitted->dynamic) {
+        Command& command = commands_[row + c];
+        command.firstIndex += static_cast<uint32_t>(indicesUsed_) + indexBase;
+        command.baseVertex = static_cast<int32_t>(verticesUsed_ + vertexBase);
+    }
+    pass_.dynamicDraws += static_cast<uint32_t>(emitted->dynamic.size());
+    pass_.withoutTexture += emitted->withoutTexture;
+    ++pass_.cachedLists;
+    if (!held) ++pass_.cacheStored;
+    return true;
+}
+
+bool CarRenderer::emitFromDraws(const CarScene& scene, const CarDrawList& list, Emitted& out) {
+    out.orderKey = list.orderKey;
+    CarPassStats   stats;
+    const CarDraw* previous = nullptr;
+    uint32_t       runs = 0;
+    for (uint32_t index : list.drawOrder) {
+        if (index >= list.draws.size()) return false;
+        const CarDraw& draw = list.draws[index];
+        if (!previous || !carDrawContinues(*previous, draw)) ++runs;
+        previous = &draw;
+        uint32_t words[kDrawWords];
+        Command  command;
+        bool     dynamic = false;
+        bool     palette = false;
+        if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), stats, words, command,
+                     dynamic, palette) ||
+            palette)
+            return false;
+        command.baseInstance = static_cast<uint32_t>(out.commands.size());
+        if (dynamic) out.dynamic.push_back(static_cast<uint32_t>(out.commands.size()));
+        out.words.insert(out.words.end(), words, words + kDrawWords);
+        out.commands.push_back(command);
+    }
+    out.withoutTexture = stats.withoutTexture;
+    return true;
+}
+
+void CarRenderer::emitOrder(const CachedList& cached, const CarDrawList& list, Emitted& out) {
+    out.orderKey = list.orderKey;
+    out.words.clear();
+    out.commands.clear();
+    out.dynamic.clear();
+    out.withoutTexture = 0;
+    out.words.reserve(list.drawOrder.size() * kDrawWords);
+    out.commands.reserve(list.drawOrder.size());
+    // A draw's rank is the place of its run among the draws this eye draws, as the pass would
+    // give it from the draws themselves.
+    auto           count = static_cast<uint32_t>(cached.commands.size());
+    const CarDraw* previous = nullptr;
+    uint32_t       runs = 0;
+    for (uint32_t index : list.drawOrder) {
+        if (index >= count) {
+            ++pass_.badOrder;
+            continue;
+        }
+        const CarDraw& draw = cached.draws[index];
+        if (!previous || !carDrawContinues(*previous, draw)) ++runs;
+        previous = &draw;
+        const uint32_t* row = &cached.words[static_cast<size_t>(index) * kDrawWords];
+        size_t          at = out.words.size();
+        out.words.insert(out.words.end(), row, row + kDrawWords);
+        out.words[at + 7] |= std::min(runs - 1, kMaxRank) << 8;
+        uint8_t kind = cached.kinds[index];
+        if (kind & kCachedDynamic) out.dynamic.push_back(static_cast<uint32_t>(out.commands.size()));
+        if (kind & kCachedWithoutTexture) ++out.withoutTexture;
+        out.commands.push_back(cached.commands[index]);
+        out.commands.back().baseInstance = static_cast<uint32_t>(out.commands.size() - 1);
+    }
+}
+
+bool CarRenderer::pinRows(uint32_t key, uint32_t frames, uint32_t& draws) {
+    CachedList* entry = initialised_ ? findCached(key, frames) : nullptr;
+    if (!entry) return false;
+    entry->lastUsed = prepares_ + 1;
+    draws = static_cast<uint32_t>(entry->commands.size());
+    return true;
+}
+
+CarRenderer::CachedList* CarRenderer::findCached(uint32_t key, uint32_t frames) {
+    auto found = cache_.find(key);
+    return found != cache_.end() && found->second.frames == frames ? &found->second : nullptr;
+}
+
+CarRenderer::CachedList* CarRenderer::storeCached(uint32_t key, CachedList&& entry) {
+    auto found = cache_.find(key);
+    if (found != cache_.end()) {
+        if (found->second.lastUsed >= prepares_) return nullptr;
+        found->second = std::move(entry);
+        return &found->second;
+    }
+    if (cache_.size() >= kCacheLists) {
+        evictIdle();
+        if (cache_.size() >= kCacheLists && !evictLeastRecent()) return nullptr;
+    }
+    CachedList& stored = cache_[key];
+    stored = std::move(entry);
+    return &stored;
+}
+
+void CarRenderer::eraseCached(uint32_t key) { cache_.erase(key); }
+
+// The least recently used entry that no list of this pass uses or pinned.
+bool CarRenderer::evictLeastRecent() {
+    auto oldest = cache_.end();
+    for (auto it = cache_.begin(); it != cache_.end(); ++it)
+        if (it->second.lastUsed < prepares_ &&
+            (oldest == cache_.end() || it->second.lastUsed < oldest->second.lastUsed))
+            oldest = it;
+    if (oldest == cache_.end()) return false;
+    cache_.erase(oldest);
+    return true;
+}
+
+// Drops the entries no prepare has used for kCacheIdlePrepares.
+void CarRenderer::evictIdle() {
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        uint32_t used = it->second.lastUsed;
+        if (used < prepares_ && prepares_ - used > kCacheIdlePrepares)
+            it = cache_.erase(it);
+        else
+            ++it;
+    }
+}
+
+void CarRenderer::clearCache() { cache_.clear(); }
+
 void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarDrawList* lists,
                           uint32_t listCount, const CarDrawList* more, uint32_t moreCount,
                           const ViewInputs& view, const CarLighting& lighting) {
@@ -767,6 +1123,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     commands_.clear();
     runsReady_ = false;
     if (!initialised_) return;
+    if (++prepares_ % 256 == 0) evictIdle();
     passLists_.clear();
     for (uint32_t l = 0; l < listCount; ++l) passLists_.push_back(lists + l);
     for (uint32_t l = 0; l < moreCount; ++l) passLists_.push_back(more + l);
@@ -831,6 +1188,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         }
         pass_.dynamicVertices = static_cast<uint32_t>(dynamicVertices);
     }
+    pass_.uploadMicroseconds = microsecondsSince(uploadStart);
 
     // Per list: eye-relative world from its dispatch frame, the frames under it, and how far
     // away the car is.
@@ -914,8 +1272,10 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         distance[l] = frameCount ? placed[3] * placed[3] + placed[7] * placed[7] +
                                        placed[11] * placed[11]
                                  : 0.0f;
-        if (list.draws.empty()) ++pass_.emptyLists;
-        pass_.listDraws += static_cast<uint32_t>(list.draws.size());
+        auto listDraws = static_cast<uint32_t>(list.contentKey ? list.drawOrder.size()
+                                                               : list.draws.size());
+        if (!listDraws) ++pass_.emptyLists;
+        pass_.listDraws += listDraws;
     }
     if (!haveLight) {
         light_[0] = 0.0f;
@@ -939,22 +1299,37 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         // The list's palette row, appended the first time one of its draws needs it.
         int32_t listPalette = -1;
         if (list.flagman) ++pass_.flagmanLists;
-        for (size_t d = 0; d < list.draws.size(); ++d) {
-            const CarDraw& draw = list.draws[d];
-            bool dynamic = draw.object == kDynamicCarObject;
-            if (dynamic ? draw.firstIndex + draw.indexCount > list.dynamicIndices.size()
-                        : draw.object >= objects_.size() || draw.object >= scene.objects.size()) {
-                ++pass_.badObject;
+        bool cached = appendCached(scene, list, frameBase[l], dynamicVertexBase[l],
+                                   dynamicIndexBase[l]);
+        // A draw's rank is the place of its run among the draws this eye draws, as its own list
+        // would have merged them (carDrawContinues): the draw's index in a list without
+        // conditions. A kept list's draws are its program's, drawOrder those this eye draws.
+        bool           ordered = list.contentKey != 0;
+        size_t         drawn = list.drawsElided ? 0
+                               : ordered      ? list.drawOrder.size()
+                                              : list.draws.size();
+        const CarDraw* previous = nullptr;
+        uint32_t       runs = 0;
+        for (size_t d = 0; !cached && d < drawn; ++d) {
+            if (ordered && list.drawOrder[d] >= list.draws.size()) {
+                ++pass_.badOrder;
                 continue;
             }
-            if (draw.frame >= list.frames.size()) {
-                ++pass_.badFrame;
+            const CarDraw& draw = list.draws[ordered ? list.drawOrder[d] : d];
+            if (!ordered && !carDrawOn(list, draw)) {
+                ++pass_.conditionedOff;
+                if (draw.condition >= list.conditionOn.size()) ++pass_.badCondition;
                 continue;
             }
-            if (draw.material >= list.materials.size()) {
-                ++pass_.badMaterial;
+            if (!previous || !carDrawContinues(*previous, draw)) ++runs;
+            previous = &draw;
+            uint32_t words[kDrawWords];
+            Command  command;
+            bool     dynamic = false;
+            bool     palette = false;
+            if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), pass_, words, command,
+                         dynamic, palette))
                 continue;
-            }
             uint32_t frame = frameBase[l] + draw.frame;
             auto     palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
             if ((commands_.size() + 1) * 2 + (palettes + 1) * kPaletteTexels > maxTexels ||
@@ -962,80 +1337,22 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                 ++pass_.tableFull;
                 continue;
             }
-            const CarMaterial& material = list.materials[draw.material];
-            bool     sprite = (draw.flags & kCarLeafSprite) != 0;
-            uint64_t handle = 0;
-            uint32_t average = 0xFFFFFFFFu;
-            bool     textured = false;
-            uint32_t bits = list.flagman ? kWalkOnlyBit : 0u;
-            if (sprite) {
-                int32_t index = draw.sprite >= 0 &&
-                                        static_cast<size_t>(draw.sprite) < scene.sprites.size()
-                                    ? scene.sprites[static_cast<size_t>(draw.sprite)].texture
-                                    : -1;
-                const GpuTexture* gpu = texture(scene, index);
-                if (!gpu || !gpu->handle) {
-                    ++pass_.badSprite;
-                    continue;
+            if (palette) {
+                if (listPalette < 0) {
+                    listPalette = static_cast<int32_t>(palettes);
+                    paletteWords_.insert(paletteWords_.end(), list.palette, list.palette + 16);
                 }
-                if (gpu->indexed) {
-                    // roglv2 colours a mip without a colormap of its own from the current one,
-                    // which only a flagman's MATERIAL sets.
-                    if (!list.flagman) {
-                        ++pass_.indexedWithoutPalette;
-                        continue;
-                    }
-                    if (listPalette < 0) {
-                        listPalette = static_cast<int32_t>(palettes);
-                        paletteWords_.insert(paletteWords_.end(), list.palette, list.palette + 16);
-                    }
-                    paletteFixups_.push_back(static_cast<uint32_t>(draws_.size() + 4));
-                    average = static_cast<uint32_t>(listPalette);
-                    bits |= kPaletteDrawBit | (gpu->opaque ? kPaletteOpaqueBit : 0u);
-                } else if (list.flagman) {
-                    ++pass_.flagmanOwnColours;
-                }
-                handle = gpu->handle;
-                textured = true;
-            } else if (material.texture >= 0) {
-                const GpuTexture* gpu = texture(scene, material.texture);
-                if (gpu) {
-                    average = gpu->average;
-                    handle = gpu->handle;
-                }
-                textured = material.textured && handle != 0;
+                paletteFixups_.push_back(static_cast<uint32_t>(draws_.size() + 4));
+                words[4] = static_cast<uint32_t>(listPalette);
             }
-            if (!sprite && material.textured && (draw.flags & kCarLeafTextured) && !handle)
-                ++pass_.withoutTexture;
-            uint32_t colour = 0xFFFFFFFFu;
-            if (sprite) colour = (draw.flags & kCarLeafPalette) ? 0xFF808080u : draw.colour;
-            uint32_t rank = std::min(static_cast<uint32_t>(d), kMaxRank);
-
-            auto row = static_cast<uint32_t>(commands_.size());
-            uint32_t words[kDrawWords] = {static_cast<uint32_t>(handle),
-                                          static_cast<uint32_t>(handle >> 32),
-                                          frame,
-                                          colour,
-                                          average,
-                                          static_cast<uint32_t>(material.specularExponent),
-                                          floatBits(material.specular),
-                                          (textured ? 1u : 0u) | bits | (rank << 8)};
-            draws_.insert(draws_.end(), words, words + kDrawWords);
-            Command command;
-            command.count = draw.indexCount;
-            command.instanceCount = 1;
-            command.baseInstance = row;
+            words[2] = frame;
+            command.baseInstance = static_cast<uint32_t>(commands_.size());
             if (dynamic) {
-                command.firstIndex =
-                    static_cast<uint32_t>(indicesUsed_) + dynamicIndexBase[l] + draw.firstIndex;
-                command.baseVertex =
-                    static_cast<int32_t>(verticesUsed_ + dynamicVertexBase[l]);
+                command.firstIndex += static_cast<uint32_t>(indicesUsed_) + dynamicIndexBase[l];
+                command.baseVertex = static_cast<int32_t>(verticesUsed_ + dynamicVertexBase[l]);
                 ++pass_.dynamicDraws;
-            } else {
-                const GpuObject& object = objects_[draw.object];
-                command.firstIndex = object.firstIndex + draw.firstIndex;
-                command.baseVertex = static_cast<int32_t>(object.baseVertex);
             }
+            draws_.insert(draws_.end(), words, words + kDrawWords);
             commands_.push_back(command);
         }
         auto carCount = static_cast<uint32_t>(commands_.size()) - carFirst;
@@ -1046,6 +1363,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             if (carCount) ++pass_.flagmanRuns;
         }
     }
+    // The contract compares the commands with the draws this eye draws.
+    pass_.listDraws -= pass_.conditionedOff;
     // The palette rows follow the draws; each palette draw names its row's first texel.
     auto paletteBase = static_cast<uint32_t>(draws_.size() / 4);
     for (uint32_t word : paletteFixups_) draws_[word] = paletteBase + draws_[word] * kPaletteTexels;
@@ -1058,6 +1377,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                      [](const CarRange& a, const CarRange& b) { return a.slot < b.slot; });
     pass_.walkRuns = static_cast<uint32_t>(walkRuns_.size());
 
+    auto tablesStart = std::chrono::steady_clock::now();
     if (!commands_.empty()) {
         ensureDrawIndices(static_cast<uint32_t>(commands_.size()));
         gl_.bindBuffer(gl::kArrayBuffer, frameBuffer_);
@@ -1071,6 +1391,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                        static_cast<GLsizeiptr>(commands_.size() * sizeof(Command)),
                        commands_.data(), gl::kStreamDraw);
     }
+    pass_.uploadMicroseconds += microsecondsSince(tablesStart);
 
     gl_.pixelStorei(gl::kUnpackSkipPixels, unpack[3]);
     gl_.pixelStorei(gl::kUnpackSkipRows, unpack[2]);

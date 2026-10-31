@@ -499,7 +499,7 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     }
 
     timersOn_ = gl_.genQueries && gl_.deleteQueries && gl_.queryCounter &&
-                gl_.getQueryObjectiv && gl_.getQueryObjectui64v;
+                gl_.getQueryObjectiv && gl_.getQueryObjectui64v && gl_.getInteger64v;
     if (timersOn_) gl_.genQueries(kTimerSets * kMarkCount, &timerQueries_[0][0]);
 
     logf("baked: GL %d.%d on \"%s\" -- %s depth, max texture %d, max anisotropy %.0f, max "
@@ -698,7 +698,7 @@ void Renderer::release(bool contextAlive) {
     timerNext_ = 0;
     timerSet_ = -1;
     timerMarks_ = 0;
-    gpuTimes_ = GpuPassTimes{};
+    for (GpuPassTimes& times : gpuTimes_) times = GpuPassTimes{};
     program_ = 0;
     spriteProgram_ = 0;
     checker_ = 0;
@@ -1783,9 +1783,12 @@ SolidHookContext Renderer::hookContext(const float clipFromView[16], const ViewI
 
 void Renderer::callSolidHook(const float clipFromView[16], const ViewInputs& view,
                              const FrameInputs& frame) {
-    if (!solidHook_) return;
-    solidHook_->drawSolid(hookContext(clipFromView, view, frame));
-    setWrites(true, true);
+    timerMark(kMarkCarsBegin);
+    if (solidHook_) {
+        solidHook_->drawSolid(hookContext(clipFromView, view, frame));
+        setWrites(true, true);
+    }
+    timerMark(kMarkCarsEnd);
 }
 
 uint32_t Renderer::hookRunPosition(uint32_t run) const {
@@ -1803,6 +1806,13 @@ void Renderer::setWrites(bool colour, bool solid) {
 
 bool Renderer::ensureTarget(int width, int height) {
     if (framebuffer_ && width == targetWidth_ && height == targetHeight_) return true;
+    // Every pass draws, copies and samples its target from (0, 0) in extents of its own rect, so a
+    // larger target holds it in its lower left corner.
+    if (keepLargerTarget_ && framebuffer_) {
+        if (width <= targetWidth_ && height <= targetHeight_) return true;
+        width = std::max(width, targetWidth_);
+        height = std::max(height, targetHeight_);
+    }
     destroyTarget();
 
     GLint previousRenderbuffer = 0;
@@ -1918,15 +1928,18 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.getIntegerv(gl::kViewport, viewport);
     GLboolean scissor = gl_.isEnabled(gl::kScissorTest);
     if (!ensureTarget(rect[2], rect[3])) return false;
+    passWidth_ = rect[2];
+    passHeight_ = rect[3];
 
     timerSet_ = -1;
     timerMarks_ = 0;
     if (timersOn_) {
         harvestTimers();
         if (timerPending_[timerNext_]) {
-            ++gpuTimes_.untimed;
+            ++gpuTimes_[passClass_].untimed;
         } else {
             timerSet_ = timerNext_;
+            timerClass_[timerSet_] = passClass_;
             timerNext_ = (timerNext_ + 1) % kTimerSets;
         }
     }
@@ -1948,6 +1961,7 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.drawBuffers(1, &colourOnly);
     gl_.blitFramebuffer(rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3], 0, 0, rect[2],
                         rect[3], gl::kColorBufferBit, gl::kNearest);
+    timerMark(kMarkCopiedIn);
 
     gl_.bindFramebuffer(gl::kReadFramebuffer, framebuffer_);
     gl_.viewport(0, 0, rect[2], rect[3]);
@@ -1976,18 +1990,22 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.clearDepth(depthClear);
     gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
     gl_.depthMask(depthMask);
+    timerMark(kMarkCleared);
 
     auto drawStart = std::chrono::steady_clock::now();
     draw(scene, view, frame, stats);
     auto drawTime = std::chrono::steady_clock::now() - drawStart;
     // A pass that drew nothing, or skipped the walk-order phase, still closes every span.
-    for (int mark = kMarkSolid; mark <= kMarkOrdered; ++mark)
+    for (int mark = kMarkCarsBegin; mark <= kMarkOrdered; ++mark)
         if (!(timerMarks_ & (1u << mark))) timerMark(static_cast<TimerMark>(mark));
 
     gl_.bindFramebuffer(gl::kDrawFramebuffer, static_cast<GLuint>(previousDraw));
     gl_.blitFramebuffer(0, 0, rect[2], rect[3], rect[0], rect[1], rect[0] + rect[2],
                         rect[1] + rect[3], gl::kColorBufferBit, gl::kNearest);
     timerMark(kMarkEnd);
+    // The pass's commands go to the GPU now: the driver otherwise held the cars' draws and the
+    // GPU idled until a later flush (report 105 section 4.25.1).
+    if (gl_.flush) gl_.flush();
     if (timerSet_ >= 0) timerPending_[timerSet_] = true;
     timerSet_ = -1;
 
@@ -2008,6 +2026,14 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
 void Renderer::timerMark(TimerMark mark) {
     if (timerSet_ < 0) return;
     gl_.queryCounter(timerQueries_[timerSet_][mark], gl::kTimestamp);
+    auto now = std::chrono::steady_clock::now();
+    if (mark == kMarkStart) {
+        gl_.getInteger64v(gl::kTimestamp, &timerGlAtStart_);
+        timerCpuAtStart_ = now;
+    }
+    timerIssued_[timerSet_][mark] =
+        timerGlAtStart_ +
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - timerCpuAtStart_).count();
     timerMarks_ |= static_cast<uint8_t>(1u << mark);
 }
 
@@ -2025,18 +2051,35 @@ void Renderer::harvestTimers() {
         for (int mark = 0; mark < kMarkCount; ++mark)
             gl_.getQueryObjectui64v(timerQueries_[set][mark], gl::kQueryResult, &at[mark]);
         timerPending_[set] = false;
-        ++gpuTimes_.passes;
-        gpuTimes_.solidMs += static_cast<double>(at[kMarkSolid] - at[kMarkStart]) * 1e-6;
-        gpuTimes_.orderedMs += static_cast<double>(at[kMarkOrdered] - at[kMarkSolid]) * 1e-6;
-        gpuTimes_.copyOutMs += static_cast<double>(at[kMarkEnd] - at[kMarkOrdered]) * 1e-6;
+        GpuPassTimes& times = gpuTimes_[timerClass_[set]];
+        ++times.passes;
+        times.solidMs += static_cast<double>(at[kMarkSolid] - at[kMarkStart]) * 1e-6;
+        times.orderedMs += static_cast<double>(at[kMarkOrdered] - at[kMarkSolid]) * 1e-6;
+        times.copyOutMs += static_cast<double>(at[kMarkEnd] - at[kMarkOrdered]) * 1e-6;
+
+        const int64_t* issued = timerIssued_[set];
+        for (int span = 0; span < GpuPassTimes::kSpanCount; ++span) {
+            auto gpu = static_cast<int64_t>(at[span + 1] - at[span]);
+            if (gpu < 0) gpu = 0;
+            // The GPU can have waited inside the span only until the CPU issued its last command.
+            int64_t waited = issued[span + 1] - static_cast<int64_t>(at[span]);
+            waited = std::min(std::max<int64_t>(waited, 0), gpu);
+            times.spanMs[span] += static_cast<double>(gpu) * 1e-6;
+            times.busyMs[span] += static_cast<double>(gpu - waited) * 1e-6;
+        }
+        times.issueMs += static_cast<double>(issued[kMarkEnd] - issued[kMarkStart]) * 1e-6;
+        times.lagMs += static_cast<double>(std::max<int64_t>(
+                           static_cast<int64_t>(at[kMarkStart]) - issued[kMarkStart], 0)) *
+                       1e-6;
+        if (static_cast<int64_t>(at[kMarkStart]) >= issued[kMarkEnd]) ++times.queued;
     }
 }
 
 bool Renderer::readProbe(std::vector<uint32_t>& solid, std::vector<uint32_t>& walk, int& width,
                          int& height) {
-    if (!framebuffer_ || !orderFramebuffer_ || !gl_.readPixels) return false;
-    width = targetWidth_;
-    height = targetHeight_;
+    if (!framebuffer_ || !orderFramebuffer_ || !gl_.readPixels || passWidth_ <= 0) return false;
+    width = passWidth_;
+    height = passHeight_;
     size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
     solid.assign(pixels, 0);
     walk.assign(pixels, 0);
@@ -2076,10 +2119,10 @@ bool Renderer::readProbe(std::vector<uint32_t>& solid, std::vector<uint32_t>& wa
     return true;
 }
 
-bool Renderer::takeGpuTimes(GpuPassTimes& out) {
-    if (!timersOn_) return false;
-    out = gpuTimes_;
-    gpuTimes_ = GpuPassTimes{};
+bool Renderer::takeGpuTimes(GpuPassTimes& out, int passClass) {
+    if (!timersOn_ || passClass < 0 || passClass >= kPassClassCount) return false;
+    out = gpuTimes_[passClass];
+    gpuTimes_[passClass] = GpuPassTimes{};
     return true;
 }
 

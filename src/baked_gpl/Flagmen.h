@@ -35,10 +35,10 @@ void flagmenInstall();
 void flagmenPassBegin();
 const baked::CarDrawList* flagmenPassLists(uint32_t& count);
 
-// From the node filter while a baked main pass is collected, for an XFORM inside the track's PRIM
-// that is no baked item. True when the dispatch was taken (gplvr draws the flagman, or it draws
-// nothing, or debug view 12 had GPL draw it already): the filter then skips GPL's handler. False
-// for any other XFORM, and for a flagman left to GPL.
+// From the node filter while a baked pass (main or mirror) is collected, for an XFORM inside the
+// track's PRIM that is no baked item. True when the dispatch was taken (gplvr draws the flagman,
+// or it draws nothing, or debug view 12 had GPL draw it already): the filter then skips GPL's
+// handler. False for any other XFORM, and for a flagman left to GPL.
 bool flagmanDispatch(const unsigned char* node, void* stock);
 
 // Debug view 12: GPL draws every flagman, and each draw is compared with what gplvr would have

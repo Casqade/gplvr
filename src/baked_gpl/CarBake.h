@@ -30,16 +30,38 @@ int32_t carBakeObjectOf(uintptr_t node, uintptr_t& primAddress, uint32_t& primSi
 // it cannot be.
 int32_t carBakeTexture(uint32_t handle);
 
+// At the begin of every baked pass, main or mirror, before any walk: checks the resource cache
+// entries the bake was made from -- each object it baked, each mip and sprite handle it resolved;
+// all of them when the cache's head moved since the last check, else a slice in turn -- and drops
+// the whole bake, with one log line naming why, when one was released or reused, or when GPL
+// loaded the track again and no entry showed it (report 105 section 4.20). GPL frees and reloads the cars, their
+// textures and their sprites when it leaves and enters a session, as it did after a change of
+// detail bias; handles and addresses come back holding other things.
+void carBakePassBegin();
+
 const baked::CarScene& carBakeScene();
 
-// Advances whenever carBakeScene() is dropped and started again (a change of car set), so a GPU
-// copy of it knows to start again too. CarScene::objects and textures only grow in between.
+// Advances whenever carBakeScene() is dropped and started again (a change of car set, or
+// carBakePassBegin following a reload), so a GPU copy of it, the walk's texture cache and its
+// vertex memo know to start again too. CarScene::objects and textures only grow in between.
 uint32_t carBakeGeneration();
 
 struct CarBakeTotals {
     uint32_t objects = 0;
     uint32_t objectsFailed = 0;
     uint32_t objectsRebaked = 0;  // an address that came back holding a different object
+    // carBakePassBegin: drops of the whole bake, for an entry released or reused and for a track
+    // reload no entry showed; track reloads seen; lookups that found a released entry in the last
+    // scan; checks made, the entries they read and their time.
+    uint32_t drops = 0;
+    uint32_t dropsReleased = 0;
+    uint32_t dropsTrack = 0;
+    uint32_t trackReloads = 0;
+    uint32_t staleLookups = 0;
+    uint32_t checks = 0;
+    uint32_t checksFull = 0;  // of them, every entry: the cache's head had moved
+    uint64_t checkedEntries = 0;
+    double   checkMicroseconds = 0.0;
     uint32_t textures = 0;
     uint32_t texturesMissing = 0;
     uint32_t sprites = 0;

@@ -11,13 +11,58 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace gplvr {
 namespace {
 
 unsigned g_captureNumber = 0;
 
+// A 32-bit TGA, bottom row first, alpha kept: GPL's copy-out takes the alpha into mirror.mip too.
+bool dumpRectRgba(const GlFunctions& gl, const int rect[4], const char* path) {
+    if (!gl.readPixels || rect[2] <= 0 || rect[3] <= 0) return false;
+    size_t bytes = static_cast<size_t>(rect[2]) * static_cast<size_t>(rect[3]) * 4;
+    auto*  pixels = static_cast<unsigned char*>(std::malloc(bytes));
+    if (!pixels) return false;
+    // 0x80E1 is GL_BGRA, TGA's byte order.
+    if (!glReadRectPacked(gl, rect[0], rect[1], rect[2], rect[3], 0x80E1, pixels)) {
+        std::free(pixels);
+        return false;
+    }
+    unsigned char header[18] = {};
+    header[2] = 2;
+    header[12] = static_cast<unsigned char>(rect[2] & 0xFF);
+    header[13] = static_cast<unsigned char>((rect[2] >> 8) & 0xFF);
+    header[14] = static_cast<unsigned char>(rect[3] & 0xFF);
+    header[15] = static_cast<unsigned char>((rect[3] >> 8) & 0xFF);
+    header[16] = 32;
+    header[17] = 8;  // eight alpha bits, origin bottom left
+    bool  ok = false;
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "wb") == 0 && file) {
+        ok = std::fwrite(header, 1, sizeof(header), file) == sizeof(header) &&
+             std::fwrite(pixels, 1, bytes, file) == bytes;
+        std::fclose(file);
+    }
+    std::free(pixels);
+    return ok;
+}
+
 }  // namespace
+
+void bakedCaptureMirrorRect(const int rect[4], const char* half, unsigned pass,
+                            const char* stage) {
+    // The vanilla half's mirror passes run before its frame end numbers the capture.
+    unsigned number = half[0] == 'v' ? g_captureNumber + 1 : g_captureNumber;
+    GlFunctions gl;
+    char        path[MAX_PATH];
+    sprintf_s(path, "%sgplvr-capture%u-%s-mirror%u-%s.tga", pathsOwnDirectory(), number, half,
+              pass, stage);
+    bool ok = glResolve(gl) && dumpRectRgba(gl, rect, path);
+    logf("baked mirrors: capture %u %s mirror pass %u %s -- %s %s, rect %d,%d %dx%d", number,
+         half, pass, stage, ok ? "written to" : "FAILED to write", path, rect[0], rect[1],
+         rect[2], rect[3]);
+}
 
 void bakedCaptureFrameEnd() {
     BakedCaptureView views[2];

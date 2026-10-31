@@ -298,7 +298,8 @@ std::vector<uintptr_t> g_pendingBindCallSites;
 
 // gpl_sceneRender's MAIN world walk: `call gpl_worldRenderSegmentRange` at 0x487FAA, eight
 // __cdecl arguments cleaned by the caller (`add esp, 20h`). The mirror walk at 0x487A4C calls
-// the same function and is not touched. Its result is never read.
+// the same function; it is redirected only with bakedMirrors = 1, by baked_gpl/BakedMirror.cpp.
+// Its result is never read.
 typedef void(__cdecl* WorldWalkFn)(int, int, int, int, int, int, int, int);
 constexpr uintptr_t     kMainWalkSite = 0x00487FAA;
 constexpr unsigned char kMainWalkStock[5] = {0xE8, 0xB1, 0xD9, 0xFF, 0xFF};
@@ -394,14 +395,20 @@ void reportOncePerSecond() {
     // rendering it. It is the pair of counters that says whether mirrorUpdateRate is doing
     // anything: a restore count of zero with the option above 1 means the copies never built,
     // and the `mirror:` line above will say why.
-    char     mirror[72] = {};
+    // `copy-outs C rebound R`: mirrorCopyRebind's copies, and those that left mirror.mip bound
+    // where roglv2's cache did not know it.
+    char     mirror[128] = {};
     unsigned restored = mirrorCacheTakeRestores();
+    unsigned copies = 0;
+    unsigned rebound = 0;
+    mirrorCacheTakeCopies(copies, rebound);
     if (g_mirrorRefreshes && restored)
-        _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s +%.1f restored | ",
-                    g_mirrorRefreshes / seconds, restored / seconds);
+        _snprintf_s(mirror, sizeof(mirror), _TRUNCATE,
+                    "mirror %.1f/s +%.1f restored, copy-outs %u rebound %u | ",
+                    g_mirrorRefreshes / seconds, restored / seconds, copies, rebound);
     else if (g_mirrorRefreshes)
-        _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s | ",
-                    g_mirrorRefreshes / seconds);
+        _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s, copy-outs %u rebound %u | ",
+                    g_mirrorRefreshes / seconds, copies, rebound);
 
     // Mirror-only renders are not counted as renders, but their time is in the scene total
     // and so in "ms each": per eye render including the pane renders before it.
@@ -2572,6 +2579,8 @@ void loadOptions(const char* fileName) {
     char text[64] = {};
 
     g_options.perEyeMirror = GetPrivateProfileIntA("gplvr", "perEyeMirror", 1, path) != 0;
+    g_options.mirrorCopyRebind =
+        GetPrivateProfileIntA("gplvr", "mirrorCopyRebind", 1, path) != 0;
     g_options.mirrorUpdateRate = GetPrivateProfileIntA("gplvr", "mirrorUpdateRate", 1, path);
     if (g_options.mirrorUpdateRate < 0) g_options.mirrorUpdateRate = 0;
     if (g_options.mirrorUpdateRate > 16) g_options.mirrorUpdateRate = 16;
@@ -2790,6 +2799,17 @@ void loadOptions(const char* fileName) {
     g_options.bakedCars = GetPrivateProfileIntA("gplvr", "bakedCars", 0, path);
     if (g_options.bakedCars < 0 || g_options.bakedCars > 3) g_options.bakedCars = 0;
     g_options.bakedFlagmen = GetPrivateProfileIntA("gplvr", "bakedFlagmen", 1, path) != 0 ? 1 : 0;
+    g_options.bakedMirrors = GetPrivateProfileIntA("gplvr", "bakedMirrors", 0, path) != 0 ? 1 : 0;
+    g_options.bakedCarShare =
+        GetPrivateProfileIntA("gplvr", "bakedCarShare", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCarUnion =
+        GetPrivateProfileIntA("gplvr", "bakedCarUnion", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCarProgram =
+        GetPrivateProfileIntA("gplvr", "bakedCarProgram", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCarProgramMirrors =
+        GetPrivateProfileIntA("gplvr", "bakedCarProgramMirrors", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCarConfigs =
+        GetPrivateProfileIntA("gplvr", "bakedCarConfigs", 1, path) != 0 ? 1 : 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2813,9 +2833,10 @@ void loadOptions(const char* fileName) {
         // what used to make it read as a VR feature.
     }
 
-    logf("options: perEyeMirror=%d mirrorUpdateRate=%d (%s) -- the aim of the glasses is per "
-         "car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
-         g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
+    logf("options: perEyeMirror=%d mirrorCopyRebind=%d mirrorUpdateRate=%d (%s) -- the aim of the "
+         "glasses is per car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
+         g_options.perEyeMirror ? 1 : 0, g_options.mirrorCopyRebind ? 1 : 0,
+         g_options.mirrorUpdateRate,
          g_options.mirrorUpdateRate <= 0
              ? "the mirror is OFF and its texture is filled with black"
          : g_options.mirrorUpdateRate > 1
@@ -2933,6 +2954,56 @@ void loadOptions(const char* fileName) {
              ? "gplvr draws the flagmen in the baked main passes, in GPL's colours and walk order"
              : "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3; GPL draws the "
                "flagmen");
+    logf("options: bakedMirrors=%d (%s)", g_options.bakedMirrors,
+         !g_options.bakedMirrors ? "off: GPL draws the mirrors"
+         : !g_options.bakedRenderer
+             ? "on, but inert: it needs bakedRenderer = 1; GPL draws the mirrors"
+         : g_options.bakedCars == 3
+             ? "gplvr draws the track, its objects, the cars and the flagmen in every mirror pass "
+               "GPL walks, from the mirror camera with GPL's mirror registers, masks and LOD"
+             : "gplvr draws the track and its objects in every mirror pass GPL walks; the cars "
+               "stay GPL's (they need bakedCars = 3)");
+    logf("options: bakedCarShare=%d (%s)", g_options.bakedCarShare,
+         !g_options.bakedCarShare ? "off: each eye walks every car it draws"
+         : !g_options.bakedRenderer || g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
+             : "in VR the second eye takes a car's draw list from the first eye's pass when the "
+               "walk's eye-dependent decisions agree, and walks it again when one differs; debug "
+               "view 16 turns it off; watch `baked cars: shared between eyes`");
+    logf("options: bakedCarUnion=%d (%s)", g_options.bakedCarUnion,
+         !g_options.bakedCarUnion ? "off: the first eye decides every gate of a car's walk"
+         : !g_options.bakedCarShare || !g_options.bakedRenderer || g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedCarShare = 1, bakedRenderer = 1 and bakedCars = 3"
+             : "in VR the first eye's car walks take every gate whose plane passes within the "
+               "eye separation both ways under a condition each eye evaluates, so the second eye "
+               "reuses the list where a gate differs; debug view 17 turns it off; watch `baked "
+               "cars: eye-independent lists`");
+    logf("options: bakedCarProgram=%d (%s)", g_options.bakedCarProgram,
+         !g_options.bakedCarProgram ? "off: the first eye walks every car every frame"
+         : !g_options.bakedRenderer || g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
+             : "in every baked main pass a car's list is walked once with every gate both ways "
+               "and then re-posed and assembled for each eye and frame until its LOD, a register, "
+               "a child pointer, the helmet colour or a decided gate changes; debug view 18 turns "
+               "it off; watch `baked cars: lists kept across frames`");
+    logf("options: bakedCarProgramMirrors=%d (%s)", g_options.bakedCarProgramMirrors,
+         !g_options.bakedCarProgramMirrors
+             ? "off: the first eye's mirror passes walk every car"
+         : !g_options.bakedCarProgram || !g_options.bakedRenderer || g_options.bakedCars != 3 ||
+                 !g_options.bakedMirrors
+             ? "on, but inert: it needs bakedCarProgram = 1, bakedRenderer = 1, bakedCars = 3 and "
+               "bakedMirrors = 1"
+             : "the mirror passes keep car lists of their own across frames as the main passes "
+               "do (report 105 section 4.42); watch the mirror clause of `baked cars: lists kept "
+               "across frames` and the walks on `baked cars: mirror passes`");
+    logf("options: bakedCarConfigs=%d (%s)", g_options.bakedCarConfigs,
+         !g_options.bakedCarConfigs
+             ? "off: one kept list a car, every gate both ways, as in report 105 section 4.23"
+         : !g_options.bakedCarProgram || !g_options.bakedRenderer || g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedCarProgram = 1, bakedRenderer = 1 and bakedCars = 3"
+             : "a kept list's walk decides the gates with a register write below them and those "
+               "a build's hazard named, and a car keeps one list per configuration of them and "
+               "LOD; watch `baked cars: configurations`");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");

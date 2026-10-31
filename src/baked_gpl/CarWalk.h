@@ -23,7 +23,9 @@
 // the car still runs on every call, but its body dispatch (the call at 0x48703F) is skipped, so
 // only the pose, the helmet tint and the blob shadow remain GPL's. Mirror passes, the cockpit and
 // any car call outside a baked main pass go to GPL whole, counted but not walked: levels 1 and 2
-// are the ones that verify every draw against GPL's counter.
+// are the ones that verify every draw against GPL's counter. With bakedMirrors = 1 a baked mirror
+// pass takes its cars the same way (report 105 section 4.18), counted apart, and debug view 15
+// walks GPL's mirror cars beside its draw and checks them as level 1 does.
 
 #include <cstdint>
 
@@ -37,9 +39,11 @@ namespace gplvr {
 // bakedCars are on; logs what it installed or why not.
 void carWalkInstall();
 
-// Stage 2b: bakedPassBegin opens a new pass's arena; bakedPassEnd reads its lists, one per car
-// drawn by gplvr, in the order GPL first called each car.
-void carWalkPassBegin();
+// Stage 2b: bakedPassBegin opens a new pass's arena (`mirror`: a mirror pass); bakedPassEnd reads
+// its lists, one per car drawn by gplvr, in the order GPL first called each car. In VR the
+// first eye's lists are kept for the second eye's pass of the same kind (CarShare.h), and in
+// every main pass a car's kept list (CarProgram.h) stands in for its walk where it holds.
+void carWalkPassBegin(bool mirror);
 const baked::CarDrawList* carWalkPassLists(uint32_t& count);
 
 }  // namespace gplvr

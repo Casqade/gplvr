@@ -261,6 +261,13 @@ void glInteropUnregister(const GlFunctions& gl, HANDLE interopDevice,
 bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
                      const char* path);
 
+// glReadPixels into a tightly packed buffer of width * bytesPerPixel per row, whatever pack
+// state the game left: alignment 1, no row length or skips, restored afterwards. GL pads each
+// row to GL_PACK_ALIGNMENT, so a width whose row is not a multiple of it writes past a tight
+// buffer (a 267-wide 24-bit capture in GPL's replay dialog corrupted the heap).
+bool glReadRectPacked(const GlFunctions& gl, int x, int y, int width, int height, GLenum format,
+                      void* pixels);
+
 // The HUD panel's image, copied into its shared texture inside the frame transfer: both
 // textures are locked in one wglDXLockObjectsNV and unlocked in one wglDXUnlockObjectsNV, so
 // the frame costs one interop synchronisation rather than two. `sourceFramebuffer` is a

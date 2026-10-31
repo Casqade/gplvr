@@ -8,6 +8,11 @@
 #include "baked/CarScene.h"
 #include "baked_gpl/BakedPass.h"
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarConfig.h"
+#include "baked_gpl/CarMemo.h"
+#include "baked_gpl/CarProgram.h"
+#include "baked_gpl/CarShare.h"
+#include "baked_gpl/CarWalkStats.h"
 #include "baked_gpl/ResidualDepth.h"
 
 #include <windows.h>
@@ -23,6 +28,8 @@
 namespace gplvr {
 namespace {
 
+using namespace carwalk;
+
 // -- game addresses (gplc67.exe; reports 103 and 105, IDA 2026-10-24) ------------------------------
 
 // gpl_carRenderRecordVtbl[0], the only entry into a car's draw (report 103 section 11): reached
@@ -35,6 +42,24 @@ constexpr uintptr_t kCarRecordDraw = 0x00486E50;  // gpl_carRecordDraw, thiscall
 constexpr uintptr_t kTeamInstanceCall = 0x00486E5D;
 constexpr uintptr_t kPoseCall = 0x00486E69;
 constexpr uintptr_t kPoseFunction = 0x0046D490;
+// gpl2020demo.exe's mod layer points the pose call at a wrapper in its own code section (0x989140
+// there, report 105 section 4.19): it stores one float of the mod's data into R+248, the last
+// dial gpl_carModelPoseDials turns, then calls gpl_carModelPoseFromRecord(I, R) with its own two
+// arguments, cdecl. Called in place of the stock function it poses a car as GPL's draw does.
+// Matched byte for byte but for the data address, which must be a writable global of the image,
+// and the inner call, which must reach kPoseFunction.
+constexpr unsigned char kPoseWrapperHead[] = {0x55, 0x8B, 0xEC,        // push ebp; mov ebp, esp
+                                              0x56, 0x8B, 0x75, 0x0C,  // push esi; mov esi, [ebp+12]
+                                              0xD9, 0x05};             // fld dword [data]
+constexpr unsigned char kPoseWrapperBody[] = {0xD9, 0x9E, 0xF8, 0x00, 0x00, 0x00,  // fstp [esi+248]
+                                              0x56, 0xFF, 0x75, 0x08};  // push esi; push [ebp+8]
+// After the inner call: pop ecx; pop ecx; pop esi; pop ebp; ret.
+constexpr unsigned char kPoseWrapperTail[] = {0x59, 0x59, 0x5E, 0x5D, 0xC3};
+constexpr unsigned kPoseWrapperData = sizeof(kPoseWrapperHead);
+constexpr unsigned kPoseWrapperBodyAt = kPoseWrapperData + 4;
+constexpr unsigned kPoseWrapperCall = kPoseWrapperBodyAt + sizeof(kPoseWrapperBody);
+constexpr unsigned kPoseWrapperTailAt = kPoseWrapperCall + 5;
+constexpr unsigned kPoseWrapperSize = kPoseWrapperTailAt + sizeof(kPoseWrapperTail);
 // Its two calls of gpl_carDrawTrackProjected 0x487060 (R, node), cdecl: the projected car shadow
 // (shadow mode 2, never under roglv2) and the blob shadow. Wrapped to count their polygons apart.
 constexpr uintptr_t kShadowCalls[] = {0x00486F52, 0x0048702A};
@@ -70,7 +95,7 @@ constexpr uintptr_t kRegistersMirror = 0x007702D8;  // gpl_renderRegistersMirror
 // handlers do (0x4CD300 and siblings, report 105 section 4.2).
 constexpr uintptr_t kTexturedMask = 0x0056FE20;     // gpl_surfaceClassTexturedMaskLive
 constexpr uintptr_t kClassTextured = 0x00872154;    // gpl_materialClassTextured, a byte
-constexpr uintptr_t kSurfaceClass = 0x00570218;     // the current surface class
+constexpr uintptr_t kSurfaceClass = 0x00570218;     // gpl_materialSurfaceClass
 constexpr uintptr_t kTextureList = 0x00872158;      // gpl_materialTextureList -> {count, handles[]}
 constexpr uintptr_t kSpecularExponent = 0x00580810;  // gpl_lightSpecularExponent, an int
 constexpr uintptr_t kSpecular = 0x00580814;          // gpl_lightSpecular, a float
@@ -90,7 +115,7 @@ constexpr uintptr_t kVertexSources = 0x00570730;    // gpl_transformedVertexSour
 constexpr uint32_t  kVertexSourceCount = 8192;
 
 // The MATERIAL handler table funcs_4CE747 (0x570220) by flags & 0x3F: a set bit has a handler of
-// its own; every other index is 0x4CD170, which only dispatches the child -- no texture, no class
+// its own; every other index is gpl_materialRender_passThrough 0x4CD170, which only dispatches the child -- no texture, no class
 // gate. Indices 1 2 4 5 8 9 C D, 10 11 14 15 18 19 1C 1D, 20 21 24 25 28 29 2C 2D.
 constexpr uint64_t kMaterialHandlers = 0x0000333333333336ull;
 
@@ -101,12 +126,18 @@ constexpr unsigned kRecordDriverObject = 52;  // R+0x34, the per-driver object, 
 constexpr unsigned kObjectRoot = 56;         // Obj3d+0x38, the root node gpl_objDrawRootNode dispatches
 constexpr unsigned kInstanceCar = 148;       // I+148, the `car` handle's XFORM
 constexpr unsigned kInstanceCockpit = 152;   // I+152, the `cockpit` handle's XFORM
+// The four wheel XFORMs I+116, 124, 132, 140, and their models: gpl_carModelSetWheelSpinLod
+// 0x46D850 points wheel w's child (w8) at I[13 + 3w + gpl_wheelRateLodLevel(rate)], the rate's
+// level 0, 1, 2 at |rate| < 20, < 60, else (0x46D290); gpl_carModelApplyWheelLoss 0x406F60 then
+// points a lost rear wheel's at gpl_nullNode.
+constexpr unsigned kInstanceWheels = 116;
+constexpr unsigned kInstanceWheelModels = 52;
+constexpr unsigned kWheelModels = 3;
 
 constexpr int kRegisterCount = 1024;  // selectors and SETREG index registers & 0x3FF
 constexpr int kMaxDepth = 512;
 constexpr int kMaxSelectorCases = 4096;
 constexpr int kMaxInstancesLogged = 32;
-constexpr uint32_t kMaxListsPerPass = 64;  // one per car; GPL has at most 20 cars
 
 using TeamInstanceFn = void*(__cdecl*)(int driver);
 using PoseFn = void(__cdecl*)(void* instance, void* record);
@@ -130,87 +161,38 @@ uint32_t floatBits(float value) {
 }
 
 // -- the walk ------------------------------------------------------------------------------------
-
-// What one walk met, by kind. `polygons` is what GPL's counter moves by for the same draw: one per
-// polygon node and one per sprite, whose quad goes through the same emitter (gpl_spriteDraw ->
-// gpl_polyKernelTexturedShaded / gpl_polyEmitTexturedUV).
-struct WalkCounts {
-    uint32_t polygons = 0;
-    uint32_t sprites = 0;
-    uint32_t lines = 0;  // gpl_lineDraw3d, not counted by GPL's polygon counter
-    uint32_t controls = 0;
-    uint32_t gates = 0;
-    uint32_t selectors = 0;
-    uint32_t setRegisters = 0;
-    uint32_t transforms = 0;
-    uint32_t boxCulled = 0;
-    uint32_t sphereCulled = 0;
-    uint32_t classHidden = 0;
-    uint32_t indexOutOfRange = 0;  // op-5 selector reads past its cases: GPL reads garbage there
-    uint32_t clockSelectors = 0;   // kind 3, taken as case value 0
-    uint32_t unknownTypes = 0;
-    uint32_t depthLimit = 0;
-    uint32_t byType[0x24] = {};
-};
-
-// Stage 2: what became of each leaf the walk reached.
-struct EmitCounts {
-    uint32_t leaves = 0;         // appended to the draw list
-    uint32_t noObject = 0;       // no loaded object holds the node, or its bake failed
-    uint32_t notLeaf = 0;        // the object's bake has no leaf at that offset
-    uint32_t typeDiffers = 0;    // the leaf there was baked from another node type
-    uint32_t overflow = 0;       // a frame or material past 65535, drawn under its parent's
-    uint32_t slotNoList = 0;     // a slot MATERIAL with no texture list published above it
-    uint32_t unresolved = 0;     // a MATERIAL bound a texture whose file was not found
-};
+//
+// Its counters are in CarWalkStats.h.
 
 // The frame of one node: clip from local (P x MV x every pose above), the eye and the cell's
 // clip planes in local space, as gpl_matrixTranslate and the rotations keep them, and the poses
 // alone (root from local). `id` is its place in the walk's own frames (Walk::frames), which GPL's
 // vertex memo is emulated against; with a draw list, `index` is its place in the list.
+// `key` names the chain of XFORM nodes from the root, the same in every walk of the car; a union
+// walk also gives each frame `canon`, the id of the first frame of this walk entered from the
+// same XFORM under the same canonical parent, whose matrices are therefore the same.
 struct Frame {
-    float    clip[16];
-    float    eye[3];
-    float    planes[6][4];
-    float    root[12];
-    uint16_t index;
-    uint16_t halfFrom;
-    uint16_t id;
-};
-
-// Skinning (report 105 section 4.4), per walk: what GPL's vertex and normal memos changed.
-struct SkinCounts {
-    uint32_t leaves = 0;           // polygons drawn from corners memoised in another frame
-    uint32_t byType[0x24] = {};
-    uint32_t corners = 0;          // corners memoised in another frame of this walk
-    uint32_t liveCorners = 0;      // corners GPL had memoised before this walk (dispatch frame)
-    uint32_t normals = 0;          // normals lit in another frame
-    uint32_t liveNormals = 0;      // normals GPL had lit before this walk (taken as this frame's)
-    uint32_t dynamicVertices = 0;
-    uint32_t vertexOverflow = 0;   // the memo table was full: transformed in place, unmemoised
-    uint32_t normalOverflow = 0;
-    uint32_t frameOverflow = 0;    // past kMaxWalkFrames: the frame's vertices are not memoised
-    uint32_t staleWords = 0;       // a record's memo word that is not a live slot of GPL's pool
-    uint32_t tooManyCorners = 0;   // a polygon over kMaxSkinCorners: not checked
-    uint32_t noBakedCorners = 0;   // a skinned polygon whose baked corners were not found
-};
-
-// A sampled walk's parts, in TSC ticks: corners and control-node vertices through the memo,
-// leaf emission (of it, building skinned leaves and finding the leaf's object), and the whole.
-struct WalkTicks {
-    uint64_t memo = 0;
-    uint64_t emit = 0;
-    uint64_t skinned = 0;
-    uint64_t object = 0;
-    uint64_t total = 0;
+    float     clip[16];
+    float     eye[3];
+    float     planes[6][4];
+    float     root[12];
+    uintptr_t node;
+    uint32_t  key;
+    uint16_t  index;
+    uint16_t  halfFrom;
+    uint16_t  id;
+    uint16_t  canon;
+    uint16_t  parentCanon;
 };
 
 constexpr int      kMaxKnownObjects = 16;
-constexpr uint32_t kProfileEvery = 16;  // one walk in this many is timed by parts
-constexpr uint16_t kMaxWalkFrames = 256;
 constexpr uint16_t kNoFrameId = 0xFFFF;
-constexpr uint32_t kMaxSkinCorners = 256;
 constexpr int      kMaxSkinnedObjects = 16;
+// A kept list's walk (report 105 section 4.23): the halves of its order nodes, and the leaves it
+// may hold before it gives up (cars18 needs at most ~6,200 at 3 m).
+constexpr uint16_t kMaxRegions = 8192;
+constexpr uint16_t kNoOrder = 0xFFFF;
+constexpr uint32_t kMaxProgramLeaves = 12288;
 
 struct Walk {
     uint32_t planeMask = 0;
@@ -258,166 +240,70 @@ struct Walk {
     uintptr_t  prim = 0;
     uint32_t   primSize = 0;
     int32_t    object = -1;
+
+    // The first eye's walk of a car in VR: its eye-dependent decisions, for the second eye
+    // (CarShare.h). Null otherwise.
+    ShareTape* tape = nullptr;
+
+    // The union (report 105 section 4.22): with a tape, a gate whose plane passes within
+    // `unionMargin` of this eye is taken both ways, each side under a condition of the tape, and
+    // `condition` is the one the current subtree is met under; 0 decides every gate. What a
+    // condition would make depend on the eye beyond what the list can say is counted in
+    // `unionHazards` by UnionRedone, and the car is walked again deciding every gate.
+    float    unionMargin = 0.0f;
+    uint16_t condition = 0;
+    uint32_t unionHazards[kUnionRedoneCount] = {};
+    uint32_t blendedLeaves = 0;  // leaves the renderer may blend, appended by a union walk
+    // Per register, in a union walk: whether every eye that reaches this point of the walk holds
+    // the value in `registers`, and else the condition of the last write, which is the value's
+    // for the eyes that condition holds for.
+    uint8_t  registerUniform[kRegisterCount];
+    uint16_t registerCondition[kRegisterCount];
+    // A verify walk of a union list: the first eye's order nodes, whose child order it keeps.
+    const std::vector<ShareOrder>* orders = nullptr;
+
+    // A kept list's walk (report 105 section 4.23, CarProgram.h): a union walk whose list serves
+    // later frames and both eyes. Every gate within `unionMargin` -- every gate with `everyGate`,
+    // and every gate inside a wheel XFORM (`wheels`), whose frame turns between frames -- is taken
+    // both ways; a BOXCULL's subtree is walked under a box condition; a BSP4 or BSP3_ASYM taken
+    // both ways seals its two halves (CarDrawList::sealed), so each pass can order them by its own
+    // side, and each half is a region: a memo entry or a register written in one half and read in
+    // the other, or after the node, depends on that order (kUnionOrder). The first hazard ends the
+    // walk (`abort`).
+    bool      program = false;
+    bool      everyGate = false;
+    bool      abort = false;
+    uintptr_t wheels[4] = {};
+    // Per wheel XFORM, the three models gpl_carModelSetWheelSpinLod 0x46D850 points its child at
+    // by spin rate (report 105 section 4.30).
+    uintptr_t wheelModels[4][kWheelModels] = {};
+    int       wheelDepth = 0;
+    uint16_t  region = 0;
+    uint16_t  regionCount = 1;
+    uint16_t  regionParent[kMaxRegions];
+    uint16_t  regionOrder[kMaxRegions];  // the tape.orders index the region is a half of
+    uint16_t  regionDepth[kMaxRegions];
+    uint16_t  registerRegion[kRegisterCount];  // the region of a register's last eye-dependent write
+
+    // A kept list's walk with configurations (report 105 section 4.24, bakedCarConfigs): every
+    // configuration gate (CarConfig.h) is decided for this eye, `configGate` the last one met. A
+    // hazard that names the gates whose sides it depends on teaches them to CarConfig and the walk
+    // goes on, so one walk learns every such gate it meets (`learnedGates` new ones); a hazard
+    // that names none (nothing to name, a full set: `unlearned`, by UnionRedone) ends it.
+    bool      learn = false;
+    uintptr_t configGate = 0;
+    uint32_t  learnedGates = 0;
+    uint32_t  unlearned[kUnionRedoneCount] = {};
 };
 
 // -- GPL's vertex and normal memos ----------------------------------------------------------------
 //
-// gpl_vertexTransformCached 0x4CFBB0 transforms a vertex record once and keeps the result until a
-// gpl_matrixPop(1) clears every memo made since its push; an XFORM 0x0D/0x13 pops with 1, an
-// XFORM 0x16 (gpl_nodeDrawAtPoseKeepCache 0x4CC6A0) with 0, and gpl_normalLightCached 0x4CFA70
-// keeps a lit normal the same way. So a vertex keeps the frame it was FIRST transformed in: a
-// polygon in a parent frame that names a vertex first transformed inside a 0x16 child is drawn
-// with the child's position (the wishbones, the forearms), and a vertex memoised in a parent keeps
-// its parent position inside a child. The walk keeps the same memo per walk: the frame of first
-// transform per record, an insertion-order pool undone where GPL pops with 1, and GPL's own memo
-// word for what GPL memoised before this walk.
+// The walk's emulation (CarMemo.h), and GPL's own memo word for what GPL memoised before the walk.
 
-constexpr uint32_t kMemoBits = 14;
-constexpr uint32_t kMemoSlots = 1u << kMemoBits;
-constexpr uint32_t kMemoFill = kMemoSlots / 4 * 3;
-constexpr uint32_t kHashEntry = 0x80000000u;  // a memo entry in the hash part, | its slot
-constexpr uint16_t kDeadFrame = 0xFFFD;       // a direct entry a pop(1) cleared
-
-// One baked object's records in the direct part of a memo: entry base + (record - address) / 16.
-struct MemoRange {
-    uint32_t address = 0;  // the object's first record, aligned as GPL indexes them
-    uint32_t count = 0;
-    uint32_t base = 0;
-};
-
-// The records of the objects baked before a walk began are memoised directly by object and
-// index: two array reads a lookup, and a walk touches only its own objects' entries. Anything
-// else -- an object baked during the walk, every record when no bake is bound (bakedCars = 1) --
-// goes to an open-addressed hash table. A record keeps one part for the whole walk.
-struct Memo {
-    std::vector<MemoRange> ranges;       // per CarScene object, in its order
-    std::vector<uint32_t>  directStamp;  // == stamp: memoised this walk
-    std::vector<uint16_t>  directFrame;  // Frame::id of the first transform, or kDeadFrame
-    uint32_t               generation = 0;
-    bool                   haveGeneration = false;
-    uint32_t               last = 0;  // the range the last lookup found
-    uint64_t tags[kMemoSlots];    // stamp << 32 | record address; another stamp is an empty slot
-    uint16_t frames[kMemoSlots];  // Frame::id of the first transform
-    uint8_t  dead[kMemoSlots];    // cleared by a pop(1) since; the slot keeps its place in the probe
-    uint32_t stamp = 0;
-    uint32_t used = 0;
-    std::vector<uint32_t> pool;  // entries in the order they were memoised
-};
+static_assert(kNoFrameId == kMemoNoFrame, "memoStore leaves a frame past the walk's limit out");
 
 Memo g_vertexMemo;
 Memo g_normalMemo;
-
-// A new walk: a new stamp, and the objects the bake finished since the last walk get their
-// direct entries (vertex or NORM records, as `normals` says).
-void memoBegin(Memo& memo, const baked::CarScene& scene, uint32_t generation, bool normals) {
-    if (!memo.haveGeneration || memo.generation != generation) {
-        memo.ranges.clear();
-        memo.directStamp.clear();
-        memo.directFrame.clear();
-        memo.generation = generation;
-        memo.haveGeneration = true;
-        memo.last = 0;
-    }
-    for (size_t i = memo.ranges.size(); i < scene.objects.size(); ++i) {
-        const baked::CarObject& object = scene.objects[i];
-        MemoRange range;
-        range.address = normals ? object.normalAddress : object.vertexAddress;
-        range.count = normals ? object.normalCount : object.vertexCount;
-        range.base = static_cast<uint32_t>(memo.directStamp.size());
-        memo.ranges.push_back(range);
-        memo.directStamp.resize(memo.directStamp.size() + range.count, 0);
-        memo.directFrame.resize(memo.directFrame.size() + range.count, 0);
-    }
-    if (++memo.stamp == 0) {
-        std::memset(memo.tags, 0, sizeof(memo.tags));
-        std::fill(memo.directStamp.begin(), memo.directStamp.end(), 0u);
-        memo.stamp = 1;
-    }
-    memo.used = 0;
-    if (memo.pool.capacity() < kMemoFill) memo.pool.reserve(kMemoFill);
-    memo.pool.clear();
-}
-
-// The hash slot holding `key` this walk, dead or alive, or the empty slot it goes to.
-uint32_t memoSlot(const Memo& memo, uint32_t key) {
-    uint64_t tag = (static_cast<uint64_t>(memo.stamp) << 32) | key;
-    uint32_t slot = ((key >> 2) * 2654435761u) >> (32 - kMemoBits);
-    while (true) {
-        uint64_t held = memo.tags[slot];
-        if (held == tag || static_cast<uint32_t>(held >> 32) != memo.stamp) return slot;
-        slot = (slot + 1) & (kMemoSlots - 1);
-    }
-}
-
-// The memo entry of record `key`: direct when a range holds it, else kHashEntry | its slot.
-uint32_t memoEntry(Memo& memo, uint32_t key) {
-    size_t count = memo.ranges.size();
-    if (count) {
-        const MemoRange& last = memo.ranges[memo.last];
-        uint32_t offset = key - last.address;
-        if (!(offset & 15) && (offset >> 4) < last.count) return last.base + (offset >> 4);
-        for (size_t i = 0; i < count; ++i) {
-            const MemoRange& range = memo.ranges[i];
-            offset = key - range.address;
-            if (!(offset & 15) && (offset >> 4) < range.count) {
-                memo.last = static_cast<uint32_t>(i);
-                return range.base + (offset >> 4);
-            }
-        }
-    }
-    return kHashEntry | memoSlot(memo, key);
-}
-
-// Whether `entry` (of record `key`) is memoised and alive this walk, and in which frame.
-bool memoAlive(const Memo& memo, uint32_t entry, uint32_t key, uint16_t& frame) {
-    if (entry & kHashEntry) {
-        uint32_t slot = entry & ~kHashEntry;
-        if (memo.tags[slot] != ((static_cast<uint64_t>(memo.stamp) << 32) | key) ||
-            memo.dead[slot])
-            return false;
-        frame = memo.frames[slot];
-        return true;
-    }
-    if (memo.directStamp[entry] != memo.stamp || memo.directFrame[entry] == kDeadFrame)
-        return false;
-    frame = memo.directFrame[entry];
-    return true;
-}
-
-// Memoises `entry` in frame `id`. A full hash table, or a frame past kMaxWalkFrames, leaves it
-// unmemoised, as if transformed here each time.
-void memoStore(Memo& memo, uint32_t entry, uint32_t key, uint16_t id, uint32_t& overflow) {
-    if (id == kNoFrameId) return;
-    if (entry & kHashEntry) {
-        uint32_t slot = entry & ~kHashEntry;
-        uint64_t tag = (static_cast<uint64_t>(memo.stamp) << 32) | key;
-        bool     known = memo.tags[slot] == tag;
-        if (!known && memo.used >= kMemoFill) {
-            ++overflow;
-            return;
-        }
-        if (!known) ++memo.used;
-        memo.tags[slot] = tag;
-        memo.dead[slot] = 0;
-        memo.frames[slot] = id;
-    } else {
-        memo.directStamp[entry] = memo.stamp;
-        memo.directFrame[entry] = id;
-    }
-    memo.pool.push_back(entry);
-}
-
-// gpl_matrixPop(1): every memo made since the pool held `mark` entries is cleared.
-void memoUndo(Memo& memo, size_t mark) {
-    for (size_t i = mark; i < memo.pool.size(); ++i) {
-        uint32_t entry = memo.pool[i];
-        if (entry & kHashEntry)
-            memo.dead[entry & ~kHashEntry] = 1;
-        else
-            memo.directFrame[entry] = kDeadFrame;
-    }
-    memo.pool.resize(mark);
-}
 
 // GPL's own memo, placed through rebase() at install; 0 when refused, and then nothing GPL
 // memoised before a walk is seen (counted as stale words).
@@ -451,14 +337,118 @@ uintptr_t gplMemoSlot(uintptr_t record, SkinCounts& skin) {
 // GPL memoised it before the walk.
 constexpr uint16_t kGplMemoFrame = 0xFFFE;
 
+uint16_t canonOf(const Walk& walk, uint16_t id) {
+    return id < walk.frameCount ? walk.frames[id].canon : id;
+}
+
+// What a union walk's list cannot say for every eye; a kept list's walk stops at the first one
+// that no gate it named (`named`, CarConfig.h) will remove from later walks.
+void unionHazard(Walk& walk, UnionRedone reason, bool named = false) {
+    ++walk.unionHazards[reason];
+    if (!walk.program || named) return;
+    if (walk.learn) ++walk.unlearned[reason];
+    walk.abort = true;
+}
+
+bool regionWithin(const Walk& walk, uint16_t inner, uint16_t outer);
+
+// A configurations walk's hazard: the gates whose sides, and the boxes whose insides, `writer` (a
+// write's or a memo entry's condition) holds under and `reader` does not. Decided, they make the
+// write every reader's. False when there is none, or one cannot join the set.
+bool blameConditions(Walk& walk, uint16_t writer, uint16_t reader) {
+    if (!walk.learn) return false;
+    const ShareTape& tape = *walk.tape;
+    bool             named = false;
+    while (writer != 0 && !shareImplies(tape, reader, writer)) {
+        if (writer > tape.conditions.size()) return false;
+        const ShareCondition& c = tape.conditions[writer - 1];
+        // A wheel model's condition is GPL's pose, no gate's side: nothing to decide.
+        if (c.kind == kConditionChild) return false;
+        uintptr_t node = c.node;
+        if (c.kind == kConditionBox)
+            node = c.plane < tape.boxes.size() ? tape.boxes[c.plane].node : 0;
+        int learned = carConfigLearn(node);
+        if (learned < 0) return false;
+        walk.learnedGates += static_cast<uint32_t>(learned);
+        named = true;
+        writer = c.parent;
+    }
+    return named;
+}
+
+// The same for regions: the order nodes whose halves hold `writer` and not `reader`. Decided, they
+// keep one order for every eye of the program.
+bool blameRegions(Walk& walk, uint16_t writer, uint16_t reader) {
+    if (!walk.learn) return false;
+    const ShareTape& tape = *walk.tape;
+    bool             named = false;
+    while (writer != 0 && !regionWithin(walk, reader, writer)) {
+        uint16_t order = walk.regionOrder[writer];
+        if (order >= tape.orders.size()) return false;
+        int learned = carConfigLearn(tape.orders[order].node);
+        if (learned < 0) return false;
+        walk.learnedGates += static_cast<uint32_t>(learned);
+        named = true;
+        writer = walk.regionParent[writer];
+    }
+    return named;
+}
+
+// Regions (Walk::program): the halves of the order nodes, a tree under region 0. Two regions
+// part at the two halves of one order node exactly when their chains below the deepest common
+// region start with halves of the same node: there each eye's side decides which comes first.
+bool regionsCross(const Walk& walk, uint16_t a, uint16_t b) {
+    if (a == b) return false;
+    while (walk.regionDepth[a] > walk.regionDepth[b]) a = walk.regionParent[a];
+    while (walk.regionDepth[b] > walk.regionDepth[a]) b = walk.regionParent[b];
+    if (a == b) return false;
+    while (walk.regionParent[a] != walk.regionParent[b]) {
+        a = walk.regionParent[a];
+        b = walk.regionParent[b];
+    }
+    return walk.regionOrder[a] == walk.regionOrder[b];
+}
+
+// Whether region `inner` is `outer` or lies inside it.
+bool regionWithin(const Walk& walk, uint16_t inner, uint16_t outer) {
+    while (walk.regionDepth[inner] > walk.regionDepth[outer]) inner = walk.regionParent[inner];
+    return inner == outer;
+}
+
+// A memo entry a union walk made under `heldCondition`, met under another condition. The union
+// walks every eye's visits in one sequence, so each eye's memo holds the first of them its own
+// walk makes. When every eye the current condition holds for made that visit, the entry is each
+// one's answer. Otherwise an eye may meet the record first here, in this frame: one answer serves
+// all only if the entry's frame has the same matrices; anything else depends on the eye. An entry
+// made in the other half of an order node than this one is first for the eyes that order that
+// half first, and the eyes on the other side meet the record here first: only the same frame
+// serves both.
+uint16_t unionHeld(Walk& walk, uint16_t held, uint16_t heldCondition, uint16_t heldRegion,
+                   const Frame& frame) {
+    if (regionsCross(walk, heldRegion, walk.region)) {
+        if (held == frame.id) return held;
+        unionHazard(walk, kUnionOrder, blameRegions(walk, heldRegion, walk.region));
+        return held;
+    }
+    if (shareImplies(*walk.tape, walk.condition, heldCondition)) return held;
+    if (canonOf(walk, held) == canonOf(walk, frame.id)) return frame.id;
+    unionHazard(walk, kUnionMemo, blameConditions(walk, heldCondition, walk.condition));
+    return held;
+}
+
 uint16_t resolveVertex(Walk& walk, uintptr_t record, const Frame& frame, uintptr_t& gplSlot) {
     auto     key = static_cast<uint32_t>(record);
     uint32_t entry = memoEntry(g_vertexMemo, key);
-    uint16_t held = 0;
-    if (memoAlive(g_vertexMemo, entry, key, held)) return held;
+    uint16_t held = 0, heldCondition = 0, heldRegion = 0;
+    if (memoAlive(g_vertexMemo, entry, key, held, heldCondition, heldRegion))
+        return heldCondition == walk.condition && heldRegion == walk.region
+                   ? held
+                   : unionHeld(walk, held, heldCondition, heldRegion, frame);
     gplSlot = gplMemoSlot(record, walk.skin);
+    if (walk.tape) shareVertex(*walk.tape, record, gplSlot != 0);
     if (gplSlot) return kGplMemoFrame;
-    memoStore(g_vertexMemo, entry, key, frame.id, walk.skin.vertexOverflow);
+    memoStore(g_vertexMemo, entry, key, frame.id, walk.condition, walk.region,
+              walk.skin.vertexOverflow);
     return frame.id;
 }
 
@@ -467,13 +457,17 @@ uint16_t resolveVertex(Walk& walk, uintptr_t record, const Frame& frame, uintptr
 uint16_t resolveNormal(Walk& walk, uintptr_t record, const Frame& frame) {
     auto     key = static_cast<uint32_t>(record);
     uint32_t entry = memoEntry(g_normalMemo, key);
-    uint16_t held = 0;
-    if (memoAlive(g_normalMemo, entry, key, held)) return held;
+    uint16_t held = 0, heldCondition = 0, heldRegion = 0;
+    if (memoAlive(g_normalMemo, entry, key, held, heldCondition, heldRegion))
+        return heldCondition == walk.condition && heldRegion == walk.region
+                   ? held
+                   : unionHeld(walk, held, heldCondition, heldRegion, frame);
     if (at<uint32_t>(record) != 0) {
         ++walk.skin.liveNormals;
         return 0;
     }
-    memoStore(g_normalMemo, entry, key, frame.id, walk.skin.normalOverflow);
+    memoStore(g_normalMemo, entry, key, frame.id, walk.condition, walk.region,
+              walk.skin.normalOverflow);
     return frame.id;
 }
 
@@ -571,6 +565,7 @@ struct Transformed {
     uint32_t outcode = 0;
     uint32_t planeBits = 0;
     float    planes[6] = {};
+    uint16_t frame = 0;  // the walk frame they came from, or kGplMemoFrame
 };
 
 void transformVertex(Walk& walk, uintptr_t record, const Frame& frame, Transformed& out) {
@@ -578,6 +573,7 @@ void transformVertex(Walk& walk, uintptr_t record, const Frame& frame, Transform
     uintptr_t gplSlot = 0;
     uint16_t  id = resolveVertex(walk, record, frame, gplSlot);
     if (walk.profile) walk.ticks.memo += __rdtsc() - start;
+    out.frame = id;
     if (id == kGplMemoFrame) {
         out.w = at<float>(gplSlot + 12);
         out.outcode = at<uint32_t>(gplSlot + 28);
@@ -586,6 +582,7 @@ void transformVertex(Walk& walk, uintptr_t record, const Frame& frame, Transform
         return;
     }
     const Frame& where = frameOf(walk, id, frame);
+    out.frame = where.id;
     float        p[3];
     vertexAt(record, p);
     out.w = clipW(where, p);
@@ -646,9 +643,10 @@ void enterFrame(Walk& walk, const Frame& parent, uintptr_t node, Frame& child) {
     list.frames.push_back(out);
 }
 
-// carBakeTexture through a direct-mapped cache: a handle's texture never changes within one car
-// set (CarBake keeps every answer, -1 included, until the set changes), so the cache only has to
-// follow carBakeGeneration.
+// carBakeTexture through a direct-mapped cache: a handle's texture never changes within one
+// generation (CarBake keeps every answer, -1 included, until the set changes or a pass begin
+// finds that GPL released what it was made from), so the cache only has to follow
+// carBakeGeneration.
 int32_t textureOf(uint32_t handle) {
     struct Cached {
         uint32_t handle;
@@ -779,6 +777,19 @@ bool resolveCorners(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame
     return other;
 }
 
+// Whether the renderer may blend some of the leaf (its phase 1, alpha below kCoreAlpha): a sprite,
+// a corner or literal alpha, or a texture with an alpha channel or a colour key under the
+// current material.
+bool mayBlend(const Walk& walk, const baked::CarScene& scene, const baked::CarLeaf& leaf) {
+    if (leaf.flags & (baked::kCarLeafSprite | baked::kCarLeafCornerAlpha)) return true;
+    if (!(leaf.flags & baked::kCarLeafTextured)) return false;
+    const baked::CarMaterial& material = walk.list->materials[walk.material];
+    if (!material.textured || material.texture < 0 ||
+        static_cast<size_t>(material.texture) >= scene.textures.size())
+        return false;
+    return scene.textures[static_cast<size_t>(material.texture)].image.blendClass() != 0;
+}
+
 // A skinned polygon: the baked corners of its leaf, each carried from the frame its vertex (and
 // normal) was memoised in through the root into `frame`, appended as a dynamic leaf under
 // `frame`. The bake's corners are the polygon's corners in node order, consecutive from corner 0
@@ -794,11 +805,29 @@ void emitSkinned(Walk& walk, int32_t objectIndex, const baked::CarObject& object
         base + count > object.vertices.size()) {
         ++walk.skin.noBakedCorners;
         baked::appendCarLeaf(*walk.list, static_cast<uint32_t>(objectIndex), leaf, frame.index,
-                             walk.material, 0);
+                             walk.material, 0, walk.condition);
         return;
     }
     static baked::CarVertex corners[kMaxSkinCorners];
     bool lit = (leaf.flags & baked::kCarLeafLit) != 0;
+    // A kept list re-makes these corners from its re-posed frames each pass (CarProgram.cpp).
+    if (walk.program) {
+        ShareTape& tape = *walk.tape;
+        if (frame.id != frame.index && tape.refusal == kShareOk) tape.refusal = kShareFrames;
+        ShareSkin skin;
+        skin.object = static_cast<uint32_t>(objectIndex);
+        skin.base = base;
+        skin.count = count;
+        skin.firstVertex = static_cast<uint32_t>(walk.list->dynamicVertices.size());
+        skin.firstCorner = static_cast<uint32_t>(tape.skinFrames.size());
+        skin.frame = frame.id;
+        skin.lit = lit;
+        tape.skins.push_back(skin);
+        for (uint32_t i = 0; i < count; ++i) {
+            tape.skinFrames.push_back(walk.cornerFrame[i]);
+            tape.skinFrames.push_back(walk.normalFrame[i]);
+        }
+    }
     for (uint32_t i = 0; i < count; ++i) {
         baked::CarVertex vertex = object.vertices[base + i];
         float            rooted[3];
@@ -816,7 +845,8 @@ void emitSkinned(Walk& walk, int32_t objectIndex, const baked::CarObject& object
         }
         corners[i] = vertex;
     }
-    baked::appendDynamicCarLeaf(*walk.list, leaf, corners, count, frame.index, walk.material);
+    baked::appendDynamicCarLeaf(*walk.list, leaf, corners, count, frame.index, walk.material,
+                                walk.condition);
     ++walk.skin.leaves;
     ++walk.skin.byType[type];
     walk.skin.dynamicVertices += count;
@@ -880,6 +910,8 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
         return;
     }
     ++emit.leaves;
+    if (walk.unionMargin > 0.0f && mayBlend(walk, scene, leaf)) ++walk.blendedLeaves;
+    if (walk.program && walk.list->polygons >= kMaxProgramLeaves) unionHazard(walk, kUnionTooBig);
     if (skinned && !(leaf.flags & baked::kCarLeafNoGeometry)) {
         uint64_t start = walk.profile ? __rdtsc() : 0;
         emitSkinned(walk, walk.object, object, leaf, node, type, frame);
@@ -888,8 +920,19 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
     }
     uint32_t colour = 0;
     if (type == 0x03) colour = (word(node, 0) & 0x200) ? word(node, 2) : 0xFFFFFFFFu;
+    if (walk.tape && type == 0x03) shareSprite(*walk.tape, node, colour);
     baked::appendCarLeaf(*walk.list, static_cast<uint32_t>(walk.object), leaf, frame.index,
-                         walk.material, colour);
+                         walk.material, colour, walk.condition);
+}
+
+// A gate's side of the eye; a first-eye walk records it for the second eye (CarShare.h), a kept
+// list's walk for its replay, marking a configuration gate.
+bool gateFront(Walk& walk, const Frame& frame, uintptr_t node) {
+    bool front = frontSide(frame, node);
+    if (walk.tape)
+        shareGate(*walk.tape, word(node, 1), frame.id, front, walk.condition,
+                  walk.learn && walk.configGate == node);
+    return front;
 }
 
 void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t rootChild);
@@ -898,10 +941,236 @@ void visitChild(Walk& walk, uintptr_t node, unsigned index, const Frame& frame, 
     visit(walk, word(node, index), frame, depth + 1, 0);
 }
 
+// -- the union (report 105 section 4.22) ---------------------------------------------------------
+
+// Whether a union walk takes the gate both ways: its plane passes within the margin of this eye,
+// |a x + b y + c z + d| <= margin |(a, b, c)|, so an eye within the margin may be on either side.
+// A kept list's walk with configurations decides every configuration gate (CarConfig.h).
+bool nearGate(Walk& walk, const Frame& frame, uintptr_t node) {
+    if (walk.unionMargin <= 0.0f) return false;
+    if (walk.learn && carConfigDecides(node)) {
+        walk.configGate = node;
+        return false;
+    }
+    if (walk.everyGate || walk.wheelDepth > 0) return true;
+    uintptr_t plane = word(node, 1);
+    float a = at<float>(plane), b = at<float>(plane + 4), c = at<float>(plane + 8);
+    float s = a * frame.eye[0] + b * frame.eye[1] + c * frame.eye[2] + at<float>(plane + 12);
+    return s * s <= walk.unionMargin * walk.unionMargin * (a * a + b * b + c * c);
+}
+
+void visitUnder(Walk& walk, uintptr_t node, unsigned index, const Frame& frame, int depth,
+                uint16_t condition) {
+    uint16_t enclosing = walk.condition;
+    walk.condition = condition;
+    visitChild(walk, node, index, frame, depth);
+    walk.condition = enclosing;
+}
+
+// The list's draw count; a kept list's walk also seals it there, so the halves of an order node
+// never share a draw.
+uint32_t sealDraws(Walk& walk) {
+    if (!walk.list) return 0;
+    auto count = static_cast<uint32_t>(walk.list->draws.size());
+    if (walk.program) walk.list->sealed = count;
+    return count;
+}
+
+// A kept list's walk enters a half of order node `order` (a tape.orders index) met in `outer`.
+void enterHalf(Walk& walk, size_t order, uint16_t outer) {
+    if (!walk.program) return;
+    if (walk.regionCount >= kMaxRegions || order >= kNoOrder) {
+        unionHazard(walk, kUnionConditions);
+        return;
+    }
+    uint16_t region = walk.regionCount++;
+    walk.regionParent[region] = outer;
+    walk.regionOrder[region] = static_cast<uint16_t>(order);
+    walk.regionDepth[region] = static_cast<uint16_t>(walk.regionDepth[outer] + 1);
+    walk.region = region;
+}
+
+// A gate a union walk takes both ways, each side's subtree under its condition. A BSP4 (front 5,
+// 3, 2; back 2, 4, 5) or BSP3_ASYM (front 4, 3, 2; back 2, 4) draws w2 and w5 (w4) from either
+// side, so they are walked once, in this eye's order, and only w3 (and BSP4's w4) are under a
+// condition; the node is recorded for the second eye's count and its verify walk. False when the
+// tape has no room for the conditions: the caller decides the gate, and the car is walked again.
+bool visitBothWays(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, int depth) {
+    ShareTape& tape = *walk.tape;
+    uintptr_t  plane = word(node, 1);
+    bool       front = frontSide(frame, node);
+    uint16_t   enclosing = walk.condition;
+    uint16_t   onFront = shareCondition(tape, plane, frame.id, enclosing, true, front);
+    uint16_t   onBack = onFront ? shareCondition(tape, plane, frame.id, enclosing, false, front) : 0;
+    if (!onBack) {
+        unionHazard(walk, kUnionConditions);
+        return false;
+    }
+    tape.conditions[onFront - 1].node = node;
+    tape.conditions[onBack - 1].node = node;
+    if (type == 0x06) {
+        visitUnder(walk, node, 2, frame, depth, onFront);
+        return true;
+    }
+    if (type == 0x07) {
+        visitUnder(walk, node, 2, frame, depth, onFront);
+        visitUnder(walk, node, 3, frame, depth, onBack);
+        return true;
+    }
+    unsigned other = type == 0x08 ? 5 : 4;
+    uint32_t leaves[2] = {}, blended[2] = {};  // w2's, the other child's
+    auto side = [&](unsigned index, uint16_t condition, int which) {
+        uint32_t polygons = walk.list->polygons;
+        uint32_t blend = walk.blendedLeaves;
+        visitUnder(walk, node, index, frame, depth, condition);
+        if (which < 0) return;
+        leaves[which] = walk.list->polygons - polygons;
+        blended[which] = walk.blendedLeaves - blend;
+    };
+    // The front side's half: w5 (w4) then w3; the back side's: w2 then BSP4's w4. The node is
+    // recorded before its children, which the tape's ranges of nested order nodes rely on.
+    auto frontHalf = [&] {
+        side(other, enclosing, 1);
+        side(3, onFront, -1);
+    };
+    auto backHalf = [&] {
+        side(2, enclosing, 0);
+        if (type == 0x08) side(4, onBack, -1);
+    };
+    size_t   k = tape.orders.size();
+    uint16_t outer = walk.region;
+    tape.orders.emplace_back();
+    tape.orders.back().node = node;  // a hazard inside its halves names it (blameRegions)
+    uint32_t begin = sealDraws(walk);
+    enterHalf(walk, k, outer);
+    if (front)
+        frontHalf();
+    else
+        backHalf();
+    walk.region = outer;
+    uint32_t split = sealDraws(walk);
+    auto     splitOrder = static_cast<uint32_t>(tape.orders.size());
+    enterHalf(walk, k, outer);
+    if (front)
+        backHalf();
+    else
+        frontHalf();
+    walk.region = outer;
+    ShareOrder& order = tape.orders[k];
+    order.node = node;
+    order.frameKey = frame.key;
+    order.plane = plane;
+    order.frame = frame.id;
+    order.condition = enclosing;
+    order.onFront = onFront;
+    order.front = front;
+    order.bothDrawn = leaves[0] && leaves[1];
+    order.bothBlended = blended[0] && blended[1];
+    order.begin = begin;
+    order.split = split;
+    order.end = sealDraws(walk);
+    order.splitOrder = splitOrder;
+    order.nested = static_cast<uint32_t>(tape.orders.size());
+    return true;
+}
+
+// A BSP4 or BSP3_ASYM decided for this eye, in the child order of side `order`: this eye's, or in
+// a verify walk of a union list the first eye's (walk.orders). w3 and BSP4's w4 are drawn on this
+// eye's side either way.
+void visitOrdered(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, int depth,
+                  bool front, bool order) {
+    unsigned other = type == 0x08 ? 5 : 4;
+    if (order) {
+        visitChild(walk, node, other, frame, depth);
+        if (front) visitChild(walk, node, 3, frame, depth);
+        visitChild(walk, node, 2, frame, depth);
+        if (type == 0x08 && !front) visitChild(walk, node, 4, frame, depth);
+    } else {
+        visitChild(walk, node, 2, frame, depth);
+        if (type == 0x08 && !front) visitChild(walk, node, 4, frame, depth);
+        visitChild(walk, node, other, frame, depth);
+        if (front) visitChild(walk, node, 3, frame, depth);
+    }
+}
+
+bool orderSide(const Walk& walk, uintptr_t node, const Frame& frame, bool front) {
+    if (!walk.orders) return front;
+    for (const ShareOrder& o : *walk.orders)
+        if (o.node == node && o.frameKey == frame.key) return o.front;
+    return front;
+}
+
+// SETREG in a union walk: a write under a condition gives the register a value that depends on
+// the eye, unless it writes what every eye already holds; so does a write in a half of an order
+// node of a kept list's walk, which the eyes on the two sides make at different times.
+void unionWrite(Walk& walk, uint32_t index, int32_t value) {
+    if (walk.condition == 0 && walk.region == 0) {
+        walk.registerUniform[index] = 1;
+        walk.registerCondition[index] = 0;
+        walk.registerRegion[index] = 0;
+    } else if (!walk.registerUniform[index] || walk.registers[index] != value) {
+        walk.registerUniform[index] = 0;
+        walk.registerCondition[index] = walk.condition;
+        walk.registerRegion[index] = walk.region;
+    }
+}
+
+// A wheel XFORM's child in a kept list's walk (report 105 section 4.30). GPL points it at one of
+// the wheel's three models each pose, by spin rate, so the walk takes every model, each under a
+// condition that holds while the child is that model, the memo put back between them as the
+// XFORM's pop would. The model GPL's pose set goes last, so what its subtree leaves (a register)
+// is what GPL's walk would leave. Walked as posed when the child is none of the models (a lost
+// wheel, another layout), when the XFORM's pop keeps the memo (0x16), or the tape is full.
+void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const Frame& child,
+                int depth, size_t vertexMark, size_t normalMark) {
+    ShareTape& tape = *walk.tape;
+    uintptr_t  current = word(node, 8);
+    const uintptr_t* models = walk.wheelModels[wheel];
+    bool       known = false;
+    for (unsigned m = 0; m < kWheelModels; ++m) known = known || models[m] == current;
+    if (!known || type == 0x16 || child.id == 0 || child.id == kNoFrameId ||
+        child.id > tape.frames.size() || tape.frames[child.id - 1u].node != node ||
+        tape.conditions.size() + kWheelModels > kMaxShareConditions) {
+        ++tape.wheelsAsPosed;
+        visitChild(walk, node, 8, child, depth);
+        return;
+    }
+    // GPL's order of the distinct models, the current one moved last.
+    uintptr_t order[kWheelModels];
+    unsigned  count = 0;
+    for (unsigned m = 0; m < kWheelModels; ++m) {
+        bool seen = models[m] == current;
+        for (unsigned k = 0; k < count; ++k) seen = seen || order[k] == models[m];
+        if (!seen) order[count++] = models[m];
+    }
+    order[count++] = current;
+    uint16_t enclosing = walk.condition;
+    uint16_t first = 0;
+    for (unsigned m = 0; m < count; ++m) {
+        uint16_t condition =
+            shareChildCondition(tape, order[m], child.id, enclosing, order[m] == current);
+        if (!first) first = condition;
+    }
+    ShareFrame& shared = tape.frames[child.id - 1u];
+    shared.switchFirst = first;
+    shared.switchCount = static_cast<uint16_t>(count);
+    ++tape.wheelsSwitched;
+    for (unsigned m = 0; m < count; ++m) {
+        if (m > 0) {
+            memoUndo(g_vertexMemo, vertexMark);
+            memoUndo(g_normalMemo, normalMark);
+        }
+        walk.condition = static_cast<uint16_t>(first + m);
+        visit(walk, order[m], child, depth + 1, 0);
+    }
+    walk.condition = enclosing;
+}
+
 // One node, as gpl_sceneNodeRenderTable 0x570330 dispatches it. `rootChild` replaces word 1 of the
 // root MATERIAL, as gpl_carRecordDraw points it at the `car` or `cockpit` handle for the dispatch.
 void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t rootChild) {
     WalkCounts& counts = walk.counts;
+    if (walk.abort) return;
     if (depth > kMaxDepth) {
         ++counts.depthLimit;
         return;
@@ -949,7 +1218,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         else if ((flags & 1) && (flags & 0x10))
             textureWords = word(node, 3) + 1;
         unsigned classWord = 3 + textureWords + ((flags & 2) ? 1 : 0);
-        // The handlers with a surface class (flag 4: 0x4CD190, 0x4CD300, 0x4CE210, 0x4CE4B0 ...)
+        // The handlers with a surface class (flag 4: gpl_materialRender_class 0x4CD190, 0x4CD300, 0x4CE210, 0x4CE4B0 ...)
         // skip the whole subtree when the class is not visible in this pass.
         if (handled && (flags & 4)) {
             uint32_t surfaceClass = word(node, classWord);
@@ -976,34 +1245,22 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     case 0x06:  // SIDEGATE
         ++counts.controls;
         ++counts.gates;
-        if (frontSide(frame, node)) visitChild(walk, node, 2, frame, depth);
+        if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
+        if (gateFront(walk, frame, node)) visitChild(walk, node, 2, frame, depth);
         return;
     case 0x07:  // SIDEPICK
         ++counts.controls;
         ++counts.gates;
-        visitChild(walk, node, frontSide(frame, node) ? 2 : 3, frame, depth);
+        if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
+        visitChild(walk, node, gateFront(walk, frame, node) ? 2 : 3, frame, depth);
         return;
-    case 0x08: {  // BSP4: front 5, 3, 2; back 2, 4, 5
-        ++counts.controls;
-        ++counts.gates;
-        bool front = frontSide(frame, node);
-        visitChild(walk, node, front ? 5 : 2, frame, depth);
-        visitChild(walk, node, front ? 3 : 4, frame, depth);
-        visitChild(walk, node, front ? 2 : 5, frame, depth);
-        return;
-    }
+    case 0x08:    // BSP4: front 5, 3, 2; back 2, 4, 5 (gpl_nodePlane08Four 0x4D76B0)
     case 0x09: {  // BSP3_ASYM: front 4, 3, 2; back 2, 4
         ++counts.controls;
         ++counts.gates;
-        bool front = frontSide(frame, node);
-        if (front) {
-            visitChild(walk, node, 4, frame, depth);
-            visitChild(walk, node, 3, frame, depth);
-            visitChild(walk, node, 2, frame, depth);
-        } else {
-            visitChild(walk, node, 2, frame, depth);
-            visitChild(walk, node, 4, frame, depth);
-        }
+        if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
+        bool front = gateFront(walk, frame, node);
+        visitOrdered(walk, node, type, frame, depth, front, orderSide(walk, node, frame, front));
         return;
     }
     case 0x0A:  // BSP3: every child from either side; the order does not change the count
@@ -1038,19 +1295,40 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         enterRoot(frame, pose, child);
         child.index = frame.index;
         child.halfFrom = frame.halfFrom;
+        child.node = node;
+        child.key = ((frame.key ^ static_cast<uint32_t>(node)) * 2654435761u) ^ (frame.key >> 15);
+        child.parentCanon = frame.canon;
         if (walk.list) enterFrame(walk, frame, node, child);
         if (walk.frameCount < kMaxWalkFrames) {
             child.id = walk.frameCount++;
+            child.canon = child.id;
+            if (walk.unionMargin > 0.0f)
+                for (uint16_t k = 1; k < child.id; ++k)
+                    if (walk.frames[k].node == node && walk.frames[k].parentCanon == frame.canon) {
+                        child.canon = walk.frames[k].canon;
+                        break;
+                    }
             walk.frames[child.id] = child;
         } else {
             child.id = kNoFrameId;
+            child.canon = kNoFrameId;
             ++walk.skin.frameOverflow;
         }
+        if (walk.tape) shareFrame(*walk.tape, node, frame.id, child.id, pose);
         // gpl_matrixPush saves the memo pools' marks; 0x0D/0x13 (gpl_nodePoseRender 0x4CC650)
         // pop(1) back to them, 0x16 (0x4CC6A0) pops(0) and leaves what its child memoised.
         size_t vertexMark = g_vertexMemo.pool.size();
         size_t normalMark = g_normalMemo.pool.size();
-        visitChild(walk, node, 8, child, depth);
+        int wheel = -1;
+        for (int w = 0; walk.program && w < 4; ++w)
+            if (node == walk.wheels[w]) wheel = w;
+        walk.wheelDepth += wheel >= 0 ? 1 : 0;
+        if (wheel >= 0 && walk.tape)
+            visitWheel(walk, node, type, static_cast<unsigned>(wheel), child, depth, vertexMark,
+                       normalMark);
+        else
+            visitChild(walk, node, 8, child, depth);
+        walk.wheelDepth -= wheel >= 0 ? 1 : 0;
         if (type != 0x16) {
             memoUndo(g_vertexMemo, vertexMark);
             memoUndo(g_normalMemo, normalMark);
@@ -1079,13 +1357,15 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         uint32_t op = word(node, 3);
         int32_t  count = static_cast<int32_t>(word(node, 4));
         if (count <= 0 || count > kMaxSelectorCases) return;
-        float value = 0.0f;
+        float    value = 0.0f;
+        uint16_t referenceFrame = 0;
         switch (kind) {
         case 0: {  // the reference vertex's memoised clip w (0x4CF7F6)
             Transformed reference;
             transformVertex(walk, param, frame, reference);
             value = reference.w * walk.lodScale;
             if (value < 0.0f) value = 0.0f;
+            referenceFrame = reference.frame;
             break;
         }
         case 1: value = walk.dlong; break;
@@ -1094,6 +1374,24 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         case 4: value = static_cast<float>(walk.registers[param & 0x3FF]); break;
         default: break;
         }
+        // In a union walk a register written under a condition holds its value only for the
+        // eyes that condition holds for; read under it, the value is the write's.
+        // A write in a half of an order node is the value only inside that half.
+        bool fromWrite = false;
+        if (kind == 4 && walk.unionMargin > 0.0f && !walk.registerUniform[param & 0x3FF]) {
+            uint32_t index = param & 0x3FF;
+            if (!shareImplies(*walk.tape, walk.condition, walk.registerCondition[index]))
+                unionHazard(walk, kUnionRegister,
+                            blameConditions(walk, walk.registerCondition[index], walk.condition));
+            else if (!regionWithin(walk, walk.region, walk.registerRegion[index]))
+                unionHazard(walk, kUnionOrder,
+                            blameRegions(walk, walk.registerRegion[index], walk.region));
+            else
+                fromWrite = true;
+        }
+        if (walk.tape)
+            shareSelector(*walk.tape, node, kind, param, referenceFrame, value, walk.condition,
+                          fromWrite);
         if (op == 5) {
             long long index = std::llrint(value);
             if (index < 0 || index >= count) {
@@ -1112,10 +1410,17 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         return;
     }
 
-    case 0x14:  // SETREG: gpl_nodeRegisterWrite_type20 0x4CFA50
+    case 0x14: {  // SETREG: gpl_nodeRegisterWrite_type20 0x4CFA50
         ++counts.setRegisters;
-        walk.registers[word(node, 1) & 0x3FF] = static_cast<int32_t>(word(node, 2));
+        uint32_t index = word(node, 1) & 0x3FF;
+        auto     value = static_cast<int32_t>(word(node, 2));
+        if (walk.unionMargin > 0.0f) unionWrite(walk, index, value);
+        walk.registers[index] = value;
+        // A write some eyes skip leaves them the pass's value: only one every eye makes stops
+        // the second eye's replay from comparing later reads with the pass's file.
+        if (walk.tape && walk.condition == 0) shareSetRegister(*walk.tape, index);
         return;
+    }
 
     case 0x15: {  // LINE: gpl_lineDraw3d memoises both ends (0x4C7E68, 0x4C7E7A)
         ++counts.lines;
@@ -1147,10 +1452,28 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     case 0x19: {  // BOXCULL: 8 corners, culled when all share an outcode bit (0x4D7210)
         ++counts.controls;
         uint32_t common = 2047;
+        uint16_t corners[8];
         for (unsigned corner = 0; corner < 8; ++corner) {
             Transformed p;
             transformVertex(walk, word(node, 1 + corner), frame, p);
             common &= (p.outcode << 6) | (walk.cellPlanes ? p.planeBits : 0u);
+            corners[corner] = p.frame;
+        }
+        if (walk.tape) shareBox(*walk.tape, node, corners, common != 0, walk.condition);
+        // A kept list's walk draws the box's subtree for every eye the box does not cull, unless
+        // the box is a configuration box (a register written inside it, report 105 section 4.24),
+        // which it decides for this eye like a plain walk.
+        if (walk.program && walk.learn && carConfigDecides(node)) {
+            walk.tape->boxes.back().config = true;
+        } else if (walk.program) {
+            uint16_t drawn = shareBoxCondition(*walk.tape, walk.tape->boxes.size() - 1,
+                                               walk.condition, common == 0);
+            if (!drawn) {
+                unionHazard(walk, kUnionConditions);
+                return;
+            }
+            visitUnder(walk, node, 9, frame, depth, drawn);
+            return;
         }
         if (common) {
             ++counts.boxCulled;
@@ -1217,94 +1540,12 @@ struct Addresses {
     uintptr_t lightingOn = 0;
 };
 
-// Stage 2b, per second: the main-pass car calls, and what became of the ones gplvr draws.
-struct OursSecond {
-    uint32_t mainInside = 0;   // main-pass car calls (cockpit apart) inside a baked pass
-    uint32_t mainOutside = 0;  // and outside one: GPL drew them whole
-    uint32_t calls = 0;        // calls for cars gplvr draws
-    uint32_t lists = 0;        // lists made: one per car per pass
-    uint32_t deduped = 0;      // calls for a car already listed this pass (another cell)
-    uint32_t arenaFull = 0;    // a car past kMaxListsPerPass: GPL drew it whole
-    uint32_t passedThrough = 0;  // GPL's own draws handed over unwalked (no verification at 3)
-    uint32_t passedCockpit = 0;
-    uint32_t passedMirror = 0;
-    uint32_t passedOther = 0;    // main-pass calls outside a baked pass, or no car renderer
-    uint32_t profiled = 0;       // walks timed by parts (WalkTicks)
-    WalkTicks ticks;
-    uint32_t walkFailed = 0;   // the walk faulted: no list, GPL draws the car's later calls whole
-    uint32_t bodyLost = 0;     // of them, the call whose body was already skipped: a car missing
-    uint32_t leftOut = 0;      // debug view 6 left GPL's draw out
-    uint32_t matched = 0;      // lists whose leaves equal the walk's polygons
-    uint32_t bodyCalls = 0;    // GPL's draw called with the body to be skipped
-    uint64_t leaves = 0;
-    uint64_t walked = 0;
-    uint64_t draws = 0;
-    uint64_t gplPolygons = 0;  // what GPL's counter moved by on those calls, shadow apart: 0
-    int64_t  walkTicks = 0;
-    EmitCounts emit;
-    SkinCounts skin;
-    bool     differed = false;
-    int      driver = 0;
-    uint32_t firstLeaves = 0;
-    uint32_t firstWalked = 0;
-};
-
 // One pass's lists, reused pass after pass so their vectors keep their capacity.
 struct PassArena {
     std::vector<baked::CarDrawList> lists;
     std::vector<uintptr_t>          records;
     uint32_t                        count = 0;
     std::vector<uintptr_t>          failed;  // records whose walk faulted this pass
-};
-
-// Stage 2, per second: the draw lists and how their leaves compared with the walk's count.
-struct EmitSecond {
-    uint32_t draws = 0;
-    uint32_t matched = 0;
-    uint64_t leaves = 0;  // appended, with or without geometry
-    uint64_t walked = 0;  // the walk's polygon count for the same draws
-    uint64_t ranges = 0;
-    uint64_t frames = 0;
-    uint64_t materials = 0;
-    uint64_t emptyLeaves = 0;
-    EmitCounts counts;
-    // The first draw this second whose list did not cover the walk.
-    bool       differed = false;
-    int        driver = 0;
-    bool       cockpit = false;
-    bool       mirror = false;
-    uint32_t   firstLeaves = 0;
-    uint32_t   firstWalked = 0;
-    EmitCounts first;
-};
-
-// Per second: what the car draws were and how the walk compared with GPL's count.
-struct Second {
-    uint32_t draws = 0;
-    uint32_t mainDraws = 0;
-    uint32_t mirrorDraws = 0;
-    uint32_t cockpitDraws = 0;
-    uint32_t matched = 0;
-    uint32_t cockpitMatched = 0;
-    uint32_t walkFailed = 0;  // the walk faulted on a read; the draw went on as GPL's
-    uint32_t leftOut = 0;     // debug view 6 left GPL's draw out, so there is no count to compare
-    uint64_t ours = 0;
-    uint64_t gpl = 0;
-    uint64_t shadow = 0;
-    int64_t  walkTicks = 0;
-    WalkCounts sums;
-    // The first draw this second whose counts differed.
-    bool     differed = false;
-    int      driver = 0;
-    void*    instance = nullptr;
-    bool     cockpit = false;
-    bool     mirror = false;
-    uint32_t planeMask = 0;
-    WalkCounts first;
-    uint32_t   firstGpl = 0;
-    EmitSecond emit;
-    OursSecond cars;
-    SkinCounts skin;  // the stage-1 walks (mirrors, cockpit, stages 1 and 2)
 };
 
 struct State {
@@ -1323,7 +1564,7 @@ struct State {
     ShadowFn  shadow = nullptr;
     bool      shadowWrapped = false;
 
-    LARGE_INTEGER windowStart = {};
+    int64_t       windowStart = 0;
     Second        second;
     void*         instancesLogged[kMaxInstancesLogged] = {};
     int           instancesLoggedCount = 0;
@@ -1334,10 +1575,13 @@ State g_car;
 // Polygons the shadow calls emitted during the current car draw.
 volatile uint32_t g_shadowPolygons = 0;
 
-// Stage 2b: set around GPL's draw of a car gplvr draws, so the body dispatch returns at once;
-// and how often it did, per second.
-volatile uint32_t g_skipBody = 0;
-uint32_t          g_bodySkipped = 0;
+// Stage 2b: set around GPL's draw of a car gplvr draws, so the body dispatch returns at once --
+// kSkipMain in a main pass, kSkipMirror in a mirror pass; and how often it did, per second.
+constexpr uint32_t kSkipMain = 1;
+constexpr uint32_t kSkipMirror = 2;
+volatile uint32_t  g_skipBody = 0;
+uint32_t           g_bodySkipped = 0;
+uint32_t           g_bodySkippedMirror = 0;
 
 uint32_t polygonsDrawn() { return *reinterpret_cast<const volatile uint32_t*>(g_car.at.polygonsDrawn); }
 
@@ -1345,7 +1589,10 @@ uint32_t polygonsDrawn() { return *reinterpret_cast<const volatile uint32_t*>(g_
 // the stack, as gpl_renderNodeDispatch takes it.
 void __fastcall bodyWrapper(void* node, void*) {
     if (g_skipBody) {
-        ++g_bodySkipped;
+        if (g_skipBody == kSkipMirror)
+            ++g_bodySkippedMirror;
+        else
+            ++g_bodySkipped;
         return;
     }
     g_car.body(node, nullptr);
@@ -1384,6 +1631,10 @@ void rootFrame(const Addresses& a, Frame& frame, float projection[16], float mod
     frame.index = 0;
     frame.halfFrom = 0;
     frame.id = 0;
+    frame.node = 0;
+    frame.key = 0x9E3779B9u;
+    frame.canon = 0;
+    frame.parentCanon = 0;
 }
 
 // A fresh walk from the root frame: GPL's memos as this walk will grow them start empty, with
@@ -1433,16 +1684,6 @@ void beginList(const Addresses& a, Walk& walk, baked::CarDrawList& list, const F
     walk.object = -1;
 }
 
-void addEmitCounts(EmitCounts& sum, const EmitCounts& add) {
-    sum.leaves += add.leaves;
-    sum.noObject += add.noObject;
-    sum.notLeaf += add.notLeaf;
-    sum.typeDiffers += add.typeDiffers;
-    sum.overflow += add.overflow;
-    sum.slotNoList += add.slotNoList;
-    sum.unresolved += add.unresolved;
-}
-
 // The walk reads only GPL's own graph, which GPL dispatches right after, but an op-5 selector or
 // a node GPL never reaches could still point anywhere; a fault ends the walk, not the game.
 bool walkGuarded(Walk& walk, uintptr_t root, uintptr_t rootChild, const Frame& frame) {
@@ -1452,25 +1693,6 @@ bool walkGuarded(Walk& walk, uintptr_t root, uintptr_t rootChild, const Frame& f
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-}
-
-void addCounts(WalkCounts& sum, const WalkCounts& add) {
-    sum.polygons += add.polygons;
-    sum.sprites += add.sprites;
-    sum.lines += add.lines;
-    sum.controls += add.controls;
-    sum.gates += add.gates;
-    sum.selectors += add.selectors;
-    sum.setRegisters += add.setRegisters;
-    sum.transforms += add.transforms;
-    sum.boxCulled += add.boxCulled;
-    sum.sphereCulled += add.sphereCulled;
-    sum.classHidden += add.classHidden;
-    sum.indexOutOfRange += add.indexOutOfRange;
-    sum.clockSelectors += add.clockSelectors;
-    sum.unknownTypes += add.unknownTypes;
-    sum.depthLimit += add.depthLimit;
-    for (int i = 0; i < 0x24; ++i) sum.byType[i] += add.byType[i];
 }
 
 void logInstance(State& s, void* instance, int driver, bool cockpit, const Walk& walk,
@@ -1533,150 +1755,13 @@ void logInstance(State& s, void* instance, int driver, bool cockpit, const Walk&
          k.corners, k.normals, k.liveCorners, k.liveNormals, used ? objects : " none");
 }
 
-void addSkinCounts(SkinCounts& sum, const SkinCounts& add) {
-    sum.leaves += add.leaves;
-    for (int i = 0; i < 0x24; ++i) sum.byType[i] += add.byType[i];
-    sum.corners += add.corners;
-    sum.liveCorners += add.liveCorners;
-    sum.normals += add.normals;
-    sum.liveNormals += add.liveNormals;
-    sum.dynamicVertices += add.dynamicVertices;
-    sum.vertexOverflow += add.vertexOverflow;
-    sum.normalOverflow += add.normalOverflow;
-    sum.frameOverflow += add.frameOverflow;
-    sum.staleWords += add.staleWords;
-    sum.tooManyCorners += add.tooManyCorners;
-    sum.noBakedCorners += add.noBakedCorners;
-}
-
-// One line a second for every walk of the second: which leaves GPL's memo skinned, and every way
-// the emulation could not follow it.
-void logSkin(const char* what, const SkinCounts& k) {
-    logf("baked cars: skinning (%s) -- %u leaves skinned (1B %u, 1C %u, 1D %u, 1E %u, 1F %u, 20 "
-         "%u, 21 %u, 22 %u), %u corners and %u normals from another frame, %u corners and %u "
-         "normals GPL memoised before the walk, %u dynamic vertices; memo full: vertices %u, "
-         "normals %u; frames past %u %u; memo words not a live slot %u; polygons over %u corners "
-         "%u; skinned polygons without baked corners %u",
-         what, k.leaves, k.byType[0x1B], k.byType[0x1C], k.byType[0x1D], k.byType[0x1E],
-         k.byType[0x1F], k.byType[0x20], k.byType[0x21], k.byType[0x22], k.corners, k.normals,
-         k.liveCorners, k.liveNormals, k.dynamicVertices, k.vertexOverflow, k.normalOverflow,
-         static_cast<unsigned>(kMaxWalkFrames), k.frameOverflow, k.staleWords,
-         kMaxSkinCorners, k.tooManyCorners, k.noBakedCorners);
-}
-
+// The per-second report (CarWalkReport.cpp).
 void reportSecond(State& s) {
-    LARGE_INTEGER now, frequency;
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&frequency);
-    if (!s.windowStart.QuadPart) s.windowStart = now;
-    if (now.QuadPart - s.windowStart.QuadPart < frequency.QuadPart) return;
-    Second& t = s.second;
-    if (t.draws) {
-        double microseconds = 1e6 * static_cast<double>(t.walkTicks) / frequency.QuadPart / t.draws;
-        const WalkCounts& c = t.sums;
-        logf("baked cars: %u car draws (main %u, mirror %u, cockpit %u), walked in %.1f us each -- "
-             "GPL's polygon count MATCHED on %u of %u (cockpit %u of %u), %u walks faulted, %u "
-             "draws left out by debug view 6; "
-             "polygons ours %llu vs GPL %llu, blob shadow %llu counted apart; per draw: %.0f "
-             "control nodes, culled by box %.2f, by sphere %.2f, by hidden class %.2f; op-5 reads "
-             "past the cases %u, clock selectors %u, unknown node types %u, depth limit %u, LINE "
-             "nodes %u (not in GPL's count)",
-             t.draws, t.mainDraws, t.mirrorDraws, t.cockpitDraws, microseconds, t.matched,
-             t.draws - t.walkFailed - t.leftOut, t.cockpitMatched, t.cockpitDraws, t.walkFailed,
-             t.leftOut,
-             static_cast<unsigned long long>(t.ours), static_cast<unsigned long long>(t.gpl),
-             static_cast<unsigned long long>(t.shadow), static_cast<double>(c.controls) / t.draws,
-             static_cast<double>(c.boxCulled) / t.draws,
-             static_cast<double>(c.sphereCulled) / t.draws,
-             static_cast<double>(c.classHidden) / t.draws, c.indexOutOfRange, c.clockSelectors,
-             c.unknownTypes, c.depthLimit, c.lines);
-        if (t.differed) {
-            const WalkCounts& f = t.first;
-            logf("baked cars: first difference this second -- driver %d, instance %p, %s, %s pass, "
-                 "user planes %02X: ours %u (sprites %u) vs GPL %u; that walk culled by box %u, by "
-                 "sphere %u, by hidden class %u, op-5 past the cases %u",
-                 t.driver, t.instance, t.cockpit ? "cockpit" : "car", t.mirror ? "mirror" : "main",
-                 t.planeMask, f.polygons, f.sprites, t.firstGpl, f.boxCulled, f.sphereCulled,
-                 f.classHidden, f.indexOutOfRange);
-        }
-    }
-    const EmitSecond& e = t.emit;
-    if (e.draws) {
-        const EmitCounts&    c = e.counts;
-        const CarBakeTotals& b = carBakeTotals();
-        double               draws = static_cast<double>(e.draws);
-        logf("baked cars: stage 2 -- %u draw lists, leaves %llu of the walk's %llu polygons: "
-             "MATCHED on %u of %u lists; per list %.1f ranges, %.1f frames, %.1f materials, %.2f "
-             "leaves without geometry; refused leaves: no object %u, not a baked leaf %u, type "
-             "differs %u; frame or material overflow %u, slot with no list %u, textures "
-             "unresolved %u",
-             e.draws, static_cast<unsigned long long>(e.leaves),
-             static_cast<unsigned long long>(e.walked), e.matched, e.draws, e.ranges / draws,
-             e.frames / draws, e.materials / draws, e.emptyLeaves / draws, c.noObject, c.notLeaf,
-             c.typeDiffers, c.overflow, c.slotNoList, c.unresolved);
-        logf("baked cars: stage 2 bake so far -- %u objects (%u failed, %u rebaked) in %.1f ms, "
-             "textures %u (%u missing), sprites %u (%u missing), files read and parsed in %.1f "
-             "ms; folders by the only one holding the name %u, by load order %u, still "
-             "ambiguous %u; resource cache scans %u",
-             b.objects, b.objectsFailed, b.objectsRebaked, b.bakeMilliseconds, b.textures,
-             b.texturesMissing, b.sprites, b.spritesMissing, b.fileMilliseconds, b.folderUnique,
-             b.folderByLoadOrder, b.folderAmbiguous, b.cacheScans);
-        if (e.differed) {
-            const EmitCounts& f = e.first;
-            logf("baked cars: stage 2 first difference this second -- driver %d, %s, %s pass: "
-                 "leaves %u vs the walk's %u; refused there: no object %u, not a baked leaf %u, "
-                 "type differs %u",
-                 e.driver, e.cockpit ? "cockpit" : "car", e.mirror ? "mirror" : "main",
-                 e.firstLeaves, e.firstWalked, f.noObject, f.notLeaf, f.typeDiffers);
-        }
-    }
-    const OursSecond& o = t.cars;
-    if (s.stage3 && o.passedThrough)
-        logf("baked cars: stage 2b -- %u draws GPL makes itself handed over UNWALKED (cockpit %u, "
-             "mirror %u, main-pass calls outside a baked pass %u): the per-draw comparison with "
-             "GPL's polygon counter is OFF at bakedCars = 3 (levels 1 and 2 run it)",
-             o.passedThrough, o.passedCockpit, o.passedMirror, o.passedOther);
-    if (s.stage3 && o.profiled && o.ticks.total) {
-        double total = static_cast<double>(o.ticks.total);
-        logf("baked cars: stage 2b walk by parts, %u walks sampled (1 in %u) -- memo (corners, "
-             "normals, control-node vertices) %.0f%%, leaf emission %.0f%% (of it building "
-             "skinned leaves %.0f%%, finding the leaf's object %.0f%%), the rest (control nodes, "
-             "MATERIALs, frames) %.0f%%",
-             o.profiled, kProfileEvery, 100.0 * o.ticks.memo / total, 100.0 * o.ticks.emit / total,
-             100.0 * o.ticks.skinned / total, 100.0 * o.ticks.object / total,
-             100.0 * (total - o.ticks.memo - o.ticks.emit) / total);
-    }
-    if (s.stage3 && (o.mainInside || o.mainOutside || o.calls)) {
-        const EmitCounts& c = o.emit;
-        double lists = o.lists ? static_cast<double>(o.lists) : 1.0;
-        logf("baked cars: stage 2b -- main-pass car calls inside a baked pass %u, OUTSIDE one %u "
-             "(GPL drew those); gplvr's cars: %u calls -> %u lists (%u calls deduped: the same "
-             "car in another cell; %u past %u lists a pass and %u faulted walks left to GPL, %u "
-             "of those a car missing in one cell), "
-             "walked in %.1f us a list, %.1f draws a list; list contract MATCHED on %u of %u "
-             "(leaves %llu of the walk's %llu); GPL's body dispatch skipped %u times on %u calls, "
-             "GPL polygons on gplvr's cars %llu (must be 0); %u calls left out by debug view 6; "
-             "refused leaves: no object %u, not a baked leaf %u, type differs %u, overflow %u, "
-             "slot with no list %u, textures unresolved %u",
-             o.mainInside, o.mainOutside, o.calls, o.lists, o.deduped, o.arenaFull,
-             kMaxListsPerPass, o.walkFailed, o.bodyLost,
-             1e6 * static_cast<double>(o.walkTicks) / static_cast<double>(frequency.QuadPart) /
-                 lists,
-             static_cast<double>(o.draws) / lists, o.matched, o.lists,
-             static_cast<unsigned long long>(o.leaves), static_cast<unsigned long long>(o.walked),
-             g_bodySkipped, o.bodyCalls, static_cast<unsigned long long>(o.gplPolygons),
-             o.leftOut, c.noObject, c.notLeaf, c.typeDiffers, c.overflow, c.slotNoList,
-             c.unresolved);
-        if (o.differed)
-            logf("baked cars: stage 2b first list this second that did not cover its walk -- "
-                 "driver %d: leaves %u vs the walk's %u",
-                 o.driver, o.firstLeaves, o.firstWalked);
-        if (o.lists) logSkin("gplvr's cars", o.skin);
-    }
-    if (t.draws) logSkin("GPL's draws: mirrors, cockpit, stages 1 and 2", t.skin);
+    if (!carwalk::reportSecond(s.second, s.windowStart, s.stage3, g_bodySkipped,
+                               g_bodySkippedMirror))
+        return;
     g_bodySkipped = 0;
-    s.second = Second{};
-    s.windowStart = now;
+    g_bodySkippedMirror = 0;
 }
 
 // A walk with the pass's decisions as GPL holds them at this call: the cell's clip planes, the
@@ -1694,6 +1779,97 @@ void setupWalk(const Addresses& a, Walk& walk, uintptr_t registers) {
         std::memcpy(walk.registers, reinterpret_cast<const void*>(registers), sizeof(walk.registers));
     else
         std::memset(walk.registers, 0, sizeof(walk.registers));
+    walk.tape = nullptr;
+    walk.unionMargin = 0.0f;
+    walk.condition = 0;
+    walk.orders = nullptr;
+}
+
+// A union walk's state (report 105 section 4.22), with `margin` from the tape: 0 decides every
+// gate.
+void beginUnion(Walk& walk, float margin) {
+    walk.unionMargin = margin;
+    walk.condition = 0;
+    walk.blendedLeaves = 0;
+    std::memset(walk.unionHazards, 0, sizeof(walk.unionHazards));
+    walk.program = false;
+    walk.everyGate = false;
+    walk.abort = false;
+    walk.learn = false;
+    walk.configGate = 0;
+    walk.learnedGates = 0;
+    std::memset(walk.unlearned, 0, sizeof(walk.unlearned));
+    walk.wheelDepth = 0;
+    walk.region = 0;
+    walk.regionCount = 1;
+    walk.regionParent[0] = 0;
+    walk.regionOrder[0] = kNoOrder;
+    walk.regionDepth[0] = 0;
+    if (margin <= 0.0f) return;
+    std::memset(walk.registerUniform, 1, sizeof(walk.registerUniform));
+    std::memset(walk.registerCondition, 0, sizeof(walk.registerCondition));
+    std::memset(walk.registerRegion, 0, sizeof(walk.registerRegion));
+}
+
+// The first reason a union walk's list cannot say what an eye draws (UnionRedone), or -1.
+int firstHazard(const Walk& walk) {
+    for (int reason = 0; reason < kUnionRedoneCount; ++reason)
+        if (walk.unionHazards[reason]) return reason;
+    return -1;
+}
+
+// A kept list's walk (report 105 section 4.23): a union walk with `margin` (0: every gate both
+// ways) and the instance's four wheel XFORMs (report 103 section 1: I+116, 124, 132, 140, whose
+// w5 the pose turns by the spin angle) with their models (section 4.30). With bakedCarConfigs it
+// decides the configuration gates (section 4.24).
+void beginProgram(Walk& walk, float margin, uintptr_t instance) {
+    beginUnion(walk, margin > 0.0f ? margin : kMaxUnionMargin);
+    walk.program = true;
+    walk.everyGate = margin <= 0.0f;
+    walk.learn = g_options.bakedCarConfigs != 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        walk.wheels[i] = at<uint32_t>(instance + kInstanceWheels + 8 * i);
+        for (unsigned m = 0; m < kWheelModels; ++m)
+            walk.wheelModels[i][m] =
+                at<uint32_t>(instance + kInstanceWheelModels + 4 * (kWheelModels * i + m));
+    }
+}
+
+// What a stage-2b walk is about to start from, for sharing it between the eyes (CarShare.h).
+ShareCall shareCall(const Walk& walk, const Frame& frame, uintptr_t record, uintptr_t root,
+                    uintptr_t handle, int driver) {
+    ShareCall call;
+    call.record = record;
+    call.root = root;
+    call.handle = handle;
+    call.driver = driver;
+    call.clip = frame.clip;
+    call.eye = frame.eye;
+    call.lodScale = walk.lodScale;
+    call.dlong = walk.dlong;
+    call.dlat = walk.dlat;
+    call.classVisible = walk.classVisible;
+    call.lightingOn = walk.lightingOn;
+    call.planeMask = walk.planeMask;
+    call.cellPlanes = walk.cellPlanes;
+    call.registers = walk.registers;
+    call.textureList = static_cast<uint32_t>(walk.textureList);
+    call.texturedMask = walk.texturedMask;
+    call.poolIndex = g_vertexPoolIndex;
+    call.poolSources = g_vertexSources;
+    return call;
+}
+
+// Whether a first-eye walk's list can stand for the second eye's: every input the tape does not
+// replay must have been the walk's own.
+ShareRefusal shareRefusal(const Walk& walk, const baked::CarDrawList& list, bool walked) {
+    const EmitCounts& e = walk.emit;
+    if (!walked) return kShareFaulted;
+    if (list.polygons != walk.counts.polygons) return kShareContract;
+    if (walk.skin.liveCorners || walk.skin.liveNormals) return kShareGplMemo;
+    if (walk.skin.frameOverflow) return kShareFrames;
+    if (e.noObject || e.notLeaf || e.typeDiffers || e.overflow || e.slotNoList) return kShareLeaves;
+    return kShareOk;
 }
 
 // Stage 2b: a car call in a baked main pass. Every call runs GPL's draw with the body dispatch
@@ -1703,10 +1879,11 @@ void setupWalk(const Addresses& a, Walk& walk, uintptr_t registers) {
 // AFTER GPL's draw because that draw writes this car's helmet colour into the BILLBOARDs of the
 // team model all cars of the team share (0x486ECB), and leaves the MATERIAL state as its body
 // dispatch would see it. A car whose walk faulted is drawn by GPL whole on its later calls this
-// pass (its first call lost the body: counted), as is a car past the arena's limit.
+// pass (its first call lost the body: counted), as is a car past the arena's limit. A mirror pass
+// (bakedMirrors = 1) is the same with the mirror's registers and camera, counted apart.
 void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uintptr_t root,
-              uintptr_t handle, uintptr_t registers) {
-    OursSecond& o = s.second.cars;
+              uintptr_t handle, uintptr_t registers, bool mirror) {
+    OursSecond& o = mirror ? s.second.mirrorCars : s.second.cars;
     PassArena&  arena = s.arena;
     auto        record = reinterpret_cast<uintptr_t>(recordPointer);
     ++o.calls;
@@ -1729,7 +1906,7 @@ void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uin
         g_shadowPolygons = 0;
         uint32_t before = polygonsDrawn();
         bool     skip = listed || fresh;
-        g_skipBody = skip ? 1u : 0u;
+        g_skipBody = !skip ? 0u : mirror ? kSkipMirror : kSkipMain;
         s.original(recordPointer, nullptr);
         g_skipBody = 0;
         uint32_t shadow = g_shadowPolygons;
@@ -1756,12 +1933,38 @@ void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uin
     beginList(s.at, walk, list, frame, projection, modelView);
     list.driver = driver;
     list.cockpit = false;
-    list.mirror = false;
+    list.mirror = mirror;
     list.walkSlot = bakedPassWalkPosition();
+
+    // The car's kept list serves both eyes and later frames (report 105 section 4.23); without
+    // one, in VR the second eye takes the first eye's list when this walk would build the same.
+    ShareCall      share = shareCall(walk, frame, record, root, handle, driver);
+    ProgramOutcome program = carProgramTake(share, list);
+    if (program == kProgramReused || program == kProgramVerify)
+        carShareTapeSkip(share, arena.count);
+    if (program == kProgramReused) {
+        arena.records[arena.count++] = record;
+        return;
+    }
+    ShareOutcome shared = program == kProgramWalk ? carShareTake(share, list) : kShareWalk;
+    if (shared == kShareReused) {
+        arena.records[arena.count++] = record;
+        return;
+    }
+    float programMargin = 0.0f;
+    walk.tape = program == kProgramBuild ? carProgramTapeBegin(share, programMargin) : nullptr;
+    if (program == kProgramBuild && !walk.tape) program = kProgramWalk;
+    if (program == kProgramWalk) walk.tape = carShareTapeBegin(share, arena.count);
+    // A verify walk of an eye-independent list keeps the first eye's order where that list does.
+    if (shared == kShareVerify) walk.orders = carShareVerifyOrders();
 
     static uint32_t walks = 0;
     LARGE_INTEGER   walkStart, walkEnd;
     QueryPerformanceCounter(&walkStart);
+    if (program == kProgramBuild)
+        beginProgram(walk, programMargin, instance);
+    else
+        beginUnion(walk, walk.tape ? walk.tape->margin : 0.0f);
     beginWalk(walk, frame);
     walk.profile = ++walks % kProfileEvery == 0;
     uint64_t tscStart = walk.profile ? __rdtsc() : 0;
@@ -1776,9 +1979,54 @@ void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uin
         o.ticks.total += walk.ticks.total;
     }
     walk.profile = false;
+    int redone = firstHazard(walk);
+    // A kept list's walk the car's program cannot keep (a hazard, a fault, a refused leaf) is
+    // thrown away, and the car is walked as in section 4.22, with CarShare's tape.
+    if (walk.program) {
+        LARGE_INTEGER built;
+        QueryPerformanceCounter(&built);
+        if (carProgramTapeEnd(*walk.tape, walked ? redone : -1, shareRefusal(walk, list, walked),
+                              list, built.QuadPart - walkStart.QuadPart, walk.learnedGates,
+                              walk.unlearned)) {
+            carShareTapeSkip(share, arena.count);
+            walk.tape = nullptr;
+        } else {
+            setupWalk(s.at, walk, registers);
+            walk.planeMask = 0;
+            walk.cellPlanes = false;
+            beginList(s.at, walk, list, frame, projection, modelView);
+            walk.tape = carShareTapeBegin(share, arena.count);
+            beginUnion(walk, walk.tape ? walk.tape->margin : 0.0f);
+            beginWalk(walk, frame);
+            walked = walkGuarded(walk, root, handle, frame);
+            redone = firstHazard(walk);
+        }
+    }
+    // A union walk whose list cannot say what an eye draws (a memoised frame or a register that
+    // depends on a side, or no room for the conditions) is thrown away, and the car is walked
+    // again deciding every gate, as at bakedCarUnion = 0 (report 105 section 4.22).
+    if (walked && walk.unionMargin > 0.0f && redone >= 0) {
+        carShareUnionRedone(static_cast<UnionRedone>(redone));
+        setupWalk(s.at, walk, registers);
+        walk.planeMask = 0;
+        walk.cellPlanes = false;
+        // CarDrawList::clear keeps the driver, kinds and walk slot set above.
+        beginList(s.at, walk, list, frame, projection, modelView);
+        walk.tape = carShareTapeBegin(share, arena.count);
+        if (walk.tape) walk.tape->margin = 0.0f;
+        beginUnion(walk, 0.0f);
+        beginWalk(walk, frame);
+        walked = walkGuarded(walk, root, handle, frame);
+    }
     QueryPerformanceCounter(&walkEnd);
     o.walkTicks += walkEnd.QuadPart - walkStart.QuadPart;
     addSkinCounts(o.skin, walk.skin);
+    if (walk.tape) carShareTapeEnd(*walk.tape, shareRefusal(walk, list, walked), list);
+    walk.tape = nullptr;
+    walk.orders = nullptr;
+    if (shared == kShareVerify) carShareVerify(list, walked);
+    if (program == kProgramVerify)
+        carProgramVerify(list, walked, walkEnd.QuadPart - walkStart.QuadPart);
     if (!walked) {
         ++o.walkFailed;
         if (!leftOut) ++o.bodyLost;
@@ -1818,14 +2066,17 @@ void __fastcall carDraw(void* recordPointer, void*) {
     uintptr_t registers = at<uint32_t>(s.at.backgroundTable);
     bool      mirror = registers == s.at.registersMirror;
     bool      mainPass = registers == s.at.registersMain;
-    if (s.stage3 && mainPass && !cockpit) {
-        OursSecond& o = s.second.cars;
-        if (!bakedPassCollecting()) {
+    // The register file names the pass (gpl_sceneRender switches it at 0x487766 and 0x487C9C); a
+    // call is gplvr's only inside a baked pass of the same kind.
+    bool bakedKind = mainPass || (mirror && g_options.bakedMirrors);
+    if (s.stage3 && bakedKind && !cockpit) {
+        OursSecond& o = mirror ? s.second.mirrorCars : s.second.cars;
+        if (!bakedPassCollecting() || bakedPassMirror() != mirror) {
             ++o.mainOutside;
         } else {
             ++o.mainInside;
             if (bakedPassDrawsCars()) {
-                drawOurs(s, recordPointer, driver, instance, root, handle, registers);
+                drawOurs(s, recordPointer, driver, instance, root, handle, registers, mirror);
                 reportSecond(s);
                 return;
             }
@@ -1833,8 +2084,11 @@ void __fastcall carDraw(void* recordPointer, void*) {
     }
     // bakedCars = 3 does not verify what GPL draws itself (mirror passes, the cockpit, car calls
     // outside a baked pass): it is counted and handed to GPL unwalked. Levels 1 and 2 walk and
-    // compare every draw.
-    if (s.stage3) {
+    // compare every draw, and so does debug view 15 for the mirror cars (bakedMirrors = 1): GPL
+    // draws the mirror then, and the walk with the mirror's registers, masks and LOD scale is
+    // checked against GPL's polygon counter.
+    bool mirrorContract = mirror && !cockpit && bakedPassMirrorsByGpl();
+    if (s.stage3 && !mirrorContract) {
         OursSecond& o = s.second.cars;
         ++o.passedThrough;
         if (cockpit)
@@ -1948,6 +2202,46 @@ uintptr_t callTarget(uintptr_t site) {
     return site + 5 + static_cast<uintptr_t>(at<int32_t>(site + 1));
 }
 
+// The data global of the pose wrapper at `target` (kPoseWrapperHead), or 0 with `why` set when
+// `target` is not one.
+uintptr_t poseWrapperData(uintptr_t target, const char*& why) {
+    ModuleImage image;
+    if (!getModuleImage(GetModuleHandleA(nullptr), image)) {
+        why = "the game's image could not be read";
+        return 0;
+    }
+    bool code = false;
+    for (const Section& section : image.sections) {
+        auto begin = reinterpret_cast<uintptr_t>(section.begin);
+        auto end = reinterpret_cast<uintptr_t>(section.end);
+        if (section.executable && section.hasRawData && target >= begin && target < end &&
+            end - target >= kPoseWrapperSize)
+            code = true;
+    }
+    if (!code) {
+        why = "it is not in a code section of the game's image";
+        return 0;
+    }
+    auto bytes = reinterpret_cast<const unsigned char*>(target);
+    if (std::memcmp(bytes, kPoseWrapperHead, sizeof(kPoseWrapperHead)) != 0 ||
+        std::memcmp(bytes + kPoseWrapperBodyAt, kPoseWrapperBody, sizeof(kPoseWrapperBody)) != 0 ||
+        std::memcmp(bytes + kPoseWrapperTailAt, kPoseWrapperTail, sizeof(kPoseWrapperTail)) != 0) {
+        why = "its bytes are not the known pose wrapper's";
+        return 0;
+    }
+    if (callTarget(target + kPoseWrapperCall) != kPoseFunction) {
+        why = "the known pose wrapper's inner call does not reach it";
+        return 0;
+    }
+    uintptr_t data = at<uint32_t>(target + kPoseWrapperData);
+    if (!isWritable(image, reinterpret_cast<const void*>(data)) ||
+        !isWritable(image, reinterpret_cast<const void*>(data + 3))) {
+        why = "the known pose wrapper's data operand is not a global of the game";
+        return 0;
+    }
+    return data;
+}
+
 }  // namespace
 
 void carWalkInstall() {
@@ -2013,12 +2307,27 @@ void carWalkInstall() {
     }
     uintptr_t team = callTarget(kTeamInstanceCall);
     uintptr_t pose = callTarget(kPoseCall);
-    if (!team || pose != kPoseFunction) {
+    if (!team || !pose) {
         logf("baked cars: NOT installed -- the calls in gpl_carRecordDraw reach %08X and %08X "
              "(expected the team lookup and %08X)",
              static_cast<unsigned>(team), static_cast<unsigned>(pose),
              static_cast<unsigned>(kPoseFunction));
         return;
+    }
+    if (pose != kPoseFunction) {
+        const char* why = "";
+        uintptr_t   poseData = poseWrapperData(pose, why);
+        if (!poseData) {
+            logf("baked cars: NOT installed -- the pose call in gpl_carRecordDraw reaches %08X, "
+                 "neither gpl_carModelPoseFromRecord %08X nor its known wrapper: %s",
+                 static_cast<unsigned>(pose), static_cast<unsigned>(kPoseFunction), why);
+            return;
+        }
+        logf("baked cars: the pose call in gpl_carRecordDraw reaches %08X, this image's wrapper of "
+             "gpl_carModelPoseFromRecord %08X: it stores the float at %08X into R+248 (the last "
+             "dial) and calls it. Every car is posed through the wrapper, as GPL's draw poses it",
+             static_cast<unsigned>(pose), static_cast<unsigned>(kPoseFunction),
+             static_cast<unsigned>(poseData));
     }
     s.teamInstance = reinterpret_cast<TeamInstanceFn>(team);
     s.pose = reinterpret_cast<PoseFn>(pose);
@@ -2101,11 +2410,17 @@ void carWalkInstall() {
          "`baked cars: stage 2b` (calls OUTSIDE 0, contract MATCHED, GPL polygons 0) and `baked: "
          "cars` (commands == list draws)",
          static_cast<unsigned>(kBodyCall));
+    carProgramInstall();
 }
 
-void carWalkPassBegin() {
-    g_car.arena.count = 0;
-    g_car.arena.failed.clear();
+void carWalkPassBegin(bool mirror) {
+    PassArena& arena = g_car.arena;
+    // The pass that ends keeps its lists for the other eye; the arena may get other vectors back.
+    carSharePassBegin(mirror, g_car.stage3, arena.lists, arena.count);
+    carProgramPassBegin(mirror, g_car.stage3);
+    arena.records.resize(arena.lists.size());
+    arena.count = 0;
+    arena.failed.clear();
 }
 
 const baked::CarDrawList* carWalkPassLists(uint32_t& count) {

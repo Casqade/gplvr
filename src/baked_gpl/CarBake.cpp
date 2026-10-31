@@ -1,5 +1,7 @@
 #include "baked_gpl/CarBake.h"
 
+#include "baked_gpl/TrackBake.h"
+
 #include "DataRebase.h"
 #include "Log.h"
 
@@ -27,12 +29,17 @@ constexpr uintptr_t kResourceCacheHead = 0x0086A128;  // -> the newest resource 
 constexpr uintptr_t kCarsetDirName = 0x005A1928;      // gpl_carsetDirName, e.g. "cars67"
 
 // A resource cache entry (gpl_resourceCacheAcquire 0x4CA420): pushed at the head after its load
-// returns, so older entries follow `next` and newer ones `prev`.
+// returns, so older entries follow `next` and newer ones `prev`. A second acquire of the same
+// name only counts a holder; gpl_resourceRelease 0x4CA3F0 drops one, and the last unlinks the
+// entry wherever it lies, frees what it loaded (gpl_resourceEntryFreeByKind 0x4CA180) and frees the 52-byte block. A freed
+// block keeps a count of 0 until it is reused; a reused one can come back at the head as the
+// newest entry, so the head's address alone does not tell that the list changed.
 constexpr unsigned kEntryNext = 0;
 constexpr unsigned kEntryType = 8;
 constexpr unsigned kEntryName = 12;
 constexpr unsigned kEntryNameBytes = 32;
 constexpr unsigned kEntryValue = 44;
+constexpr unsigned kEntryHolders = 48;
 constexpr uint32_t kResourceObject = 0;  // value: the Obj3d
 constexpr uint32_t kResourceMip = 1;     // value: the raster mip handle a MATERIAL binds
 constexpr uint32_t kResourceSprite = 4;  // value: the sprite handle a BILLBOARD holds
@@ -52,15 +59,32 @@ constexpr uint32_t kMaxRecords = 4u << 20;
 // How far resolveFolder looks along the cache for the files loaded around a name.
 constexpr int kMaxNeighbours = 4096;
 constexpr int kMaxNamedMisses = 16;
+// Pass begins after which the reload check logs what it has cost, once; and the drops it logs a
+// line for, after which it only counts them.
+constexpr uint32_t kCheckCostReportAfter = 1000;
+constexpr uint32_t kMaxDropLines = 32;
+// Entries the reload check reads at a pass begin while the cache's head has not moved.
+constexpr uint32_t kCheckSlice = 64;
 
 // -- guarded reads -------------------------------------------------------------------------------
 // The cache and the objects are GPL's and stay put while it runs, but a freed object or a torn
 // list must cost a refusal, not the game. These functions hold no C++ objects, so __try is legal.
 
 struct RawEntry {
+    uint32_t entry;
     uint32_t type;
     uint32_t value;
     char     name[kEntryNameBytes + 1];
+};
+
+// A resource cache entry the bake was made from: an object it baked, or a mip or sprite handle
+// it resolved to a file. What the entry held then is kept, to be checked against it later.
+struct Dependency {
+    uint32_t entry;
+    uint32_t type;
+    uint32_t value;
+    char     name[kEntryNameBytes];  // up to its terminator, the rest zero
+    uint32_t words[kObjWords];       // an object's Obj3d words; zero for a handle
 };
 
 // Copies the cache list, newest first, into `out`. The entry count, or -1 when a read faulted.
@@ -71,6 +95,7 @@ int readCacheList(uintptr_t headSlot, RawEntry* out, int capacity, uint32_t* hea
         int count = 0;
         while (entry && count < capacity) {
             RawEntry& raw = out[count++];
+            raw.entry = static_cast<uint32_t>(entry);
             raw.type = *reinterpret_cast<const uint32_t*>(entry + kEntryType);
             raw.value = *reinterpret_cast<const uint32_t*>(entry + kEntryValue);
             std::memcpy(raw.name, reinterpret_cast<const void*>(entry + kEntryName),
@@ -99,9 +124,63 @@ uint32_t readWord(uintptr_t address) {
     return value;
 }
 
+// Whether `entry` is a live cache entry holding `value` of `type`: one a scan listed can have been
+// released since, its block freed or reused.
+bool entryLive(uintptr_t entry, uint32_t type, uint32_t value) {
+    __try {
+        return *reinterpret_cast<const uint32_t*>(entry + kEntryHolders) != 0 &&
+               *reinterpret_cast<const uint32_t*>(entry + kEntryType) == type &&
+               *reinterpret_cast<const uint32_t*>(entry + kEntryValue) == value;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// What `entry` holds now, for the log: false when it cannot be read.
+bool readEntryNow(uintptr_t entry, RawEntry& out, uint32_t& holders) {
+    __try {
+        out.entry = static_cast<uint32_t>(entry);
+        out.type = *reinterpret_cast<const uint32_t*>(entry + kEntryType);
+        out.value = *reinterpret_cast<const uint32_t*>(entry + kEntryValue);
+        holders = *reinterpret_cast<const uint32_t*>(entry + kEntryHolders);
+        std::memcpy(out.name, reinterpret_cast<const void*>(entry + kEntryName), kEntryNameBytes);
+        out.name[kEntryNameBytes] = '\0';
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The first dependency whose entry no longer holds what it held when the bake used it -- no
+// holder left, another type, value or name, or an object whose Obj3d words moved -- or `count`
+// when none. A read that faults is a change.
+size_t firstChanged(const Dependency* dependencies, size_t count) {
+    size_t i = 0;
+    __try {
+        for (; i < count; ++i) {
+            const Dependency& d = dependencies[i];
+            uintptr_t         entry = d.entry;
+            if (*reinterpret_cast<const uint32_t*>(entry + kEntryHolders) == 0 ||
+                *reinterpret_cast<const uint32_t*>(entry + kEntryType) != d.type ||
+                *reinterpret_cast<const uint32_t*>(entry + kEntryValue) != d.value ||
+                std::strncmp(reinterpret_cast<const char*>(entry + kEntryName), d.name,
+                             kEntryNameBytes) != 0)
+                return i;
+            if (d.type == kResourceObject &&
+                std::memcmp(reinterpret_cast<const void*>(static_cast<uintptr_t>(d.value)),
+                            d.words, sizeof(d.words)) != 0)
+                return i;
+        }
+        return count;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return i;
+    }
+}
+
 // -- state ---------------------------------------------------------------------------------------
 
 struct CacheEntry {
+    uint32_t    entry = 0;  // the entry's own address
     uint32_t    type = 0;
     uint32_t    value = 0;
     std::string name;  // lower case
@@ -116,6 +195,7 @@ struct Folder {
 
 // A loaded .3do: where its PRIM lives, the Obj3d words that identify it, and its bake.
 struct Known {
+    uintptr_t   entry = 0;  // its resource cache entry
     uintptr_t   obj3d = 0;
     uintptr_t   prim = 0;
     uint32_t    primSize = 0;
@@ -142,15 +222,32 @@ struct State {
     std::vector<CacheEntry> cache;  // newest first
     std::unordered_map<uint64_t, uint32_t> cacheByValue;  // type << 32 | value -> cache index
     uint32_t                lastHead = 0;
+    RawEntry                headEntry = {};  // what the head held at the last scan
     bool                    scanned = false;
+    uint32_t                scanPass = 0;  // `pass` when the cache was last read
     std::vector<Known>      known;  // by PRIM address
 
     baked::CarScene scene;
     std::unordered_map<std::string, int32_t> textureByFile;  // "folder|name" -> scene.textures
     std::unordered_map<std::string, int32_t> spriteByFile;   // -> scene.sprites
+    // Every cache entry `scene` was made from, which carBakePassBegin checks.
+    std::vector<Dependency> dependencies;
     CarBakeTotals totals;
     int           namedMisses = 0;
     uint32_t      generation = 0;
+
+    // carBakePassBegin: passes begun, the track scene generation it last saw, the drops counted
+    // when that generation landed, the pass of the last drop, the cache's head at the last check
+    // and where the next slice of `dependencies` starts.
+    uint32_t pass = 0;
+    uint32_t trackGeneration = 0;
+    uint32_t dropsAtTrack = 0;
+    uint32_t lastDropPass = 0;
+    uint32_t checkedHead = 0;
+    RawEntry checkedHeadEntry = {};
+    size_t   sliceAt = 0;
+    bool     checkArmedLogged = false;
+    bool     checkCostLogged = false;
 };
 
 State g_bake;
@@ -217,29 +314,56 @@ void openFolders(State& s, const std::string& carset) {
          s.objs.assets.inArchive("wav1.srb") ? "holds wav1.srb" : "does NOT hold wav1.srb");
 }
 
-// Everything baked belongs to one car set; another set loads other objects at other addresses.
-void checkCarset(State& s) {
-    char name[64] = {};
-    if (!copyGuarded(name, s.carsetName, sizeof(name) - 1) || !name[0]) return;
-    if (s.carset == name && !s.folders.empty()) return;
+// Drops everything baked: the scene, what it was made from, and the objects known by address.
+// The car set's folders stay. The new generation tells the car renderer, the walk's texture
+// cache and its vertex memo to start again too.
+void resetBake(State& s) {
     s.scene = baked::CarScene{};
     ++s.generation;
     s.known.clear();
     s.textureByFile.clear();
     s.spriteByFile.clear();
+    s.dependencies.clear();
+    s.sliceAt = 0;
     s.scanned = false;
+    s.namedMisses = 0;
+}
+
+// Everything baked belongs to one car set; another set loads other objects at other addresses.
+void checkCarset(State& s) {
+    char name[64] = {};
+    if (!copyGuarded(name, s.carsetName, sizeof(name) - 1) || !name[0]) return;
+    if (s.carset == name && !s.folders.empty()) return;
+    resetBake(s);
     openFolders(s, name);
 }
 
+// Records that the bake used `entry`, holding `value` of `type` -- an object's Obj3d words with
+// it. An entry that cannot be read now keeps an empty name, so the next check drops the bake.
+void addDependency(State& s, uintptr_t entry, uint32_t type, uint32_t value,
+                   const uint32_t* words) {
+    Dependency d = {};
+    d.entry = static_cast<uint32_t>(entry);
+    d.type = type;
+    d.value = value;
+    char name[kEntryNameBytes + 1] = {};
+    if (copyGuarded(name, entry + kEntryName, kEntryNameBytes))
+        std::memcpy(d.name, name, strnlen(name, kEntryNameBytes));
+    if (words) std::memcpy(d.words, words, sizeof(d.words));
+    s.dependencies.push_back(d);
+}
+
 // Re-reads GPL's resource cache and the Obj3d words of every loaded .3do. A known object whose
-// words are unchanged keeps its bake.
+// entry, name and words are unchanged keeps its bake.
 void scanCache(State& s) {
     s.raw.resize(kMaxCacheEntries);
     uint32_t head = 0;
     int      count = readCacheList(s.cacheHead, s.raw.data(), kMaxCacheEntries, &head);
     ++s.totals.cacheScans;
     s.scanned = true;
+    s.scanPass = s.pass;
     s.lastHead = head;
+    s.headEntry = count > 0 ? s.raw[0] : RawEntry{};
     if (count < 0) {
         logf("baked cars: GPL's resource cache could not be read (a fault in the list) -- no car "
              "object can be found until it changes");
@@ -254,6 +378,7 @@ void scanCache(State& s) {
     s.cache.resize(static_cast<size_t>(count));
     s.cacheByValue.clear();
     for (int i = 0; i < count; ++i) {
+        s.cache[i].entry = s.raw[i].entry;
         s.cache[i].type = s.raw[i].type;
         s.cache[i].value = s.raw[i].value;
         s.cache[i].name = baked::lowerCase(s.raw[i].name);
@@ -266,6 +391,7 @@ void scanCache(State& s) {
     for (const CacheEntry& entry : s.cache) {
         if (entry.type != kResourceObject || !entry.value) continue;
         Known object;
+        object.entry = entry.entry;
         object.obj3d = entry.value;
         if (!copyGuarded(object.words, entry.value, sizeof(object.words))) continue;
         object.prim = object.words[kObjPrim];
@@ -273,7 +399,9 @@ void scanCache(State& s) {
         if (!object.prim || object.primSize < 8 || object.primSize > kMaxPrimBytes) continue;
         object.name = entry.name;
         auto old = previous.find(object.obj3d);
-        if (old != previous.end() && sameObject(s.known[old->second], object.words)) {
+        if (old != previous.end() && s.known[old->second].entry == object.entry &&
+            s.known[old->second].name == object.name &&
+            sameObject(s.known[old->second], object.words)) {
             object.object = s.known[old->second].object;
             object.failed = s.known[old->second].failed;
         }
@@ -284,8 +412,21 @@ void scanCache(State& s) {
     s.known.swap(known);
 }
 
+// Whether the cache's head differs from `head` holding `held`: another block, or the same block
+// now holding another resource or none. Every load pushes its entry at the head.
+bool headMoved(const State& s, uint32_t head, const RawEntry& held) {
+    uint32_t now = readWord(s.cacheHead);
+    if (now != head) return true;
+    if (!now) return false;
+    RawEntry entry = {};
+    uint32_t holders = 0;
+    return !readEntryNow(now, entry, holders) || !holders || entry.type != held.type ||
+           entry.value != held.value || std::strncmp(entry.name, held.name, kEntryNameBytes) != 0;
+}
+
+// Whether the cache may differ from the last scan.
 bool cacheChanged(const State& s) {
-    return !s.scanned || readWord(s.cacheHead) != s.lastHead;
+    return !s.scanned || headMoved(s, s.lastHead, s.headEntry);
 }
 
 // The folder GPL read the cache entry `index` from. Every file a load acquires comes from the
@@ -333,7 +474,8 @@ void namedMiss(State& s, const char* kind, uint32_t handle, const std::string& n
 }
 
 // A mip or sprite handle to a CarScene index, through the cache entry's name and the folder
-// GPL loaded it from.
+// GPL loaded it from. The answer is kept per handle until the bake is dropped, and the entry it
+// came from is checked at every pass begin (carBakePassBegin).
 int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
     bool sprite = type == kResourceSprite;
     std::unordered_map<uint32_t, int32_t>& byHandle =
@@ -344,13 +486,23 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
     const char* kind = sprite ? "sprite" : "texture";
     int32_t     result = -1;
     auto        entry = s.cacheByValue.find(cacheKey(type, handle));
-    if (entry == s.cacheByValue.end() && cacheChanged(s)) {
+    // An entry from an earlier scan that GPL has released since names what the handle was, not
+    // what it is.
+    if (entry != s.cacheByValue.end() && !entryLive(s.cache[entry->second].entry, type, handle)) {
+        ++s.totals.staleLookups;
+        scanCache(s);
+        entry = s.cacheByValue.find(cacheKey(type, handle));
+    }
+    // The head's address can come back after a reload, so a handle not found is looked for again
+    // once in each pass.
+    if (entry == s.cacheByValue.end() && (cacheChanged(s) || s.scanPass != s.pass)) {
         scanCache(s);
         entry = s.cacheByValue.find(cacheKey(type, handle));
     }
     if (entry == s.cacheByValue.end()) {
         namedMiss(s, kind, handle, std::string(), "not in GPL's resource cache");
     } else {
+        addDependency(s, s.cache[entry->second].entry, type, handle, nullptr);
         const std::string& name = s.cache[entry->second].name;
         int           folder = resolveFolder(s, entry->second);
         const Folder* from = folder >= 0               ? &s.folders[static_cast<size_t>(folder)]
@@ -498,9 +650,12 @@ void bakeKnown(State& s, Known source) {
         index = static_cast<int32_t>(s.scene.objects.size());
         s.scene.objects.push_back(std::move(object));
         ++s.totals.objects;
+        addDependency(s, source.entry, kResourceObject, static_cast<uint32_t>(source.obj3d),
+                      source.words);
     }
     for (Known& known : s.known)
-        if (known.obj3d == source.obj3d && sameObject(known, source.words)) {
+        if (known.entry == source.entry && known.obj3d == source.obj3d &&
+            sameObject(known, source.words)) {
             known.object = index;
             known.failed = index < 0;
         }
@@ -525,9 +680,11 @@ int32_t objectOf(State& s, uintptr_t node, uintptr_t& primAddress, uint32_t& pri
     }
     if (!known) return -1;
 
-    // The same address can hold another object after a reload; the Obj3d words tell.
+    // The same address can hold another object after a reload; its entry and the Obj3d words
+    // tell.
     uint32_t words[kObjWords];
-    if (!copyGuarded(words, known->obj3d, sizeof(words)) || !sameObject(*known, words)) {
+    if (!entryLive(known->entry, kResourceObject, static_cast<uint32_t>(known->obj3d)) ||
+        !copyGuarded(words, known->obj3d, sizeof(words)) || !sameObject(*known, words)) {
         if (known->object >= 0) ++s.totals.objectsRebaked;
         scanCache(s);
         known = findKnown(s, node);
@@ -542,6 +699,171 @@ int32_t objectOf(State& s, uintptr_t node, uintptr_t& primAddress, uint32_t& pri
     primAddress = known->prim;
     primSize = known->primSize;
     return known->object;
+}
+
+// -- following GPL's reloads (report 105 section 4.20) -------------------------------------------
+
+// What a changed dependency held, and what its entry holds now, for the drop's log line.
+std::string describeChange(const Dependency& d) {
+    const char* kind = d.type == kResourceObject   ? "object"
+                       : d.type == kResourceSprite ? "sprite handle"
+                                                   : "texture handle";
+    char name[kEntryNameBytes + 1] = {};
+    std::memcpy(name, d.name, kEntryNameBytes);
+    RawEntry now = {};
+    uint32_t holders = 0;
+    char     text[320];
+    if (!readEntryNow(d.entry, now, holders))
+        std::snprintf(text, sizeof(text),
+                      "the cache entry %08X of %s %08X (%s) can no longer be read", d.entry, kind,
+                      d.value, name[0] ? name : "no name");
+    else if (!holders && now.type == d.type && now.value == d.value &&
+             std::strncmp(now.name, d.name, kEntryNameBytes) == 0)
+        std::snprintf(text, sizeof(text),
+                      "%s %08X (%s) was released: its cache entry %08X has no holder left", kind,
+                      d.value, name[0] ? name : "no name", d.entry);
+    else if (now.type != d.type || now.value != d.value ||
+             std::strncmp(now.name, d.name, kEntryNameBytes) != 0)
+        std::snprintf(text, sizeof(text),
+                      "%s %08X (%s) was released and its cache entry %08X reused: it holds type "
+                      "%u, value %08X (%.32s), %u holders",
+                      kind, d.value, name[0] ? name : "no name", d.entry, now.type, now.value,
+                      now.name, holders);
+    else
+        std::snprintf(text, sizeof(text),
+                      "object %s (Obj3d %08X, cache entry %08X) holds other Obj3d words: its PRIM, "
+                      "XYZS or NORM moved",
+                      name[0] ? name : "no name", d.value, d.entry);
+    return text;
+}
+
+// Drops the car bake, with one log line naming why. The car renderer, the walk's texture cache
+// and its vertex memo follow the new generation.
+void dropBake(State& s, const std::string& why) {
+    size_t objects = s.scene.objects.size();
+    size_t textures = s.scene.textures.size();
+    size_t sprites = s.scene.sprites.size();
+    size_t entries = s.dependencies.size();
+    resetBake(s);
+    ++s.totals.drops;
+    s.lastDropPass = s.pass;
+    if (s.totals.drops > kMaxDropLines) {
+        if (s.totals.drops == kMaxDropLines + 1)
+            logf("baked cars: the car bake was DROPPED %u times -- further drops are counted, not "
+                 "logged; a drop at every few passes means GPL releases something the bake "
+                 "depends on while it draws (report 105 section 4.20)",
+                 s.totals.drops);
+        return;
+    }
+    logf("baked cars: the car bake was DROPPED -- %s. Gone: %zu objects, %zu textures, %zu "
+         "sprites (made from %zu cache entries); the car renderer releases its GPU copy when it "
+         "next prepares a pass, and each object is baked again from GPL's memory when a car or "
+         "flagman is next drawn (drops so far %u: %u for a released entry, %u for a track "
+         "reload no entry showed)",
+         why.c_str(), objects, textures, sprites, entries, s.totals.drops, s.totals.dropsReleased,
+         s.totals.dropsTrack);
+}
+
+// At every pass begin, before any walk: the bake must hold only what GPL holds now.
+void followGame(State& s) {
+    ++s.pass;
+
+    // A track reload comes only from leaving and entering a session (or loading a replay), and
+    // the leave releases every car model, its textures and mirror.mip (0x4A5930 -> 0x406ED0).
+    // The entry check below normally drops the bake at the first pass after it; a reload it did
+    // not catch is dropped here, when the new track's scene lands.
+    uint32_t track = trackBakeSceneGeneration();
+    if (track != s.trackGeneration) {
+        if (s.trackGeneration) {
+            ++s.totals.trackReloads;
+            if (s.totals.drops != s.dropsAtTrack) {
+                logf("baked cars: GPL loaded the track again (track scene generation %u) -- the "
+                     "car bake followed the reload already (dropped %u passes ago)",
+                     track, s.pass - s.lastDropPass);
+            } else if (s.scene.objects.empty() && s.dependencies.empty()) {
+                logf("baked cars: GPL loaded the track again (track scene generation %u) -- "
+                     "nothing of the cars was baked since the last one, nothing to drop",
+                     track);
+            } else {
+                ++s.totals.dropsTrack;
+                char why[256];
+                std::snprintf(why, sizeof(why),
+                              "GPL loaded the track again (track scene generation %u -> %u), "
+                              "which releases every car model, yet no cache entry the bake was "
+                              "made from showed it",
+                              s.trackGeneration, track);
+                dropBake(s, why);
+            }
+        }
+        s.trackGeneration = track;
+        s.dropsAtTrack = s.totals.drops;
+    }
+
+    // Every entry when the head moved since the last check (a load happened, and a reload frees
+    // before it loads); else the next slice, so an entry released without a load after it is
+    // still found within a sweep.
+    bool moved = headMoved(s, s.checkedHead, s.checkedHeadEntry);
+    s.checkedHead = readWord(s.cacheHead);
+    uint32_t holders = 0;
+    if (!s.checkedHead || !readEntryNow(s.checkedHead, s.checkedHeadEntry, holders))
+        s.checkedHeadEntry = RawEntry{};
+
+    if (s.dependencies.empty()) return;
+    if (!s.checkArmedLogged) {
+        s.checkArmedLogged = true;
+        logf("baked cars: following GPL's reloads -- every pass begin checks the resource cache "
+             "entries the car bake was made from (%zu now: objects, mip and sprite handles): all "
+             "of them when the cache's head moved, else %u in turn; one released or reused drops "
+             "the whole car bake, and so does a track reload no entry showed. Expect `baked cars: "
+             "the car bake was DROPPED` once after a graphics change or a session restart, and "
+             "never while driving",
+             s.dependencies.size(), kCheckSlice);
+    }
+    LARGE_INTEGER start, end;
+    QueryPerformanceCounter(&start);
+    size_t count = s.dependencies.size();
+    size_t changed = count;
+    size_t checked = 0;
+    if (moved || count <= kCheckSlice) {
+        changed = firstChanged(s.dependencies.data(), count);
+        checked = count;
+        ++s.totals.checksFull;
+    } else {
+        size_t first = s.sliceAt < count ? s.sliceAt : 0;
+        size_t run = std::min<size_t>(kCheckSlice, count - first);
+        size_t found = firstChanged(s.dependencies.data() + first, run);
+        if (found < run) changed = first + found;
+        checked = run;
+        if (changed == count && run < kCheckSlice) {
+            size_t wrap = kCheckSlice - run;
+            found = firstChanged(s.dependencies.data(), wrap);
+            if (found < wrap) changed = found;
+            checked += wrap;
+            s.sliceAt = wrap;
+        } else {
+            s.sliceAt = first + run;
+        }
+    }
+    QueryPerformanceCounter(&end);
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    s.totals.checkMicroseconds += 1e6 * static_cast<double>(end.QuadPart - start.QuadPart) /
+                                  static_cast<double>(frequency.QuadPart);
+    ++s.totals.checks;
+    s.totals.checkedEntries += checked;
+    if (!s.checkCostLogged && s.totals.checks >= kCheckCostReportAfter) {
+        s.checkCostLogged = true;
+        logf("baked cars: reload check -- %u pass begins checked (%u of them every entry, the "
+             "cache's head having moved), %.0f cache entries and %.2f us a check on average; %zu "
+             "entries held now",
+             s.totals.checks, s.totals.checksFull,
+             static_cast<double>(s.totals.checkedEntries) / s.totals.checks,
+             s.totals.checkMicroseconds / s.totals.checks, count);
+    }
+    if (changed < count) {
+        ++s.totals.dropsReleased;
+        dropBake(s, describeChange(s.dependencies[changed]));
+    }
 }
 
 }  // namespace
@@ -588,6 +910,20 @@ int32_t carBakeTexture(uint32_t handle) {
         return resolveResource(g_bake, kResourceMip, handle);
     } catch (...) {
         return -1;
+    }
+}
+
+void carBakePassBegin() {
+    State& s = g_bake;
+    if (!s.bound || s.refused) return;
+    try {
+        followGame(s);
+    } catch (const std::exception& thrown) {
+        logf("baked cars: the reload check threw (%s); the car bake is dropped", thrown.what());
+        resetBake(s);
+    } catch (...) {
+        logf("baked cars: the reload check threw an unknown exception; the car bake is dropped");
+        resetBake(s);
     }
 }
 

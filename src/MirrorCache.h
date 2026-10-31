@@ -57,6 +57,17 @@ bool mirrorCacheBlackout();
 // How many restores happened since the last call, for the once-a-second line.
 unsigned mirrorCacheTakeRestores();
 
+// Around GPL's mirror copy-out (bitmapDraw into mirror.mip), after roglv2's queued polygons are
+// flushed: Begin notes unit 0's texture, End binds it again if the copy left mirror.mip there.
+// roglv2 binds the texture for the copy without telling its polygon drawer's cache, so without
+// this the next polygon whose texture the cache names is drawn with mirror.mip (report 105
+// section 4.18.1). `mirrorCopyRebind`.
+void mirrorCacheCopyBegin();
+void mirrorCacheCopyEnd();
+
+// Copy-outs wrapped since the last call, and of them the ones that left another texture bound.
+void mirrorCacheTakeCopies(unsigned& copies, unsigned& rebound);
+
 // Forget the texture and the saved images, without touching GL. Called on a mode change, where
 // the bitmap this was told about may already be freed and the context may not be ours -- the
 // two cache textures are kept and reused, since their size follows mirror.mip and that is one

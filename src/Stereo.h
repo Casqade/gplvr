@@ -20,6 +20,7 @@
 #include "Discovery.h"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace gplvr {
 
@@ -194,6 +195,13 @@ void stereoOnCameraBind(void* camera);
 // renders one pane into mirror.mip and nothing into the eye.
 bool stereoMirrorOnlyPass();
 
+// While stereoRender's eye loop runs (the mirror-only renders included): the stereo frame, a
+// count that advances once per frame at its first eye, and the eye, 0 or 1. False outside the
+// loop: flat mode, and a VR frame drawn as one image because the head poses were missing. The
+// baked car walk shares a car's draw list from the first eye with the second
+// (baked_gpl/CarShare.h).
+bool stereoEyePass(uint32_t& frame, int& eye);
+
 // Patch gpl_sceneRender's two segment-lookup calls (0x487D73 eye, 0x4877D9 mirror) so the walk
 // is centred on the viewed car and GPL's answer is containment-checked. Idempotent.
 //
@@ -222,7 +230,8 @@ int stereoDlongDelta(int from, int to);
 // Rewrites x and y in place when the copy is a pane's, to that glass's region of mirror.mip --
 // the +Y pane's half when the car is drawn with the two halves. The destination is left as GPL
 // passed it, which is mirror.mip, and so is everything else. It also notes the destination
-// bitmap for MirrorCache, because this is the one place in the process that names it.
-void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y);
+// bitmap for MirrorCache, because this is the one place in the process that names it. True when
+// the call is a mirror copy-out.
+bool stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y);
 
 }  // namespace gplvr

@@ -66,6 +66,23 @@ struct ResidualPass {
 };
 void residualArm(const ResidualPass& pass);
 
+// Drops an arm no flush has taken -- after a pass whose walk left roglv2 nothing to paint, a
+// glClear-bracketed flush may not come -- so a later flush of another pass is not tested against
+// this pass's depth and rectangle. True when there was one.
+bool residualDisarm();
+
+// roglv2 flushes seen so far (each opens with its glClear of depth), never reset; 0 while the
+// hooks are not installed. A caller compares two readings to learn whether a call flushed.
+unsigned residualFlushCount();
+
+// roglv2 flushes since the last baked pass drew (its residualArm), or -1 before the first one:
+// 0 means the next flush is GPL's first draw after a baked pass.
+int residualFlushesSinceBakedPass();
+
+// The polygons roglv2's z-buffer drawer holds for its next flush (its submission count since the
+// last one), or -1 when the numbering was not verified or the current drawer is another one.
+int residualQueuedPolygons();
+
 // Brackets the baked main walk, so a flush inside it is counted: whatever roglv2 paints then
 // lands under the baked image, which the composite draws over it.
 void residualWalkBegin();

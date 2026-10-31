@@ -299,7 +299,10 @@ bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
     unsigned char* pixels = static_cast<unsigned char*>(std::malloc(bytes));
     if (!pixels) return false;
 
-    gl.readPixels(x, y, width, height, 0x80E0, GL_UNSIGNED_BYTE, pixels);
+    if (!glReadRectPacked(gl, x, y, width, height, 0x80E0, pixels)) {
+        std::free(pixels);
+        return false;
+    }
 
     unsigned char header[18] = {};
     header[2] = 2;  // uncompressed true-colour
@@ -319,6 +322,29 @@ bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
 
     std::free(pixels);
     return ok;
+}
+
+bool glReadRectPacked(const GlFunctions& gl, int x, int y, int width, int height, GLenum format,
+                      void* pixels) {
+    if (!gl.readPixels || !gl.pixelStorei || !gl.getIntegerv) return false;
+    GLint alignment = 4;
+    GLint rowLength = 0;
+    GLint skipRows = 0;
+    GLint skipPixels = 0;
+    gl.getIntegerv(GL_PACK_ALIGNMENT, &alignment);
+    gl.getIntegerv(GL_PACK_ROW_LENGTH, &rowLength);
+    gl.getIntegerv(GL_PACK_SKIP_ROWS, &skipRows);
+    gl.getIntegerv(GL_PACK_SKIP_PIXELS, &skipPixels);
+    gl.pixelStorei(GL_PACK_ALIGNMENT, 1);
+    gl.pixelStorei(GL_PACK_ROW_LENGTH, 0);
+    gl.pixelStorei(GL_PACK_SKIP_ROWS, 0);
+    gl.pixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    gl.readPixels(x, y, width, height, format, GL_UNSIGNED_BYTE, pixels);
+    gl.pixelStorei(GL_PACK_ALIGNMENT, alignment);
+    gl.pixelStorei(GL_PACK_ROW_LENGTH, rowLength);
+    gl.pixelStorei(GL_PACK_SKIP_ROWS, skipRows);
+    gl.pixelStorei(GL_PACK_SKIP_PIXELS, skipPixels);
+    return true;
 }
 
 namespace {

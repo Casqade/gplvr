@@ -304,6 +304,10 @@ unsigned g_fogged = 0;      // of them, flushes that started with fog on
 unsigned g_untested = 0;    // armed flushes left as they were (no program, no array)
 unsigned g_inWalkFlushes = 0;
 unsigned g_unarmedFlushes = 0;
+unsigned g_flushCount = 0;  // every flush seen, never reset (residualFlushCount)
+// g_flushCount when the last baked pass drew (residualFlushesSinceBakedPass).
+unsigned g_flushesAtBakedPass = 0;
+bool     g_bakedPassSeen = false;
 struct ShadowCounts {
     unsigned calls = 0;          // shadow calls in baked walks
     unsigned emitting = 0;       // of them, calls that submitted polygons
@@ -594,6 +598,7 @@ void WINAPI clearHook(GLbitfield mask) {
     g_realClear(mask);
     // roglv2 clears depth only at the start of a flush (ZBufferOpenGL slot 0).
     if (!(mask & kDepthBufferBit)) return;
+    ++g_flushCount;
     if (g_inWalk) {
         ++g_inWalkFlushes;
         g_walkFlushed = true;
@@ -737,6 +742,8 @@ void residualInstall() {
 void residualArm(const ResidualPass& pass) {
     g_pass = pass;
     g_armed = true;
+    g_bakedPassSeen = true;
+    g_flushesAtBakedPass = g_flushCount;
     g_armedRangeCount = 0;
     g_armedDrawer = g_walkDrawer;
     if (g_walkRangeCount && g_walkFlushed) {
@@ -745,6 +752,25 @@ void residualArm(const ResidualPass& pass) {
     }
     g_armedRangeCount = g_walkRangeCount;
     std::memcpy(g_armedRanges, g_walkRanges, sizeof(ShadowRange) * g_walkRangeCount);
+}
+
+unsigned residualFlushCount() { return g_installed ? g_flushCount : 0; }
+
+int residualFlushesSinceBakedPass() {
+    if (!g_installed || !g_bakedPassSeen) return -1;
+    return static_cast<int>(g_flushCount - g_flushesAtBakedPass);
+}
+
+int residualQueuedPolygons() {
+    uintptr_t drawer = g_installed ? currentDrawer() : 0;
+    return drawer ? static_cast<int>(submitted(drawer)) : -1;
+}
+
+bool residualDisarm() {
+    bool armed = g_armed;
+    g_armed = false;
+    g_armedRangeCount = 0;
+    return armed;
 }
 
 void residualWalkBegin() {

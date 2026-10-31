@@ -784,6 +784,7 @@ int      g_walkFrameDlat = 0;
 int  g_walkCentre[3] = {};
 bool g_walkHaveCentre = false;
 int  g_walkPass = -1;  // which eye pass is rendering, -1 outside the loop
+uint32_t g_walkFrame = 0;  // stereo frames that reached the eye loop, counted at the first eye
 
 void walkSetCentre(float x, float y, float z) {
     auto toUnits = [](float metres) {
@@ -1005,7 +1006,10 @@ int __cdecl walkLookupMirrorThunk(int hint, int* out, int x, int y, int z) {
     return walkLookupCompute(hint, out, x, y, z);
 }
 
-void walkPassBegin(int pass) { g_walkPass = pass; }
+void walkPassBegin(int pass) {
+    if (pass == 0) ++g_walkFrame;
+    g_walkPass = pass;
+}
 
 void walkFrameEnd() { g_walkPass = -1; }
 
@@ -1459,6 +1463,13 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
 
+bool stereoEyePass(uint32_t& frame, int& eye) {
+    if (g_walkPass < 0) return false;
+    frame = g_walkFrame;
+    eye = g_walkPass;
+    return true;
+}
+
 void stereoInstallWalkLookup() {
     // The defect is GPL's own search answering from a segment the camera is not in, and the
     // fallback is the viewed car's blended position -- so this is wanted wherever such a
@@ -1473,9 +1484,9 @@ void stereoInstallWalkLookup() {
 
 bool stereoDroppingPolygons() { return g_paneDropPolys != 0; }
 
-void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y) {
+bool stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y) {
     State& s = g_state;
-    if (!s.frameMirrorSurface) return;
+    if (!s.frameMirrorSurface) return false;
 
     // The surfaces a mirror copy-out can read from: any pane when the glasses render
     // separately, GPL's own frame-corner instance when they do not. Everything else going
@@ -1487,7 +1498,7 @@ void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y) {
     int pane = -1;
     for (int i = 0; i < s.paneCount; ++i)
         if (s.pane[i].surface && readSurface == handleOf(s.pane[i].surface)) pane = i;
-    if (pane < 0 && readSurface != handleOf(s.frameMirrorSurface)) return;
+    if (pane < 0 && readSurface != handleOf(s.frameMirrorSurface)) return false;
 
     // `writeBitmap` is where the pixels LAND. GPL always passes mirror.mip's level-0 bitmap,
     // the one thing in this process that names the texture every glass is read out of. It is a
@@ -1496,10 +1507,11 @@ void stereoMirrorCopy(int& writeBitmap, int readSurface, int& x, int& y) {
     void* handle = reinterpret_cast<void*>(static_cast<intptr_t>(writeBitmap));
     mirrorCacheNoteTexture(writeBitmap, bitmapWidth(handle), bitmapHeight(handle));
 
-    if (pane < 0) return;
+    if (pane < 0) return true;
     x = s.paneRect[pane].x;
     y = s.paneRect[pane].y;
     ++s.paneCopies;
+    return true;
 }
 
 void stereoRelease() {

@@ -76,6 +76,7 @@ else()
     # -- the mod itself ----------------------------------------------------------
     add_library(gplvr SHARED
         src/dllmain.cpp
+        src/BuildStamp.cpp
         src/Billboard.cpp
         src/CrashGuard.cpp
         src/CursorOverlay.cpp
@@ -143,9 +144,16 @@ else()
         src/baked/Srb.cpp
         src/baked/TwoSided.cpp
         src/baked_gpl/BakedCapture.cpp
+        src/baked_gpl/BakedMirror.cpp
         src/baked_gpl/BakedPass.cpp
         src/baked_gpl/CarBake.cpp
+        src/baked_gpl/CarConfig.cpp
+        src/baked_gpl/CarMemo.cpp
+        src/baked_gpl/CarProgram.cpp
+        src/baked_gpl/CarShare.cpp
+        src/baked_gpl/CarUnion.cpp
         src/baked_gpl/CarWalk.cpp
+        src/baked_gpl/CarWalkReport.cpp
         src/baked_gpl/Flagmen.cpp
         src/baked_gpl/ResidualDepth.cpp
         src/baked_gpl/TrackBake.cpp
@@ -153,6 +161,13 @@ else()
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
     target_include_directories(gplvr PRIVATE src)
+    set(GPLVR_STAMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    add_custom_target(gplvr_build_stamp
+        COMMAND ${CMAKE_COMMAND} -DOUT=${GPLVR_STAMP_DIR}/GplvrBuildStamp.h
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/BuildStamp.cmake
+        COMMENT "gplvr build stamp")
+    add_dependencies(gplvr gplvr_build_stamp)
+    target_include_directories(gplvr PRIVATE "${GPLVR_STAMP_DIR}")
     # No d3d11 or opengl32 import here on purpose. GlInterop.cpp resolves both by name,
     # so neither is loaded into the game until VR is switched on -- and with the D3D7
     # rasterizer selected there is no GL at all, which has to stay a logged note rather

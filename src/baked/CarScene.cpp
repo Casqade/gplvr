@@ -333,18 +333,19 @@ bool bakeCarObject(const CarObjectImage& image, CarSpriteLookup sprites, void* c
 }
 
 void appendCarLeaf(CarDrawList& list, uint32_t object, const CarLeaf& leaf, uint16_t frame,
-                   uint16_t material, uint32_t colour) {
+                   uint16_t material, uint32_t colour, uint16_t condition) {
     ++list.polygons;
     if (leaf.flags & kCarLeafNoGeometry) {
         ++list.emptyLeaves;
         return;
     }
     bool sprite = (leaf.flags & kCarLeafSprite) != 0;
-    if (!list.draws.empty()) {
+    if (list.draws.size() > list.sealed) {
         CarDraw& last = list.draws.back();
         if (last.object == object && last.frame == frame && last.material == material &&
             last.colour == colour && ((last.flags & kCarLeafSprite) != 0) == sprite &&
-            last.sprite == leaf.sprite && last.firstIndex + last.indexCount == leaf.firstIndex) {
+            last.sprite == leaf.sprite && last.firstIndex + last.indexCount == leaf.firstIndex &&
+            last.condition == condition) {
             last.indexCount += leaf.indexCount;
             ++last.polygons;
             last.flags |= leaf.flags;
@@ -361,11 +362,12 @@ void appendCarLeaf(CarDrawList& list, uint32_t object, const CarLeaf& leaf, uint
     draw.colour = colour;
     draw.flags = leaf.flags;
     draw.sprite = leaf.sprite;
+    draw.condition = condition;
     list.draws.push_back(draw);
 }
 
 void appendDynamicCarLeaf(CarDrawList& list, const CarLeaf& leaf, const CarVertex* corners,
-                          uint32_t count, uint16_t frame, uint16_t material) {
+                          uint32_t count, uint16_t frame, uint16_t material, uint16_t condition) {
     ++list.polygons;
     ++list.dynamicLeaves;
     auto base = static_cast<uint32_t>(list.dynamicVertices.size());
@@ -373,10 +375,11 @@ void appendDynamicCarLeaf(CarDrawList& list, const CarLeaf& leaf, const CarVerte
     list.dynamicVertices.insert(list.dynamicVertices.end(), corners, corners + count);
     appendGplFan(list.dynamicIndices, base, count);
     uint32_t indexCount = 3 * (count - 2);
-    if (!list.draws.empty()) {
+    if (list.draws.size() > list.sealed) {
         CarDraw& last = list.draws.back();
         if (last.object == kDynamicCarObject && last.frame == frame &&
-            last.material == material && last.firstIndex + last.indexCount == first) {
+            last.material == material && last.firstIndex + last.indexCount == first &&
+            last.condition == condition) {
             last.indexCount += indexCount;
             ++last.polygons;
             last.flags |= leaf.flags;
@@ -392,7 +395,19 @@ void appendDynamicCarLeaf(CarDrawList& list, const CarLeaf& leaf, const CarVerte
     draw.material = material;
     draw.colour = 0;
     draw.flags = leaf.flags;
+    draw.condition = condition;
     list.draws.push_back(draw);
+}
+
+bool carDrawContinues(const CarDraw& previous, const CarDraw& next) {
+    if (previous.frame != next.frame || previous.material != next.material) return false;
+    bool dynamic = previous.object == kDynamicCarObject;
+    if (dynamic || next.object == kDynamicCarObject)
+        return dynamic && next.object == kDynamicCarObject;
+    return previous.object == next.object && previous.colour == next.colour &&
+           ((previous.flags & kCarLeafSprite) != 0) == ((next.flags & kCarLeafSprite) != 0) &&
+           previous.sprite == next.sprite &&
+           previous.firstIndex + previous.indexCount == next.firstIndex;
 }
 
 }  // namespace baked

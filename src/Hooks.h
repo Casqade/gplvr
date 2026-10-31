@@ -43,6 +43,12 @@ struct Options {
     // not a third mode of how -- and this went down to the one question it is really about.
     bool perEyeMirror = true;
 
+    // Put unit 0's texture back after GPL's mirror copy-out. roglv2 binds mirror.mip for the copy
+    // without telling its polygon drawer's texture cache, so the next polygon whose texture the
+    // cache names is drawn with mirror.mip: a glass's background drawn right after a baked pass
+    // showed the mirror images upside down (report 105 section 4.18.1). 0 leaves GPL's binding.
+    bool mirrorCopyRebind = true;
+
     // Render the mirror on one frame in N, counting from the frame that latched the sim tick.
     //
     // With `frameRate` above 0 the frames between two ticks are GPL's own frames, so they redraw
@@ -663,6 +669,49 @@ struct Options {
     // sprite in the 16 colours GPL sets for it and at its place in GPL's walk; whatever it cannot
     // resolve stays GPL's. 0: GPL draws them, as before.
     int bakedFlagmen = 1;
+    // The mirror passes (report 105 section 4.18). 1: gpl_sceneRender's mirror walk (0x487A4C)
+    // is baked as the main walk is -- GPL's mirror walk decides what is visible, gplvr draws the
+    // track, its objects and, with bakedCars = 3, the AI cars and the flagmen from the mirror
+    // camera, with the mirror's registers, masks and LOD scale, into the mirror's own rectangle
+    // with its own depth; GPL's leftovers are tested against that depth before the copy into
+    // mirror.mip. 0: GPL draws the mirrors, as before. Needs bakedRenderer = 1. Flat mode and VR.
+    int bakedMirrors = 0;
+    // The car walk shared between the eyes (report 105 section 4.21; baked_gpl/CarShare.cpp). 1:
+    // in VR, the second eye's pass takes each car's draw list from the first eye's pass of the
+    // same frame when every eye-dependent decision of its walk (gate sides, box culls, LOD
+    // selectors) comes out the same from the second eye and nothing else it read has moved, and
+    // walks the car again otherwise; one reuse in 64 is walked anyway and compared element by
+    // element. Debug view 16 turns it off live. 0: every eye walks every car, as before. Needs
+    // bakedCars = 3; does nothing in flat mode.
+    int bakedCarShare = 1;
+    // Eye-independent car lists (report 105 section 4.22; baked_gpl/CarShare.cpp, CarWalk.cpp).
+    // 1: with bakedCarShare, the first eye's walk takes every gate whose plane passes within the
+    // measured eye separation of its eye both ways, each side's draws under a condition that each
+    // eye's pass evaluates, so the second eye reuses the list where a gate differs instead of
+    // walking the car again; BSP4 / BSP3_ASYM keep the first eye's order. Debug view 17 turns it
+    // off live. 0: the first eye decides every gate, as in section 4.21.
+    int bakedCarUnion = 1;
+    // Car lists kept across frames (report 105 section 4.23; baked_gpl/CarProgram.cpp). 1: in
+    // every baked main pass, VR and flat, a car's list is walked once into a program that holds
+    // for any eye and pose of the same LOD -- every gate both ways (or within 0.3 m of the eye
+    // where the memo cannot be followed so), order nodes put in each eye's order -- and each later
+    // call re-poses and assembles it instead of walking, until a selection, a register, a child
+    // pointer, the helmet colour or a decided gate changes; one reuse in 64 is walked anyway and
+    // compared. Debug view 18 turns it off live. 0: the first eye walks every car every frame, as
+    // in section 4.22. Needs bakedCars = 3.
+    int bakedCarProgram = 1;
+    // Car lists kept in the mirror passes too (report 105 section 4.42; CarProgram.cpp). 1: with
+    // bakedCarProgram, the mirror passes keep and reuse car programs of their own, as the main
+    // passes do. 0: the first eye's mirror passes walk every car, the second eye's take its lists
+    // (section 4.21).
+    int bakedCarProgramMirrors = 1;
+    // Car lists kept per configuration (report 105 section 4.24; baked_gpl/CarConfig.cpp,
+    // CarProgram.cpp). 1: with bakedCarProgram, a kept list's walk decides for its eye every gate
+    // with a register write below it and every gate an earlier build's hazard named (the sector
+    // planes of the stock-derived models), and a car keeps up to 8 lists, one a configuration of
+    // those gates and LOD; each call takes the one whose decisions hold. 0: one kept list a car
+    // with every gate both ways, as in section 4.23 (the stock-derived models then mostly walk).
+    int bakedCarConfigs = 1;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

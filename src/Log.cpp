@@ -55,7 +55,7 @@ void logf(const char* format, ...) {
     char stamp[16] = {};
     _snprintf_s(stamp, _TRUNCATE, "[%3u.%03u] ", elapsed / 1000, elapsed % 1000);
 
-    char line[1024] = {};
+    char line[4096] = {};
     va_list args;
     va_start(args, format);
     _vsnprintf_s(line, _TRUNCATE, format, args);

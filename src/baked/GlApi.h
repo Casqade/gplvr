@@ -65,6 +65,7 @@ struct GlApi {
                                      const void*) = nullptr;
     void(BAKED_GLAPI* texParameteri)(GLenum, GLenum, GLint) = nullptr;
     void(BAKED_GLAPI* drawArrays)(GLenum, GLint, GLsizei) = nullptr;
+    void(BAKED_GLAPI* flush)() = nullptr;
 
     // GL 1.3 - 3.3
     void(BAKED_GLAPI* activeTexture)(GLenum) = nullptr;
@@ -134,6 +135,7 @@ struct GlApi {
     void(BAKED_GLAPI* queryCounter)(GLuint, GLenum) = nullptr;
     void(BAKED_GLAPI* getQueryObjectiv)(GLuint, GLenum, GLint*) = nullptr;
     void(BAKED_GLAPI* getQueryObjectui64v)(GLuint, GLenum, uint64_t*) = nullptr;
+    void(BAKED_GLAPI* getInteger64v)(GLenum, int64_t*) = nullptr;
 
     // GL 3.3 - 4.3, used only by the car renderer (CarRenderer.cpp), which checks them itself;
     // glApiMissing does not require them.

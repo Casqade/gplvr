@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace baked {
@@ -54,7 +55,11 @@ struct CarPassStats {
     bool     drawn = false;
     bool     hidden = false;  // debug view kDebugWithoutCars
     uint32_t lists = 0;
-    uint32_t listDraws = 0;    // CarDraws over all lists
+    uint32_t listDraws = 0;    // CarDraws over all lists that this pass's eye draws
+    // Draws of eye-independent lists left out because their condition does not hold for this
+    // pass's eye (report 105 section 4.22), and of them, conditions past the list's table.
+    uint32_t conditionedOff = 0;
+    uint32_t badCondition = 0;
     uint32_t commands = 0;     // indirect commands issued per phase: must equal listDraws
     uint32_t multiDraws = 0;   // glMultiDrawElementsIndirect calls: the cores, then one per translucent run
     uint32_t cars = 0;         // cars with draws
@@ -86,7 +91,26 @@ struct CarPassStats {
     float    maxRotationError = 0.0f;     // |eyeFromRoot rotation - I|, largest this pass
     float    maxTranslationError = 0.0f;  // |eyeFromRoot translation + eye|, metres
     double   prepareMicroseconds = 0.0;
+    double   uploadMicroseconds = 0.0;  // of prepare: the geometry, frames, rows and commands to GL
     double   drawMicroseconds = 0.0;
+    // Kept lists (CarDrawList::contentKey, report 105 sections 4.26, 4.29): those in the pass,
+    // those whose rows and commands came from the cache, those built into it, and those it could
+    // not serve (a refused draw, no room); of the cached, those built again to check, and checks
+    // that differed. `badOrder`: a drawOrder index past its list's draws (not drawn).
+    // `ordersReused`: cached lists whose drawOrder's rows came as emitted for an earlier list
+    // (section 4.29.1).
+    uint32_t badOrder = 0;
+    uint32_t ordersReused = 0;
+    uint32_t keyedLists = 0;
+    uint32_t cachedLists = 0;
+    uint32_t cacheStored = 0;
+    uint32_t cacheRefused = 0;
+    uint32_t cacheChecked = 0;
+    uint32_t cacheMismatched = 0;
+    // Kept lists that came without their draws (CarDrawList::drawsElided, report 105 section
+    // 4.27), and of them those whose pinned rows were gone or found no room: drawn nothing.
+    uint32_t elidedLists = 0;
+    uint32_t elidedLost = 0;
     // The flagmen (CarDrawList::flagman; report 105 section 4.13), also counted in the totals
     // above: their lists and commands, their walk-order runs prepared and drawn, the palette rows
     // uploaded, sprites of theirs drawn with the colormap their own .srb carries, and sprites
@@ -153,6 +177,14 @@ public:
     // projection at the car's dispatch against the pass's own view. Empty after it was taken.
     std::string takeFrameCheck();
 
+    // Kept lists' rows and commands held now (CachedList).
+    uint32_t cachedListCount() const { return static_cast<uint32_t>(cache_.size()); }
+
+    // Whether the cache holds the rows of a kept list with this key and frame count; if so they
+    // are pinned for the next prepare and `draws` is their count, so the list may come without its
+    // draws (CarDrawList::drawsElided, report 105 section 4.27).
+    bool pinRows(uint32_t key, uint32_t frames, uint32_t& draws);
+
 private:
     struct GpuTexture {
         GLuint   name = 0;
@@ -183,6 +215,62 @@ private:
     void uploadTexture(const Texture& texture, GpuTexture& out);
     void ensureDrawIndices(uint32_t count);
     void checkFrame(const CarDrawList& list, const ViewInputs& view, const float eyeFromRoot[12]);
+
+    // The rows and commands of one drawOrder, in its order and with its ranks, relative as
+    // CachedList's but with base instances from 0 (report 105 section 4.29.1).
+    struct Emitted {
+        uint32_t              orderKey = 0;  // CarDrawList::orderKey; 0: empty
+        std::vector<uint32_t> words;
+        std::vector<Command>  commands;
+        std::vector<uint32_t> dynamic;  // the commands of skinned draws
+        uint32_t              withoutTexture = 0;
+        uint32_t              lastUsed = 0;  // prepares_
+    };
+    // As CarProgram's order memos (report 105 section 4.36).
+    static constexpr int kEmittedOrders = 4;
+    // One kept program's rows and commands, a draw each of every draw it holds, relative to the
+    // list: frame words without its frame base, rank 0, base instances 0, skinned draws' first
+    // indices without its dynamic base (report 105 sections 4.26, 4.29). A pass emits the draws its
+    // drawOrder names, with the rank of each draw's run among them, and keeps what it emitted for
+    // the next list with that drawOrder. Only programs none of whose draws was refused.
+    struct CachedList {
+        std::vector<CarDraw>  draws;     // the program's, for the runs (carDrawContinues)
+        std::vector<uint32_t> words;     // a row a draw
+        std::vector<Command>  commands;  // a command a draw
+        std::vector<uint8_t>  kinds;     // a draw's kCachedDynamic | kCachedWithoutTexture
+        uint32_t frames = 0;             // the list's frame count
+        // prepares_ of the last prepare that used it, or of the next one when pinned; at or above
+        // prepares_ it is in use and is not evicted.
+        uint32_t lastUsed = 0;
+        Emitted  emitted[kEmittedOrders];
+    };
+    static constexpr uint8_t kCachedDynamic = 1;
+    static constexpr uint8_t kCachedWithoutTexture = 2;
+    // One draw's row (`words`, the frame word relative to its list) and its command, relative as
+    // CachedList's: false, counted in `stats`, when it is refused. `dynamic`: a skinned draw;
+    // `palette`: its average word is to name its list's palette row (a flagman's indexed sprite).
+    bool drawRow(const CarScene& scene, const CarDrawList& list, const CarDraw& draw,
+                 uint32_t rank, CarPassStats& stats, uint32_t* words, Command& command,
+                 bool& dynamic, bool& palette);
+    bool buildCached(const CarScene& scene, const CarDrawList& list, CachedList& out);
+    // `list`'s drawOrder from `cached`: the draws it names, with their runs' ranks.
+    void emitOrder(const CachedList& cached, const CarDrawList& list, Emitted& out);
+    // The same from the list's own draws (a whole list's), as a list without a key is drawn;
+    // false when a draw is refused or an index is past the draws.
+    bool emitFromDraws(const CarScene& scene, const CarDrawList& list, Emitted& out);
+    // Appends the rows and commands of a kept list's drawOrder from the cache, building its
+    // program's into it first when they are not there; false, with nothing appended, when the list
+    // is to be built as before.
+    bool appendCached(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
+                      uint32_t vertexBase, uint32_t indexBase);
+    CachedList* findCached(uint32_t key, uint32_t frames);
+    // Stores `entry` under `key`, replacing what the key held, or else the least recently used
+    // entry past kCacheLists; null when every candidate is in use.
+    CachedList* storeCached(uint32_t key, CachedList&& entry);
+    void        eraseCached(uint32_t key);
+    bool        evictLeastRecent();
+    void        evictIdle();
+    void        clearCache();
 
     GlApi gl_;
     bool  initialised_ = false;
@@ -264,6 +352,10 @@ private:
     bool                  framesChecked_ = false;
     std::string           frameCheck_;
     CarPassStats          pass_;
+
+    // By contentKey (a kept program).
+    std::unordered_map<uint32_t, CachedList> cache_;
+    uint32_t prepares_ = 0;
 };
 
 }  // namespace baked

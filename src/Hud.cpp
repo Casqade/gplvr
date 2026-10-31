@@ -4,6 +4,8 @@
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "MenuScale.h"
+#include "MirrorCache.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "ReplayPanel.h"
@@ -978,9 +980,19 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     // pixels, the reverse of the names above. Each mirror pane's image belongs in the region of
     // mirror.mip its glass's UVs read, so both coordinates are rewritten here. roglv2 copies the
     // read surface's own width and height, so exactly that rect is written.
-    stereoMirrorCopy(source, dest, x, y);
+    bool mirrorCopy = stereoMirrorCopy(source, dest, x, y);
 
     if (!g_bitmapDrawOriginal) return 0;
+
+    // The copy binds mirror.mip behind roglv2's texture cache; the binding goes back after it.
+    // The flush comes first so the binding noted is the one the cache last saw.
+    if (mirrorCopy && g_options.mirrorCopyRebind) {
+        rasterFlushPending();
+        mirrorCacheCopyBegin();
+        int result = g_bitmapDrawOriginal(source, x, y, dest);
+        mirrorCacheCopyEnd();
+        return result;
+    }
 
     // GPL'S REPLAY BANDS GO TO THE REPLAY PANEL, at the coordinates GPL gave them. The button art
     // is drawn into the panel's layer and shown on a quad of its own; see ReplayPanel.h. Only a

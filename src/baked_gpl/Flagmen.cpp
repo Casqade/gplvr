@@ -246,7 +246,7 @@ int readFlagman(const State& s, uintptr_t xform, FlagmanRead& out) {
         auto m = reinterpret_cast<const uint32_t*>(child);
         if ((m[0] & 0xFF) != kNodeMaterial) return kReadNotMaterial;
         // gpl_materialNewWithPalette(&m, 0, 0, 1) makes flags 2: no texture, list or slot word
-        // ahead of the colormap, which is then word 3 (sub_482650).
+        // ahead of the colormap, which is then word 3 (gpl_materialTextureWordsBytes 0x482650).
         if ((m[2] & 0x33) != 2) return kReadNoPalette;
         out.palette = m[3];
         out.frame = m[1];
@@ -507,7 +507,7 @@ bool flagmanDispatch(const unsigned char* node, void* stock) {
     list.clear();
     list.driver = -1;
     list.cockpit = false;
-    list.mirror = false;
+    list.mirror = bakedPassMirror();
     std::memcpy(list.rootModelView, read.modelView, sizeof(list.rootModelView));
     std::memcpy(list.projection, read.projection, sizeof(list.projection));
     std::memset(list.light, 0, sizeof(list.light));

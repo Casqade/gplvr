@@ -11,6 +11,7 @@
 
 #include "baked_gpl/BakedPass.h"
 #include "Billboard.h"
+#include "BuildStamp.h"
 #include "CrashGuard.h"
 #include "DataRebase.h"
 #include "Discovery.h"
@@ -252,13 +253,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, exe, MAX_PATH);
         // Stamp the build. Two runs have now been discussed without knowing whether
-        // the binary contained a given fix, which wastes the test.
+        // the binary contained a given fix, which wastes the test. The stamp is the link's
+        // (BuildStamp.cpp is recompiled every build); this file's own __DATE__/__TIME__ only
+        // moved when it was recompiled.
         //
         // And gplvr's own folder, which is where this log, gplvr.ini and everything else of
         // ours is: the game can be launched with any executable in any layout, so "which ini
         // did it read" is a question the log has to answer rather than the reader assume.
-        logf("gplvr attached to %s -- built %s %s, from %s", exe, __DATE__, __TIME__,
-             pathsOwnDirectory());
+        logf("gplvr attached to %s -- built %s, from %s", exe, buildStamp(), pathsOwnDirectory());
 
         // Where this image keeps its globals, before anything reads or writes one. Links of
         // 1.2.0.2 ship identical code with the tail of `.data` 8 or 16 bytes apart, so a guard

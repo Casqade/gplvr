@@ -338,6 +338,60 @@ unsigned mirrorCacheTakeRestores() {
     return count;
 }
 
+namespace {
+
+// The binding around GPL's copy-out, with GL of its own: the cache's needs the framebuffer entry
+// points, and this must work wherever the copy does.
+struct CopyBinding {
+    GlFunctions gl;
+    bool        ready = false;
+    bool        failed = false;
+    bool        saved = false;
+    GLint       name = 0;
+    unsigned    copies = 0;
+    unsigned    rebound = 0;
+};
+
+CopyBinding g_copy;
+
+}  // namespace
+
+void mirrorCacheCopyBegin() {
+    CopyBinding& c = g_copy;
+    c.saved = false;
+    if (!c.ready) {
+        if (c.failed) return;
+        if (!glResolve(c.gl) || !c.gl.getIntegerv || !c.gl.bindTexture) {
+            c.failed = true;
+            logf("mirror: glGetIntegerv or glBindTexture did not resolve; the copy-out's texture "
+                 "binding is left as GPL leaves it (mirrorCopyRebind does nothing)");
+            return;
+        }
+        c.ready = true;
+    }
+    c.gl.getIntegerv(GL_TEXTURE_BINDING_2D, &c.name);
+    c.saved = true;
+}
+
+void mirrorCacheCopyEnd() {
+    CopyBinding& c = g_copy;
+    if (!c.saved) return;
+    c.saved = false;
+    ++c.copies;
+    GLint now = 0;
+    c.gl.getIntegerv(GL_TEXTURE_BINDING_2D, &now);
+    if (now == c.name) return;
+    ++c.rebound;
+    c.gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(c.name));
+}
+
+void mirrorCacheTakeCopies(unsigned& copies, unsigned& rebound) {
+    copies = g_copy.copies;
+    rebound = g_copy.rebound;
+    g_copy.copies = 0;
+    g_copy.rebound = 0;
+}
+
 void mirrorCacheRelease() {
     State& s = g_state;
     s.bitmapHandle = 0;
