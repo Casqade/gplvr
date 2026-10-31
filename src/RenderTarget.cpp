@@ -19,9 +19,21 @@ struct Entries {
     void** bitmapWidthSlot = nullptr;
     void** bitmapHeightSlot = nullptr;
     void** backBufferSlot = nullptr;
+    void** mipSetCurrentSlot = nullptr;
 };
 
 Entries g_entries;
+
+// roglv2's MIP handle table, decoded out of mipSetCurrent (0x20003980): `mov ecx, [table]`,
+// `mov edx, [ecx+8]`, `mov esi, [edx+eax*8]`. Mips have a table of their own; the bitmap table
+// (Surface::handleTable) maps the same numbers to other objects. Decoded again whenever the slot
+// points at different code, since GPL re-resolves its rasterizer globals on a mode change.
+struct MipTable {
+    const void*  code = nullptr;
+    void* const* table = nullptr;
+};
+
+MipTable g_mipTable;
 
 // roglv2's screenDisplay, as it was BEFORE the frame counter replaced the global. The
 // display object is decoded out of its code, and the global now points at our own hook,
@@ -238,6 +250,40 @@ bool resolveSurface() {
          "%dx%d and the fields agree",
          (void*)found, engineW, engineH);
     return true;
+}
+
+// The MIP handle table's pointer (MipTable), or null when mipSetCurrent's code does not hold
+// exactly one `8B 0D imm32 8B 51 08 8B 34 C2` in its first 96 bytes. Each new verdict is logged.
+void* const* mipHandleTable() {
+    if (!g_entries.mipSetCurrentSlot || !*g_entries.mipSetCurrentSlot) return nullptr;
+    const void* code = *g_entries.mipSetCurrentSlot;
+    if (code == g_mipTable.code) return g_mipTable.table;
+    g_mipTable.code = code;
+    g_mipTable.table = nullptr;
+
+    constexpr int        kScan = 96;
+    static const uint8_t kTail[] = {0x8B, 0x51, 0x08, 0x8B, 0x34, 0xC2};
+    auto                 bytes = static_cast<const unsigned char*>(code);
+    void* const*         found = nullptr;
+    int                  matches = 0;
+    if (readable(bytes, kScan)) {
+        for (int i = 0; i + 6 + static_cast<int>(sizeof(kTail)) <= kScan; ++i) {
+            if (bytes[i] != 0x8B || bytes[i + 1] != 0x0D) continue;
+            if (std::memcmp(bytes + i + 6, kTail, sizeof(kTail)) != 0) continue;
+            std::memcpy(&found, bytes + i + 2, sizeof(found));
+            ++matches;
+        }
+    }
+    if (matches == 1 && found && readable(found, sizeof(void*))) g_mipTable.table = found;
+    if (g_mipTable.table)
+        logf("target: roglv2's mip handle table reached through %p, decoded out of mipSetCurrent "
+             "at %p",
+             (void*)found, code);
+    else
+        logf("target: mipSetCurrent at %p holds %d readings of a mip handle table, expected "
+             "exactly 1 -- mip handles reach no GL texture (report 105 section 4.49)",
+             code, matches);
+    return g_mipTable.table;
 }
 
 // Two globals hold something display-shaped, and only one of them is the display.
@@ -699,6 +745,7 @@ void renderTargetBind(const Binding& binding) {
     g_entries.bitmapWidthSlot = binding.raster.bitmapWidth;
     g_entries.bitmapHeightSlot = binding.raster.bitmapHeight;
     g_entries.backBufferSlot = binding.raster.screenGetBackBuffer;
+    g_entries.mipSetCurrentSlot = rasterGlobal(binding.image, "mipSetCurrent");
 }
 
 void renderTargetSetScreenDisplay(const void* original) {
@@ -966,6 +1013,28 @@ GLuint rasterBitmapGlTexture(int handle) {
 
     GLuint name = 0;
     if (!readAt(static_cast<const unsigned char*>(root) + 84, name)) return 0;
+    return name;
+}
+
+GLuint rasterMipGlTexture(int handle, bool& flipT) {
+    flipT = false;
+    void* const* table = mipHandleTable();
+    if (handle <= 0 || !table) return 0;
+    void* manager = nullptr;
+    if (!readAt(table, manager) || !manager) return 0;
+    void* entries = nullptr;
+    if (!readAt(static_cast<const unsigned char*>(manager) + 8, entries) || !entries) return 0;
+    void* mip = nullptr;
+    if (!readAt(static_cast<const unsigned char*>(entries) + static_cast<size_t>(handle) * 8, mip) ||
+        !mip)
+        return 0;
+    GLuint        name = 0;
+    unsigned char flip = 0;
+    if (!readAt(static_cast<const unsigned char*>(mip) + 72, name) ||
+        !readAt(static_cast<const unsigned char*>(mip) + 113, flip))
+        return 0;
+    if (name == 0xFFFFFFFFu) return 0;
+    flipT = flip != 0;
     return name;
 }
 

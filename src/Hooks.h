@@ -43,6 +43,11 @@ struct Options {
     // not a third mode of how -- and this went down to the one question it is really about.
     bool perEyeMirror = true;
 
+    // Leave out a mirror pane whose glass no eye that samples it can see this frame (report 105
+    // section 4.45, Stereo.cpp paneInView): the glass's bounding sphere against a cone holding
+    // the eye's frustum plus 15 degrees. 0: every pane is rendered on every mirror frame.
+    int mirrorSkipOutOfView = 1;
+
     // Put unit 0's texture back after GPL's mirror copy-out. roglv2 binds mirror.mip for the copy
     // without telling its polygon drawer's texture cache, so the next polygon whose texture the
     // cache names is drawn with mirror.mip: a glass's background drawn right after a baked pass
@@ -661,8 +666,8 @@ struct Options {
     // list per car draw from car objects baked out of GPL's memory (CarBake.cpp), checked against
     // the walk's count; still nothing drawn from it. 3, stage 2b: in the baked main passes gplvr
     // draws the cars itself from those lists (CarRenderer.cpp) and GPL's draw of each car keeps
-    // only its blob shadow; mirror passes and the cockpit stay GPL's, counted but not walked (1
-    // and 2 verify every draw). Needs bakedRenderer = 1.
+    // only its blob shadow; mirror passes and the cockpit (but with bakedCockpit) stay GPL's,
+    // counted but not walked (1 and 2 verify every draw). Needs bakedRenderer = 1.
     int bakedCars = 0;
     // The flagmen and the starter (report 105 section 4.13). 1: in the baked main passes gplvr
     // draws them itself (Flagmen.cpp, through the car renderer, so it needs bakedCars = 3), each
@@ -705,6 +710,59 @@ struct Options {
     // passes do. 0: the first eye's mirror passes walk every car, the second eye's take its lists
     // (section 4.21).
     int bakedCarProgramMirrors = 1;
+    // A mirror car's reuse ends its run of builds (report 105 section 4.51; CarProgram.cpp). 1: a
+    // mirror car is backed off for rebuilding every pass only when its builds are not reused in
+    // between; it serves up to six cameras a frame (three glasses, two eyes), so builds on
+    // consecutive passes are how it gathers them. 0: counted in main passes, as a main car's.
+    int bakedMirrorChurnReset = 1;
+    // What a mirror car's kept lists are keyed by (report 105 section 4.54; CarProgram.cpp). 0: one
+    // set of programs a car for every glass and eye, as in section 4.42. 1: one set a car and glass
+    // (Stereo.cpp's pane), so the glasses' different directions and fields of view do not replay and
+    // rebuild each other's. 2: one set a car, glass and eye: a glass is 0.4-1.4 m from the eyes, so
+    // the two eyes' reflections look 3-10 degrees apart (section 4.55), but where both eyes need
+    // one configuration it is built twice, and the programs need about twice the memory (section
+    // 4.55.1). A pass whose glass (or eye) is not known keys by less, counted.
+    int bakedMirrorCarKey = 1;
+    // A mirror car whose root box (the BOXCULL around the whole model) the mirror's view culls is
+    // not listed and no kept list is tried for it (report 105 section 4.54; CarPassView.cpp): its
+    // list would be empty. One such call in 64 is walked as before and listed, and must come out
+    // empty; one that does not turns the skip off until the car set changes. 0: every mirror car
+    // is listed.
+    int bakedMirrorCarCull = 1;
+    // A kept car program's draw order patched from the nearest memo on a memo miss (report 105
+    // section 4.53; CarOrder.cpp). 1: the order nodes the changed condition bits reach are emitted
+    // again and every other node's run is copied from the memo, one patch in 64 checked against a
+    // whole emission. 0: every miss emits the whole order, as in section 4.38.
+    int bakedOrderPatch = 1;
+    // A check before gplvr draws the cockpit (report 105 section 4.47, step 0): with bakedCars = 3,
+    // each cockpit draw is also walked into a list and its polygons compared with GPL's counter
+    // (`baked cars: N car draws ... cockpit M of K` and the stage-2 lines). Costs a walk per
+    // cockpit call (~3 a frame): for a test run only. 0: the cockpit is handed to GPL unwalked.
+    int bakedCockpitCheck = 0;
+    // The cockpit drawn by gplvr (report 105 section 4.48, step 1). 1: in a baked main pass the
+    // player's cockpit is walked once (the second eye takes the first eye's list) into a list the
+    // car renderer draws with real depth, its translucent parts after all of the track's; GPL's
+    // own draw of it keeps only the mirror glass, which samples mirror.mip as before (step 2,
+    // bakedCockpitOverlay, takes the glass too and changes how the list is drawn). A cockpit
+    // gplvr cannot list is drawn whole by GPL, counted (`baked cars: the cockpit`). 0: GPL draws
+    // the cockpit. Needs bakedCars = 3; bakedCockpitCheck = 1 takes precedence.
+    int bakedCockpit = 1;
+    // The cockpit drawn over the eye image (report 105 section 4.49, step 2). 1: with
+    // bakedCockpit, the cockpit's list holds the mirror glass too (GPL's live UVs, a copy of
+    // mirror.mip's live texture) and is drawn after GPL's last flush of each baked main pass, in
+    // GPL's order without a depth test, as GPL's painter's order drew it; GPL's draw of it hands
+    // GPL no leaf. A pass that cannot is step 1's, counted (`baked: the cockpit over the eye
+    // image`). 0: step 1.
+    int bakedCockpitOverlay = 1;
+    // Cockpit step 3 (report 105 section 4.50), both with bakedCockpitOverlay's step 2.
+    // bakedCockpitProgram 1: the cockpit keeps lists across frames as a car does (bakedCarProgram),
+    // the glass's UVs taken from GPL at each reuse; a MISMATCH turns it off until the car set
+    // changes (`baked cars: the cockpit's kept list`). 0: walked every pass, as in step 2.
+    // bakedCockpitSkipGpl 1: GPL's own draw of the cockpit, which hands GPL nothing in step 2, is
+    // skipped and the registers it writes are written instead, checked against GPL's draw now and
+    // then (`baked cars: GPL's cockpit draw skipped`). 0: it runs on every call.
+    int bakedCockpitProgram = 1;
+    int bakedCockpitSkipGpl = 1;
     // Car lists kept per configuration (report 105 section 4.24; baked_gpl/CarConfig.cpp,
     // CarProgram.cpp). 1: with bakedCarProgram, a kept list's walk decides for its eye every gate
     // with a register write below it and every gate an earlier build's hazard named (the sector

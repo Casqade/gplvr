@@ -34,7 +34,14 @@
 //
 // Main passes, VR and flat mode; and with bakedCarProgramMirrors the mirror passes (section 4.42),
 // whose programs are a car's own apart from its main passes' (the mirror's registers, LOD scale and
-// camera). The passes a program's age and a car's retries are counted in are the main passes.
+// camera); with bakedMirrorCarKey (section 4.54) a mirror car has a Car per glass (1) or per glass
+// and eye (2), each with its own programs. The passes a program's age and a car's retries are
+// counted in are the main passes.
+//
+// The player's cockpit (section 4.50, `bakedCockpitProgram`) keeps programs of its own in the main
+// passes whose cockpit list holds the mirror glass (step 2, section 4.49): each assembly takes the
+// glass's UVs from GPL's PRIM again, and a MISMATCH turns its programs off until the car set
+// changes. Its counts are apart from the cars'.
 
 #include "baked_gpl/CarShare.h"
 
@@ -57,17 +64,24 @@ enum ProgramOutcome {
     kProgramReused,  // `list` holds the program's list for this call's eye and pose
     kProgramVerify,  // walk the car without a tape and hand the list to carProgramVerify
     kProgramBuild,   // walk the car into carProgramTapeBegin's tape and hand it to ...TapeEnd
+    kProgramEmpty,   // a mirror car whose root box the view culls: list nothing (CarPassView.h)
 };
 
 // From carWalkInstall once stage 2b is on: logs whether the program runs.
 void carProgramInstall();
 
-// From carWalkPassBegin. `enabled`: stage 2b is on.
-void carProgramPassBegin(bool mirror, bool enabled);
+// From carWalkPassBegin. `enabled`: stage 2b is on. `pane`: a mirror pass's glass, -1 not known
+// (report 105 section 4.54, bakedMirrorCarKey).
+void carProgramPassBegin(bool mirror, bool enabled, int pane);
 
 // A car's first call in a baked main or mirror pass, `list` begun for it (header, root frame, root
-// material). Leaves `list` alone unless the outcome is kProgramReused.
+// material). Leaves `list` alone unless the outcome is kProgramReused. In a mirror pass a car whose
+// list would be empty comes back kProgramEmpty before any kept list is tried (bakedMirrorCarCull).
 ProgramOutcome carProgramTake(const ShareCall& call, baked::CarDrawList& list);
+
+// From CarWalk's drawOurs, with each list a car call listed (kept, taken or walked): a culled call
+// let through as a check of the skip must have come out empty (CarPassView.h).
+void carProgramListed(const baked::CarDrawList& list);
 
 // For kProgramBuild: the tape the walk records, and its margin (0: every gate both ways).
 ShareTape* carProgramTapeBegin(const ShareCall& call, float& margin);

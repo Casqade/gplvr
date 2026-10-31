@@ -126,6 +126,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*));
 // leaves one eye looking at the other's reflection.
 bool stereoMirrorDueThisFrame();
 
+// Mirror panes rendered, and panes left out because no eye that samples them could see their glass
+// (mirrorSkipOutOfView, report 105 section 4.45), since the last call; starts both again.
+void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView);
+
 // Drops the eye surfaces and cameras. Called when the render target changes size and
 // on shutdown; the next frame rebuilds them.
 void stereoRelease();
@@ -194,6 +198,11 @@ void stereoOnCameraBind(void* camera);
 // (Hooks.cpp) and every polygon after its main cameraBind is dropped (Stereo.cpp), so it
 // renders one pane into mirror.mip and nothing into the eye.
 bool stereoMirrorOnlyPass();
+
+// The mirror pane whose camera is `camera` (the index the pane loop renders glasses by), or -1 when
+// it is none of them: flat mode's single mirror, GPL's stock image without panes, or no camera. The
+// baked mirror pass keys its cars' kept lists by it (report 105 section 4.54).
+int stereoMirrorPaneOf(const void* camera);
 
 // While stereoRender's eye loop runs (the mirror-only renders included): the stereo frame, a
 // count that advances once per frame at its first eye, and the eye, 0 or 1. False outside the

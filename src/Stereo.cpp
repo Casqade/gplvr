@@ -17,6 +17,7 @@
 #include "MirrorUv.h"
 #include "Pe.h"
 #include "RenderTarget.h"
+#include "StereoEuler.h"
 #include "VrCamera.h"
 
 #include <windows.h>
@@ -45,9 +46,6 @@ typedef void*(__thiscall* CameraCreateFn)(void* self, void* surface, float fov, 
 // camera->fov) -- so binding a camera IS a destination change, which is the whole reason
 // we need it here.
 typedef int(__cdecl* CameraBindFn)(void* camera);
-
-// Defined below, next to the euler round-trip check it exists for.
-void gplMatrixToEuler(const float m[9], float& yaw, float& pitch, float& roll);
 
 namespace {
 
@@ -218,6 +216,10 @@ struct State {
     void* frameMirrorSurface = nullptr;
     int  paneCopies = 0;
     bool reportedNoCopy = false;
+    // Report 105 section 4.45: panes rendered, and panes not rendered because no eye that samples
+    // them could see their glass (mirrorSkipOutOfView), since stereoTakePaneCounts.
+    unsigned panesRendered = 0;
+    unsigned panesOutOfView = 0;
 
     // Why the panes are or are not in use, reported when it changes. Pointer comparison.
     const char* paneReason = nullptr;
@@ -1463,6 +1465,12 @@ bool stereoEyeGeometry(float& fov, float& separation) {
 
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
 
+int stereoMirrorPaneOf(const void* camera) {
+    for (int i = 0; camera && i < g_state.paneCount; ++i)
+        if (camera == g_state.pane[i].camera) return i;
+    return -1;
+}
+
 bool stereoEyePass(uint32_t& frame, int& eye) {
     if (g_walkPass < 0) return false;
     frame = g_walkFrame;
@@ -1528,51 +1536,6 @@ void stereoRelease() {
     g_state.sourceSurface = nullptr;
     g_state.sourceWidth = 0;
     g_state.sourceHeight = 0;
-}
-
-// GPL's own matrix-to-euler, transcribed from gpl_matrixToEuler (0x004E4ED0).
-//
-// This matters because gpl_sceneRender does NOT render from the orientation matrix we
-// hand it. It calls this, then rebuilds the view from the three angles:
-//
-//     gpl_matrixToEuler(&yaw, &pitch, &roll, params->orientation);
-//     gpl_setViewTransform(eyeX, eyeY, eyeZ, yaw, pitch, roll);
-//
-// So our matrix survives only as far as this decomposition preserves it. It is a
-// standard ZYX decomposition and should round-trip exactly -- but "should" is what has
-// been wrong every other time, and there is a degenerate branch here when the forward
-// axis approaches vertical, where the roll extraction divides by a norm going to zero.
-void gplMatrixToEuler(const float m[9], float& yaw, float& pitch, float& roll) {
-    yaw = std::atan2(m[3], m[0]);
-    const float norm = std::sqrt(m[3] * m[3] + m[0] * m[0]);
-    pitch = std::atan2(-m[6], norm);
-
-    if (norm < 1e-6f) {
-        // Gimbal lock: looking straight up or down, yaw and roll are the same axis.
-        roll = yaw - std::atan2(m[5], m[2]);
-        if (m[6] > 0.0f) roll = 3.1415927f - roll;
-        return;
-    }
-    const float cosYaw = m[0] / norm;
-    const float sinYaw = -m[3] / norm;
-    roll = std::atan2(-(m[5] * cosYaw + m[2] * sinYaw), m[4] * cosYaw + m[1] * sinYaw);
-}
-
-// Rebuild in the order the decomposition implies, so the two can be compared.
-void gplEulerToMatrix(float yaw, float pitch, float roll, float out[9]) {
-    const float cz = std::cos(yaw), sz = std::sin(yaw);
-    const float cy = std::cos(pitch), sy = std::sin(pitch);
-    const float cx = std::cos(roll), sx = std::sin(roll);
-
-    out[0] = cz * cy;
-    out[1] = cz * sy * sx - sz * cx;
-    out[2] = cz * sy * cx + sz * sx;
-    out[3] = sz * cy;
-    out[4] = sz * sy * sx + cz * cx;
-    out[5] = sz * sy * cx - cz * sx;
-    out[6] = -sy;
-    out[7] = cy * sx;
-    out[8] = cy * cx;
 }
 
 namespace {
@@ -1733,6 +1696,41 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
     aim.pitch = std::asin(rzLocal) * 57.2957795f;
 }
 
+// The cone a pane's glass is tested against (report 105 section 4.45): the eye's frustum held in a
+// cone of half-angle atan(kPaneFrustumDiagonal x tan(horizontal half field)), which covers a
+// vertical extent up to 1.5x the horizontal one, widened by kPaneViewMargin for the runtime's
+// reprojection and the next frame's head turn.
+constexpr float kPaneFrustumDiagonal = 1.8f;
+constexpr float kPaneViewMargin = 0.26f;  // 15 degrees
+
+// Whether glass `side` can show in the view of an eye at `eye` (world) looking along the first
+// column of `orientation`, with full horizontal field `fov`: the glass's bounding sphere against
+// the eye's cone. As aimPane places it.
+bool paneInView(const PaneFrame& frame, const PaneGeometry& glass, int side, const float eye[3],
+                const float orientation[9], float fov) {
+    float sign = side == 0 ? 1.0f : -1.0f;
+    float geomSign = g_derivedActive ? 1.0f : sign;
+    float c[3] = {glass.centre[0], geomSign * glass.centre[1], glass.centre[2]};
+    float e[3];
+    worldToLocal(frame, eye, e);
+    float t[3] = {c[0] - e[0], c[1] - e[1], c[2] - e[2]};
+    float distance = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+    float radius = std::sqrt(glass.halfWidth * glass.halfWidth + glass.halfHeight * glass.halfHeight);
+    if (distance <= radius) return true;
+    // The view direction in car axes (frame.R's columns are the car's axes in world).
+    float forward[3] = {orientation[0], orientation[3], orientation[6]};
+    float f[3];
+    for (int column = 0; column < 3; ++column)
+        f[column] = frame.R[0 * 3 + column] * forward[0] + frame.R[1 * 3 + column] * forward[1] +
+                    frame.R[2 * 3 + column] * forward[2];
+    float length = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (length < 1e-6f || !(fov > 0.0f)) return true;
+    float cosine = (t[0] * f[0] + t[1] * f[1] + t[2] * f[2]) / (distance * length);
+    cosine = cosine > 1.0f ? 1.0f : (cosine < -1.0f ? -1.0f : cosine);
+    float half = std::atan(kPaneFrustumDiagonal * std::tan(fov * 0.5f));
+    return std::acos(cosine) - std::asin(radius / distance) < half + kPaneViewMargin;
+}
+
 // When the team changes, or the first time: the glass data in use and whether the derived
 // car frame is believable. The seat eye in car axes is the check report 41 T1 asks for.
 void reportPaneGeometry(const PaneGeometry& glass, const PaneFrame& frame,
@@ -1816,6 +1814,13 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
 // gives each eye a copy and puts it back on the frames that do not render; until both copies
 // exist there is nothing to put back, so the frame renders.
 bool stereoMirrorOn() { return g_options.mirrorUpdateRate > 0; }
+
+void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView) {
+    rendered = g_state.panesRendered;
+    outOfView = g_state.panesOutOfView;
+    g_state.panesRendered = 0;
+    g_state.panesOutOfView = 0;
+}
 
 // Every glass is a region of the one shared mirror.mip, so they are all rendered on the same
 // frames: the cache restores the whole texture, and restoring it after writing one region would
@@ -2095,6 +2100,33 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                  (vr[0].offset[2] + vr[1].offset[2]) * 0.5f, centreX, centreY, centreZ);
     walkSetCentre(savedX + centreX, savedY + centreY, savedZ + centreZ);
 
+    // Which glasses each eye can see (report 105 section 4.45), from the orientation and position
+    // each pass below writes. A pane no eye that samples it can see is not rendered this frame;
+    // its region of mirror.mip keeps an older reflection nobody looks at.
+    bool paneSeen[2][kMaxMirrorSurfaces];
+    for (int pass = 0; pass < 2; ++pass)
+        for (int surface = 0; surface < kMaxMirrorSurfaces; ++surface)
+            paneSeen[pass][surface] = true;
+    if (g_options.mirrorSkipOutOfView && tracked && panes) {
+        for (int pass = 0; pass < 2; ++pass) {
+            float orientation[9];
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    orientation[row * 3 + column] =
+                        savedOrientation[row * 3 + 0] * vr[pass].rotation[0 * 3 + column] +
+                        savedOrientation[row * 3 + 1] * vr[pass].rotation[1 * 3 + column] +
+                        savedOrientation[row * 3 + 2] * vr[pass].rotation[2 * 3 + column];
+            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            localToWorld(savedOrientation, vr[pass].offset[0], vr[pass].offset[1],
+                         vr[pass].offset[2], dx, dy, dz);
+            float eye[3] = {savedX + dx, savedY + dy, savedZ + dz};
+            for (int surface = 0; surface < g_state.paneCount && surface < kMaxMirrorSurfaces;
+                 ++surface)
+                paneSeen[pass][surface] = paneInView(paneFrame, paneGlass(*glass, surface),
+                                                     surface, eye, orientation, vr[pass].fov);
+        }
+    }
+
     for (int pass = 0; pass < 2; ++pass) {
         // pass 0 draws the left half of the buffer and is the left eye. Proven in
         // game, not assumed: the left viewpoint lands in the left half with no swap
@@ -2198,12 +2230,29 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                 eye[2] = savedZ + hz;
             }
 
-            PaneAim aim[kMaxMirrorSurfaces];
+            // The panes to render: those an eye sampling this pass's writes can see (perEyeMirror
+            // 0 renders here for both eyes). The last of them rides the eye's render.
+            int rendered[kMaxMirrorSurfaces];
+            int renderCount = 0;
             for (int surface = 0; surface < dueCount; ++surface) {
+                bool seen = g_options.perEyeMirror
+                                ? paneSeen[pass][surface]
+                                : paneSeen[0][surface] || paneSeen[1][surface];
+                if (seen)
+                    rendered[renderCount++] = surface;
+                else
+                    ++g_state.panesOutOfView;
+            }
+            g_state.panesRendered += static_cast<unsigned>(renderCount);
+            if (renderCount == 0) params->mirrorCamera = nullptr;
+
+            PaneAim aim[kMaxMirrorSurfaces] = {};
+            for (int k = 0; k < renderCount; ++k) {
+                int surface = rendered[k];
                 aimPane(params, mirrorStock, paneFrame, paneGlass(*glass, surface), surface, eye,
                         g_state.pane[surface].camera, aim[surface]);
                 params->mirrorCamera = g_state.pane[surface].camera;
-                if (surface + 1 >= dueCount) break;
+                if (k + 1 >= renderCount) break;
 
                 int copies = g_state.paneCopies;
                 g_state.mirrorOnly = true;

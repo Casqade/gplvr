@@ -356,6 +356,9 @@ void __cdecl mainWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, 
     reinterpret_cast<WorldWalkFn>(kWorldWalk)(a1, a2, a3, a4, a5, a6, a7, a8);
     // Always: it also ends the capture probe's watch of a pass GPL drew alone.
     bakedPassEnd(g_lastSceneParams);
+    // Nothing of the pass is submitted after the walk (0x487FAF-0x487FEE: pops, resets, the stats
+    // overlay), so the cockpit goes over the eye here (report 105 section 4.49).
+    bakedPassMainWalkDone();
 }
 
 unsigned g_sceneMirrorOnlyCalls = 0;  // mirror-only renders, counted apart from the eyes
@@ -409,6 +412,15 @@ void reportOncePerSecond() {
     else if (g_mirrorRefreshes)
         _snprintf_s(mirror, sizeof(mirror), _TRUNCATE, "mirror %.1f/s, copy-outs %u rebound %u | ",
                     g_mirrorRefreshes / seconds, copies, rebound);
+    // Panes rendered and panes whose glass no eye could see (report 105 section 4.45).
+    unsigned panesRendered = 0;
+    unsigned panesOutOfView = 0;
+    stereoTakePaneCounts(panesRendered, panesOutOfView);
+    char panes[96] = {};
+    if (panesRendered || panesOutOfView)
+        _snprintf_s(panes, sizeof(panes), _TRUNCATE,
+                    "mirror panes %u, out of view %u (mirrorSkipOutOfView %d) | ", panesRendered,
+                    panesOutOfView, g_options.mirrorSkipOutOfView);
 
     // Mirror-only renders are not counted as renders, but their time is in the scene total
     // and so in "ms each": per eye render including the pane renders before it.
@@ -427,13 +439,13 @@ void reportOncePerSecond() {
                     transfers / seconds);
 
     logf("fps %.1f%s | worldFrames %.1f/s, renders %.1f/s (x%.2f)%s, %.2f ms each, "
-         "%.2f ms worst | transfer %.2f ms x%.1f/frame | %s%s%smode %s",
+         "%.2f ms worst | transfer %.2f ms x%.1f/frame | %s%s%s%smode %s",
          g_frames / seconds, headsetRate, g_sceneHookCalls / seconds, g_sceneOrigCalls / seconds,
          g_sceneHookCalls ? static_cast<double>(g_sceneOrigCalls) / g_sceneHookCalls : 0.0,
          paneRenders, msPerRender, worstMs,
          haveTransfer && transfers ? transferMs / transfers : 0.0,
          haveTransfer && g_frames ? static_cast<double>(transfers) / g_frames : 0.0,
-         mirror, haveTick ? tick : "", haveTick ? " | " : "",
+         mirror, panes, haveTick ? tick : "", haveTick ? " | " : "",
          g_options.vr ? "stereo" : "single");
 
     // The frame budget, broken up. Per FRAME, not per render, so the four parts and the
@@ -2579,6 +2591,8 @@ void loadOptions(const char* fileName) {
     char text[64] = {};
 
     g_options.perEyeMirror = GetPrivateProfileIntA("gplvr", "perEyeMirror", 1, path) != 0;
+    g_options.mirrorSkipOutOfView =
+        GetPrivateProfileIntA("gplvr", "mirrorSkipOutOfView", 1, path) != 0 ? 1 : 0;
     g_options.mirrorCopyRebind =
         GetPrivateProfileIntA("gplvr", "mirrorCopyRebind", 1, path) != 0;
     g_options.mirrorUpdateRate = GetPrivateProfileIntA("gplvr", "mirrorUpdateRate", 1, path);
@@ -2808,6 +2822,24 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "bakedCarProgram", 1, path) != 0 ? 1 : 0;
     g_options.bakedCarProgramMirrors =
         GetPrivateProfileIntA("gplvr", "bakedCarProgramMirrors", 1, path) != 0 ? 1 : 0;
+    g_options.bakedMirrorChurnReset =
+        GetPrivateProfileIntA("gplvr", "bakedMirrorChurnReset", 1, path) != 0 ? 1 : 0;
+    g_options.bakedMirrorCarKey = GetPrivateProfileIntA("gplvr", "bakedMirrorCarKey", 1, path);
+    if (g_options.bakedMirrorCarKey < 0 || g_options.bakedMirrorCarKey > 2)
+        g_options.bakedMirrorCarKey = 1;
+    g_options.bakedMirrorCarCull =
+        GetPrivateProfileIntA("gplvr", "bakedMirrorCarCull", 1, path) != 0 ? 1 : 0;
+    g_options.bakedOrderPatch =
+        GetPrivateProfileIntA("gplvr", "bakedOrderPatch", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCockpitCheck =
+        GetPrivateProfileIntA("gplvr", "bakedCockpitCheck", 0, path) != 0 ? 1 : 0;
+    g_options.bakedCockpit = GetPrivateProfileIntA("gplvr", "bakedCockpit", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCockpitOverlay =
+        GetPrivateProfileIntA("gplvr", "bakedCockpitOverlay", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCockpitProgram =
+        GetPrivateProfileIntA("gplvr", "bakedCockpitProgram", 1, path) != 0 ? 1 : 0;
+    g_options.bakedCockpitSkipGpl =
+        GetPrivateProfileIntA("gplvr", "bakedCockpitSkipGpl", 1, path) != 0 ? 1 : 0;
     g_options.bakedCarConfigs =
         GetPrivateProfileIntA("gplvr", "bakedCarConfigs", 1, path) != 0 ? 1 : 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
@@ -2833,6 +2865,11 @@ void loadOptions(const char* fileName) {
         // what used to make it read as a VR feature.
     }
 
+    logf("options: mirrorSkipOutOfView=%d (%s)", g_options.mirrorSkipOutOfView,
+         g_options.mirrorSkipOutOfView
+             ? "a mirror pane whose glass no eye can see this frame is not rendered; watch "
+               "`mirror panes N, out of view M` on the fps line"
+             : "off: every pane is rendered on every mirror frame");
     logf("options: perEyeMirror=%d mirrorCopyRebind=%d mirrorUpdateRate=%d (%s) -- the aim of the "
          "glasses is per car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
          g_options.perEyeMirror ? 1 : 0, g_options.mirrorCopyRebind ? 1 : 0,
@@ -2939,7 +2976,8 @@ void loadOptions(const char* fileName) {
          g_options.bakedCars >= 3
              ? "stage 2b: in the baked main passes gplvr draws the other cars itself from its "
                "draw lists, with real depth, and GPL draws only their blob shadows; mirrors and "
-               "the cockpit stay GPL's, counted but not walked (levels 1 and 2 verify them)"
+               "the cockpit (but with bakedCockpit) stay GPL's, counted but not walked (levels 1 "
+               "and 2 verify them)"
          : g_options.bakedCars == 2
              ? "stage 2a: every car GPL draws is also walked by gplvr, its polygon count checked "
                "against GPL's, and a draw list of baked leaves filled and checked against the "
@@ -2996,6 +3034,64 @@ void loadOptions(const char* fileName) {
              : "the mirror passes keep car lists of their own across frames as the main passes "
                "do (report 105 section 4.42); watch the mirror clause of `baked cars: lists kept "
                "across frames` and the walks on `baked cars: mirror passes`");
+    logf("options: bakedMirrorChurnReset=%d (%s)", g_options.bakedMirrorChurnReset,
+         g_options.bakedMirrorChurnReset
+             ? "a mirror car's reuse ends its run of builds, so gathering a list for each glass "
+               "does not back it off (report 105 section 4.51); watch `backing off` on `baked "
+               "cars: lists kept across frames`"
+             : "off: a mirror car's builds count toward the backoff as a main car's do");
+    logf("options: bakedMirrorCarKey=%d (%s)", g_options.bakedMirrorCarKey,
+         g_options.bakedMirrorCarKey == 2
+             ? "a mirror car keeps its lists per glass and eye (report 105 section 4.54); watch "
+               "`baked cars: Cars keyed by glass and eye`"
+         : g_options.bakedMirrorCarKey == 1
+             ? "a mirror car keeps its lists per glass (report 105 section 4.54); watch `baked "
+               "cars: Cars keyed by glass and eye` (the two eyes' same / different / built)"
+             : "a mirror car keeps one set of lists for every glass and eye, as in section 4.42");
+    logf("options: bakedMirrorCarCull=%d (%s)", g_options.bakedMirrorCarCull,
+         g_options.bakedMirrorCarCull
+             ? "a mirror car whose root box the mirror's view culls is not listed (report 105 "
+               "section 4.54); watch `baked cars: mirror cars off the view` (NOT empty 0)"
+             : "off: every mirror car is listed, empty lists included");
+    logf("options: bakedOrderPatch=%d (%s)", g_options.bakedOrderPatch,
+         g_options.bakedOrderPatch
+             ? "a kept car's draw order missing from its memos is patched from the nearest memo "
+               "(report 105 section 4.53); watch `baked cars: the draw order patched from the "
+               "nearest memo` (differing 0)"
+             : "off: every memo miss emits the whole draw order");
+    logf("options: bakedCockpitCheck=%d (%s)", g_options.bakedCockpitCheck,
+         g_options.bakedCockpitCheck
+             ? "a test run: every cockpit draw is also walked and compared with GPL's polygon "
+               "counter (report 105 section 4.47); watch `cockpit M of K` on the `baked cars: N "
+               "car draws` line and the stage-2 lines"
+             : "off: the cockpit is handed to GPL unwalked");
+    logf("options: bakedCockpit=%d (%s)", g_options.bakedCockpit,
+         !g_options.bakedCockpit ? "off: GPL draws the cockpit"
+         : !g_options.bakedRenderer || g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
+         : g_options.bakedCockpitCheck
+             ? "on, but bakedCockpitCheck = 1 takes precedence: GPL draws the cockpit"
+             : "in the baked main passes gplvr draws the cockpit from one list a pass and GPL "
+               "only its mirror glass (report 105 section 4.48); watch `baked cars: the "
+               "cockpit`");
+    logf("options: bakedCockpitOverlay=%d (%s)", g_options.bakedCockpitOverlay,
+         !g_options.bakedCockpitOverlay ? "off: the cockpit is step 1's (section 4.48)"
+         : !g_options.bakedCockpit || g_options.bakedCockpitCheck || !g_options.bakedRenderer ||
+                 g_options.bakedCars != 3
+             ? "on, but inert: it needs bakedCockpit = 1, bakedCockpitCheck = 0, bakedRenderer = "
+               "1 and bakedCars = 3"
+             : "gplvr draws the whole cockpit, mirror glass included, over each eye's finished "
+               "image in GPL's order without depth (report 105 section 4.49); watch `baked: the "
+               "cockpit over the eye image` and `baked cars: the cockpit, step 2`");
+    logf("options: bakedCockpitProgram=%d bakedCockpitSkipGpl=%d (%s; report 105 section 4.50: "
+         "the cockpit's kept list, GPL's empty cockpit draw skipped; watch `baked cars: the "
+         "cockpit's kept list` and `baked cars: GPL's cockpit draw skipped`)",
+         g_options.bakedCockpitProgram, g_options.bakedCockpitSkipGpl,
+         !g_options.bakedCockpitOverlay || !g_options.bakedCockpit ||
+                 g_options.bakedCockpitCheck || !g_options.bakedRenderer ||
+                 g_options.bakedCars != 3
+             ? "inert: both act on step 2's passes only, which need bakedCockpitOverlay = 1"
+             : "cockpit step 3, in the passes step 2 draws");
     logf("options: bakedCarConfigs=%d (%s)", g_options.bakedCarConfigs,
          !g_options.bakedCarConfigs
              ? "off: one kept list a car, every gate both ways, as in report 105 section 4.23"

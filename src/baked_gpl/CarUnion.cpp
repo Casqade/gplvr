@@ -52,7 +52,7 @@ bool sameMaterial(const baked::CarMaterial& a, const baked::CarMaterial& b) {
     return a.textureHandle == b.textureHandle && a.texture == b.texture &&
            a.surfaceClass == b.surfaceClass && a.textured == b.textured &&
            a.specularExponent == b.specularExponent &&
-           floatBits(a.specular) == floatBits(b.specular);
+           floatBits(a.specular) == floatBits(b.specular) && a.liveMirror == b.liveMirror;
 }
 
 // The skinned corners a run draws, index by index, against the other run's.
@@ -101,9 +101,9 @@ bool carUnionSameDrawn(const baked::CarDrawList& a, const baked::CarDrawList& b,
                       b.mirror ? "mirror" : "main", what, index, of);
         return false;
     };
-    if (a.driver != b.driver || a.cockpit != b.cockpit || a.mirror != b.mirror ||
-        a.flagman != b.flagman)
-        return differs("driver, cockpit, mirror or flagman", 0, 1);
+    if (a.driver != b.driver || a.cockpit != b.cockpit || a.overlay != b.overlay ||
+        a.mirror != b.mirror || a.flagman != b.flagman)
+        return differs("driver, cockpit, overlay, mirror or flagman", 0, 1);
     if (!sameBits(a.rootModelView, b.rootModelView, sizeof(a.rootModelView)))
         return differs("root model-view", 0, 1);
     if (!sameBits(a.projection, b.projection, sizeof(a.projection)))

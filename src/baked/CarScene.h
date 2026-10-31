@@ -174,6 +174,9 @@ struct CarMaterial {
     uint8_t  textured = 0;       // gpl_materialClassTextured: family B takes the texture
     int32_t  specularExponent = 0;  // gpl_lightSpecularExponent; 0 is no specular
     float    specular = 0.0f;       // gpl_lightSpecular (ks)
+    // Its textured leaves sample the host's live mirror texture (CarRenderer::setLiveMirror)
+    // instead of `texture`: the cockpit's mirror glass in an overlay list (report 105 section 4.49).
+    bool     liveMirror = false;
 };
 
 // CarDraw::object of a draw whose leaves were skinned this pass: its corners are in its list's
@@ -195,11 +198,21 @@ struct CarDraw {
     uint16_t condition = 0;
 };
 
+// A CarDrawList::walkSlot past every place GPL's walk reaches: the list's translucent runs follow
+// all of the track's walk-order content and paint over every track pixel, as the cockpit's must
+// (report 105 section 4.48). Renderer::hookRunPosition clamps it to the visible list's end; it
+// stays below 2^31, so the car shader's signed u_walkSlot is above every track order number.
+constexpr uint32_t kWalkSlotLast = 0x7FFFFFFFu;
+
 // What one car draws in one pass, in GPL's walk order: translucent parts are drawn in it.
 struct CarDrawList {
     int   driver = 0;
     bool  cockpit = false;
     bool  mirror = false;
+    // Drawn over the pass's finished image instead of among the cars (report 105 section 4.49, the
+    // cockpit): after GPL's last flush, in list order, without a depth test, its translucent parts
+    // blended in place (CarRenderer::drawOverlay).
+    bool  overlay = false;
     float rootModelView[16] = {};  // GPL's model-view at the car's dispatch, row-major
     float projection[16] = {};
     float light[3] = {};  // the light direction GPL holds in the dispatch frame, unit

@@ -6,6 +6,10 @@
 
 #include <cstdint>
 
+namespace baked {
+struct CarDrawList;
+}
+
 namespace gplvr {
 namespace carwalk {
 
@@ -45,6 +49,14 @@ struct EmitCounts {
     uint32_t overflow = 0;       // a frame or material past 65535, drawn under its parent's
     uint32_t slotNoList = 0;     // a slot MATERIAL with no texture list published above it
     uint32_t unresolved = 0;     // a MATERIAL bound a texture whose file was not found
+    // The cockpit's mirror glass (report 105 section 4.48): polygons under a MATERIAL binding
+    // mirror.mip, left out of the list for GPL to draw, and those the glass set had no room for.
+    uint32_t glass = 0;
+    uint32_t glassOverflow = 0;
+    // Step 2 (section 4.49): glass appended to the list with the UVs GPL holds live, and glass
+    // refused (skinned, or its baked corners not found), which refuses the list.
+    uint32_t glassListed = 0;
+    uint32_t glassRefused = 0;
 };
 
 // Skinning (report 105 section 4.4), per walk: what GPL's vertex and normal memos changed.
@@ -90,10 +102,16 @@ struct OursSecond {
     WalkTicks ticks;
     uint32_t walkFailed = 0;   // the walk faulted: no list, GPL draws the car's later calls whole
     uint32_t bodyLost = 0;     // of them, the call whose body was already skipped: a car missing
+    uint32_t refused = 0;      // the cockpit: a list not holding every polygon walked but the glass
     uint32_t leftOut = 0;      // debug view 6 left GPL's draw out
     uint32_t matched = 0;      // lists whose leaves equal the walk's polygons
     uint32_t bodyCalls = 0;    // GPL's draw called with the body to be skipped
+    // Report 105 section 4.44: GPL's draw in these calls (pose, helmet colours, register 11, blob
+    // shadow), QueryPerformanceCounter ticks.
+    uint32_t originalCalls = 0;
+    int64_t  originalTicks = 0;
     uint64_t leaves = 0;
+    uint64_t glass = 0;   // the cockpit's glass leaves left to GPL in those lists
     uint64_t walked = 0;
     uint64_t draws = 0;
     uint64_t gplPolygons = 0;  // what GPL's counter moved by on those calls, shadow apart: 0
@@ -104,6 +122,46 @@ struct OursSecond {
     int      driver = 0;
     uint32_t firstLeaves = 0;
     uint32_t firstWalked = 0;
+};
+
+// Why a cockpit call of bakedCockpit = 1 was drawn whole by GPL (report 105 section 4.48).
+enum CockpitWhole : int {
+    kCockpitNotBaked,     // outside a baked main pass whose cars the car renderer draws
+    kCockpitNotMainFile,  // not the main register file (GPL enqueues it for main passes only)
+    kCockpitFilter,       // the node filter does not see the lit polygon types (not stock)
+    kCockpitNoMirrorMip,  // the car set's mirror.mip handle is not known, so the glass is not
+    kCockpitArenaFull,    // past kMaxListsPerPass lists this pass
+    kCockpitFaulted,      // this pass's walk of it faulted
+    kCockpitRefused,      // its list did not hold every polygon walked but the glass
+    kCockpitWholeKinds
+};
+
+// Report 105 section 4.48, per second: the cockpit gplvr draws while GPL draws its mirror glass
+// (Second::cockpitOurs). Its lists are counted in Second::cockpitList as the cars' in Second::cars.
+struct CockpitSecond {
+    uint32_t calls = 0;        // cockpit calls at bakedCockpit = 1
+    uint32_t taken = 0;        // lists the second eye took from the first eye's (CarShare.h)
+    uint32_t kept = 0;         // lists assembled from its kept program (report 105 section 4.50)
+    uint32_t glassCalls = 0;   // GPL's draws of it keeping only the glass
+    int64_t  glassTicks = 0;   // their QueryPerformanceCounter ticks
+    uint64_t glassPassed = 0;  // glass leaves the node filter handed to GPL in those draws
+    uint64_t dropped = 0;      // every other polygon and sprite leaf, dropped there
+    uint64_t lines = 0;        // lines handed to GPL there (a walk lists none)
+    uint64_t gplPolygons = 0;  // what GPL's counter moved by over those draws
+    uint32_t glassNodes = 0;   // glass nodes known at the second's last call
+    uint32_t whole[kCockpitWholeKinds] = {};
+    // Step 2 (bakedCockpitOverlay = 1, report 105 section 4.49): lists made with the glass in them
+    // and drawn over the eye image, and lists made for step 1 instead (the reasons are on the
+    // `baked: the cockpit over the eye image` line); GPL's draws of the cockpit handing GPL no
+    // leaf, what the filter did in them, and what GPL's counter moved by over them.
+    uint32_t overlayLists = 0;
+    uint32_t stepOne = 0;
+    uint32_t overlayCalls = 0;
+    int64_t  overlayTicks = 0;
+    uint64_t overlayPassed = 0;  // leaves handed to GPL there: 0
+    uint64_t overlayDropped = 0;
+    uint64_t overlayLines = 0;
+    uint64_t overlayGplPolygons = 0;  // 0
 };
 
 // Stage 2, per second: the draw lists and how their leaves compared with the walk's count.
@@ -155,7 +213,17 @@ struct Second {
     OursSecond cars;
     // The same for the mirror passes (bakedMirrors = 1): its `main` counters are mirror-pass calls.
     OursSecond mirrorCars;
+    // The cockpit gplvr draws (report 105 section 4.48): its lists, and its calls.
+    OursSecond    cockpitList;
+    CockpitSecond cockpitOurs;
     SkinCounts skin;  // the stage-1 walks (mirrors, cockpit, stages 1 and 2)
+    // Report 105 section 4.44: the cockpit drawn by GPL at bakedCars = 3, QueryPerformanceCounter
+    // ticks; at bakedCockpit = 1 GPL's draws of its glass alone (section 4.48), and any whole.
+    uint32_t cockpitCalls = 0;
+    int64_t  cockpitTicks = 0;
+    // Report 105 section 4.46: every car call, whole, by BakedTimeKind (BakedPass.h).
+    int64_t  callTicks[3] = {};
+    uint32_t callCount[3] = {};
 };
 
 // Once a second (the window starting at `windowStart`, QueryPerformanceCounter ticks): the
@@ -164,6 +232,14 @@ struct Second {
 // again. `stage3`: bakedCars = 3 is on.
 bool reportSecond(Second& second, int64_t& windowStart, bool stage3, uint32_t bodySkipped,
                   uint32_t bodySkippedMirror);
+
+// A team instance's first draw (as a car or as the cockpit): what its walk met and, with a list,
+// what the list holds and which objects GPL's vertex memo skinned -- `skinnedLeaves[i]` leaves of
+// object `skinnedObject[i]` (CarScene::objects) for i below `skinnedObjects`.
+void logInstance(void* instance, int driver, bool cockpit, const WalkCounts& c,
+                 const EmitCounts& emit, const SkinCounts& k, const int32_t* skinnedObject,
+                 const uint32_t* skinnedLeaves, int skinnedObjects,
+                 const baked::CarDrawList* list);
 
 // One walk's counts added into a sum.
 void addCounts(WalkCounts& sum, const WalkCounts& add);

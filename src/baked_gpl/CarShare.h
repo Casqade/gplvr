@@ -177,6 +177,16 @@ struct ShareSprite {
     uint32_t  colour;
 };
 
+// A mirror glass of the cockpit's kept list (report 105 section 4.50): polygon node `node`, listed
+// as `count` dynamic corners at `firstVertex` of the list's dynamicVertices (CockpitGlass.h,
+// cockpitGlassCorners), whose UVs each assembly takes again from GPL's PRIM, where MirrorUv
+// rewrites them.
+struct ShareGlass {
+    uintptr_t node;
+    uint32_t  firstVertex;
+    uint32_t  count;
+};
+
 struct ShareTape {
     uintptr_t record = 0;
     uintptr_t root = 0;
@@ -216,6 +226,8 @@ struct ShareTape {
     // full tape).
     uint16_t wheelsSwitched = 0;
     uint16_t wheelsAsPosed = 0;
+    // And the cockpit's mirror glass, listed with GPL's live UVs (section 4.50).
+    std::vector<ShareGlass> glass;
 };
 
 // -- recording: from the walk while CarWalk's Walk::tape is set ----------------------------------

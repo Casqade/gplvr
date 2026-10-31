@@ -79,4 +79,19 @@ void memoStore(Memo& memo, uint32_t entry, uint32_t key, uint16_t id, uint16_t c
 // gpl_matrixPop(1): every memo made since the pool held `mark` entries is cleared.
 void memoUndo(Memo& memo, size_t mark);
 
+// GPL's own vertex memo (report 105 section 4.4; gpl_vertexTransformCached 0x4CFBB0), for what
+// GPL memoised before a walk: a vertex record's word 0 points at its 64-byte slot in the pool
+// while it is cached, and gpl_transformedVertexSourceList[i] names the record that owns slot i.
+// Bound once at the car walk's install: the pool, its index and the source list placed through
+// rebase(), and only when the function names those addresses; logged when it does not, and the
+// walk then does without it.
+void carMemoGplBind();
+// A vertex GPL memoised before this walk, outside every pop(1) the walk makes: the slot its
+// record's word 0 names, when that slot is in use and its source is the record; else 0, with
+// `staleWords` counting a word that names no live slot (every word, while not bound).
+uintptr_t carMemoGplSlot(uintptr_t record, uint32_t& staleWords);
+// The bound pool index and source list (CarShare.h replays against them), 0 while not bound.
+uintptr_t carMemoGplPoolIndex();
+uintptr_t carMemoGplSources();
+
 }  // namespace gplvr

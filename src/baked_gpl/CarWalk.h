@@ -42,8 +42,10 @@ void carWalkInstall();
 // Stage 2b: bakedPassBegin opens a new pass's arena (`mirror`: a mirror pass); bakedPassEnd reads
 // its lists, one per car drawn by gplvr, in the order GPL first called each car. In VR the
 // first eye's lists are kept for the second eye's pass of the same kind (CarShare.h), and in
-// every main pass a car's kept list (CarProgram.h) stands in for its walk where it holds.
-void carWalkPassBegin(bool mirror);
+// every main pass a car's kept list (CarProgram.h) stands in for its walk where it holds. `pane`:
+// a mirror pass's glass (stereoMirrorPaneOf, -1 not known), which keys its cars' kept lists
+// (report 105 section 4.54).
+void carWalkPassBegin(bool mirror, int pane);
 const baked::CarDrawList* carWalkPassLists(uint32_t& count);
 
 }  // namespace gplvr

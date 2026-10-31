@@ -383,7 +383,8 @@ bool sameInputs(const ShareTape& tape, const ShareCall& call, const baked::CarDr
            call.planeMask == 0 && !call.cellPlanes &&
            tape.generation == carBakeGeneration() &&
            tape.rebaked == carBakeTotals().objectsRebaked && fresh.driver == stored.driver &&
-           fresh.cockpit == stored.cockpit && fresh.mirror == stored.mirror && !stored.flagman &&
+           fresh.cockpit == stored.cockpit && fresh.overlay == stored.overlay &&
+           fresh.mirror == stored.mirror && !stored.flagman &&
            !fresh.materials.empty() && !stored.materials.empty() &&
            sameMaterial(fresh.materials[0], stored.materials[0]);
 }
@@ -491,9 +492,9 @@ bool sameList(const baked::CarDrawList& a, const baked::CarDrawList& b, char* wh
                       b.mirror ? "mirror" : "main", what, index, of);
         return false;
     };
-    if (a.driver != b.driver || a.cockpit != b.cockpit || a.mirror != b.mirror ||
-        a.flagman != b.flagman)
-        return differs("driver, cockpit, mirror or flagman", 0, 1);
+    if (a.driver != b.driver || a.cockpit != b.cockpit || a.overlay != b.overlay ||
+        a.mirror != b.mirror || a.flagman != b.flagman)
+        return differs("driver, cockpit, overlay, mirror or flagman", 0, 1);
     if (!sameBits(a.rootModelView, b.rootModelView, sizeof(a.rootModelView)))
         return differs("root model-view", 0, 1);
     if (!sameBits(a.projection, b.projection, sizeof(a.projection)))

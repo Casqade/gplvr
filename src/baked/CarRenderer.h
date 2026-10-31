@@ -17,6 +17,9 @@
 //      literal alpha), blended and not written, inside the track's walk-order phase at the
 //      place GPL's walk dispatched the car, so the track's sprites and cutouts GPL drew after
 //      the car paint over it and those it drew before lie under it (report 105 section 4.8).
+// An overlay list (the cockpit, report 105 section 4.49) takes neither phase: drawOverlay paints it
+// over the finished eye image after GPL's last flush, in its own order and without depth, as
+// GPL's painter's order drew it.
 // The flagmen (report 105 section 4.13) are lists of the same kind, one sprite each, painted whole
 // in phase 2's place (CarDrawList::flagman) with their colours looked up per texel from a
 // 16-colour palette row, so they need nothing a car does not have but that lookup.
@@ -124,6 +127,37 @@ struct CarPassStats {
     uint32_t indexedWithoutPalette = 0;
 };
 
+// Report 105 section 4.49: an overlay list (CarDrawList::overlay) as prepare made it and
+// drawOverlay drew it. Its leaves are drawn + empty + conditionedOff + refused == listPolygons.
+struct CarOverlayStats {
+    uint32_t lists = 0;
+    uint32_t commands = 0;
+    uint32_t polygons = 0;        // leaves its commands draw
+    uint32_t glass = 0;           // of them under CarMaterial::liveMirror
+    uint32_t empty = 0;           // leaves without geometry: counted, nothing to draw
+    uint32_t conditionedOff = 0;  // leaves of draws the pass's eye does not draw
+    uint32_t refused = 0;         // leaves of draws prepare refused (a bad row, past the table)
+    uint32_t listPolygons = 0;    // the lists' leaves
+    bool     copied = false;      // the live mirror texture copied for the glass
+    double   microseconds = 0.0;
+};
+
+// What drawOverlay did.
+enum CarOverlayOutcome : int {
+    kOverlayDrawn,
+    kOverlayNone,        // no overlay list was prepared this pass
+    kOverlayHidden,      // debug view 7 hides the cars, the overlay with them
+    kOverlayNotReady,    // drawSolid never ran for the pass: its cars were not drawn
+    kOverlayNoCommands,  // every draw of the overlay was refused or off for this eye
+};
+
+// setLiveMirror's answer.
+enum LiveMirrorRefusal : int {
+    kLiveMirrorReady,
+    kLiveMirrorNoSize,  // GL reports no size or format for the texture
+    kLiveMirrorNoCopy,  // the copy texture, its framebuffers or its bindless handle failed
+};
+
 // Since the last takeTotals.
 struct CarUploadTotals {
     uint32_t objects = 0;
@@ -168,8 +202,22 @@ public:
     void     drawWalkOrderRun(uint32_t run, uint32_t position,
                               const SolidHookContext& context) override;
     // After the pass: what it did. A prepared pass the renderer never called back for is
-    // reported with `drawn` false.
+    // reported with `drawn` false. An overlay the pass prepared is kept for drawOverlay.
     CarPassStats finishPass();
+
+    // Report 105 section 4.49. Before prepare: the GL texture the glass of an overlay list samples
+    // (CarMaterial::liveMirror), and whether its t is flipped as roglv2 flips mirror.mip's. It is
+    // copied into a texture of the renderer's own (with the flip, so the glass keeps GPL's UVs)
+    // when the overlay is drawn; the copy is made again whenever the size or format changes.
+    int setLiveMirror(GLuint texture, bool flipT);
+    // Whether the last prepare holds an overlay list not drawn yet.
+    bool overlayPrepared() const { return overlayLists_ != 0; }
+    // The overlay lists of the prepared pass, once the rest of the pass is on screen: into the
+    // draw framebuffer `framebuffer` at `rect` (GL window pixels), in list order, depth test off,
+    // blended as roglv2 blends, with the pass's uniforms. Consumes the overlay.
+    int drawOverlay(GLuint framebuffer, const int rect[4], CarOverlayStats& stats);
+    // Forgets an overlay no drawOverlay took.
+    void discardOverlay();
 
     CarUploadTotals takeTotals();
 
@@ -347,6 +395,28 @@ private:
     // drawSolid ran this pass, so the walk-order runs may be drawn (in debug view 7 too, where
     // only the flagmen's are left).
     bool runsReady_ = false;
+    // Report 105 section 4.49: the overlay lists' commands, after every other list's in commands_
+    // (phase 0 and the walk-order runs leave them out); drawSolid set the program's uniforms for
+    // them (`overlayReady_`) or hid them (debug view 7); the checker texture of debug view 8.
+    uint32_t        overlayLists_ = 0;
+    uint32_t        overlayFirst_ = 0;
+    uint32_t        overlayCount_ = 0;
+    bool            overlayReady_ = false;
+    bool            overlayHidden_ = false;
+    GLuint          overlayChecker_ = 0;
+    CarOverlayStats overlay_;
+    // The live mirror texture and the renderer's copy of it, with its bindless handle and the
+    // read and draw framebuffers of the copy.
+    GLuint   mirrorSource_ = 0;
+    bool     mirrorFlip_ = false;
+    GLint    mirrorWidth_ = 0;
+    GLint    mirrorHeight_ = 0;
+    GLint    mirrorFormat_ = 0;
+    GLuint   mirrorCopy_ = 0;
+    uint64_t mirrorHandle_ = 0;
+    GLuint   copyFramebuffers_[2] = {0, 0};
+    void releaseMirrorCopy();
+    bool copyMirror(bool blit);
     float                 light_[3] = {0.0f, 0.0f, 1.0f};
     CarLighting           lighting_;
     bool                  framesChecked_ = false;

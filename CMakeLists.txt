@@ -119,6 +119,7 @@ else()
         src/SimRing.cpp
         src/SkidFlood.cpp
         src/Stereo.cpp
+        src/StereoEuler.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
         src/TweakApi.cpp
@@ -149,11 +150,16 @@ else()
         src/baked_gpl/CarBake.cpp
         src/baked_gpl/CarConfig.cpp
         src/baked_gpl/CarMemo.cpp
+        src/baked_gpl/CarOrder.cpp
+        src/baked_gpl/CarPassView.cpp
+        src/baked_gpl/CarPoseWrapper.cpp
         src/baked_gpl/CarProgram.cpp
         src/baked_gpl/CarShare.cpp
         src/baked_gpl/CarUnion.cpp
         src/baked_gpl/CarWalk.cpp
         src/baked_gpl/CarWalkReport.cpp
+        src/baked_gpl/CockpitDraw.cpp
+        src/baked_gpl/CockpitGlass.cpp
         src/baked_gpl/Flagmen.cpp
         src/baked_gpl/ResidualDepth.cpp
         src/baked_gpl/TrackBake.cpp

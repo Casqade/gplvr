@@ -175,7 +175,8 @@ void main() {
 // phase 1 the rest above alpha 0, blended, inside the track's walk-order phase, tested as the
 // track's walk-order fragments are (Renderer.cpp, kFragmentShader): over a track surface by the
 // walk's order -- hidden where GPL's walk reached that surface after the car -- and over a car
-// by depth. The depth moves towards the eye by the draw's rank.
+// by depth. The depth moves towards the eye by the draw's rank. Phase 2 (an overlay list, report 105
+// section 4.49) keeps every fragment above alpha 0, untested: it is drawn without depth, in order.
 const char* const kCarFragmentShader = R"(#version 400
 #extension GL_ARB_bindless_texture : require
 in vec2 v_uv;
@@ -237,8 +238,9 @@ void main() {
     colour.rgb = min(colour.rgb + v_secondary, vec3(1.0));
     // A walk-order-only draw (a flagman) has no core: all of it is painted in phase 1.
     bool walkOnly = (v_drawBits & 2u) != 0u;
-    bool keep = u_phase == 0 ? !walkOnly && colour.a >= kCoreAlpha
-                             : colour.a >= 1.0 / 255.0 && (walkOnly || colour.a < kCoreAlpha);
+    bool keep = u_phase == 0   ? !walkOnly && colour.a >= kCoreAlpha
+                : u_phase == 1 ? colour.a >= 1.0 / 255.0 && (walkOnly || colour.a < kCoreAlpha)
+                               : colour.a >= 1.0 / 255.0;
     if (!keep) discard;
     float z = gl_FragCoord.z;
     float biased = z + u_depthBias.x * v_rank * u_depthBias.z * (u_depthBias.y > 0.5 ? z : 1.0 - z);
@@ -559,7 +561,16 @@ void CarRenderer::release(bool contextAlive) {
         if (drawTexture_) gl_.deleteTextures(1, &drawTexture_);
         if (vertexArray_) gl_.deleteVertexArrays(1, &vertexArray_);
         if (program_) gl_.deleteProgram(program_);
+        releaseMirrorCopy();
+        for (GLuint& framebuffer : copyFramebuffers_)
+            if (framebuffer) gl_.deleteFramebuffers(1, &framebuffer);
     }
+    mirrorCopy_ = 0;
+    mirrorHandle_ = 0;
+    mirrorSource_ = 0;
+    mirrorWidth_ = mirrorHeight_ = mirrorFormat_ = 0;
+    copyFramebuffers_[0] = copyFramebuffers_[1] = 0;
+    discardOverlay();
     initialised_ = false;
     program_ = 0;
     vertexArray_ = vertexBuffer_ = indexBuffer_ = drawIndexBuffer_ = 0;
@@ -817,12 +828,14 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
         }
         handle = gpu->handle;
         textured = true;
-    } else if (material.texture >= 0) {
+    } else if (material.texture >= 0 || material.liveMirror) {
         const GpuTexture* gpu = texture(scene, material.texture);
         if (gpu) {
             average = gpu->average;
             handle = gpu->handle;
         }
+        // The glass of an overlay list: the copy of the live mirror texture (setLiveMirror).
+        if (material.liveMirror) handle = mirrorHandle_;
         textured = material.textured && handle != 0;
     }
     if (!sprite && material.textured && (draw.flags & kCarLeafTextured) && !handle)
@@ -895,7 +908,9 @@ bool sameDraws(const std::vector<CarDraw>& a, const std::vector<CarDraw>& b) {
 
 bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
                                uint32_t vertexBase, uint32_t indexBase) {
-    if (!list.contentKey || !list.conditionOn.empty() || list.flagman) return false;
+    // An overlay list (the cockpit's kept list, report 105 section 4.50) is drawn from its own
+    // draws, which count its leaves and glass for drawOverlay.
+    if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return false;
     ++pass_.keyedLists;
     auto        frames = static_cast<uint32_t>(list.frames.size());
     CachedList* held = findCached(list.contentKey, frames);
@@ -1122,6 +1137,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     pass_ = CarPassStats{};
     commands_.clear();
     runsReady_ = false;
+    discardOverlay();
     if (!initialised_) return;
     if (++prepares_ % 256 == 0) evictIdle();
     passLists_.clear();
@@ -1293,7 +1309,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     paletteFixups_.clear();
     uint32_t maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
     uint32_t maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
-    for (uint32_t l : listOrder_) {
+    // One list's rows and commands, appended to the pass's; its command count.
+    auto appendList = [&](uint32_t l) -> uint32_t {
         const CarDrawList& list = *passLists_[l];
         auto carFirst = static_cast<uint32_t>(commands_.size());
         // The list's palette row, appended the first time one of its draws needs it.
@@ -1310,6 +1327,12 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                                               : list.draws.size();
         const CarDraw* previous = nullptr;
         uint32_t       runs = 0;
+        // An overlay list's leaves, each counted where it went (CarOverlayStats).
+        bool overlay = list.overlay;
+        if (overlay) {
+            overlay_.listPolygons += list.polygons;
+            overlay_.empty += list.emptyLeaves;
+        }
         for (size_t d = 0; !cached && d < drawn; ++d) {
             if (ordered && list.drawOrder[d] >= list.draws.size()) {
                 ++pass_.badOrder;
@@ -1319,6 +1342,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             if (!ordered && !carDrawOn(list, draw)) {
                 ++pass_.conditionedOff;
                 if (draw.condition >= list.conditionOn.size()) ++pass_.badCondition;
+                if (overlay) overlay_.conditionedOff += draw.polygons;
                 continue;
             }
             if (!previous || !carDrawContinues(*previous, draw)) ++runs;
@@ -1328,14 +1352,21 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             bool     dynamic = false;
             bool     palette = false;
             if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), pass_, words, command,
-                         dynamic, palette))
+                         dynamic, palette)) {
+                if (overlay) overlay_.refused += draw.polygons;
                 continue;
+            }
             uint32_t frame = frameBase[l] + draw.frame;
             auto     palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
             if ((commands_.size() + 1) * 2 + (palettes + 1) * kPaletteTexels > maxTexels ||
                 frame >= maxFrames) {
                 ++pass_.tableFull;
+                if (overlay) overlay_.refused += draw.polygons;
                 continue;
+            }
+            if (overlay) {
+                overlay_.polygons += draw.polygons;
+                if (list.materials[draw.material].liveMirror) overlay_.glass += draw.polygons;
             }
             if (palette) {
                 if (listPalette < 0) {
@@ -1355,7 +1386,13 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             draws_.insert(draws_.end(), words, words + kDrawWords);
             commands_.push_back(command);
         }
-        auto carCount = static_cast<uint32_t>(commands_.size()) - carFirst;
+        return static_cast<uint32_t>(commands_.size()) - carFirst;
+    };
+    for (uint32_t l : listOrder_) {
+        const CarDrawList& list = *passLists_[l];
+        if (list.overlay) continue;
+        auto carFirst = static_cast<uint32_t>(commands_.size());
+        uint32_t carCount = appendList(l);
         if (carCount)
             carRanges_.push_back(CarRange{carFirst, carCount, list.walkSlot, list.flagman});
         if (list.flagman) {
@@ -1363,6 +1400,15 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             if (carCount) ++pass_.flagmanRuns;
         }
     }
+    // The overlay lists last, in the pass's list order: drawOverlay draws them as one range.
+    overlayFirst_ = static_cast<uint32_t>(commands_.size());
+    for (uint32_t l = 0; l < count; ++l) {
+        if (!passLists_[l]->overlay) continue;
+        ++overlayLists_;
+        overlayCount_ += appendList(l);
+    }
+    overlay_.lists = overlayLists_;
+    overlay_.commands = overlayCount_;
     // The contract compares the commands with the draws this eye draws.
     pass_.listDraws -= pass_.conditionedOff;
     // The palette rows follow the draws; each palette draw names its row's first texel.
@@ -1407,6 +1453,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     bool withoutCars = context.debug == kDebugWithoutCars;
     if (withoutCars) {
         pass_.hidden = true;
+        overlayHidden_ = true;
         walkRuns_.erase(std::remove_if(walkRuns_.begin(), walkRuns_.end(),
                                        [](const CarRange& run) { return !run.flagman; }),
                         walkRuns_.end());
@@ -1459,10 +1506,13 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
     gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
 
-    auto drawCount = static_cast<GLsizei>(commands_.size());
+    // The overlay lists' commands follow every other list's and take neither phase.
+    auto drawCount = static_cast<GLsizei>(overlayFirst_);
+    overlayChecker_ = checker ? context.uvChecker : 0;
+    overlayReady_ = !withoutCars;
     // Phase 0: the cores, with depth and the car mark in the order attachment. The flagmen's
     // draws discard everything here (kWalkOnlyBit).
-    if (!withoutCars) {
+    if (!withoutCars && drawCount > 0) {
         GLenum solid[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
         gl_.drawBuffers(2, solid);
         gl_.depthMask(1);
@@ -1513,9 +1563,205 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t position,
     ++pass_.walkRunsDrawn;
     if (car.flagman) ++pass_.flagmanRunsDrawn;
     if (position >= context.orderedCount) ++pass_.walkRunsAtEnd;
-    pass_.walkSlotSum += car.slot;
+    // A slot past the walk's end (kWalkSlotLast, the cockpit) counts as the visible list's end.
+    pass_.walkSlotSum += std::min<uint64_t>(car.slot, context.visibleCount);
     pass_.walkVisibleSum += context.visibleCount;
     pass_.drawMicroseconds += microsecondsSince(start);
+}
+
+void CarRenderer::releaseMirrorCopy() {
+    if (mirrorHandle_) gl_.makeTextureHandleNonResident(mirrorHandle_);
+    if (mirrorCopy_) gl_.deleteTextures(1, &mirrorCopy_);
+    mirrorHandle_ = 0;
+    mirrorCopy_ = 0;
+    mirrorWidth_ = mirrorHeight_ = mirrorFormat_ = 0;
+}
+
+int CarRenderer::setLiveMirror(GLuint texture, bool flipT) {
+    if (!initialised_) return kLiveMirrorNoCopy;
+    if (!texture || !gl_.getTexLevelParameteriv) return kLiveMirrorNoSize;
+    // The size and format GL holds for it, asked on the upload unit, whose binding goes back.
+    GLint previousUnit = 0;
+    GLint previousTexture = 0;
+    GLint width = 0;
+    GLint height = 0;
+    GLint format = 0;
+    gl_.getIntegerv(gl::kActiveTexture, &previousUnit);
+    gl_.activeTexture(kUploadUnit);
+    gl_.getIntegerv(gl::kTextureBinding2D, &previousTexture);
+    gl_.bindTexture(gl::kTexture2D, texture);
+    gl_.getTexLevelParameteriv(gl::kTexture2D, 0, gl::kTextureWidth, &width);
+    gl_.getTexLevelParameteriv(gl::kTexture2D, 0, gl::kTextureHeight, &height);
+    gl_.getTexLevelParameteriv(gl::kTexture2D, 0, gl::kTextureInternalFormat, &format);
+    gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(previousTexture));
+    if (width <= 0 || height <= 0 || width > maxTextureSize_ || height > maxTextureSize_ ||
+        !format) {
+        gl_.activeTexture(static_cast<GLenum>(previousUnit));
+        return kLiveMirrorNoSize;
+    }
+    mirrorSource_ = texture;
+    mirrorFlip_ = flipT;
+    if (mirrorCopy_ && width == mirrorWidth_ && height == mirrorHeight_ && format == mirrorFormat_) {
+        gl_.activeTexture(static_cast<GLenum>(previousUnit));
+        return kLiveMirrorReady;
+    }
+
+    // The copy, in the source's own format so the blit is exact; one level, filtered as a
+    // magnified glass is.
+    releaseMirrorCopy();
+    for (GLuint& framebuffer : copyFramebuffers_)
+        if (!framebuffer) gl_.genFramebuffers(1, &framebuffer);
+    gl_.genTextures(1, &mirrorCopy_);
+    gl_.bindTexture(gl::kTexture2D, mirrorCopy_);
+    gl_.texImage2D(gl::kTexture2D, 0, format, width, height, 0, gl::kRgba, gl::kUnsignedByte,
+                   nullptr);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureBaseLevel, 0);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxLevel, 0);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureMinFilter, gl::kLinear);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter, gl::kLinear);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapS, gl::kClampToEdge);
+    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT, gl::kClampToEdge);
+    gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(previousTexture));
+    gl_.activeTexture(static_cast<GLenum>(previousUnit));
+    if (mirrorCopy_) mirrorHandle_ = gl_.getTextureHandle(mirrorCopy_);
+    mirrorWidth_ = width;
+    mirrorHeight_ = height;
+    mirrorFormat_ = format;
+    if (!mirrorHandle_ || !copyFramebuffers_[0] || !copyFramebuffers_[1] || !copyMirror(false)) {
+        releaseMirrorCopy();
+        return kLiveMirrorNoCopy;
+    }
+    gl_.makeTextureHandleResident(mirrorHandle_);
+    return kLiveMirrorReady;
+}
+
+// The live mirror texture into the copy, its rows reversed when roglv2 flips its t, so the glass
+// samples the copy at GPL's own UVs; with `blit` false only whether both attach completely. Neither
+// texture is bound, only attached; the caller has the scissor test off and every colour channel
+// writable, which a blit obeys.
+bool CarRenderer::copyMirror(bool blit) {
+    if (!mirrorCopy_ || !mirrorSource_) return false;
+    GLint previousDraw = 0;
+    GLint previousRead = 0;
+    gl_.getIntegerv(gl::kDrawFramebufferBinding, &previousDraw);
+    gl_.getIntegerv(gl::kReadFramebufferBinding, &previousRead);
+    gl_.bindFramebuffer(gl::kReadFramebuffer, copyFramebuffers_[0]);
+    gl_.framebufferTexture2D(gl::kReadFramebuffer, gl::kColorAttachment0, gl::kTexture2D,
+                             mirrorSource_, 0);
+    gl_.readBuffer(gl::kColorAttachment0);
+    gl_.bindFramebuffer(gl::kDrawFramebuffer, copyFramebuffers_[1]);
+    gl_.framebufferTexture2D(gl::kDrawFramebuffer, gl::kColorAttachment0, gl::kTexture2D,
+                             mirrorCopy_, 0);
+    GLenum colourOnly = gl::kColorAttachment0;
+    gl_.drawBuffers(1, &colourOnly);
+    bool complete = gl_.checkFramebufferStatus(gl::kReadFramebuffer) == gl::kFramebufferComplete &&
+                    gl_.checkFramebufferStatus(gl::kDrawFramebuffer) == gl::kFramebufferComplete;
+    if (complete && blit)
+        gl_.blitFramebuffer(0, 0, mirrorWidth_, mirrorHeight_, 0, mirrorFlip_ ? mirrorHeight_ : 0,
+                            mirrorWidth_, mirrorFlip_ ? 0 : mirrorHeight_, gl::kColorBufferBit,
+                            gl::kNearest);
+    gl_.framebufferTexture2D(gl::kReadFramebuffer, gl::kColorAttachment0, gl::kTexture2D, 0, 0);
+    gl_.framebufferTexture2D(gl::kDrawFramebuffer, gl::kColorAttachment0, gl::kTexture2D, 0, 0);
+    gl_.bindFramebuffer(gl::kReadFramebuffer, static_cast<GLuint>(previousRead));
+    gl_.bindFramebuffer(gl::kDrawFramebuffer, static_cast<GLuint>(previousDraw));
+    return complete;
+}
+
+void CarRenderer::discardOverlay() {
+    overlayLists_ = 0;
+    overlayFirst_ = 0;
+    overlayCount_ = 0;
+    overlayReady_ = false;
+    overlayHidden_ = false;
+    overlayChecker_ = 0;
+    overlay_ = CarOverlayStats{};
+}
+
+int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlayStats& stats) {
+    stats = overlay_;
+    int outcome = !overlayLists_                ? kOverlayNone
+                  : overlayHidden_              ? kOverlayHidden
+                  : !overlayReady_ || !initialised_ ? kOverlayNotReady
+                  : !overlayCount_              ? kOverlayNoCommands
+                                                : kOverlayDrawn;
+    if (outcome != kOverlayDrawn) {
+        discardOverlay();
+        return outcome;
+    }
+    auto start = std::chrono::steady_clock::now();
+
+    // Everything changed below goes back: roglv2 keeps drawing into this framebuffer after it.
+    SavedBindings saved;
+    saveBindings(gl_, saved);
+    GLint     previousDraw = 0;
+    GLint     viewport[4] = {0, 0, 0, 0};
+    GLint     blendSrc = 0;
+    GLint     blendDst = 0;
+    GLint     checkerTexture = 0;
+    GLboolean colourMask[4] = {1, 1, 1, 1};
+    GLboolean depthMask = 1;
+    gl_.getIntegerv(gl::kDrawFramebufferBinding, &previousDraw);
+    gl_.getIntegerv(gl::kViewport, viewport);
+    gl_.getIntegerv(gl::kBlendSrc, &blendSrc);
+    gl_.getIntegerv(gl::kBlendDst, &blendDst);
+    gl_.getBooleanv(gl::kColorWritemask, colourMask);
+    gl_.getBooleanv(gl::kDepthWritemask, &depthMask);
+    GLboolean scissor = gl_.isEnabled(gl::kScissorTest);
+    GLboolean depthTest = gl_.isEnabled(gl::kDepthTest);
+    GLboolean blend = gl_.isEnabled(gl::kBlend);
+    GLboolean alphaTest = gl_.isEnabled(gl::kAlphaTest);
+    GLboolean cullFace = gl_.isEnabled(gl::kCullFace);
+
+    gl_.disable(gl::kScissorTest);
+    gl_.colorMask(1, 1, 1, 1);
+    if (overlay_.glass) stats.copied = copyMirror(true);
+
+    // GPL's painter's order: every draw over what is there, the later over the earlier, the
+    // translucent ones blended in place as roglv2 blends them. Without a depth test GL writes no
+    // depth, and nothing after this reads the frame's depth (roglv2 clears it at each flush).
+    gl_.bindFramebuffer(gl::kDrawFramebuffer, framebuffer);
+    gl_.viewport(rect[0], rect[1], rect[2], rect[3]);
+    gl_.disable(gl::kDepthTest);
+    gl_.depthMask(0);
+    gl_.enable(gl::kBlend);
+    gl_.blendFunc(gl::kSrcAlpha, gl::kOneMinusSrcAlpha);
+    gl_.disable(gl::kAlphaTest);
+    gl_.disable(gl::kCullFace);
+    gl_.useProgram(program_);
+    gl_.bindVertexArray(vertexArray_);
+    gl_.uniform1i(uPhase_, 2);
+    gl_.uniform1i(uOrderTest_, 0);
+    gl_.activeTexture(kCheckerUnit);
+    gl_.getIntegerv(gl::kTextureBinding2D, &checkerTexture);
+    if (overlayChecker_) gl_.bindTexture(gl::kTexture2D, overlayChecker_);
+    gl_.activeTexture(kFrameUnit);
+    gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
+    gl_.activeTexture(kDrawUnit);
+    gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
+    gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
+    gl_.multiDrawElementsIndirect(
+        gl::kTriangles, gl::kUnsignedInt,
+        reinterpret_cast<const void*>(static_cast<uintptr_t>(overlayFirst_) * sizeof(Command)),
+        static_cast<GLsizei>(overlayCount_), sizeof(Command));
+
+    gl_.activeTexture(kCheckerUnit);
+    gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(checkerTexture));
+    restoreBindings(gl_, saved);
+    if (cullFace) gl_.enable(gl::kCullFace);
+    if (alphaTest) gl_.enable(gl::kAlphaTest);
+    gl_.blendFunc(static_cast<GLenum>(blendSrc), static_cast<GLenum>(blendDst));
+    if (!blend) gl_.disable(gl::kBlend);
+    gl_.depthMask(depthMask);
+    if (depthTest) gl_.enable(gl::kDepthTest);
+    gl_.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    gl_.bindFramebuffer(gl::kDrawFramebuffer, static_cast<GLuint>(previousDraw));
+    gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
+    if (scissor) gl_.enable(gl::kScissorTest);
+    // The overlay's commands go to the GPU now, as each pass's do (Renderer::drawComposited).
+    if (gl_.flush) gl_.flush();
+    stats.microseconds = microsecondsSince(start);
+    discardOverlay();
+    return kOverlayDrawn;
 }
 
 CarPassStats CarRenderer::finishPass() {

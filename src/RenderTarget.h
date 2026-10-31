@@ -95,6 +95,14 @@ GLuint renderTargetAttachedColour();
 // it.
 GLuint rasterBitmapGlTexture(int handle);
 
+// The GL texture a rasterizer MIP handle (the handle a MATERIAL binds, mipSetCurrent 0x20003980)
+// draws with, or 0. Resolved as mipSetCurrent resolves it, through the MIP handle table decoded
+// out of mipSetCurrent's code (the bitmap table maps the same numbers to other objects): the
+// entry is the mip object, whose +72 is the GL name rogl_zbufferPolySubmit 0x2001DEE0 puts in every polygon record
+// (-1 when it has none) and whose byte +113 is the t flip that submit applies (`flipT`), set by
+// rogl_mipmapLoaderLoad for mirror.mip alone. Every read goes through the readability check.
+GLuint rasterMipGlTexture(int handle, bool& flipT);
+
 // Resize the surface a camera is about to render into, to match the off-screen target.
 //
 // Changing the back buffer's own width and height is NOT enough, and the first run

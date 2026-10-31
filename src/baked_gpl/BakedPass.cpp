@@ -15,6 +15,7 @@
 #include "MenuScale.h"
 #include "Paths.h"
 #include "Pe.h"
+#include "RenderTarget.h"
 #include "Stereo.h"
 
 #include "baked/CarRenderer.h"
@@ -22,6 +23,8 @@
 #include "baked/Scene.h"
 
 #include <windows.h>
+
+#include <intrin.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -192,6 +195,38 @@ struct CarSecond {
     uint64_t ordersReused = 0;  // section 4.29.1
 };
 
+// Why a main pass that listed an overlay did not draw it (report 105 section 4.49): the cockpit
+// is missing from that eye, since GPL's draw of it handed GPL no leaf.
+enum OverlayLost : int {
+    kLostNotDrawn,    // the pass's cars were not drawn (no camera, no scene, drawSolid never ran)
+    kLostNoCommands,  // every draw of the overlay was refused or off for this eye
+    kLostNoWalkEnd,   // the next pass began before the walk's end drew it
+    kLostKinds
+};
+
+// Report 105 section 4.49, once a second: the cockpit drawn over the eye image.
+struct OverlaySecond {
+    unsigned asked = 0;                       // bakedCockpitOverlayReady calls
+    unsigned refused[kOverlayRefusals] = {};  // of them refused: step 1 instead
+    unsigned listed = 0;      // main passes whose car lists held an overlay list
+    unsigned drawn = 0;
+    unsigned hidden = 0;      // debug view 7
+    unsigned lost[kLostKinds] = {};
+    unsigned flushed = 0;        // walk ends whose flush painted GPL's queued polygons
+    unsigned armsUnflushed = 0;  // residual arms no flush took (nothing GPL drew was queued)
+    unsigned framebufferMoved = 0;  // another draw framebuffer bound at the walk's end
+    unsigned copied = 0;      // drawn overlays with glass whose mirror.mip copy was made
+    unsigned copyFailed = 0;  // and those whose copy failed: the glass showed the last copy
+    uint64_t commands = 0;
+    uint64_t polygons = 0;
+    uint64_t glass = 0;
+    uint64_t empty = 0;
+    uint64_t conditionedOff = 0;
+    uint64_t refusedPolygons = 0;
+    uint64_t listPolygons = 0;
+    double   microseconds = 0.0;
+};
+
 struct State {
     bool      bound = false;
     Addresses at;
@@ -222,6 +257,12 @@ struct State {
     bool               carsBound = false;   // the lighting addresses placed
     bool               carsFailed = false;  // it could not start: GPL draws the cars
     CarSecond          carSecond;
+    // Report 105 section 4.49: a main pass whose car lists held an overlay list, waiting for the
+    // walk's end (bakedPassMainWalkDone), with the draw framebuffer and rect it was composited into.
+    bool               overlayPending = false;
+    baked::GLint       overlayFramebuffer = 0;
+    int                overlayRect[4] = {0, 0, 0, 0};
+    OverlaySecond      overlaySecond;
 
     bool drawEnabled = true;
     bool keyLast = false;
@@ -326,12 +367,32 @@ uint32_t               g_stockCalls[3][256] = {};
 // except while the car hook draws the cockpit (bakedCockpitDraw).
 volatile unsigned char g_withoutGpl = 0;
 volatile unsigned char g_cockpitDraw = 0;
+// Report 105 section 4.48: while set, GPL's draw of the cockpit keeps only these leaves, its
+// mirror glass (bakedCockpitGlassOnly); and what the filter passed and dropped meanwhile.
+const uintptr_t*       g_glassOnly = nullptr;
+uint32_t               g_glassOnlyCount = 0;
+uint32_t               g_glassPassed = 0;
+uint32_t               g_glassDropped = 0;
+uint32_t               g_glassLines = 0;
+// Set by installFilter when the lit polygon types are hooked too.
+bool                   g_everyLeafHooked = false;
 // Stage 2b: set with g_collecting when the car renderer will draw this pass's car lists.
 volatile unsigned char g_carsReady = 0;
 // Set with g_collecting when the pass is a mirror pass (bakedPassBeginMirror).
 volatile unsigned char g_mirrorPass = 0;
 // Set with g_observing when the observation is debug view 15's of a mirror walk, not the probe's.
 bool                   g_observingMirror = false;
+// Report 105 section 4.44: the filter's calls, and the TSC ticks of one in kFilterSampleEvery, by
+// where they ran (BakedTimeKind).
+constexpr uint32_t     kFilterSampleEvery = 16;
+uint32_t               g_filterSample = 0;
+uint64_t               g_filterCalls[kBakedTimeKinds] = {};
+uint64_t               g_filterSampledTicks[kBakedTimeKinds] = {};
+// Report 105 section 4.46: each baked pass's walk window, beginPass to endPass, in
+// QueryPerformanceCounter ticks, main and mirror.
+int64_t                g_windowStart = 0;
+int64_t                g_windowTicks[2] = {};
+uint32_t               g_windowPasses[2] = {};
 
 bool readable(const void* address, size_t bytes) {
     MEMORY_BASIC_INFORMATION info = {};
@@ -413,15 +474,18 @@ bool installFilter(State& s) {
          "15 1B 1C 1F 20",
          thunk, static_cast<unsigned>(s.at.nodeTable));
 
-    char   counted[64] = {};
-    size_t used = 0;
+    char     counted[64] = {};
+    size_t   used = 0;
+    unsigned countedHooked = 0;
     for (const HookedType& hooked : kCountedTypes) {
         if (reinterpret_cast<uintptr_t>(table[hooked.type]) != hooked.stock) continue;
         g_stockHandlers[hooked.type] = reinterpret_cast<void*>(hooked.stock);
         if (!patchBytes(&table[hooked.type], &thunk, sizeof(thunk))) continue;
+        ++countedHooked;
         used += static_cast<size_t>(
             std::snprintf(counted + used, sizeof(counted) - used, " %02X", hooked.type));
     }
+    g_everyLeafHooked = countedHooked == sizeof(kCountedTypes) / sizeof(kCountedTypes[0]);
     logf("baked: counting only (never baked, always drawn by GPL):%s",
          used ? counted : " none -- the entries were not stock");
     residualInstall();
@@ -481,6 +545,7 @@ bool fillGlApi(baked::GlApi& g) {
     BAKED_CORE(flush, "glFlush");
     BAKED_CORE(drawElements, "glDrawElements");
     BAKED_CORE(readPixels, "glReadPixels");
+    BAKED_CORE(getTexLevelParameteriv, "glGetTexLevelParameteriv");
     BAKED_EXT(activeTexture, "glActiveTexture");
     BAKED_EXT(genBuffers, "glGenBuffers");
     BAKED_EXT(deleteBuffers, "glDeleteBuffers");
@@ -938,6 +1003,34 @@ void reportSecond(State& s) {
                  c.indexedWithoutPalette);
     }
     s.carSecond = CarSecond{};
+    const OverlaySecond& v = s.overlaySecond;
+    if (v.asked || v.listed) {
+        unsigned refused = 0;
+        for (unsigned n : v.refused) refused += n;
+        logf("baked: the cockpit over the eye image (report 105 section 4.49) -- asked %u, step 1 "
+             "instead %u: not a baked main pass with the car renderer %u, mirror.mip's handle "
+             "reaches no GL texture %u, the mip there lacks mirror.mip's t flip %u, GL gives it no "
+             "size %u, no copy of it %u; overlays listed %u: drawn %u (%.0f us each), hidden by "
+             "view 7 %u, NOT drawn, the cockpit missing: pass not drawn %u, every draw refused %u, "
+             "no walk end %u; GPL's queued polygons flushed first %u, arms no flush took %u, "
+             "framebuffer moved %u; mirror.mip copied %u, copy failed %u; commands %llu; leaves "
+             "drawn %llu (glass %llu) + without geometry %llu + off for this eye %llu + refused "
+             "%llu = %llu of the lists' %llu (contract: equal, refused 0)",
+             v.asked, refused, v.refused[kOverlayNoRenderer], v.refused[kOverlayNoMip],
+             v.refused[kOverlayNotFlipped], v.refused[kOverlayNoSize], v.refused[kOverlayNoCopy],
+             v.listed, v.drawn, v.drawn ? v.microseconds / v.drawn : 0.0, v.hidden,
+             v.lost[kLostNotDrawn], v.lost[kLostNoCommands], v.lost[kLostNoWalkEnd], v.flushed,
+             v.armsUnflushed, v.framebufferMoved, v.copied, v.copyFailed,
+             static_cast<unsigned long long>(v.commands),
+             static_cast<unsigned long long>(v.polygons), static_cast<unsigned long long>(v.glass),
+             static_cast<unsigned long long>(v.empty),
+             static_cast<unsigned long long>(v.conditionedOff),
+             static_cast<unsigned long long>(v.refusedPolygons),
+             static_cast<unsigned long long>(v.polygons + v.empty + v.conditionedOff +
+                                             v.refusedPolygons),
+             static_cast<unsigned long long>(v.listPolygons));
+    }
+    s.overlaySecond = OverlaySecond{};
     if (s.refusedNoScene || s.refusedRenderer || s.refusedUpload || s.refusedStopped ||
         s.refusedRect)
         logf("baked: passes not baked in %.1f s -- no scene yet %u, renderer not up %u, upload "
@@ -1055,6 +1148,12 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
             ++*mainCount;
         return false;
     };
+    // An overlay the last main pass's walk end never drew (report 105 section 4.49).
+    if (s.overlayPending) {
+        s.overlayPending = false;
+        ++s.overlaySecond.lost[kLostNoWalkEnd];
+        s.cars.discardOverlay();
+    }
     void* camera = mirror ? params->mirrorCamera : params->camera;
     if (!camera) return refuse(nullptr, kMirrorNoCamera);
     if (!installFilter(s)) return refuse(nullptr, kMirrorNoFilter);
@@ -1218,8 +1317,9 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
     g_primEnd = g_primBegin + primSize;
     s.renderer.beginPass(*scene);
     // Stage 2b: the car hook draws a car itself only while this is set, from lists in a fresh
-    // arena that bakedPassEnd hands to the car renderer.
-    carWalkPassBegin(mirror);
+    // arena that bakedPassEnd hands to the car renderer. A mirror pass's glass keys its cars' kept
+    // lists (report 105 section 4.54).
+    carWalkPassBegin(mirror, mirror ? stereoMirrorPaneOf(camera) : -1);
     flagmenPassBegin();
     bool cars = g_options.bakedCars == 3 && s.cars.initialised();
     s.renderer.setSolidHook(cars ? &s.cars : nullptr);
@@ -1227,6 +1327,9 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
     g_mirrorPass = mirror ? 1 : 0;
     g_collecting = 1;
     residualWalkBegin();
+    LARGE_INTEGER windowStart;
+    QueryPerformanceCounter(&windowStart);
+    g_windowStart = windowStart.QuadPart;
     return true;
 }
 
@@ -1234,6 +1337,13 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
 // per-second sums -- a mirror pass's into BakedMirror.cpp's, so the main pass lines stay the main
 // passes'.
 void endPass(State& s, SceneParams* params, bool mirror) {
+    if (g_collecting) {
+        LARGE_INTEGER windowEnd;
+        QueryPerformanceCounter(&windowEnd);
+        int kind = g_mirrorPass ? 1 : 0;
+        g_windowTicks[kind] += windowEnd.QuadPart - g_windowStart;
+        ++g_windowPasses[kind];
+    }
     if (g_observing) {
         g_observing = 0;
         if (g_observingMirror) {
@@ -1260,8 +1370,14 @@ void endPass(State& s, SceneParams* params, bool mirror) {
     uint32_t                  flagmanCount = 0;
     const baked::CarDrawList* flagmanLists = cars ? flagmenPassLists(flagmanCount) : nullptr;
     uint32_t                  listCount = carListCount + flagmanCount;
+    // Report 105 section 4.49: the cockpit's list made to be drawn over this main pass's image.
+    bool overlayListed = false;
+    for (uint32_t l = 0; l < carListCount && !mirror; ++l)
+        overlayListed = overlayListed || carLists[l].overlay;
+    if (overlayListed) ++s.overlaySecond.listed;
     void* cameraObject = !params ? nullptr : mirror ? params->mirrorCamera : params->camera;
     if (!cameraObject || !s.scene) {
+        if (overlayListed) ++s.overlaySecond.lost[kLostNotDrawn];
         // GPL skipped the bodies of these cars and these flagmen in the walk, and they will not
         // be drawn.
         if (mirror) {
@@ -1424,6 +1540,13 @@ void endPass(State& s, SceneParams* params, bool mirror) {
         t.elidedLost += c.elidedLost;
         t.badOrder += c.badOrder;
         t.ordersReused += c.ordersReused;
+    }
+    // The overlay waits for the walk's end, where GPL has submitted everything of the pass; it
+    // goes where the composite went.
+    if (overlayListed) {
+        s.overlayPending = true;
+        s.gl.getIntegerv(baked::gl::kDrawFramebufferBinding, &s.overlayFramebuffer);
+        std::memcpy(s.overlayRect, s.rect, sizeof(s.overlayRect));
     }
 
     LARGE_INTEGER end;
@@ -1753,6 +1876,103 @@ unsigned bakedPassWalkPosition() {
 
 void bakedCockpitDraw(bool drawing) { g_cockpitDraw = drawing ? 1 : 0; }
 
+void bakedCockpitGlassOnly(const uintptr_t* glass, uint32_t count) {
+    g_glassOnly = glass;
+    g_glassOnlyCount = glass ? count : 0;
+}
+
+void bakedCockpitGlassTake(uint32_t& passed, uint32_t& dropped, uint32_t& lines) {
+    passed = g_glassPassed;
+    dropped = g_glassDropped;
+    lines = g_glassLines;
+    g_glassPassed = 0;
+    g_glassDropped = 0;
+    g_glassLines = 0;
+}
+
+bool bakedFilterSeesEveryLeaf() { return g_everyLeafHooked; }
+
+int bakedCockpitOverlayReady(uint32_t mirrorMip) {
+    State&         s = g_state;
+    OverlaySecond& o = s.overlaySecond;
+    ++o.asked;
+    int    refusal = kOverlayReady;
+    bool   flipT = false;
+    GLuint texture = 0;
+    if (!g_collecting || g_mirrorPass || !g_carsReady || !s.cars.initialised())
+        refusal = kOverlayNoRenderer;
+    if (refusal == kOverlayReady) {
+        texture = rasterMipGlTexture(static_cast<int>(mirrorMip), flipT);
+        if (!texture)
+            refusal = kOverlayNoMip;
+        else if (!flipT)
+            refusal = kOverlayNotFlipped;
+    }
+    if (refusal == kOverlayReady) {
+        int copy = s.cars.setLiveMirror(texture, flipT);
+        if (copy == baked::kLiveMirrorNoSize)
+            refusal = kOverlayNoSize;
+        else if (copy != baked::kLiveMirrorReady)
+            refusal = kOverlayNoCopy;
+    }
+    if (refusal != kOverlayReady) ++o.refused[refusal];
+    return refusal;
+}
+
+void bakedPassMainWalkDone() {
+    State& s = g_state;
+    if (!s.overlayPending) return;
+    s.overlayPending = false;
+    OverlaySecond& o = s.overlaySecond;
+    // Everything GPL submitted in the pass goes to the frame first, under the residual test the
+    // pass armed; an arm no flush took is dropped, as the mirror walk's end does.
+    unsigned flushes = residualFlushCount();
+    rasterFlushPending();
+    if (residualFlushCount() != flushes) ++o.flushed;
+    if (residualDisarm()) ++o.armsUnflushed;
+    baked::GLint bound = 0;
+    s.gl.getIntegerv(baked::gl::kDrawFramebufferBinding, &bound);
+    if (bound != s.overlayFramebuffer) ++o.framebufferMoved;
+    baked::CarOverlayStats stats;
+    int outcome = s.cars.drawOverlay(static_cast<baked::GLuint>(s.overlayFramebuffer),
+                                     s.overlayRect, stats);
+    switch (outcome) {
+    case baked::kOverlayDrawn: ++o.drawn; break;
+    case baked::kOverlayHidden: ++o.hidden; return;
+    case baked::kOverlayNoCommands: ++o.lost[kLostNoCommands]; return;
+    default: ++o.lost[kLostNotDrawn]; return;
+    }
+    if (stats.glass) ++(stats.copied ? o.copied : o.copyFailed);
+    o.commands += stats.commands;
+    o.polygons += stats.polygons;
+    o.glass += stats.glass;
+    o.empty += stats.empty;
+    o.conditionedOff += stats.conditionedOff;
+    o.refusedPolygons += stats.refused;
+    o.listPolygons += stats.listPolygons;
+    o.microseconds += stats.microseconds;
+}
+
+int bakedTimeKind() { return !g_collecting ? kBakedOutside : g_mirrorPass ? kBakedMirror : kBakedMain; }
+
+void bakedFilterTake(uint64_t calls[kBakedTimeKinds], uint64_t ticks[kBakedTimeKinds]) {
+    for (int kind = 0; kind < kBakedTimeKinds; ++kind) {
+        calls[kind] = g_filterCalls[kind];
+        ticks[kind] = g_filterSampledTicks[kind] * kFilterSampleEvery;
+        g_filterCalls[kind] = 0;
+        g_filterSampledTicks[kind] = 0;
+    }
+}
+
+void bakedPassWindowsTake(int64_t ticks[2], uint32_t passes[2]) {
+    for (int kind = 0; kind < 2; ++kind) {
+        ticks[kind] = g_windowTicks[kind];
+        passes[kind] = g_windowPasses[kind];
+        g_windowTicks[kind] = 0;
+        g_windowPasses[kind] = 0;
+    }
+}
+
 bool bakedCarRowsPinned(uint32_t key, uint32_t frames, uint32_t& draws) {
     if (!g_collecting || !bakedPassDrawsCars()) return false;
     return g_state.cars.pinRows(key, frames, draws);
@@ -1784,10 +2004,11 @@ void bakedLogGpuSpans(const char* who, const baked::GpuPassTimes& gpu) {
          gpu.passes);
 }
 
-}  // namespace gplvr
+namespace {
 
-extern "C" void* __cdecl gplvrBakedNodeFilter(const unsigned char* node) {
-    using namespace gplvr;
+// The filter's decision for one node GPL dispatches (gplvrBakedNodeFilter): the stock handler, or
+// null when gplvr draws the node.
+void* filterNode(const unsigned char* node) {
     unsigned char type = node[0];
     void*         stock = g_stockHandlers[type];
     auto          address = reinterpret_cast<uintptr_t>(node);
@@ -1818,7 +2039,36 @@ extern "C" void* __cdecl gplvrBakedNodeFilter(const unsigned char* node) {
     // The flagmen: the track bake leaves their XFORMs to GPL, and gplvr draws them from there
     // (Flagmen.h).
     if (inside && (type == 0x0D || type == 0x13) && flagmanDispatch(node, stock)) return nullptr;
+    // The cockpit gplvr draws: GPL's draw of it keeps the mirror glass alone (report 105 section
+    // 4.48), sprites and every polygon type being leaves of its list.
+    if (g_glassOnly) {
+        if (type == 0x03 || (type >= 0x1B && type <= 0x22)) {
+            if (!std::binary_search(g_glassOnly, g_glassOnly + g_glassOnlyCount, address)) {
+                ++g_glassDropped;
+                return nullptr;
+            }
+            ++g_glassPassed;
+        } else if (type == 0x15) {
+            ++g_glassLines;
+        }
+    }
     if (g_withoutGpl && !g_cockpitDraw) return nullptr;
     ++g_stockCalls[g_mirrorPass ? 2 : inside ? 0 : 1][type];
     return stock;
+}
+
+}  // namespace
+}  // namespace gplvr
+
+// One call in kFilterSampleEvery is timed (report 105 section 4.44); a single call is shorter
+// than QueryPerformanceCounter's tick, hence the TSC.
+extern "C" void* __cdecl gplvrBakedNodeFilter(const unsigned char* node) {
+    using namespace gplvr;
+    int kind = bakedTimeKind();
+    ++g_filterCalls[kind];
+    if (++g_filterSample % kFilterSampleEvery) return filterNode(node);
+    uint64_t start = __rdtsc();
+    void*    handler = filterNode(node);
+    g_filterSampledTicks[kind] += __rdtsc() - start;
+    return handler;
 }

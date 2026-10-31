@@ -2,13 +2,18 @@
 
 #include "Log.h"
 
+#include "baked_gpl/BakedPass.h"
 #include "baked_gpl/CarBake.h"
 #include "baked_gpl/CarProgram.h"
 #include "baked_gpl/CarShare.h"
+#include "baked_gpl/CockpitDraw.h"
 
 #include <windows.h>
 
+#include <intrin.h>
+
 #include <cstdint>
+#include <cstdio>
 
 namespace gplvr {
 namespace carwalk {
@@ -27,6 +32,119 @@ void logSkin(const char* what, const SkinCounts& k) {
          k.liveCorners, k.liveNormals, k.dynamicVertices, k.vertexOverflow, k.normalOverflow,
          static_cast<unsigned>(kMaxWalkFrames), k.frameOverflow, k.staleWords,
          kMaxSkinCorners, k.tooManyCorners, k.noBakedCorners);
+}
+
+// GPL's own work in the baked passes, timed (report 105 section 4.44), in ms of CPU over the
+// second: the cockpit GPL draws, GPL's car draw with the body skipped, and the node filter. The
+// filter's TSC is calibrated against QueryPerformanceCounter over the second; the first second
+// has no rate.
+void logGplOwn(const Second& t, int64_t qpcNow, int64_t qpcFrequency) {
+    static uint64_t lastTsc = 0;
+    static int64_t  lastQpc = 0;
+    uint64_t        tsc = __rdtsc();
+    uint64_t        filterCalls[kBakedTimeKinds] = {}, filterTicks[kBakedTimeKinds] = {};
+    bakedFilterTake(filterCalls, filterTicks);
+    int64_t  windowTicks[2] = {};
+    uint32_t windowPasses[2] = {};
+    bakedPassWindowsTake(windowTicks, windowPasses);
+    double tscPerMs = lastQpc && qpcNow > lastQpc
+                          ? static_cast<double>(tsc - lastTsc) * 1000.0 /
+                                (static_cast<double>(qpcNow - lastQpc) / qpcFrequency * 1e6)
+                          : 0.0;
+    lastTsc = tsc;
+    lastQpc = qpcNow;
+    if (tscPerMs <= 0.0) return;
+    double ms = 1000.0 / static_cast<double>(qpcFrequency);
+    const OursSecond& o = t.cars;
+    const OursSecond& m = t.mirrorCars;
+    uint64_t calls = 0;
+    double   filterMs = 0.0;
+    double   filterKind[kBakedTimeKinds];
+    for (int kind = 0; kind < kBakedTimeKinds; ++kind) {
+        filterKind[kind] = static_cast<double>(filterTicks[kind]) / tscPerMs;
+        filterMs += filterKind[kind];
+        calls += filterCalls[kind];
+    }
+    // Report 105 section 4.46: each walk window less the car calls and the filter inside it is
+    // GPL's own walk (segments, cells, lists, plane nodes, box culls, selectors, sort groups).
+    double window[2], carCalls[2], walk[2];
+    for (int kind = 0; kind < 2; ++kind) {
+        window[kind] = static_cast<double>(windowTicks[kind]) * ms;
+        carCalls[kind] = static_cast<double>(t.callTicks[kind]) * ms;
+        walk[kind] = window[kind] - carCalls[kind] - filterKind[kind];
+    }
+    logf("baked: GPL's walk windows (report 105 section 4.46), ms a second -- main passes %u: "
+         "window %.2f = car calls %.2f (%u) + node filter %.2f + GPL's own walk %.2f; mirror "
+         "passes %u: window %.2f = car calls %.2f (%u) + node filter %.2f + GPL's own walk %.2f; "
+         "outside the windows: car calls %.2f (%u), node filter %.2f",
+         windowPasses[0], window[0], carCalls[0], t.callCount[kBakedMain], filterKind[kBakedMain],
+         walk[0], windowPasses[1], window[1], carCalls[1], t.callCount[kBakedMirror],
+         filterKind[kBakedMirror], walk[1],
+         static_cast<double>(t.callTicks[kBakedOutside]) * ms, t.callCount[kBakedOutside],
+         filterKind[kBakedOutside]);
+    logf("baked: GPL's own work timed (report 105 section 4.44), ms a second -- the cockpit GPL "
+         "draws %.2f (%u calls, %.0f us each); GPL's car draw with the body skipped: main passes "
+         "%.2f (%u calls, %.1f us each), mirror passes %.2f (%u calls, %.1f us each); the node "
+         "filter ~%.2f (%llu calls, %.0f ns each, 1 in 16 timed); TSC %.0f MHz",
+         static_cast<double>(t.cockpitTicks) * ms, t.cockpitCalls,
+         t.cockpitCalls ? static_cast<double>(t.cockpitTicks) * ms * 1000.0 / t.cockpitCalls : 0.0,
+         static_cast<double>(o.originalTicks) * ms, o.originalCalls,
+         o.originalCalls ? static_cast<double>(o.originalTicks) * ms * 1000.0 / o.originalCalls
+                         : 0.0,
+         static_cast<double>(m.originalTicks) * ms, m.originalCalls,
+         m.originalCalls ? static_cast<double>(m.originalTicks) * ms * 1000.0 / m.originalCalls
+                         : 0.0,
+         filterMs, static_cast<unsigned long long>(calls),
+         calls ? filterMs * 1e6 / static_cast<double>(calls) : 0.0, tscPerMs / 1000.0);
+}
+
+// The cockpit gplvr draws while GPL draws its mirror glass (report 105 section 4.48): its lists,
+// GPL's glass-only draws, and every call GPL drew whole, by why.
+void logCockpit(const OursSecond& k, const CockpitSecond& c, int64_t qpcFrequency) {
+    uint32_t whole = 0;
+    for (uint32_t n : c.whole) whole += n;
+    double us = 1e6 / static_cast<double>(qpcFrequency);
+    logf("baked cars: the cockpit (report 105 section 4.48) -- %u calls: %u lists walked (%.0f us "
+         "each), %u taken from the first eye and %u from its kept list (section 4.50), %u calls "
+         "deduped; list contract MATCHED on %u of "
+         "%u (leaves %llu + glass left to GPL %llu of the walk's %llu); GPL's glass-only draws %u "
+         "(%.0f us each): glass leaves handed to GPL %llu, other leaves dropped %llu, lines "
+         "handed to GPL %llu, GPL's polygons %llu (contract: the glass handed over, less any its "
+         "clipper drops whole); glass nodes known %u; drawn WHOLE by GPL %u: not a baked main "
+         "pass %u, not the main register file %u, node filter blind to the lit polygon types %u, "
+         "mirror.mip not known %u, past %u lists %u, walk faulted %u, list refused %u (refused "
+         "leaves: no object %u, not a baked leaf %u, type differs %u, overflow %u, slot with no "
+         "list %u, glass past the set's room %u, step 2's glass without live corners %u)",
+         c.calls, k.lists, k.lists ? us * static_cast<double>(k.walkTicks) / k.lists : 0.0,
+         c.taken, c.kept, k.deduped, k.matched, k.lists, static_cast<unsigned long long>(k.leaves),
+         static_cast<unsigned long long>(k.glass), static_cast<unsigned long long>(k.walked),
+         c.glassCalls, c.glassCalls ? us * static_cast<double>(c.glassTicks) / c.glassCalls : 0.0,
+         static_cast<unsigned long long>(c.glassPassed),
+         static_cast<unsigned long long>(c.dropped), static_cast<unsigned long long>(c.lines),
+         static_cast<unsigned long long>(c.gplPolygons), c.glassNodes, whole,
+         c.whole[kCockpitNotBaked], c.whole[kCockpitNotMainFile], c.whole[kCockpitFilter],
+         c.whole[kCockpitNoMirrorMip], kMaxListsPerPass, c.whole[kCockpitArenaFull],
+         c.whole[kCockpitFaulted], c.whole[kCockpitRefused], k.emit.noObject, k.emit.notLeaf,
+         k.emit.typeDiffers, k.emit.overflow, k.emit.slotNoList, k.emit.glassOverflow,
+         k.emit.glassRefused);
+    if (c.overlayLists || c.stepOne || c.overlayCalls)
+        logf("baked cars: the cockpit, step 2 (report 105 section 4.49) -- lists made to be drawn "
+             "over the eye image %u (walked, taken or kept; glass the walked ones listed with "
+             "GPL's live UVs %u), lists for step 1 instead %u; "
+             "GPL's draws handing it no leaf %u (%.0f us each): leaves dropped %llu, leaves "
+             "handed to GPL %llu (must be 0), lines handed to GPL %llu, GPL's polygons %llu (must "
+             "be 0)",
+             c.overlayLists, k.emit.glassListed, c.stepOne, c.overlayCalls,
+             c.overlayCalls ? us * static_cast<double>(c.overlayTicks) / c.overlayCalls : 0.0,
+             static_cast<unsigned long long>(c.overlayDropped),
+             static_cast<unsigned long long>(c.overlayPassed),
+             static_cast<unsigned long long>(c.overlayLines),
+             static_cast<unsigned long long>(c.overlayGplPolygons));
+    if (k.differed)
+        logf("baked cars: the cockpit, first list this second that did not cover its walk -- "
+             "leaves and glass %u vs the walk's %u",
+             k.firstLeaves, k.firstWalked);
+    if (k.lists) logSkin("gplvr's cockpit", k.skin);
 }
 
 }  // namespace
@@ -167,14 +285,74 @@ bool reportSecond(Second& t, int64_t& windowStart, bool stage3, uint32_t bodySki
                  m.driver, m.firstLeaves, m.firstWalked);
         if (m.lists) logSkin("gplvr's mirror cars", m.skin);
     }
+    if (stage3 && t.cockpitOurs.calls)
+        logCockpit(t.cockpitList, t.cockpitOurs, frequency.QuadPart);
+    if (stage3) cockpitGplDrawSecond();
     if (t.draws) logSkin("GPL's draws: mirrors, cockpit, stages 1 and 2", t.skin);
     if (stage3) {
+        logGplOwn(t, now.QuadPart, frequency.QuadPart);
         carShareSecond();
         carProgramSecond();
     }
     t = Second{};
     windowStart = now.QuadPart;
     return true;
+}
+
+void logInstance(void* instance, int driver, bool cockpit, const WalkCounts& c,
+                 const EmitCounts& emit, const SkinCounts& k, const int32_t* skinnedObject,
+                 const uint32_t* skinnedLeaves, int skinnedObjects,
+                 const baked::CarDrawList* list) {
+    logf("baked cars: team instance %p first drawn for driver %d (%s) -- the walk met %u control "
+         "nodes (%u gates, %u selectors, %u SETREG, %u transforms), %u polygons (1B %u, 1C %u, 1D "
+         "%u, 1E %u, 1F %u, 20 %u, 21 %u, 22 %u), %u sprites, %u lines, %u MATERIALs; culled by "
+         "box %u, by sphere %u, by hidden class %u; unknown node types %u",
+         instance, driver, cockpit ? "cockpit" : "car", c.controls, c.gates, c.selectors,
+         c.setRegisters, c.transforms, c.polygons - c.sprites, c.byType[0x1B], c.byType[0x1C],
+         c.byType[0x1D], c.byType[0x1E], c.byType[0x1F], c.byType[0x20], c.byType[0x21],
+         c.byType[0x22], c.sprites, c.lines, c.byType[0x05], c.boxCulled, c.sphereCulled,
+         c.classHidden, c.unknownTypes);
+    if (!list) return;
+    uint32_t spriteRuns = 0;
+    for (const baked::CarDraw& draw : list->draws)
+        if (draw.flags & baked::kCarLeafSprite) ++spriteRuns;
+    uint32_t textured = 0, unresolved = 0;
+    for (const baked::CarMaterial& material : list->materials) {
+        if (!material.textureHandle) continue;
+        ++textured;
+        if (material.texture < 0) ++unresolved;
+    }
+    logf("baked cars: team instance %p stage 2 -- its first draw list holds %u leaves of the "
+         "walk's %u polygons (%u without geometry) in %zu ranges (%u of sprites), %zu frames, %zu "
+         "materials (%u with a texture, %u of them unresolved); mirror glass left to GPL %u, "
+         "listed with GPL's live UVs %u; leaves refused: no object %u, not a baked leaf %u, type "
+         "differs %u",
+         instance, list->polygons, c.polygons, list->emptyLeaves, list->draws.size(), spriteRuns,
+         list->frames.size(), list->materials.size(), textured, unresolved, emit.glass,
+         emit.glassListed, emit.noObject, emit.notLeaf, emit.typeDiffers);
+
+    // Which objects GPL's vertex memo skins (report 105 section 4.4): in stock cars, the
+    // suspension and the arms, whose 0x16 XFORMs leave their vertices memoised for the parent.
+    char   objects[512];
+    size_t used = 0;
+    objects[0] = '\0';
+    const baked::CarScene& scene = carBakeScene();
+    for (int i = 0; i < skinnedObjects && used + 64 < sizeof(objects); ++i) {
+        int32_t     index = skinnedObject[i];
+        const char* name = index >= 0 && static_cast<size_t>(index) < scene.objects.size() &&
+                                   !scene.objects[static_cast<size_t>(index)].name.empty()
+                               ? scene.objects[static_cast<size_t>(index)].name.c_str()
+                               : "?";
+        used += static_cast<size_t>(std::snprintf(objects + used, sizeof(objects) - used,
+                                                  " %.40s x %u", name, skinnedLeaves[i]));
+    }
+    logf("baked cars: team instance %p skinning -- %u of its %u leaves drawn from corners GPL's "
+         "vertex memo holds from another frame (1B %u, 1C %u, 1D %u, 1E %u, 1F %u, 20 %u, 21 %u, "
+         "22 %u; %u corners, %u normals lit in another frame, %u corners and %u normals GPL "
+         "memoised before the walk), by object:%s",
+         instance, k.leaves, list->polygons, k.byType[0x1B], k.byType[0x1C], k.byType[0x1D],
+         k.byType[0x1E], k.byType[0x1F], k.byType[0x20], k.byType[0x21], k.byType[0x22],
+         k.corners, k.normals, k.liveCorners, k.liveNormals, used ? objects : " none");
 }
 
 void addCounts(WalkCounts& sum, const WalkCounts& add) {
@@ -204,6 +382,10 @@ void addEmitCounts(EmitCounts& sum, const EmitCounts& add) {
     sum.overflow += add.overflow;
     sum.slotNoList += add.slotNoList;
     sum.unresolved += add.unresolved;
+    sum.glass += add.glass;
+    sum.glassOverflow += add.glassOverflow;
+    sum.glassListed += add.glassListed;
+    sum.glassRefused += add.glassRefused;
 }
 
 void addSkinCounts(SkinCounts& sum, const SkinCounts& add) {

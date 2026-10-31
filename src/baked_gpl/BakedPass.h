@@ -85,6 +85,43 @@ void bakedMarkFrameEnd();
 bool bakedPassWithoutGpl();
 void bakedCockpitDraw(bool drawing);
 
+// Report 105 section 4.48: around GPL's draw of a cockpit gplvr draws, the node filter hands GPL
+// only the polygon and sprite leaves among `glass` (ascending, `count` nodes: the mirror glass,
+// CockpitGlass.h) and drops every other one; lines and the control nodes go to GPL as usual.
+// Null ends it.
+void bakedCockpitGlassOnly(const uintptr_t* glass, uint32_t count);
+// What the filter did under bakedCockpitGlassOnly since the last call of this: glass leaves
+// handed to GPL, other leaves dropped, lines handed to GPL.
+void bakedCockpitGlassTake(uint32_t& passed, uint32_t& dropped, uint32_t& lines);
+// Whether the node filter sees every polygon type: the lit ones (1D 1E 21 22) are hooked only to
+// count and only where the table holds the stock handlers, and without them it cannot keep the
+// glass alone.
+bool bakedFilterSeesEveryLeaf();
+
+// Report 105 section 4.49 (bakedCockpitOverlay = 1, step 2): whether this baked main pass can draw
+// the cockpit's list over its finished eye image, glass included. `mirrorMip` is the car set's
+// mirror.mip handle (gpl_mirrorMip); its live GL texture is what the glass samples, copied with
+// roglv2's t flip by the car renderer. Asked at the cockpit's first call of the pass; on
+// kOverlayReady the cockpit's list is made with the glass in it (CarDrawList::overlay) and GPL's
+// draw of the cockpit hands GPL no leaf. Else the cockpit is step 1's, counted by the reason.
+enum BakedOverlayRefusal : int {
+    kOverlayReady = -1,
+    kOverlayNoRenderer,  // not a baked main pass whose cars the car renderer draws
+    kOverlayNoMip,       // mirror.mip's handle reaches no mip object with a GL texture
+    kOverlayNotFlipped,  // the mip there lacks the t flip roglv2's loader gives mirror.mip alone
+    kOverlayNoSize,      // GL reports no size or format for that texture
+    kOverlayNoCopy,      // the car renderer could not make its copy of it
+    kOverlayRefusals
+};
+int bakedCockpitOverlayReady(uint32_t mirrorMip);
+
+// From the main walk's thunk once the walk has returned and bakedPassEnd has run. When the pass
+// prepared an overlay: flushes roglv2, so everything GPL submitted in the pass (blob shadows,
+// particles, debris, the residual items) is painted under the residual test first, drops an arm
+// no flush took, then draws the overlay into the framebuffer the pass was composited into, before
+// gpl_sceneRender returns -- so before the eye image is copied out and before any 2D.
+void bakedPassMainWalkDone();
+
 // True between bakedPassBegin and bakedPassEnd of a baked main pass, or between their mirror
 // counterparts (the node filter is collecting). bakedPassDrawsCars: and bakedCars = 3 with the
 // car renderer up, so the car hook may leave a car's body to CarRenderer for this pass.
@@ -111,6 +148,20 @@ unsigned bakedPassWalkPosition();
 // prepare and `draws` is their count, so the assembly may leave its draws out (report 105
 // sections 4.27, 4.29).
 bool bakedCarRowsPinned(uint32_t key, uint32_t frames, uint32_t& draws);
+
+// Where a timed call ran (report 105 sections 4.44, 4.46): inside a baked main pass's walk window,
+// a baked mirror pass's, or outside both.
+enum BakedTimeKind : int { kBakedMain, kBakedMirror, kBakedOutside, kBakedTimeKinds };
+int bakedTimeKind();
+
+// The node filter's calls since the last call of this, and the TSC ticks they took, estimated
+// from the sampled ones, by BakedTimeKind; starts them again.
+void bakedFilterTake(uint64_t calls[kBakedTimeKinds], uint64_t ticks[kBakedTimeKinds]);
+
+// The baked passes' walk windows (beginPass to endPass, GPL's world walk with every hook inside
+// it) since the last call of this: QueryPerformanceCounter ticks and passes, main [0] and mirror
+// [1]; starts them again.
+void bakedPassWindowsTake(int64_t ticks[2], uint32_t passes[2]);
 
 // The second's GPU spans of one class of pass (baked::GpuPassTimes), one line prefixed with `who`.
 void bakedLogGpuSpans(const char* who, const baked::GpuPassTimes& gpu);
