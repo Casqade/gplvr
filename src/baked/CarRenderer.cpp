@@ -4,7 +4,6 @@
 #include "baked/RendererInternal.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -199,11 +198,8 @@ uniform vec3 u_fogColour;
 // x: +1 where nearer is a larger depth (reversed-Z), -1 where smaller; y: 1 when depth is
 // near / w, 0 when it is 1 - near / w; z: the relative step per rank.
 uniform vec3 u_depthBias;
-// Debug view 8: every texture is the UV checker (Renderer::uvCheckerTexture).
-uniform int u_uvChecker;
-uniform sampler2D u_checker;
 // Phase 1: the solid surfaces' order numbers and depth, the test (0 none, 1 the walk's order
-// then depth, 2 depth alone: debug views 1 and 3), and the car's place in the walk.
+// then depth), and the car's place in the walk.
 uniform usampler2D u_solidOrder;
 uniform sampler2D u_solidDepth;
 uniform int u_orderTest;
@@ -232,9 +228,8 @@ vec4 paletteTexel(sampler2D indices) {
 }
 void main() {
     vec4 colour = (v_texture.x | v_texture.y) == 0u ? v_primary
-                : u_uvChecker != 0 ? texture(u_checker, v_uv) * v_primary
-                : v_palette >= 0   ? paletteTexel(sampler2D(v_texture)) * v_primary
-                                   : texture(sampler2D(v_texture), v_uv) * v_primary;
+                : v_palette >= 0 ? paletteTexel(sampler2D(v_texture)) * v_primary
+                                 : texture(sampler2D(v_texture), v_uv) * v_primary;
     colour.rgb = min(colour.rgb + v_secondary, vec3(1.0));
     // A walk-order-only draw (a flagman) has no core: all of it is painted in phase 1.
     bool walkOnly = (v_drawBits & 2u) != 0u;
@@ -249,7 +244,7 @@ void main() {
         uint solid = texelFetch(u_solidOrder, pixel, 0).r;
         // A track item's order number is its place in the walk + 1; one of 1..slot was reached
         // before the car, so the car paints over it whatever the depth.
-        if (u_orderTest == 1 && solid < 0x80000000u) {
+        if (solid < 0x80000000u) {
             if (int(solid) > u_walkSlot) discard;
         } else if (u_depthBias.x * (biased - texelFetch(u_solidDepth, pixel, 0).r) < 0.0) {
             discard;
@@ -329,11 +324,6 @@ bool normalise(float v[3]) {
     v[1] /= length;
     v[2] /= length;
     return true;
-}
-
-double microsecondsSince(std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start)
-        .count();
 }
 
 bool hasExtension(const GlApi& gl, const char* wanted) {
@@ -459,8 +449,6 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     uOffsetStep_ = gl_.getUniformLocation(program_, "u_offsetStep");
     uPhase_ = gl_.getUniformLocation(program_, "u_phase");
     uDepthBias_ = gl_.getUniformLocation(program_, "u_depthBias");
-    uUvView_ = gl_.getUniformLocation(program_, "u_uvChecker");
-    uChecker_ = gl_.getUniformLocation(program_, "u_checker");
     uSolidOrder_ = gl_.getUniformLocation(program_, "u_solidOrder");
     uSolidDepth_ = gl_.getUniformLocation(program_, "u_solidDepth");
     uOrderTest_ = gl_.getUniformLocation(program_, "u_orderTest");
@@ -581,8 +569,7 @@ void CarRenderer::release(bool contextAlive) {
     objects_.clear();
     textures_.clear();
     verticesUsed_ = indicesUsed_ = 0;
-    totals_.vertexBytes = totals_.textureBytes = 0;
-    pass_ = CarPassStats{};
+    prepared_ = false;
     commands_.clear();
     clearCache();
 }
@@ -597,7 +584,6 @@ void CarRenderer::resetScene() {
     objects_.clear();
     clearCache();
     verticesUsed_ = indicesUsed_ = 0;
-    totals_.vertexBytes = totals_.textureBytes = 0;
 }
 
 void CarRenderer::ensureDrawIndices(uint32_t count) {
@@ -640,8 +626,6 @@ bool CarRenderer::uploadObjects(const CarScene& scene, size_t extraVertices, siz
         first = 0;
         objects_.clear();
         verticesUsed_ = indicesUsed_ = 0;
-        totals_.vertexBytes = 0;
-        ++totals_.rebuilds;
     }
     for (size_t i = first; i < scene.objects.size(); ++i) {
         const CarObject& object = scene.objects[i];
@@ -664,10 +648,7 @@ bool CarRenderer::uploadObjects(const CarScene& scene, size_t extraVertices, siz
         }
         verticesUsed_ += object.vertices.size();
         indicesUsed_ += object.indices.size();
-        totals_.vertexBytes += object.vertices.size() * sizeof(CarVertex) +
-                               object.indices.size() * sizeof(uint32_t);
         objects_.push_back(gpu);
-        ++totals_.objects;
     }
     return true;
 }
@@ -691,7 +672,6 @@ void CarRenderer::uploadTexture(const Texture& texture, GpuTexture& out) {
         gl_.texImage2D(gl::kTexture2D, static_cast<GLint>(level - first),
                        static_cast<GLint>(format.internal), data.width, data.height, 0,
                        format.format, format.type, data.data.data());
-        totals_.textureBytes += data.data.size();
     }
     GLint levels = static_cast<GLint>(image.levels.size() - first);
     gl_.texParameteri(gl::kTexture2D, gl::kTextureBaseLevel, 0);
@@ -725,14 +705,8 @@ const CarRenderer::GpuTexture* CarRenderer::texture(const CarScene& scene, int32
     GpuTexture& gpu = textures_[static_cast<size_t>(index)];
     if (!gpu.tried) {
         gpu.tried = true;
-        auto start = std::chrono::steady_clock::now();
         gl_.activeTexture(kUploadUnit);
         uploadTexture(scene.textures[static_cast<size_t>(index)], gpu);
-        totals_.milliseconds += microsecondsSince(start) / 1000.0;
-        if (gpu.handle)
-            ++totals_.textures;
-        else
-            ++totals_.textureFailures;
     }
     return &gpu;
 }
@@ -740,7 +714,7 @@ const CarRenderer::GpuTexture* CarRenderer::texture(const CarScene& scene, int32
 // Once per session: GPL's model-view at the dispatch beside the pass's view matrix,
 // camera = R^T (world - eye) with R the camera's orientation (Renderer.cpp, draw).
 void CarRenderer::checkFrame(const CarDrawList& list, const ViewInputs& view,
-                             const float eyeFromRoot[12]) {
+                             const float eyeFromRoot[12], bool world) {
     if (framesChecked_) return;
     framesChecked_ = true;
     const float* r = view.orientation;
@@ -770,8 +744,8 @@ void CarRenderer::checkFrame(const CarDrawList& list, const ViewInputs& view,
         eyeFromRoot[4], eyeFromRoot[5], eyeFromRoot[6], eyeFromRoot[8], eyeFromRoot[9],
         eyeFromRoot[10], eyeFromRoot[3] + view.eye[0], eyeFromRoot[7] + view.eye[1],
         eyeFromRoot[11] + view.eye[2],
-        pass_.worldLists ? "IS world space: the poses alone place the cars"
-                         : "is NOT world space: cars are placed through GPL's model-view");
+        world ? "IS world space: the poses alone place the cars"
+              : "is NOT world space: cars are placed through GPL's model-view");
     frameCheck_ = text;
 }
 
@@ -782,23 +756,15 @@ std::string CarRenderer::takeFrameCheck() {
 }
 
 bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const CarDraw& draw,
-                          uint32_t rank, CarPassStats& stats, uint32_t* words, Command& command,
-                          bool& dynamic, bool& palette) {
+                          uint32_t rank, uint32_t* words, Command& command, bool& dynamic,
+                          bool& palette) {
     dynamic = draw.object == kDynamicCarObject;
     palette = false;
     if (dynamic ? draw.firstIndex + draw.indexCount > list.dynamicIndices.size()
-                : draw.object >= objects_.size() || draw.object >= scene.objects.size()) {
-        ++stats.badObject;
+                : draw.object >= objects_.size() || draw.object >= scene.objects.size())
         return false;
-    }
-    if (draw.frame >= list.frames.size()) {
-        ++stats.badFrame;
-        return false;
-    }
-    if (draw.material >= list.materials.size()) {
-        ++stats.badMaterial;
-        return false;
-    }
+    if (draw.frame >= list.frames.size()) return false;
+    if (draw.material >= list.materials.size()) return false;
     const CarMaterial& material = list.materials[draw.material];
     bool     sprite = (draw.flags & kCarLeafSprite) != 0;
     uint64_t handle = 0;
@@ -810,21 +776,13 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
                             ? scene.sprites[static_cast<size_t>(draw.sprite)].texture
                             : -1;
         const GpuTexture* gpu = texture(scene, index);
-        if (!gpu || !gpu->handle) {
-            ++stats.badSprite;
-            return false;
-        }
+        if (!gpu || !gpu->handle) return false;
         if (gpu->indexed) {
             // roglv2 colours a mip without a colormap of its own from the current one, which only
             // a flagman's MATERIAL sets.
-            if (!list.flagman) {
-                ++stats.indexedWithoutPalette;
-                return false;
-            }
+            if (!list.flagman) return false;
             palette = true;
             bits |= kPaletteDrawBit | (gpu->opaque ? kPaletteOpaqueBit : 0u);
-        } else if (list.flagman) {
-            ++stats.flagmanOwnColours;
         }
         handle = gpu->handle;
         textured = true;
@@ -838,8 +796,6 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
         if (material.liveMirror) handle = mirrorHandle_;
         textured = material.textured && handle != 0;
     }
-    if (!sprite && material.textured && (draw.flags & kCarLeafTextured) && !handle)
-        ++stats.withoutTexture;
     uint32_t colour = 0xFFFFFFFFu;
     if (sprite) colour = (draw.flags & kCarLeafPalette) ? 0xFF808080u : draw.colour;
 
@@ -871,17 +827,14 @@ bool CarRenderer::buildCached(const CarScene& scene, const CarDrawList& list, Ca
     out.words.assign(count * kDrawWords, 0);
     out.commands.assign(count, Command{});
     out.kinds.assign(count, 0);
-    CarPassStats stats;
     for (size_t d = 0; d < count; ++d) {
-        bool     dynamic = false;
-        bool     palette = false;
-        uint32_t flat = stats.withoutTexture;
-        if (!drawRow(scene, list, list.draws[d], 0, stats, &out.words[d * kDrawWords],
-                     out.commands[d], dynamic, palette) ||
+        bool dynamic = false;
+        bool palette = false;
+        if (!drawRow(scene, list, list.draws[d], 0, &out.words[d * kDrawWords], out.commands[d],
+                     dynamic, palette) ||
             palette)
             return false;
-        out.kinds[d] = static_cast<uint8_t>((dynamic ? kCachedDynamic : 0) |
-                                            (stats.withoutTexture != flat ? kCachedWithoutTexture : 0));
+        out.kinds[d] = dynamic ? kCachedDynamic : 0;
     }
     out.frames = static_cast<uint32_t>(list.frames.size());
     return true;
@@ -911,19 +864,14 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
     // An overlay list (the cockpit's kept list, report 105 section 4.50) is drawn from its own
     // draws, which count its leaves and glass for drawOverlay.
     if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return false;
-    ++pass_.keyedLists;
     auto        frames = static_cast<uint32_t>(list.frames.size());
-    CachedList* held = findCached(list.contentKey, frames);
-    CachedList* entry = held;
+    CachedList* entry = findCached(list.contentKey, frames);
     if (list.drawsElided) {
         // Its draws are not here to build from: the pinned rows are the only way to draw it.
-        ++pass_.elidedLists;
-        if (!entry || entry->commands.size() != list.elidedDraws) {
-            ++pass_.elidedLost;
-            return false;
-        }
+        if (!entry || entry->commands.size() != list.elidedDraws) return false;
     } else if (entry && list.contentCheck) {
-        ++pass_.cacheChecked;
+        // The check of a cached program against a fresh build: on a difference the entry goes and
+        // the list is drawn from its own draws.
         CachedList fresh;
         bool       same = buildCached(scene, list, fresh) && fresh.words == entry->words &&
                     fresh.kinds == entry->kinds && sameDraws(fresh.draws, entry->draws) &&
@@ -932,31 +880,22 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
                      std::memcmp(fresh.commands.data(), entry->commands.data(),
                                  fresh.commands.size() * sizeof(Command)) == 0);
         if (!same) {
-            ++pass_.cacheMismatched;
             eraseCached(list.contentKey);
             return false;
         }
     } else if (!entry) {
         CachedList fresh;
-        if (!buildCached(scene, list, fresh)) {
-            ++pass_.cacheRefused;
-            return false;
-        }
+        if (!buildCached(scene, list, fresh)) return false;
         entry = storeCached(list.contentKey, std::move(fresh));
-        if (!entry) {
-            ++pass_.cacheRefused;
-            return false;
-        }
+        if (!entry) return false;
     }
     auto maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
     auto maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
     auto palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
     if ((commands_.size() + list.drawOrder.size()) * 2 + (palettes + 1) * kPaletteTexels >
             maxTexels ||
-        frameBase + entry->frames > maxFrames) {
-        ++(list.drawsElided ? pass_.elidedLost : pass_.cacheRefused);
+        frameBase + entry->frames > maxFrames)
         return false;
-    }
     CachedList& cached = *entry;
     cached.lastUsed = prepares_;
 
@@ -967,9 +906,7 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
         for (Emitted& e : cached.emitted)
             if (e.orderKey == list.orderKey) emitted = &e;
     Emitted scratch;
-    if (emitted) {
-        ++pass_.ordersReused;
-    } else {
+    if (!emitted) {
         emitted = &scratch;
         if (list.orderKey) {
             emitted = &cached.emitted[0];
@@ -985,12 +922,10 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
         Emitted reference;
         if (!emitFromDraws(scene, list, reference) || reference.words != emitted->words ||
             reference.dynamic != emitted->dynamic ||
-            reference.withoutTexture != emitted->withoutTexture ||
             reference.commands.size() != emitted->commands.size() ||
             (!reference.commands.empty() &&
              std::memcmp(reference.commands.data(), emitted->commands.data(),
                          reference.commands.size() * sizeof(Command)) != 0)) {
-            ++pass_.cacheMismatched;
             eraseCached(list.contentKey);
             return false;
         }
@@ -1007,16 +942,11 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
         command.firstIndex += static_cast<uint32_t>(indicesUsed_) + indexBase;
         command.baseVertex = static_cast<int32_t>(verticesUsed_ + vertexBase);
     }
-    pass_.dynamicDraws += static_cast<uint32_t>(emitted->dynamic.size());
-    pass_.withoutTexture += emitted->withoutTexture;
-    ++pass_.cachedLists;
-    if (!held) ++pass_.cacheStored;
     return true;
 }
 
 bool CarRenderer::emitFromDraws(const CarScene& scene, const CarDrawList& list, Emitted& out) {
     out.orderKey = list.orderKey;
-    CarPassStats   stats;
     const CarDraw* previous = nullptr;
     uint32_t       runs = 0;
     for (uint32_t index : list.drawOrder) {
@@ -1028,8 +958,8 @@ bool CarRenderer::emitFromDraws(const CarScene& scene, const CarDrawList& list, 
         Command  command;
         bool     dynamic = false;
         bool     palette = false;
-        if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), stats, words, command,
-                     dynamic, palette) ||
+        if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), words, command, dynamic,
+                     palette) ||
             palette)
             return false;
         command.baseInstance = static_cast<uint32_t>(out.commands.size());
@@ -1037,7 +967,6 @@ bool CarRenderer::emitFromDraws(const CarScene& scene, const CarDrawList& list, 
         out.words.insert(out.words.end(), words, words + kDrawWords);
         out.commands.push_back(command);
     }
-    out.withoutTexture = stats.withoutTexture;
     return true;
 }
 
@@ -1046,7 +975,6 @@ void CarRenderer::emitOrder(const CachedList& cached, const CarDrawList& list, E
     out.words.clear();
     out.commands.clear();
     out.dynamic.clear();
-    out.withoutTexture = 0;
     out.words.reserve(list.drawOrder.size() * kDrawWords);
     out.commands.reserve(list.drawOrder.size());
     // A draw's rank is the place of its run among the draws this eye draws, as the pass would
@@ -1055,10 +983,7 @@ void CarRenderer::emitOrder(const CachedList& cached, const CarDrawList& list, E
     const CarDraw* previous = nullptr;
     uint32_t       runs = 0;
     for (uint32_t index : list.drawOrder) {
-        if (index >= count) {
-            ++pass_.badOrder;
-            continue;
-        }
+        if (index >= count) continue;
         const CarDraw& draw = cached.draws[index];
         if (!previous || !carDrawContinues(*previous, draw)) ++runs;
         previous = &draw;
@@ -1066,9 +991,8 @@ void CarRenderer::emitOrder(const CachedList& cached, const CarDrawList& list, E
         size_t          at = out.words.size();
         out.words.insert(out.words.end(), row, row + kDrawWords);
         out.words[at + 7] |= std::min(runs - 1, kMaxRank) << 8;
-        uint8_t kind = cached.kinds[index];
-        if (kind & kCachedDynamic) out.dynamic.push_back(static_cast<uint32_t>(out.commands.size()));
-        if (kind & kCachedWithoutTexture) ++out.withoutTexture;
+        if (cached.kinds[index] & kCachedDynamic)
+            out.dynamic.push_back(static_cast<uint32_t>(out.commands.size()));
         out.commands.push_back(cached.commands[index]);
         out.commands.back().baseInstance = static_cast<uint32_t>(out.commands.size() - 1);
     }
@@ -1133,8 +1057,7 @@ void CarRenderer::clearCache() { cache_.clear(); }
 void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarDrawList* lists,
                           uint32_t listCount, const CarDrawList* more, uint32_t moreCount,
                           const ViewInputs& view, const CarLighting& lighting) {
-    auto start = std::chrono::steady_clock::now();
-    pass_ = CarPassStats{};
+    prepared_ = false;
     commands_.clear();
     runsReady_ = false;
     discardOverlay();
@@ -1144,8 +1067,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     for (uint32_t l = 0; l < listCount; ++l) passLists_.push_back(lists + l);
     for (uint32_t l = 0; l < moreCount; ++l) passLists_.push_back(more + l);
     auto count = static_cast<uint32_t>(passLists_.size());
-    pass_.prepared = true;
-    pass_.lists = count;
+    prepared_ = true;
     lighting_ = lighting;
 
     SavedBindings saved;
@@ -1177,11 +1099,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         dynamicVertices += passLists_[l]->dynamicVertices.size();
         dynamicIndices += passLists_[l]->dynamicIndices.size();
     }
-    auto uploadStart = std::chrono::steady_clock::now();
-    size_t objectsBefore = objects_.size();
     uploadObjects(scene, dynamicVertices, dynamicIndices);
-    if (objects_.size() != objectsBefore)
-        totals_.milliseconds += microsecondsSince(uploadStart) / 1000.0;
     if (dynamicVertices) {
         for (uint32_t l = 0; l < count; ++l) {
             const CarDrawList& list = *passLists_[l];
@@ -1202,9 +1120,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                     list.dynamicIndices.data());
             }
         }
-        pass_.dynamicVertices = static_cast<uint32_t>(dynamicVertices);
     }
-    pass_.uploadMicroseconds = microsecondsSince(uploadStart);
 
     // Per list: eye-relative world from its dispatch frame, the frames under it, and how far
     // away the car is.
@@ -1233,32 +1149,20 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             translationError =
                 std::max(translationError, std::fabs(eyeFromRoot[row * 4 + 3] + view.eye[row]));
         }
-        pass_.maxRotationError = std::max(pass_.maxRotationError, rotationError);
-        pass_.maxTranslationError = std::max(pass_.maxTranslationError, translationError);
         bool world = rotationError < kWorldRotationTolerance &&
                      translationError < kWorldTranslationTolerance;
+        checkFrame(list, view, eyeFromRoot, world);
         if (world) {
-            ++pass_.worldLists;
             float exact[12] = {1.0f, 0.0f, 0.0f, -view.eye[0], 0.0f, 1.0f, 0.0f, -view.eye[1],
                                0.0f, 0.0f, 1.0f, -view.eye[2]};
-            checkFrame(list, view, eyeFromRoot);
             std::memcpy(eyeFromRoot, exact, sizeof(exact));
-        } else {
-            ++pass_.composedLists;
-            checkFrame(list, view, eyeFromRoot);
         }
 
         float light[3];
         rotate34(eyeFromRoot, list.light, light);
-        if (normalise(light)) {
-            if (!haveLight) {
-                std::memcpy(light_, light, sizeof(light_));
-                haveLight = true;
-            } else if (std::fabs(light[0] - light_[0]) + std::fabs(light[1] - light_[1]) +
-                           std::fabs(light[2] - light_[2]) >
-                       1e-3f) {
-                ++pass_.lightDisagrees;
-            }
+        if (!haveLight && normalise(light)) {
+            std::memcpy(light_, light, sizeof(light_));
+            haveLight = true;
         }
 
         frameBase[l] = static_cast<uint32_t>(frames_.size() / kFrameFloats);
@@ -1282,16 +1186,11 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                 if (!normalise(half)) half[0] = half[1] = half[2] = 0.0f;
             }
         }
-        pass_.frames += static_cast<uint32_t>(frameCount);
         // The car's distance: its `car` frame, else the dispatch frame.
         const float* placed = &frames_[at + (frameCount > 1 ? 1 : 0) * kFrameFloats];
         distance[l] = frameCount ? placed[3] * placed[3] + placed[7] * placed[7] +
                                        placed[11] * placed[11]
                                  : 0.0f;
-        auto listDraws = static_cast<uint32_t>(list.contentKey ? list.drawOrder.size()
-                                                               : list.draws.size());
-        if (!listDraws) ++pass_.emptyLists;
-        pass_.listDraws += listDraws;
     }
     if (!haveLight) {
         light_[0] = 0.0f;
@@ -1315,7 +1214,6 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         auto carFirst = static_cast<uint32_t>(commands_.size());
         // The list's palette row, appended the first time one of its draws needs it.
         int32_t listPalette = -1;
-        if (list.flagman) ++pass_.flagmanLists;
         bool cached = appendCached(scene, list, frameBase[l], dynamicVertexBase[l],
                                    dynamicIndexBase[l]);
         // A draw's rank is the place of its run among the draws this eye draws, as its own list
@@ -1327,47 +1225,25 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                                               : list.draws.size();
         const CarDraw* previous = nullptr;
         uint32_t       runs = 0;
-        // An overlay list's leaves, each counted where it went (CarOverlayStats).
-        bool overlay = list.overlay;
-        if (overlay) {
-            overlay_.listPolygons += list.polygons;
-            overlay_.empty += list.emptyLeaves;
-        }
         for (size_t d = 0; !cached && d < drawn; ++d) {
-            if (ordered && list.drawOrder[d] >= list.draws.size()) {
-                ++pass_.badOrder;
-                continue;
-            }
+            if (ordered && list.drawOrder[d] >= list.draws.size()) continue;
             const CarDraw& draw = list.draws[ordered ? list.drawOrder[d] : d];
-            if (!ordered && !carDrawOn(list, draw)) {
-                ++pass_.conditionedOff;
-                if (draw.condition >= list.conditionOn.size()) ++pass_.badCondition;
-                if (overlay) overlay_.conditionedOff += draw.polygons;
-                continue;
-            }
+            if (!ordered && !carDrawOn(list, draw)) continue;
             if (!previous || !carDrawContinues(*previous, draw)) ++runs;
             previous = &draw;
             uint32_t words[kDrawWords];
             Command  command;
             bool     dynamic = false;
             bool     palette = false;
-            if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), pass_, words, command,
-                         dynamic, palette)) {
-                if (overlay) overlay_.refused += draw.polygons;
+            if (!drawRow(scene, list, draw, std::min(runs - 1, kMaxRank), words, command, dynamic,
+                         palette))
                 continue;
-            }
             uint32_t frame = frameBase[l] + draw.frame;
             auto     palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
             if ((commands_.size() + 1) * 2 + (palettes + 1) * kPaletteTexels > maxTexels ||
-                frame >= maxFrames) {
-                ++pass_.tableFull;
-                if (overlay) overlay_.refused += draw.polygons;
+                frame >= maxFrames)
                 continue;
-            }
-            if (overlay) {
-                overlay_.polygons += draw.polygons;
-                if (list.materials[draw.material].liveMirror) overlay_.glass += draw.polygons;
-            }
+            if (list.overlay && list.materials[draw.material].liveMirror) overlayGlass_ = true;
             if (palette) {
                 if (listPalette < 0) {
                     listPalette = static_cast<int32_t>(palettes);
@@ -1381,7 +1257,6 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
             if (dynamic) {
                 command.firstIndex += static_cast<uint32_t>(indicesUsed_) + dynamicIndexBase[l];
                 command.baseVertex = static_cast<int32_t>(verticesUsed_ + dynamicVertexBase[l]);
-                ++pass_.dynamicDraws;
             }
             draws_.insert(draws_.end(), words, words + kDrawWords);
             commands_.push_back(command);
@@ -1395,10 +1270,6 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         uint32_t carCount = appendList(l);
         if (carCount)
             carRanges_.push_back(CarRange{carFirst, carCount, list.walkSlot, list.flagman});
-        if (list.flagman) {
-            pass_.flagmanCommands += carCount;
-            if (carCount) ++pass_.flagmanRuns;
-        }
     }
     // The overlay lists last, in the pass's list order: drawOverlay draws them as one range.
     overlayFirst_ = static_cast<uint32_t>(commands_.size());
@@ -1407,23 +1278,16 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         ++overlayLists_;
         overlayCount_ += appendList(l);
     }
-    overlay_.lists = overlayLists_;
-    overlay_.commands = overlayCount_;
-    // The contract compares the commands with the draws this eye draws.
-    pass_.listDraws -= pass_.conditionedOff;
     // The palette rows follow the draws; each palette draw names its row's first texel.
     auto paletteBase = static_cast<uint32_t>(draws_.size() / 4);
     for (uint32_t word : paletteFixups_) draws_[word] = paletteBase + draws_[word] * kPaletteTexels;
     draws_.insert(draws_.end(), paletteWords_.begin(), paletteWords_.end());
-    pass_.paletteRows = static_cast<uint32_t>(paletteWords_.size() / 16);
     // Phase 1's runs in the order of the walk; carRanges_ is far to near, which a stable sort
     // keeps between cars dispatched at one place.
     walkRuns_ = carRanges_;
     std::stable_sort(walkRuns_.begin(), walkRuns_.end(),
                      [](const CarRange& a, const CarRange& b) { return a.slot < b.slot; });
-    pass_.walkRuns = static_cast<uint32_t>(walkRuns_.size());
 
-    auto tablesStart = std::chrono::steady_clock::now();
     if (!commands_.empty()) {
         ensureDrawIndices(static_cast<uint32_t>(commands_.size()));
         gl_.bindBuffer(gl::kArrayBuffer, frameBuffer_);
@@ -1437,29 +1301,16 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                        static_cast<GLsizeiptr>(commands_.size() * sizeof(Command)),
                        commands_.data(), gl::kStreamDraw);
     }
-    pass_.uploadMicroseconds += microsecondsSince(tablesStart);
 
     gl_.pixelStorei(gl::kUnpackSkipPixels, unpack[3]);
     gl_.pixelStorei(gl::kUnpackSkipRows, unpack[2]);
     gl_.pixelStorei(gl::kUnpackRowLength, unpack[1]);
     gl_.pixelStorei(gl::kUnpackAlignment, unpack[0]);
     restoreBindings(gl_, saved);
-    pass_.prepareMicroseconds = microsecondsSince(start);
 }
 
 void CarRenderer::drawSolid(const SolidHookContext& context) {
-    if (!pass_.prepared || commands_.empty()) return;
-    // Debug view 7 hides the cars; the flagmen's runs stay, and they need the uniforms below.
-    bool withoutCars = context.debug == kDebugWithoutCars;
-    if (withoutCars) {
-        pass_.hidden = true;
-        overlayHidden_ = true;
-        walkRuns_.erase(std::remove_if(walkRuns_.begin(), walkRuns_.end(),
-                                       [](const CarRange& run) { return !run.flagman; }),
-                        walkRuns_.end());
-        if (walkRuns_.empty()) return;
-    }
-    auto start = std::chrono::steady_clock::now();
+    if (!prepared_ || commands_.empty()) return;
     const ViewInputs&  view = *context.view;
     const FrameInputs& frame = *context.frame;
 
@@ -1487,19 +1338,12 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.uniform1i(uPaletteLinear_, filter_.trilinear ? 1 : 0);
     gl_.uniform3f(uDepthBias_, context.reversedZ ? 1.0f : -1.0f, context.reversedZ ? 1.0f : 0.0f,
                   kRankDepthStep);
-    // The checker is on its own unit, bound by the track renderer for this pass (Renderer::draw).
-    bool checker = context.debug == kDebugUvChecker && context.uvChecker != 0;
-    gl_.uniform1i(uUvView_, checker ? 1 : 0);
-    gl_.uniform1i(uChecker_, static_cast<GLint>(kCheckerUnit - gl::kTexture0));
-    if (checker) ++pass_.checkerDraws;
     // Phase 1's test, drawn later in this pass (drawWalkOrderRun): the units the track renderer
     // binds the solid order and depth on for its walk-order phase. The program keeps every
     // uniform set here until then.
     gl_.uniform1i(uSolidOrder_, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
     gl_.uniform1i(uSolidDepth_, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
-    gl_.uniform1i(uOrderTest_, context.debug == kDebugWalkOrderOverAll   ? 0
-                               : context.debug == kDebugWalkOrderByDepth ? 2
-                                                                         : 1);
+    gl_.uniform1i(uOrderTest_, 1);
     gl_.activeTexture(kFrameUnit);
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
@@ -1508,28 +1352,21 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
 
     // The overlay lists' commands follow every other list's and take neither phase.
     auto drawCount = static_cast<GLsizei>(overlayFirst_);
-    overlayChecker_ = checker ? context.uvChecker : 0;
-    overlayReady_ = !withoutCars;
+    overlayReady_ = true;
     // Phase 0: the cores, with depth and the car mark in the order attachment. The flagmen's
     // draws discard everything here (kWalkOnlyBit).
-    if (!withoutCars && drawCount > 0) {
+    if (drawCount > 0) {
         GLenum solid[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
         gl_.drawBuffers(2, solid);
         gl_.depthMask(1);
         gl_.uniform1i(uPhase_, 0);
         gl_.multiDrawElementsIndirect(gl::kTriangles, gl::kUnsignedInt, nullptr, drawCount,
                                       sizeof(Command));
-        pass_.multiDraws = 1;
     }
     gl_.uniform1i(uPhase_, 1);
     restoreBindings(gl_, saved);
 
     runsReady_ = true;
-    pass_.drawMicroseconds = microsecondsSince(start);
-    if (withoutCars) return;
-    pass_.drawn = true;
-    pass_.commands = static_cast<uint32_t>(commands_.size());
-    pass_.cars = static_cast<uint32_t>(carRanges_.size()) - pass_.flagmanRuns;
 }
 
 uint32_t CarRenderer::walkOrderRuns() const {
@@ -1538,10 +1375,9 @@ uint32_t CarRenderer::walkOrderRuns() const {
 
 uint32_t CarRenderer::walkOrderSlot(uint32_t run) const { return walkRuns_[run].slot; }
 
-void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t position,
-                                   const SolidHookContext& context) {
+void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
+                                   const SolidHookContext& /*context*/) {
     if (run >= walkRuns_.size()) return;
-    auto               start = std::chrono::steady_clock::now();
     const CarRange&    car = walkRuns_[run];
     SavedBindings      saved;
     saveBindings(gl_, saved);
@@ -1558,15 +1394,6 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t position,
         reinterpret_cast<const void*>(static_cast<uintptr_t>(car.first) * sizeof(Command)),
         static_cast<GLsizei>(car.count), sizeof(Command));
     restoreBindings(gl_, saved);
-
-    ++pass_.multiDraws;
-    ++pass_.walkRunsDrawn;
-    if (car.flagman) ++pass_.flagmanRunsDrawn;
-    if (position >= context.orderedCount) ++pass_.walkRunsAtEnd;
-    // A slot past the walk's end (kWalkSlotLast, the cockpit) counts as the visible list's end.
-    pass_.walkSlotSum += std::min<uint64_t>(car.slot, context.visibleCount);
-    pass_.walkVisibleSum += context.visibleCount;
-    pass_.drawMicroseconds += microsecondsSince(start);
 }
 
 void CarRenderer::releaseMirrorCopy() {
@@ -1672,23 +1499,18 @@ void CarRenderer::discardOverlay() {
     overlayFirst_ = 0;
     overlayCount_ = 0;
     overlayReady_ = false;
-    overlayHidden_ = false;
-    overlayChecker_ = 0;
-    overlay_ = CarOverlayStats{};
+    overlayGlass_ = false;
 }
 
-int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlayStats& stats) {
-    stats = overlay_;
-    int outcome = !overlayLists_                ? kOverlayNone
-                  : overlayHidden_              ? kOverlayHidden
+int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
+    int outcome = !overlayLists_                    ? kOverlayNone
                   : !overlayReady_ || !initialised_ ? kOverlayNotReady
-                  : !overlayCount_              ? kOverlayNoCommands
-                                                : kOverlayDrawn;
+                  : !overlayCount_                  ? kOverlayNoCommands
+                                                    : kOverlayDrawn;
     if (outcome != kOverlayDrawn) {
         discardOverlay();
         return outcome;
     }
-    auto start = std::chrono::steady_clock::now();
 
     // Everything changed below goes back: roglv2 keeps drawing into this framebuffer after it.
     SavedBindings saved;
@@ -1697,7 +1519,6 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlaySt
     GLint     viewport[4] = {0, 0, 0, 0};
     GLint     blendSrc = 0;
     GLint     blendDst = 0;
-    GLint     checkerTexture = 0;
     GLboolean colourMask[4] = {1, 1, 1, 1};
     GLboolean depthMask = 1;
     gl_.getIntegerv(gl::kDrawFramebufferBinding, &previousDraw);
@@ -1714,7 +1535,8 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlaySt
 
     gl_.disable(gl::kScissorTest);
     gl_.colorMask(1, 1, 1, 1);
-    if (overlay_.glass) stats.copied = copyMirror(true);
+    // A failed copy leaves the glass showing the last copy.
+    if (overlayGlass_) copyMirror(true);
 
     // GPL's painter's order: every draw over what is there, the later over the earlier, the
     // translucent ones blended in place as roglv2 blends them. Without a depth test GL writes no
@@ -1731,9 +1553,6 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlaySt
     gl_.bindVertexArray(vertexArray_);
     gl_.uniform1i(uPhase_, 2);
     gl_.uniform1i(uOrderTest_, 0);
-    gl_.activeTexture(kCheckerUnit);
-    gl_.getIntegerv(gl::kTextureBinding2D, &checkerTexture);
-    if (overlayChecker_) gl_.bindTexture(gl::kTexture2D, overlayChecker_);
     gl_.activeTexture(kFrameUnit);
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
@@ -1744,8 +1563,6 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlaySt
         reinterpret_cast<const void*>(static_cast<uintptr_t>(overlayFirst_) * sizeof(Command)),
         static_cast<GLsizei>(overlayCount_), sizeof(Command));
 
-    gl_.activeTexture(kCheckerUnit);
-    gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(checkerTexture));
     restoreBindings(gl_, saved);
     if (cullFace) gl_.enable(gl::kCullFace);
     if (alphaTest) gl_.enable(gl::kAlphaTest);
@@ -1759,24 +1576,14 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4], CarOverlaySt
     if (scissor) gl_.enable(gl::kScissorTest);
     // The overlay's commands go to the GPU now, as each pass's do (Renderer::drawComposited).
     if (gl_.flush) gl_.flush();
-    stats.microseconds = microsecondsSince(start);
     discardOverlay();
     return kOverlayDrawn;
 }
 
-CarPassStats CarRenderer::finishPass() {
-    CarPassStats out = pass_;
-    pass_ = CarPassStats{};
+void CarRenderer::finishPass() {
+    prepared_ = false;
     commands_.clear();
     runsReady_ = false;
-    return out;
-}
-
-CarUploadTotals CarRenderer::takeTotals() {
-    CarUploadTotals out = totals_;
-    totals_.objects = totals_.textures = totals_.textureFailures = totals_.rebuilds = 0;
-    totals_.milliseconds = 0.0;
-    return out;
 }
 
 }  // namespace baked

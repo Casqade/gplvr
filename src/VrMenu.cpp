@@ -371,8 +371,8 @@ MenuRow g_rows[] = {
     {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
      "what is in the car with you: the mirrors and pribluda's panel", kTabCockpit},
     {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "what a frame costs: the frame rate, the render scale and how often the mirrors and the "
-     "panel are redrawn",
+     "what a frame costs: the frame rate, the renderer, the render scale and how often the "
+     "mirrors and the panel are redrawn",
      kTabPerformance},
     {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
      "text and screens: GPL's own text, its menus in the headset, and the monitor window",
@@ -438,6 +438,15 @@ MenuRow g_rows[] = {
      "blend the world between ticks, which is what makes the extra frames new pictures "
      "instead of copies, and costs one tick of latency. Vsync follows this and is not a "
      "separate setting",
+     kTabPerformance},
+    {"Renderer", kRowNamedInt, kCommandNone, nullptr, &g_options.bakedRenderer, nullptr, 0, 2,
+     1,
+     "who draws the world. Vanilla is GPL's own renderer, as it ships. GPL VR is gplvr's: the "
+     "track, the other cars, the flagmen, your cockpit and the mirrors drawn with real depth "
+     "and less CPU time, anything it cannot draw left to GPL. GPL VR (debug) is the same with a "
+     "red square in the corner of every view it drew. Takes effect on the next frame; the first "
+     "switch away from Vanilla in a session prepares the track for a few seconds while GPL "
+     "draws it",
      kTabPerformance},
     {"Render scale", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrRenderScale, 0.5f, 2.0f, 0.05f,
@@ -1280,6 +1289,13 @@ const char* namedValue(const MenuRow& row) {
             default: return "unlimited";
         }
     }
+    if (row.intValue == &g_options.bakedRenderer) {
+        switch (*row.intValue) {
+            case 0: return "Vanilla";
+            case 1: return "GPL VR";
+            default: return "GPL VR (debug)";
+        }
+    }
     return "";
 }
 
@@ -1561,6 +1577,7 @@ void saveSettings() {
     writeInt("perEyeMirror", g_options.perEyeMirror ? 1 : 0);
     writeInt("mirrorUpdateRate", g_options.mirrorUpdateRate);
     writeInt("frameRate", g_options.frameRate);
+    writeInt("bakedRenderer", g_options.bakedRenderer);
     writeInt("pribludaUpdateRate", g_options.pribludaUpdateRate);
     writeFloat("vrRenderScale", g_options.vrRenderScale);
     writeFloat("vrMenuScale", g_options.vrMenuScale);
@@ -1576,18 +1593,19 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 15 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 16 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
     notice("saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudLayer=%d perEyeMirror=%d mirrorUpdateRate=%d "
-         "frameRate=%d pribludaUpdateRate=%d vrRenderScale=%.3f "
+         "frameRate=%d bakedRenderer=%d pribludaUpdateRate=%d vrRenderScale=%.3f "
          "vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d vrGplTextInset=%.3f "
          "vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f vrHeadAudioWidth=%.3f "
          "vrMonitorEye=%d",
          path, g_options.vrHudLayer, g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
-         g_options.frameRate, g_options.pribludaUpdateRate, g_options.vrRenderScale,
+         g_options.frameRate, g_options.bakedRenderer, g_options.pribludaUpdateRate,
+         g_options.vrRenderScale,
          g_options.vrMenuScale, g_options.vrHudBackdropOpacity, g_options.vrGplTextScale,
          g_options.vrGplTextInset, g_options.vrGamma, g_options.vrHorizonLock,
          g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);

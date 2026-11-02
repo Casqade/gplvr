@@ -144,7 +144,7 @@ const char* const kFragmentSource = R"(#version 130
 uniform sampler2D u_texture;
 uniform sampler2D u_bakedDepth;
 uniform usampler2D u_solidOrder;
-uniform int u_shadowTest;  // a shadow's test: 0 none, 1 GPL's walk order, 2 depth as the rest
+uniform int u_shadowTest;  // a shadow's test: 1 GPL's walk order, 2 depth as the rest
 uniform int u_textured;
 uniform int u_colourSum;
 uniform vec4 u_rect;   // the baked pass's rect, window pixels
@@ -175,8 +175,7 @@ float slopeAlong(float w, float before, float after) {
 void main() {
     vec2 at = gl_FragCoord.xy - u_rect.xy;
     bool shadow = v_shadowSlot >= 0;
-    if (v_inverseW > 0.0 && at.x >= 0.0 && at.y >= 0.0 && at.x < u_rect.z && at.y < u_rect.w &&
-        !(shadow && u_shadowTest == 0)) {
+    if (v_inverseW > 0.0 && at.x >= 0.0 && at.y >= 0.0 && at.x < u_rect.z && at.y < u_rect.w) {
         ivec2 pixel = ivec2(at);
         bool byDepth = true;
         if (shadow && u_shadowTest == 1) {
@@ -298,32 +297,11 @@ ShadowRange g_armedRanges[kMaxShadowRanges];
 int         g_armedRangeCount = 0;
 uintptr_t   g_armedDrawer = 0;
 
-// Since the last report.
-unsigned g_tested = 0;      // armed flushes drawn under the program
-unsigned g_fogged = 0;      // of them, flushes that started with fog on
-unsigned g_untested = 0;    // armed flushes left as they were (no program, no array)
-unsigned g_inWalkFlushes = 0;
-unsigned g_unarmedFlushes = 0;
-unsigned g_flushCount = 0;  // every flush seen, never reset (residualFlushCount)
-// g_flushCount when the last baked pass drew (residualFlushesSinceBakedPass).
-unsigned g_flushesAtBakedPass = 0;
-bool     g_bakedPassSeen = false;
-struct ShadowCounts {
-    unsigned calls = 0;          // shadow calls in baked walks
-    unsigned emitting = 0;       // of them, calls that submitted polygons
-    unsigned polygons = 0;       // polygons they submitted (roglv2's numbering)
-    unsigned gplPolygons = 0;    // GPL's counter over the same calls: bumped on entry to its
-                                 // clipper (0x4C87D0), so it also counts polygons clipped away
-    unsigned ranges = 0;         // ranges handed to armed flushes
-    unsigned tested[3] = {};     // armed flushes by the shadow test they ran: none, order, depth
-    // Refused: polygons left to the depth test, by reason.
-    unsigned noDrawer = 0;       // calls: rogl_polyDrawerCurrent is not the z-buffer drawer
-    unsigned drawerChanged = 0;  // calls: the drawer changed during the call or the walk
-    unsigned tableFull = 0;      // calls past kMaxShadowRanges ranges in a pass
-    unsigned walkFlushed = 0;    // passes whose ranges a flush inside the walk invalidated
-    unsigned flushDrawer = 0;    // armed flushes drawn by another drawer than the ranges'
-};
-ShadowCounts g_shadow;
+// The shadow test a flush runs (u_shadowTest): GPL's walk order at the shadow's place, or the
+// depth test with the margin, as everything else -- where the pass has no solid order, or a
+// shadow's polygons cannot be told apart.
+constexpr int kShadowByWalkOrder = 1;
+constexpr int kShadowByDepth = 2;
 
 uintptr_t readWord(uintptr_t address) { return *reinterpret_cast<const uint32_t*>(address); }
 
@@ -518,16 +496,10 @@ void setFogUniforms(bool on) {
 
 // The first thing an armed flush draws with: the arrays are set, the program goes in.
 void openProgram(void* drawer) {
-    if (!g_pass.depthTexture || !resolveGl()) {
-        ++g_untested;
-        return;
-    }
+    if (!g_pass.depthTexture || !resolveGl()) return;
     const float* fog = nullptr;
     std::memcpy(&fog, static_cast<const uint8_t*>(drawer) + kFogArrayOffset, sizeof(fog));
-    if (!fog) {
-        ++g_untested;
-        return;
-    }
+    if (!fog) return;
     GLint unit = 0;
     g_gl.getIntegerv(kCurrentProgram, &g_previousProgram);
     g_gl.getIntegerv(kActiveTexture, &unit);
@@ -552,13 +524,9 @@ void openProgram(void* drawer) {
 
     // The pass's blob shadows: their ranges hold only for the drawer they were counted in, and
     // the order test needs the solid order.
-    int shadowTest = g_pass.shadowTest;
-    if (shadowTest == kShadowByWalkOrder && !g_pass.orderTexture) shadowTest = kShadowByDepth;
+    int shadowTest = g_pass.orderTexture ? kShadowByWalkOrder : kShadowByDepth;
     int ranges = g_armedRangeCount;
-    if (ranges && g_armedDrawer != reinterpret_cast<uintptr_t>(drawer)) {
-        ++g_shadow.flushDrawer;
-        ranges = 0;
-    }
+    if (ranges && g_armedDrawer != reinterpret_cast<uintptr_t>(drawer)) ranges = 0;
     uint32_t total = submitted(reinterpret_cast<uintptr_t>(drawer));
     if (!total) ranges = 0;
     g_gl.uniform1i(g_gl.uShadowCount, ranges);
@@ -573,16 +541,11 @@ void openProgram(void* drawer) {
             g_gl.bindTexture(kTexture2D, g_pass.orderTexture);
             g_gl.activeTexture(static_cast<GLenum>(unit));
         }
-        g_shadow.ranges += static_cast<unsigned>(ranges);
-        ++g_shadow.tested[shadowTest];
     }
     g_armedRangeCount = 0;
 
-    bool fogOn = g_gl.isEnabled(kFog) != 0;
-    setFogUniforms(fogOn);
+    setFogUniforms(g_gl.isEnabled(kFog) != 0);
     g_bound = true;
-    ++g_tested;
-    if (fogOn) ++g_fogged;
 }
 
 void closeFlush() {
@@ -598,12 +561,7 @@ void WINAPI clearHook(GLbitfield mask) {
     g_realClear(mask);
     // roglv2 clears depth only at the start of a flush (ZBufferOpenGL slot 0).
     if (!(mask & kDepthBufferBit)) return;
-    ++g_flushCount;
-    if (g_inWalk) {
-        ++g_inWalkFlushes;
-        g_walkFlushed = true;
-    }
-    if (!g_armed) ++g_unarmedFlushes;
+    if (g_inWalk) g_walkFlushed = true;
     g_flushOpen = g_armed;
     g_armed = false;
 }
@@ -742,28 +700,12 @@ void residualInstall() {
 void residualArm(const ResidualPass& pass) {
     g_pass = pass;
     g_armed = true;
-    g_bakedPassSeen = true;
-    g_flushesAtBakedPass = g_flushCount;
     g_armedRangeCount = 0;
     g_armedDrawer = g_walkDrawer;
-    if (g_walkRangeCount && g_walkFlushed) {
-        ++g_shadow.walkFlushed;
-        return;
-    }
+    // A flush inside the walk restarted the numbering: the ranges no longer name the polygons.
+    if (g_walkRangeCount && g_walkFlushed) return;
     g_armedRangeCount = g_walkRangeCount;
     std::memcpy(g_armedRanges, g_walkRanges, sizeof(ShadowRange) * g_walkRangeCount);
-}
-
-unsigned residualFlushCount() { return g_installed ? g_flushCount : 0; }
-
-int residualFlushesSinceBakedPass() {
-    if (!g_installed || !g_bakedPassSeen) return -1;
-    return static_cast<int>(g_flushCount - g_flushesAtBakedPass);
-}
-
-int residualQueuedPolygons() {
-    uintptr_t drawer = g_installed ? currentDrawer() : 0;
-    return drawer ? static_cast<int>(submitted(drawer)) : -1;
 }
 
 bool residualDisarm() {
@@ -787,25 +729,16 @@ void residualShadowBegin() {
     g_callFirst = g_callDrawer ? submitted(g_callDrawer) : 0;
 }
 
-void residualShadowEnd(unsigned slot, unsigned gplPolygons) {
+void residualShadowEnd(unsigned slot) {
     if (!g_inWalk) return;
-    ++g_shadow.calls;
-    g_shadow.gplPolygons += gplPolygons;
     uintptr_t drawer = g_callDrawer;
     g_callDrawer = 0;
-    if (!drawer) {
-        if (gplPolygons) ++g_shadow.noDrawer;
-        return;
-    }
+    if (!drawer) return;
     uint32_t end = submitted(drawer);
     if (currentDrawer() != drawer || end < g_callFirst ||
-        (g_walkDrawer && g_walkDrawer != drawer)) {
-        ++g_shadow.drawerChanged;
+        (g_walkDrawer && g_walkDrawer != drawer))
         return;
-    }
     if (end == g_callFirst) return;
-    ++g_shadow.emitting;
-    g_shadow.polygons += end - g_callFirst;
     g_walkDrawer = drawer;
     if (g_walkRangeCount) {
         ShadowRange& last = g_walkRanges[g_walkRangeCount - 1];
@@ -814,45 +747,12 @@ void residualShadowEnd(unsigned slot, unsigned gplPolygons) {
             return;
         }
     }
-    if (g_walkRangeCount == kMaxShadowRanges) {
-        ++g_shadow.tableFull;
-        return;
-    }
+    // Past kMaxShadowRanges the call keeps the depth test of everything else.
+    if (g_walkRangeCount == kMaxShadowRanges) return;
     ShadowRange& range = g_walkRanges[g_walkRangeCount++];
     range.first = static_cast<GLint>(g_callFirst);
     range.end = static_cast<GLint>(end);
     range.slot = static_cast<GLint>(slot);
-}
-
-bool residualFormat(char* out, unsigned size, unsigned passes) {
-    if (!g_installed || !passes) return false;
-    int used = std::snprintf(
-        out, size,
-        "residual depth per pass -- GPL flushes tested %.2f (%.2f with fog), left "
-        "untested %.2f (no program or no array), flushed inside the walk %.2f (painted "
-        "under the baked image), unarmed %.2f",
-        static_cast<double>(g_tested) / passes, static_cast<double>(g_fogged) / passes,
-        static_cast<double>(g_untested) / passes, static_cast<double>(g_inWalkFlushes) / passes,
-        static_cast<double>(g_unarmedFlushes) / passes);
-    const ShadowCounts& c = g_shadow;
-    if (used > 0 && static_cast<unsigned>(used) < size && c.calls) {
-        std::snprintf(
-            out + used, size - used,
-            "; blob shadows: %.2f calls a pass (%.2f submitting), polygons %u roglv2-numbered of "
-            "%u entering GPL's clipper (at most; it drops what lies outside the view), %.2f "
-            "ranges a flush; flushes testing them by walk order "
-            "%u, by depth %u (view 9), untested %u (view 10); left to the depth test: calls with "
-            "no z-buffer drawer %u, drawer changed %u, past %d ranges %u; passes dropped by a "
-            "flush inside the walk %u, flushes by another drawer %u",
-            static_cast<double>(c.calls) / passes, static_cast<double>(c.emitting) / passes,
-            c.polygons, c.gplPolygons,
-            g_tested ? static_cast<double>(c.ranges) / g_tested : 0.0, c.tested[kShadowByWalkOrder],
-            c.tested[kShadowByDepth], c.tested[kShadowUntested], c.noDrawer, c.drawerChanged,
-            kMaxShadowRanges, c.tableFull, c.walkFlushed, c.flushDrawer);
-    }
-    g_tested = g_fogged = g_untested = g_inWalkFlushes = g_unarmedFlushes = 0;
-    g_shadow = ShadowCounts{};
-    return true;
 }
 
 }  // namespace gplvr

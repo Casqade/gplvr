@@ -109,20 +109,14 @@ struct State {
 
     // The window since the last report.
     unsigned windowLatches = 0;    // car latches the render thread ran
-    unsigned windowVerified = 0;   // of those, compared against a slot of the same tick
     unsigned windowSkipped = 0;    // slot was from another tick, or the car was not in it
-    unsigned windowMismatchCars = 0;
-    unsigned windowMismatchWords = 0;
     unsigned windowMaterialised = 0;
     unsigned windowRepins = 0;     // the slot changed under the pin and was taken again
     int      grantsAtReport = 0;
 
     // Totals.
     unsigned totalPublishes = 0;
-    unsigned totalMismatchCars = 0;
     unsigned totalGrantsDeferred = 0;
-    int      firstMismatchWord = -1;
-    int      firstMismatchCar = -1;
 
     long long frequency = 0;
 
@@ -281,9 +275,9 @@ int pinNewest(unsigned& sequence) {
 
 void unpin() { g_state.pinned.store(-1, std::memory_order_release); }
 
-// gpl_carLatchRenderRecord 0x46D030, written out of the slot. `r` is the 66-word record --
-// car[320..385] itself, or a scratch copy for the verify -- and `car` its owner; the two lookups
-// and the back-pointer stay the render thread's.
+// gpl_carLatchRenderRecord 0x46D030, written out of the slot. `r` is the 66-word record,
+// car[320..385], and `car` its owner; the two lookups and the back-pointer stay the render
+// thread's.
 void materialise(uint32_t* car, const CarSource& source, uint32_t* r) {
     State& s = g_state;
     const uint32_t* w = source.words;  // w[k] is car[271 + k]
@@ -340,58 +334,12 @@ void materialise(uint32_t* car, const CarSource& source, uint32_t* r) {
     r[65] = word(274);
 }
 
-// The words of the record this file does not write from the slot: the back-pointer [321], the
-// two lookups [330] and [332], and [327] and [331], which gpl_carLatchRenderRecord leaves to
-// its caller.
-bool comparedWord(int index) {
-    switch (index) {
-        case 1:
-        case 7:
-        case 10:
-        case 11:
-        case 12: return false;
-        default: return true;
-    }
-}
-
-// What the slot would have written, against what GPL's own latch just wrote. `source` is the
-// caller's own validated copy. Only meaningful while the two describe the same tick: the render
-// thread holds gpl_taskFgBgLock here, so the sim is blocked at bgSleep and its last publish is
-// the state GPL has just read -- unless a grant slipped in before the lock, which the tick
-// numbers catch.
-void verify(uint32_t* car, const CarSource& source, unsigned publish) {
-    State&   s = g_state;
-    uint32_t expected[kRecordWords];
-    const uint32_t* written = car + kRecordFirst;
-
-    materialise(car, source, expected);
-
-    int differing = 0;
-    for (int i = 0; i < kRecordWords; ++i) {
-        if (!comparedWord(i) || expected[i] == written[i]) continue;
-        ++differing;
-        if (s.firstMismatchWord < 0) {
-            s.firstMismatchWord = kRecordFirst + i;
-            s.firstMismatchCar = carSlotOf(reinterpret_cast<uintptr_t>(car));
-            logf("ring: car[%d] differs -- the slot says %08X, GPL's latch wrote %08X (car slot "
-                 "%d, publish %u). Every later mismatch is counted, not logged.",
-                 kRecordFirst + i, expected[i], written[i], s.firstMismatchCar, publish);
-        }
-    }
-    if (differing) {
-        ++s.windowMismatchCars;
-        ++s.totalMismatchCars;
-        s.windowMismatchWords += static_cast<unsigned>(differing);
-    }
-}
-
 void* __cdecl carLatchHook(void* car) {
     State& s = g_state;
-    int    mode = g_options.simRing;
     int    slot = carSlotOf(reinterpret_cast<uintptr_t>(car));
     ++s.windowLatches;
 
-    if (mode <= 0 || slot < 0) return s.carLatch(car);
+    if (g_options.simRing <= 0 || slot < 0) return s.carLatch(car);
 
     unsigned sequence = 0;
     int      index = pinNewest(sequence);
@@ -412,7 +360,6 @@ void* __cdecl carLatchHook(void* car) {
     const Slot& published = s.slots[index];
     CarSource   source = published.cars[slot];
     int         bgTick = published.bgTick;
-    unsigned    publish = published.publish;
     std::atomic_thread_fence(std::memory_order_acquire);
     bool whole = published.sequence.load(std::memory_order_relaxed) == sequence;
     unpin();
@@ -428,18 +375,11 @@ void* __cdecl carLatchHook(void* car) {
         return s.carLatch(car);
     }
 
-    if (mode >= 2) {
-        materialise(reinterpret_cast<uint32_t*>(car), source,
-                    reinterpret_cast<uint32_t*>(car) + kRecordFirst);
-        ++s.windowMaterialised;
-        // gpl_carLatchRenderRecord returns `a1 + 271` -- the source words, not the record.
-        return reinterpret_cast<uint32_t*>(car) + kCarFirstWord;
-    }
-
-    void* result = s.carLatch(car);
-    verify(reinterpret_cast<uint32_t*>(car), source, publish);
-    ++s.windowVerified;
-    return result;
+    materialise(reinterpret_cast<uint32_t*>(car), source,
+                reinterpret_cast<uint32_t*>(car) + kRecordFirst);
+    ++s.windowMaterialised;
+    // gpl_carLatchRenderRecord returns `a1 + 271` -- the source words, not the record.
+    return reinterpret_cast<uint32_t*>(car) + kCarFirstWord;
 }
 
 int deferredGrants() {
@@ -527,10 +467,8 @@ void simRingInstall() {
          (sizeof(Slot) * kSlots + 1023) / 1024, static_cast<unsigned>(kCarLatchCalls[0].site),
          static_cast<unsigned>(kCarLatchCalls[1].site),
          static_cast<unsigned>(kCarLatchCalls[2].site), g_options.simRing,
-         g_options.simRing >= 2 ? "the car records are written from the ring"
-         : g_options.simRing == 1
-             ? "the ring is verified against GPL's own latch; nothing drawn changes"
-             : "publishing is off until simRing is set");
+         g_options.simRing > 0 ? "the car records are written from the ring"
+                               : "publishing is off until simRing is set");
 }
 
 bool simRingActive() { return g_state.installed && g_options.simRing > 0; }
@@ -555,19 +493,14 @@ bool simRingFormat(char* out, size_t size, unsigned frames) {
     if (!window && !s.windowLatches) return false;
 
     std::snprintf(out, size,
-                  "ring: %u ticks published, %.1f a frame | car latches %u: %u verified, %u "
-                  "materialised, %u skipped (another tick or no car) | %u cars differed, %u "
-                  "words | %u re-pins | GPL deferred %d tick grants while the latch held the "
-                  "lock",
+                  "ring: %u ticks published, %.1f a frame | car latches %u: %u materialised, %u "
+                  "skipped (another tick or no car) | %u re-pins | GPL deferred %d tick grants "
+                  "while the latch held the lock",
                   window, frames ? static_cast<double>(window) / frames : 0.0, s.windowLatches,
-                  s.windowVerified, s.windowMaterialised, s.windowSkipped, s.windowMismatchCars,
-                  s.windowMismatchWords, s.windowRepins, deferred);
+                  s.windowMaterialised, s.windowSkipped, s.windowRepins, deferred);
 
     s.windowLatches = 0;
-    s.windowVerified = 0;
     s.windowSkipped = 0;
-    s.windowMismatchCars = 0;
-    s.windowMismatchWords = 0;
     s.windowMaterialised = 0;
     s.windowRepins = 0;
     return true;
@@ -576,15 +509,7 @@ bool simRingFormat(char* out, size_t size, unsigned frames) {
 void simRingLogSummary() {
     State& s = g_state;
     if (!s.installed) return;
-    if (s.firstMismatchWord >= 0) {
-        logf("ring: %u ticks published in the session; %u cars differed from GPL's latch, the "
-             "first at car[%d] of car slot %d; GPL deferred %u tick grants in all",
-             s.publishes.load(std::memory_order_relaxed), s.totalMismatchCars,
-             s.firstMismatchWord, s.firstMismatchCar, s.totalGrantsDeferred);
-        return;
-    }
-    logf("ring: %u ticks published in the session, no car ever differed from GPL's latch; GPL "
-         "deferred %u tick grants in all",
+    logf("ring: %u ticks published in the session; GPL deferred %u tick grants in all",
          s.publishes.load(std::memory_order_relaxed), s.totalGrantsDeferred);
 }
 

@@ -18,13 +18,9 @@
 // THIS IS STAGE 2 OF THE STAGED PLAN, and it is deliberately not the decoupling yet:
 //
 //   simRing = 1  the sim thread publishes each tick's car sources, and the render thread
-//                VERIFIES the ring against GPL's own latch -- it rebuilds each car's render
-//                record from the slot and compares it with what gpl_carLatchRenderRecord just
-//                wrote, dword by dword. Nothing drawn changes. This is what proves the payload
-//                is complete and the mapping exact before anything depends on it.
-//   simRing = 2  the render thread MATERIALISES the record from the slot instead of reading
-//                live sim state. GPL's lock bracket, its tick wait and the rest of its latch
-//                are still GPL's, so the wait is not reclaimed yet -- what changes is that the
+//                MATERIALISES each car's render record from the slot instead of reading live
+//                sim state. GPL's lock bracket, its tick wait and the rest of its latch are
+//                still GPL's, so the wait is not reclaimed yet -- what changes is that the
 //                per-car part of the latch no longer reads across the thread boundary.
 //
 // Stage 3 -- skipping the bracket, so the render thread stops waiting for a tick and the sim
@@ -59,12 +55,12 @@ bool simRingActive();
 // so that its own stock-byte check can accept it. 0 when nothing was installed.
 uintptr_t simRingCarLatchHookAddress();
 
-// The once-a-second `ring:` line: publishes, ticks skipped, the slot the renderer took, the
-// verify result and the deferred grants GPL counted in the window. False when nothing was
+// The once-a-second `ring:` line: publishes, the car latches written from the ring and those
+// left to GPL, and the deferred grants GPL counted in the window. False when nothing was
 // published.
 bool simRingFormat(char* out, size_t size, unsigned frames);
 
-// Totals and the worst case, before the log closes.
+// The session's totals, before the log closes.
 void simRingLogSummary();
 
 }  // namespace gplvr

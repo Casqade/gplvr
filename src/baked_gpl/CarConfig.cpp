@@ -20,7 +20,7 @@ constexpr uint32_t kMaxGroup = 65536;
 // about: 2020's cars18 have 2,900-28,600 a team (~120,000 for the ten), stock cars67 a few
 // thousand. It starts at 2^17 entries and doubles before a scan whenever it is a quarter full, so
 // one scan (at most one model's nodes) never fills it; past 2^20 a scan that fills it leaves the
-// gate undecided (counted), never decided.
+// gate undecided, never decided.
 constexpr unsigned kScanMinBits = 17;
 constexpr unsigned kScanMaxBits = 20;
 constexpr unsigned kLearnBits = 13;
@@ -39,7 +39,8 @@ unsigned               g_scanBits = 0;
 uintptr_t              g_learned[kLearnSize];
 uint32_t               g_generation = 0;
 bool                   g_haveGeneration = false;
-ConfigCounts           g_counts;
+uint32_t               g_nodes = 0;    // control nodes the scan memoised
+uint32_t               g_learnedCount = 0;  // gates and boxes hazards named
 
 template <typename T>
 T at(uintptr_t address) {
@@ -64,18 +65,14 @@ void follow() {
     g_scanKeys.assign(size_t{1} << g_scanBits, 0);
     g_scanStates.assign(size_t{1} << g_scanBits, kUnknown);
     std::memset(g_learned, 0, sizeof(g_learned));
-    g_counts.scanned = 0;
-    g_counts.writers = 0;
-    g_counts.nodes = 0;
-    g_counts.learned = 0;
-    g_counts.tableKiB = 0;
-    ++g_counts.generations;
+    g_nodes = 0;
+    g_learnedCount = 0;
 }
 
 // Doubles the memo while it is a quarter full or more, between scans only (a scan holds slot
 // pointers).
 void roomForScan() {
-    while (g_scanBits < kScanMaxBits && g_counts.nodes >= (1u << g_scanBits) / 4) {
+    while (g_scanBits < kScanMaxBits && g_nodes >= (1u << g_scanBits) / 4) {
         std::vector<uintptr_t> keys(size_t{1} << (g_scanBits + 1), 0);
         std::vector<uint8_t>   states(keys.size(), kUnknown);
         uint32_t               mask = static_cast<uint32_t>(keys.size() - 1);
@@ -90,8 +87,6 @@ void roomForScan() {
         g_scanStates.swap(states);
         ++g_scanBits;
     }
-    g_counts.tableKiB = static_cast<uint32_t>(
-        (g_scanKeys.size() * (sizeof(uintptr_t) + sizeof(uint8_t))) >> 10);
 }
 
 // The memo slot of a control node, made when new; null when the table is half full.
@@ -100,10 +95,10 @@ uint8_t* stateOf(uintptr_t node) {
     for (uint32_t i = slotOf(node, g_scanBits);; i = (i + 1) & mask) {
         if (g_scanKeys[i] == node) return &g_scanStates[i];
         if (g_scanKeys[i]) continue;
-        if (g_counts.nodes >= g_scanKeys.size() / 2) return nullptr;
+        if (g_nodes >= g_scanKeys.size() / 2) return nullptr;
         g_scanKeys[i] = node;
         g_scanStates[i] = kUnknown;
-        ++g_counts.nodes;
+        ++g_nodes;
         return &g_scanStates[i];
     }
 }
@@ -245,15 +240,7 @@ bool carConfigDecides(uintptr_t node) {
     }
     // A scan that could not answer leaves the gate to the both-ways walk of section 4.23; a
     // hazard it causes can still name it.
-    if (faulted || scan.deep || scan.full) {
-        if (faulted) ++g_counts.scanFaults;
-        if (scan.deep) ++g_counts.scanDeep;
-        if (scan.full) ++g_counts.scanFull;
-        ++g_counts.unanswered;
-        return false;
-    }
-    ++g_counts.scanned;
-    if (result) ++g_counts.writers;
+    if (faulted || scan.deep || scan.full) return false;
     return result;
 }
 
@@ -263,26 +250,11 @@ int carConfigLearn(uintptr_t node) {
     for (uint32_t i = slotOf(node, kLearnBits);; i = (i + 1) & (kLearnSize - 1)) {
         if (g_learned[i] == node) return 0;
         if (g_learned[i]) continue;
-        if (g_counts.learned >= kLearnSize / 2) {
-            ++g_counts.learnFull;
-            return -1;
-        }
+        if (g_learnedCount >= kLearnSize / 2) return -1;
         g_learned[i] = node;
-        ++g_counts.learned;
-        ++g_counts.learnedNow;
+        ++g_learnedCount;
         return 1;
     }
-}
-
-ConfigCounts carConfigCounts() { return g_counts; }
-
-void carConfigSecond() {
-    g_counts.learnedNow = 0;
-    g_counts.scanFaults = 0;
-    g_counts.scanDeep = 0;
-    g_counts.scanFull = 0;
-    g_counts.unanswered = 0;
-    g_counts.learnFull = 0;
 }
 
 }  // namespace gplvr

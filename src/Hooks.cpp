@@ -119,31 +119,6 @@ bool      g_vrStarted = false;
 bool      g_vrRecentreKeyLast = false;
 bool      g_vrHudLayerKeyLast = false;
 bool      g_vrMirrorModeKeyLast = false;
-bool      g_dumpEyesKeyLast = false;
-bool      g_dumpEyesRequested = false;
-bool      g_dumpEyesLate = false;
-bool      g_frameRateKeyLast = false;
-int       g_frameRateWanted = 1;  // what the ini asked for, so the toggle can put it back
-
-// One eye's rect to a TGA, read from the framebuffer the headset's copy is taken from.
-//
-// The eye rects are in the coordinates of whatever the frame was rendered into. With the
-// off-screen target that is its own framebuffer -- 6344x3172 for a 3172-per-eye headset --
-// and by the time the dumps run it has already been unbound for the presenter, so a plain
-// glReadPixels reads the WINDOW: the monitor's copy, where the right eye's rect points past
-// the edge. A dump that only looks right when the target happens to fit the window and the
-// window happens to show both eyes is not evidence of anything. GL_FRAMEBUFFER rather than
-// the read target alone, because the EXT entry points do not know GL_READ_FRAMEBUFFER;
-// both bindings are 0 again afterwards, which is what the present expects.
-bool dumpEyeRect(GlFunctions& gl, const int rect[4], const char* path) {
-    GLuint source = renderTargetFramebuffer();
-    bool bound = source && glResolveFramebuffer(gl) && gl.bindFramebuffer;
-    if (bound) gl.bindFramebuffer(kGlFramebuffer, source);
-    bool ok = glDumpRectToTga(gl, rect[0], rect[1], rect[2], rect[3], path);
-    if (bound) gl.bindFramebuffer(kGlFramebuffer, 0);
-    return ok;
-}
-
 bool      g_vrMouseLookKeyLast = false;
 bool      g_loggedMouseLook = false;
 
@@ -283,7 +258,6 @@ struct ExtraFrameCounts {
     unsigned noDeadline = 0;   // the tick clock had no reading, so the old estimate was used
     unsigned noPose = 0;       // the presenter published no newer view set before the deadline
     unsigned noRoom = 0;       // a render would not have finished before the next tick
-    unsigned suppressed = 0;   // vrExtraRenders = 0: the deliberate bisect, not a refusal
     LONGLONG roomShort = 0;    // how much it was short by, summed, for the worst case below
     LONGLONG roomWorst = 0;
 };
@@ -298,7 +272,7 @@ std::vector<uintptr_t> g_pendingBindCallSites;
 
 // gpl_sceneRender's MAIN world walk: `call gpl_worldRenderSegmentRange` at 0x487FAA, eight
 // __cdecl arguments cleaned by the caller (`add esp, 20h`). The mirror walk at 0x487A4C calls
-// the same function; it is redirected only with bakedMirrors = 1, by baked_gpl/BakedMirror.cpp.
+// the same function; it is redirected only with the baked renderer, by baked_gpl/BakedMirror.cpp.
 // Its result is never read.
 typedef void(__cdecl* WorldWalkFn)(int, int, int, int, int, int, int, int);
 constexpr uintptr_t     kMainWalkSite = 0x00487FAA;
@@ -545,18 +519,13 @@ void reportOncePerSecond() {
         double toMsShort = e.noRoom ? 1000.0 / static_cast<double>(frequency.QuadPart) : 0.0;
         logf("extra: %u drawn from %u game frames%s | refused: no room %u (short by %.1f ms "
              "mean, %.1f worst), no newer pose %u, frame already late %u, game under 25 fps "
-             "%u, no tracked stereo frame %u, no tick clock %u | one costs %.2f ms%s",
+             "%u, no tracked stereo frame %u, no tick clock %u | one costs %.2f ms",
              e.rendered, e.ticks, e.ticks ? "" : " -- NONE REACHED THE BUDGET", e.noRoom,
              e.noRoom ? toMsShort * static_cast<double>(e.roomShort) / e.noRoom : 0.0,
              toMsShort * static_cast<double>(e.roomWorst), e.noPose, e.late, e.slow,
              e.notStereo, e.noDeadline,
              1000.0 * static_cast<double>(g_extraRenderCost) /
-                 static_cast<double>(frequency.QuadPart),
-             e.suppressed ? " | vrExtraRenders = 0, so these are SUPPRESSED on purpose: "
-                            "blending is still on and the extra renders are not. An artifact "
-                            "that survives this is in the blended values; one that goes is in "
-                            "what an extra render fails to redraw."
-                          : "");
+                 static_cast<double>(frequency.QuadPart));
         g_extraFrames = ExtraFrameCounts{};
     }
 
@@ -789,35 +758,6 @@ void mirrorTweakExit(const char* why, bool save) {
 namespace {
 
 void pollToggle() {
-    bakedPassPollKey();
-
-    // Armed here, taken at publish time -- the key is polled on the game thread and the
-    // read has to happen where the frame is complete and still bound.
-    if (g_options.dumpEyesKey) {
-        const bool down = (GetAsyncKeyState(g_options.dumpEyesKey) & 0x8000) != 0;
-        if (down && !g_dumpEyesKeyLast) {
-            g_dumpEyesRequested = true;
-            g_dumpEyesLate = true;
-        }
-        g_dumpEyesKeyLast = down;
-    }
-
-    // The blend, on and off, in the same session. A visual artifact is compared far better
-    // against itself a second ago than against a memory of another run, and both readers of
-    // frameRate take it per call, so there is nothing to reinstall either way.
-    if (g_options.frameRateKey) {
-        const bool down = (GetAsyncKeyState(g_options.frameRateKey) & 0x8000) != 0;
-        if (down && !g_frameRateKeyLast) {
-            g_options.frameRate = g_options.frameRate > 0 ? 0 : g_frameRateWanted;
-            logf("frames: frameRate now %d -- the world is %s, and %s", g_options.frameRate,
-                 g_options.frameRate > 0 ? "BLENDED again" : "drawn at the last latched tick",
-                 g_options.frameRate > 0
-                     ? "frames between ticks are new pictures"
-                     : "the loop waits for each tick, which is vanilla pacing");
-        }
-        g_frameRateKeyLast = down;
-    }
-
     // Recentre: whatever pose the driver is in becomes the seat. Needed because
     // OpenXR's LOCAL space has its origin on the floor, not at the head -- measured,
     // see STATUS.md -- so without this the view starts a standing height too high.
@@ -962,15 +902,6 @@ void __cdecl callOriginalSceneRender(void* params);  // defined below
 // are genuinely newer.
 void renderExtraFrames() {
     if (!g_options.vr || g_options.frameRate <= 0) return;
-    // THE BISECT. `frameRate = 0` turns off blending AND these extra renders together, so an
-    // A/B against it cannot say which of the two a blending-only artifact belongs to -- and the
-    // 2026-10-09 test did exactly that A/B and came back "absent", which fits either. This
-    // separates them: blending stays on, the extra renders stop. If the artifact survives, it
-    // is in the blended values; if it goes, it is in what an extra render fails to redraw.
-    if (!g_options.vrExtraRenders) {
-        ++g_extraFrames.suppressed;
-        return;
-    }
     // THE FALLBACK ONLY. When the frame loop's wait is ours every frame is a whole frame of
     // GPL's own, drawn through its loop with the mirror pass and the HUD, and there is nothing
     // for a partial repeat after the present to add. This path exists for the case where those
@@ -1342,9 +1273,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // to both eyes.
     if (g_options.vrNoSignal && noSignalDrawnThisFrame()) rasterFlushPending();
 
-    // bakedCaptureKey: while the frame is still bound, so its own flush lands in it. The baked
-    // renderer's mark goes on after the capture has read the frame.
-    bakedCaptureFrameEnd();
+    // bakedRenderer = 2's mark, while the frame is still bound.
     bakedMarkFrameEnd();
 
     // The off-screen frame has to stop being the draw target before the presenter
@@ -1386,37 +1315,11 @@ int __cdecl screenDisplayHook(void* surface) {
         // queued gets issued. The glDrawArrays counter reads zero through a race because
         // it counts one entry point and a 2D flush does not use it.
         //
-        // Everything gplvr takes off the framebuffer -- the dump below and the headset's
-        // copy after it -- has to come after this.
+        // Everything gplvr takes off the framebuffer -- the headset's copy after it -- has to
+        // come after this.
         frameBudgetSwitch(kSpanFlushPending);
         rasterFlushPending();
         frameBudgetSwitch(kSpanPublish);
-
-        // BEFORE the publish, so what lands on disk is exactly what is handed over.
-        if (g_dumpEyesRequested) {
-            g_dumpEyesRequested = false;
-            GlFunctions gl;
-            int rect[2][4];
-            if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
-                // BESIDE GPLVR, not wherever the process happens to be standing.
-                // gplc67 runs with its working directory set to the `font` subfolder, so
-                // the first version of this wrote two files nobody could find and
-                // reported success doing it.
-                const char* base = pathsOwnDirectory();
-
-                char path[MAX_PATH];
-                for (int eye = 0; eye < 2; ++eye) {
-                    sprintf_s(path, "%sgplvr-eye%d.tga", base, eye);
-                    bool ok = dumpEyeRect(gl, rect[eye], path);
-                    logf("dump: eye %d rect %d,%d %dx%d of framebuffer %u -> %s%s", eye,
-                         rect[eye][0], rect[eye][1], rect[eye][2], rect[eye][3],
-                         renderTargetFramebuffer(), path, ok ? "" : "  <-- FAILED");
-                }
-            } else {
-                logf("dump: nothing written -- GL did not resolve, or there are no eye "
-                     "rects this frame (stereo is not running)");
-            }
-        }
 
         // WHETHER THE BUFFER HOLDS A STEREO PAIR IS NOT THE SAME QUESTION AS WHETHER THIS
         // FRAME DREW ONE.
@@ -1631,34 +1534,6 @@ int __cdecl screenDisplayHook(void* surface) {
     // that would set the flag is swallowed by DirectInput's subclass.
     //
     bool background = !keepDrawingWhileUnfocused() && !windowHasFocus();
-
-    // THE LATE DUMP: the same two eye rects, taken as late as gplvr can reach, with only
-    // roglv2's screenDisplay left between here and the swap.
-    //
-    // The early pair above is what the headset receives. If the HUD is in this pair and
-    // not in that one, something draws it between the copy and the present -- pribluda is
-    // the obvious candidate, since gplc67 loads it from the rasterizer's own startup and
-    // it paints its overlay through a hook of its own. If it is in NEITHER pair while the
-    // monitor shows it, it is drawn inside screenDisplay or after it, and the question
-    // becomes which.
-    if (g_dumpEyesLate) {
-        g_dumpEyesLate = false;
-        GlFunctions gl;
-        int rect[2][4];
-        if (glResolve(gl) && stereoEyeRect(0, rect[0]) && stereoEyeRect(1, rect[1])) {
-            const char* base = pathsOwnDirectory();
-
-            char path[MAX_PATH];
-            for (int eye = 0; eye < 2; ++eye) {
-                sprintf_s(path, "%sgplvr-eye%d-late.tga", base, eye);
-                dumpEyeRect(gl, rect[eye], path);
-            }
-            logf("dump: the LATE pair is written too -- compare gplvr-eye0.tga (what the "
-                 "headset got) against gplvr-eye0-late.tga (the last thing gplvr can see "
-                 "before roglv2 presents). A difference between them is drawn by someone "
-                 "else after our copy.");
-        }
-    }
 
     // Every stampDraw of the frame has been issued, so anything the fast text path still has
     // batched is drawn now -- before roglv2 presents, and after everything GPL drew over it.
@@ -2542,11 +2417,6 @@ void hotkeyCollisionReport() {
     const Entry keys[] = {
         {"vrMirrorTweakKey", g_options.vrMirrorTweakKey},
         {"vrMirrorModeKey", g_options.vrMirrorModeKey},
-        {"dumpEyesKey", g_options.dumpEyesKey},
-        {"frameRateKey", g_options.frameRateKey},
-        {"bakedRendererKey", g_options.bakedRenderer ? g_options.bakedRendererKey : 0},
-        {"bakedCaptureKey", g_options.bakedRenderer ? g_options.bakedCaptureKey : 0},
-        {"bakedDebugKey", g_options.bakedRenderer ? g_options.bakedDebugKey : 0},
         {"vrRecentreKey", g_options.vrRecentreKey},
         {"vrMouseLookKey", g_options.vrMouseLookKey},
         {"vrHudLayerKey", g_options.vrHudLayerKey},
@@ -2636,11 +2506,6 @@ void loadOptions(const char* fileName) {
     g_options.profileTargetHz = GetPrivateProfileIntA("gplvr", "profileTargetHz", 90, path);
     if (g_options.profileTargetHz < 30) g_options.profileTargetHz = 30;
     if (g_options.profileTargetHz > 240) g_options.profileTargetHz = 240;
-    g_options.dumpEyesKey = GetPrivateProfileIntA("gplvr", "dumpEyesKey", '0', path);
-    g_options.vrExtraRenders = GetPrivateProfileIntA("gplvr", "vrExtraRenders", 1, path);
-    if (g_options.vrExtraRenders < 0 || g_options.vrExtraRenders > 1)
-        g_options.vrExtraRenders = 1;
-    g_options.frameRateKey = GetPrivateProfileIntA("gplvr", "frameRateKey", '7', path);
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
@@ -2743,9 +2608,6 @@ void loadOptions(const char* fileName) {
     if (g_options.vrHudTweakSpeed > 2.0f) g_options.vrHudTweakSpeed = 2.0f;
     g_options.frameRate = GetPrivateProfileIntA("gplvr", "frameRate", 1, path);
     if (g_options.frameRate < 0 || g_options.frameRate > 2) g_options.frameRate = 1;
-    // What frameRateKey puts back. A toggle from an ini that already says 0 has to turn the
-    // blend ON, not off again.
-    g_frameRateWanted = g_options.frameRate > 0 ? g_options.frameRate : 1;
 
     // FRAME RATE IS ONE LEVER, AND VSYNC FALLS OUT OF IT.
     //
@@ -2800,59 +2662,19 @@ void loadOptions(const char* fileName) {
         }
     }
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
-    if (g_options.simRing < 0 || g_options.simRing > 2) g_options.simRing = 0;
-    g_options.bakedRenderer = GetPrivateProfileIntA("gplvr", "bakedRenderer", 0, path);
-    if (g_options.bakedRenderer < 0 || g_options.bakedRenderer > 1) g_options.bakedRenderer = 0;
-    g_options.bakedRendererKey = GetPrivateProfileIntA("gplvr", "bakedRendererKey", '5', path);
-    g_options.bakedCaptureKey = GetPrivateProfileIntA("gplvr", "bakedCaptureKey", '8', path);
-    g_options.bakedDebugKey = GetPrivateProfileIntA("gplvr", "bakedDebugKey", '9', path);
-    g_options.bakedMergedDraws =
-        GetPrivateProfileIntA("gplvr", "bakedMergedDraws", 1, path) != 0 ? 1 : 0;
-    g_options.bakedGrooveLayers =
-        GetPrivateProfileIntA("gplvr", "bakedGrooveLayers", 1, path) == 2 ? 2 : 1;
-    g_options.bakedCars = GetPrivateProfileIntA("gplvr", "bakedCars", 0, path);
-    if (g_options.bakedCars < 0 || g_options.bakedCars > 3) g_options.bakedCars = 0;
-    g_options.bakedFlagmen = GetPrivateProfileIntA("gplvr", "bakedFlagmen", 1, path) != 0 ? 1 : 0;
-    g_options.bakedMirrors = GetPrivateProfileIntA("gplvr", "bakedMirrors", 0, path) != 0 ? 1 : 0;
-    g_options.bakedCarShare =
-        GetPrivateProfileIntA("gplvr", "bakedCarShare", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCarUnion =
-        GetPrivateProfileIntA("gplvr", "bakedCarUnion", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCarProgram =
-        GetPrivateProfileIntA("gplvr", "bakedCarProgram", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCarProgramMirrors =
-        GetPrivateProfileIntA("gplvr", "bakedCarProgramMirrors", 1, path) != 0 ? 1 : 0;
-    g_options.bakedMirrorChurnReset =
-        GetPrivateProfileIntA("gplvr", "bakedMirrorChurnReset", 1, path) != 0 ? 1 : 0;
-    g_options.bakedMirrorCarKey = GetPrivateProfileIntA("gplvr", "bakedMirrorCarKey", 1, path);
-    if (g_options.bakedMirrorCarKey < 0 || g_options.bakedMirrorCarKey > 2)
-        g_options.bakedMirrorCarKey = 1;
-    g_options.bakedMirrorCarCull =
-        GetPrivateProfileIntA("gplvr", "bakedMirrorCarCull", 1, path) != 0 ? 1 : 0;
-    g_options.bakedOrderPatch =
-        GetPrivateProfileIntA("gplvr", "bakedOrderPatch", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCockpitCheck =
-        GetPrivateProfileIntA("gplvr", "bakedCockpitCheck", 0, path) != 0 ? 1 : 0;
-    g_options.bakedCockpit = GetPrivateProfileIntA("gplvr", "bakedCockpit", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCockpitOverlay =
-        GetPrivateProfileIntA("gplvr", "bakedCockpitOverlay", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCockpitProgram =
-        GetPrivateProfileIntA("gplvr", "bakedCockpitProgram", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCockpitSkipGpl =
-        GetPrivateProfileIntA("gplvr", "bakedCockpitSkipGpl", 1, path) != 0 ? 1 : 0;
-    g_options.bakedCarConfigs =
-        GetPrivateProfileIntA("gplvr", "bakedCarConfigs", 1, path) != 0 ? 1 : 0;
+    if (g_options.simRing < 0 || g_options.simRing > 1) g_options.simRing = 0;
+    g_options.bakedRenderer = GetPrivateProfileIntA("gplvr", "bakedRenderer", 1, path);
+    if (g_options.bakedRenderer < 0 || g_options.bakedRenderer > 2) g_options.bakedRenderer = 1;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
     // Flat mode is the vanilla game in a borderless window: the window itself, the
     // letterbox and widescreen fixes, front-end scaling, roglv2's glFinish drop and swap
     // interval, and mouselook. The tools built to develop and measure the headset path --
-    // the eye dumps, the stage and polygon profilers -- are for vr only. Switching them off
+    // the mirror keys, the stage and polygon profilers -- are for vr only. Switching them off
     // here keeps every installer and key that reads them inert, without a second check at
     // each one. Stereo itself needs no entry: it IS vr now, not a setting of its own.
     if (!g_options.vr) {
-        g_options.dumpEyesKey = 0;
         g_options.vrMirrorTweakKey = 0;
         g_options.vrMirrorModeKey = 0;
         g_options.profilePolys = false;
@@ -2864,6 +2686,21 @@ void loadOptions(const char* fileName) {
         // the same mechanism doing the same thing in flat GPL, and switching it off here is
         // what used to make it read as a VR feature.
     }
+
+    // The hotkeys are debug controls; the VR menu has what each of them toggles. Off, every key
+    // reads 0, which each poll, each swallow and the clash table already take as "no key".
+    g_options.debugKeys = GetPrivateProfileIntA("gplvr", "debugKeys", 0, path) != 0;
+    if (!g_options.debugKeys) {
+        g_options.vrMirrorTweakKey = 0;
+        g_options.vrMirrorModeKey = 0;
+        g_options.vrRecentreKey = 0;
+        g_options.vrMouseLookKey = 0;
+        g_options.vrHudLayerKey = 0;
+        g_options.vrHudTweakKey = 0;
+    }
+    logf("options: debugKeys=%d (%s)", g_options.debugKeys ? 1 : 0,
+         g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
+                             : "no hotkey is polled; the VR menu has every setting they toggle");
 
     logf("options: mirrorSkipOutOfView=%d (%s)", g_options.mirrorSkipOutOfView,
          g_options.mirrorSkipOutOfView
@@ -2953,153 +2790,18 @@ void loadOptions(const char* fileName) {
              "costs one sim tick of latency (6.94 ms at 144 Hz); frameRate = 0 does not pay "
              "it and does not get the rate.");
     logf("options: simRing=%d (%s)", g_options.simRing,
-         g_options.simRing >= 2
+         g_options.simRing > 0
              ? "the sim thread publishes each tick and the car render records are written from "
                "the ring"
-         : g_options.simRing == 1
-             ? "the sim thread publishes each tick and the ring is verified against GPL's own "
-               "latch; nothing drawn changes"
              : "off: the sim and the render thread exchange state through GPL's latch alone");
-    logf("options: bakedRenderer=%d (%s), bakedRendererKey=0x%02X, bakedCaptureKey=0x%02X, "
-         "bakedDebugKey=0x%02X, bakedMergedDraws=%d (%s), bakedGrooveLayers=%d, bakedCars=%d (%s)",
-         g_options.bakedRenderer,
-         g_options.bakedRenderer
-             ? "the track is baked on a worker thread, then drawn from the bake with real depth "
-               "in every main pass; GPL draws the rest, tested against that depth"
-             : "off: GPL draws everything",
-         g_options.bakedRendererKey, g_options.bakedCaptureKey, g_options.bakedDebugKey,
-         g_options.bakedMergedDraws,
-         g_options.bakedMergedDraws ? "one multi-draw a phase, bindless textures, when the "
-                                      "driver has them"
-                                    : "batch by batch",
-         g_options.bakedGrooveLayers, g_options.bakedCars,
-         g_options.bakedCars >= 3
-             ? "stage 2b: in the baked main passes gplvr draws the other cars itself from its "
-               "draw lists, with real depth, and GPL draws only their blob shadows; mirrors and "
-               "the cockpit (but with bakedCockpit) stay GPL's, counted but not walked (levels 1 "
-               "and 2 verify them)"
-         : g_options.bakedCars == 2
-             ? "stage 2a: every car GPL draws is also walked by gplvr, its polygon count checked "
-               "against GPL's, and a draw list of baked leaves filled and checked against the "
-               "walk; GPL still draws them"
-         : g_options.bakedCars == 1
-             ? "stage 1: every car GPL draws is also walked by gplvr and its polygon count "
-               "checked against GPL's; GPL still draws them"
-             : "off: GPL draws the cars");
-    logf("options: bakedFlagmen=%d (%s)", g_options.bakedFlagmen,
-         !g_options.bakedFlagmen ? "off: GPL draws the flagmen"
-         : g_options.bakedRenderer && g_options.bakedCars == 3
-             ? "gplvr draws the flagmen in the baked main passes, in GPL's colours and walk order"
-             : "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3; GPL draws the "
-               "flagmen");
-    logf("options: bakedMirrors=%d (%s)", g_options.bakedMirrors,
-         !g_options.bakedMirrors ? "off: GPL draws the mirrors"
-         : !g_options.bakedRenderer
-             ? "on, but inert: it needs bakedRenderer = 1; GPL draws the mirrors"
-         : g_options.bakedCars == 3
-             ? "gplvr draws the track, its objects, the cars and the flagmen in every mirror pass "
-               "GPL walks, from the mirror camera with GPL's mirror registers, masks and LOD"
-             : "gplvr draws the track and its objects in every mirror pass GPL walks; the cars "
-               "stay GPL's (they need bakedCars = 3)");
-    logf("options: bakedCarShare=%d (%s)", g_options.bakedCarShare,
-         !g_options.bakedCarShare ? "off: each eye walks every car it draws"
-         : !g_options.bakedRenderer || g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
-             : "in VR the second eye takes a car's draw list from the first eye's pass when the "
-               "walk's eye-dependent decisions agree, and walks it again when one differs; debug "
-               "view 16 turns it off; watch `baked cars: shared between eyes`");
-    logf("options: bakedCarUnion=%d (%s)", g_options.bakedCarUnion,
-         !g_options.bakedCarUnion ? "off: the first eye decides every gate of a car's walk"
-         : !g_options.bakedCarShare || !g_options.bakedRenderer || g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedCarShare = 1, bakedRenderer = 1 and bakedCars = 3"
-             : "in VR the first eye's car walks take every gate whose plane passes within the "
-               "eye separation both ways under a condition each eye evaluates, so the second eye "
-               "reuses the list where a gate differs; debug view 17 turns it off; watch `baked "
-               "cars: eye-independent lists`");
-    logf("options: bakedCarProgram=%d (%s)", g_options.bakedCarProgram,
-         !g_options.bakedCarProgram ? "off: the first eye walks every car every frame"
-         : !g_options.bakedRenderer || g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
-             : "in every baked main pass a car's list is walked once with every gate both ways "
-               "and then re-posed and assembled for each eye and frame until its LOD, a register, "
-               "a child pointer, the helmet colour or a decided gate changes; debug view 18 turns "
-               "it off; watch `baked cars: lists kept across frames`");
-    logf("options: bakedCarProgramMirrors=%d (%s)", g_options.bakedCarProgramMirrors,
-         !g_options.bakedCarProgramMirrors
-             ? "off: the first eye's mirror passes walk every car"
-         : !g_options.bakedCarProgram || !g_options.bakedRenderer || g_options.bakedCars != 3 ||
-                 !g_options.bakedMirrors
-             ? "on, but inert: it needs bakedCarProgram = 1, bakedRenderer = 1, bakedCars = 3 and "
-               "bakedMirrors = 1"
-             : "the mirror passes keep car lists of their own across frames as the main passes "
-               "do (report 105 section 4.42); watch the mirror clause of `baked cars: lists kept "
-               "across frames` and the walks on `baked cars: mirror passes`");
-    logf("options: bakedMirrorChurnReset=%d (%s)", g_options.bakedMirrorChurnReset,
-         g_options.bakedMirrorChurnReset
-             ? "a mirror car's reuse ends its run of builds, so gathering a list for each glass "
-               "does not back it off (report 105 section 4.51); watch `backing off` on `baked "
-               "cars: lists kept across frames`"
-             : "off: a mirror car's builds count toward the backoff as a main car's do");
-    logf("options: bakedMirrorCarKey=%d (%s)", g_options.bakedMirrorCarKey,
-         g_options.bakedMirrorCarKey == 2
-             ? "a mirror car keeps its lists per glass and eye (report 105 section 4.54); watch "
-               "`baked cars: Cars keyed by glass and eye`"
-         : g_options.bakedMirrorCarKey == 1
-             ? "a mirror car keeps its lists per glass (report 105 section 4.54); watch `baked "
-               "cars: Cars keyed by glass and eye` (the two eyes' same / different / built)"
-             : "a mirror car keeps one set of lists for every glass and eye, as in section 4.42");
-    logf("options: bakedMirrorCarCull=%d (%s)", g_options.bakedMirrorCarCull,
-         g_options.bakedMirrorCarCull
-             ? "a mirror car whose root box the mirror's view culls is not listed (report 105 "
-               "section 4.54); watch `baked cars: mirror cars off the view` (NOT empty 0)"
-             : "off: every mirror car is listed, empty lists included");
-    logf("options: bakedOrderPatch=%d (%s)", g_options.bakedOrderPatch,
-         g_options.bakedOrderPatch
-             ? "a kept car's draw order missing from its memos is patched from the nearest memo "
-               "(report 105 section 4.53); watch `baked cars: the draw order patched from the "
-               "nearest memo` (differing 0)"
-             : "off: every memo miss emits the whole draw order");
-    logf("options: bakedCockpitCheck=%d (%s)", g_options.bakedCockpitCheck,
-         g_options.bakedCockpitCheck
-             ? "a test run: every cockpit draw is also walked and compared with GPL's polygon "
-               "counter (report 105 section 4.47); watch `cockpit M of K` on the `baked cars: N "
-               "car draws` line and the stage-2 lines"
-             : "off: the cockpit is handed to GPL unwalked");
-    logf("options: bakedCockpit=%d (%s)", g_options.bakedCockpit,
-         !g_options.bakedCockpit ? "off: GPL draws the cockpit"
-         : !g_options.bakedRenderer || g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedRenderer = 1 and bakedCars = 3"
-         : g_options.bakedCockpitCheck
-             ? "on, but bakedCockpitCheck = 1 takes precedence: GPL draws the cockpit"
-             : "in the baked main passes gplvr draws the cockpit from one list a pass and GPL "
-               "only its mirror glass (report 105 section 4.48); watch `baked cars: the "
-               "cockpit`");
-    logf("options: bakedCockpitOverlay=%d (%s)", g_options.bakedCockpitOverlay,
-         !g_options.bakedCockpitOverlay ? "off: the cockpit is step 1's (section 4.48)"
-         : !g_options.bakedCockpit || g_options.bakedCockpitCheck || !g_options.bakedRenderer ||
-                 g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedCockpit = 1, bakedCockpitCheck = 0, bakedRenderer = "
-               "1 and bakedCars = 3"
-             : "gplvr draws the whole cockpit, mirror glass included, over each eye's finished "
-               "image in GPL's order without depth (report 105 section 4.49); watch `baked: the "
-               "cockpit over the eye image` and `baked cars: the cockpit, step 2`");
-    logf("options: bakedCockpitProgram=%d bakedCockpitSkipGpl=%d (%s; report 105 section 4.50: "
-         "the cockpit's kept list, GPL's empty cockpit draw skipped; watch `baked cars: the "
-         "cockpit's kept list` and `baked cars: GPL's cockpit draw skipped`)",
-         g_options.bakedCockpitProgram, g_options.bakedCockpitSkipGpl,
-         !g_options.bakedCockpitOverlay || !g_options.bakedCockpit ||
-                 g_options.bakedCockpitCheck || !g_options.bakedRenderer ||
-                 g_options.bakedCars != 3
-             ? "inert: both act on step 2's passes only, which need bakedCockpitOverlay = 1"
-             : "cockpit step 3, in the passes step 2 draws");
-    logf("options: bakedCarConfigs=%d (%s)", g_options.bakedCarConfigs,
-         !g_options.bakedCarConfigs
-             ? "off: one kept list a car, every gate both ways, as in report 105 section 4.23"
-         : !g_options.bakedCarProgram || !g_options.bakedRenderer || g_options.bakedCars != 3
-             ? "on, but inert: it needs bakedCarProgram = 1, bakedRenderer = 1 and bakedCars = 3"
-             : "a kept list's walk decides the gates with a register write below them and those "
-               "a build's hazard named, and a car keeps one list per configuration of them and "
-               "LOD; watch `baked cars: configurations`");
+    logf("options: bakedRenderer=%d (%s)", g_options.bakedRenderer,
+         g_options.bakedRenderer == 0
+             ? "vanilla: GPL draws everything; the VR menu's Renderer row switches it live"
+         : g_options.bakedRenderer == 1
+             ? "gplvr's renderer: the track baked on a worker thread and drawn with real depth, "
+               "the other cars, the flagmen, the cockpit and the mirrors drawn by gplvr, GPL the "
+               "rest, tested against that depth"
+             : "gplvr's renderer, and a red square marking every rectangle it drew");
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
@@ -3115,18 +2817,6 @@ void loadOptions(const char* fileName) {
          g_options.vrHudSeat.right, g_options.vrHudSeat.width);
     logf("options: vrHudLayerKey=0x%02X vrHudTweakKey=0x%02X vrHudTweakSpeed=%.3f",
          g_options.vrHudLayerKey, g_options.vrHudTweakKey, g_options.vrHudTweakSpeed);
-    logf("options: vrExtraRenders=%d (%s)", g_options.vrExtraRenders,
-         g_options.vrExtraRenders
-             ? "the interpolated renders between sim ticks are drawn, as always"
-             : "SUPPRESSED -- blending is still on and the extra renders are not. This is the "
-               "bisect frameRate = 0 cannot do, because that removes both at once: an artifact "
-               "that survives this is in the blended values, one that goes is in what an extra "
-               "render fails to redraw");
-    logf("options: frameRateKey=0x%02X (%s)", g_options.frameRateKey,
-         g_options.frameRateKey
-             ? "toggles frameRate between 0 and the ini's value live -- the A/B for anything "
-               "that might be the blend's"
-             : "off -- frameRate cannot be changed without a restart");
     logf("options: vrMouseLook=%d sensitivity=%.3f invertPitch=%d key=0x%02X",
          g_options.vrMouseLook ? 1 : 0, g_options.vrMouseLookSensitivity,
          g_options.vrMouseLookInvertPitch ? 1 : 0, g_options.vrMouseLookKey);

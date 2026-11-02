@@ -37,8 +37,7 @@ struct MemoRange {
 
 // The records of the objects baked before a walk began are memoised directly by object and
 // index: two array reads a lookup, and a walk touches only its own objects' entries. Anything
-// else -- an object baked during the walk, every record when no bake is bound (bakedCars = 1) --
-// goes to an open-addressed hash table. A record keeps one part for the whole walk.
+// else -- an object baked during the walk -- goes to an open-addressed hash table. A record keeps one part for the whole walk.
 struct Memo {
     std::vector<MemoRange> ranges;       // per CarScene object, in its order
     std::vector<uint32_t>  directStamp;  // == stamp: memoised this walk

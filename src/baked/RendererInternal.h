@@ -63,8 +63,6 @@ constexpr GLenum kSolidDepthUnit = gl::kTexture0 + 3;
 constexpr GLenum kItemOrderUnit = gl::kTexture0 + 4;
 // The merged program's per-batch table (Renderer::buildBatchTable).
 constexpr GLenum kBatchTableUnit = gl::kTexture0 + 5;
-// The UV checker of debug view 8 (Renderer::uvCheckerTexture), for every program.
-constexpr GLenum kCheckerUnit = gl::kTexture0 + 8;
 constexpr uint32_t kNoItem = 0xFFFFFFFFu;
 
 // Overlays (report 59). An overlay is drawn after the base surfaces, level by level, each level's

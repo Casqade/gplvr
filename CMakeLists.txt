@@ -144,7 +144,6 @@ else()
         src/baked/SegmentReach.cpp
         src/baked/Srb.cpp
         src/baked/TwoSided.cpp
-        src/baked_gpl/BakedCapture.cpp
         src/baked_gpl/BakedMirror.cpp
         src/baked_gpl/BakedPass.cpp
         src/baked_gpl/CarBake.cpp
@@ -157,13 +156,11 @@ else()
         src/baked_gpl/CarShare.cpp
         src/baked_gpl/CarUnion.cpp
         src/baked_gpl/CarWalk.cpp
-        src/baked_gpl/CarWalkReport.cpp
         src/baked_gpl/CockpitDraw.cpp
         src/baked_gpl/CockpitGlass.cpp
         src/baked_gpl/Flagmen.cpp
         src/baked_gpl/ResidualDepth.cpp
         src/baked_gpl/TrackBake.cpp
-        src/baked_gpl/UvOverlay.cpp
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
     target_include_directories(gplvr PRIVATE src)

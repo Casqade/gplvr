@@ -23,7 +23,7 @@ constexpr uintptr_t kPoseFunction = 0x0046D490;
 // (shadow mode 2, never under roglv2) and the blob shadow. Wrapped to count their polygons apart.
 constexpr uintptr_t kShadowCalls[] = {0x00486F52, 0x0048702A};
 constexpr uintptr_t kShadowFunction = 0x00487060;
-// Stage 2b: its body dispatch, `mov ecx, esi; call gpl_renderNodeDispatch` (8B CE E8 rel32 at
+// Its body dispatch, `mov ecx, esi; call gpl_renderNodeDispatch` (8B CE E8 rel32 at
 // 0x48703D), the root MATERIAL with word 1 swapped to the `car` or `cockpit` handle. With the two
 // shadow calls it is the only call in gpl_carRecordDraw that emits polygons (IDA, task "R2 stage
 // 2b": the others are the team and driver lookups, the pose, lighting / LOD / textured-mask
@@ -50,7 +50,7 @@ constexpr uintptr_t kSelectorDlong = 0x0087215C;    // gpl_selectorCameraDlong
 constexpr uintptr_t kSelectorDlat = 0x00872160;     // gpl_selectorCameraDlat
 constexpr uintptr_t kRegistersMain = 0x0076D768;    // gpl_renderRegistersMain
 constexpr uintptr_t kRegistersMirror = 0x007702D8;  // gpl_renderRegistersMirror
-// Stage 2: the MATERIAL state at the car's dispatch, which the walk carries down as GPL's
+// The MATERIAL state at the car's dispatch, which the walk carries down as GPL's
 // handlers do (0x4CD300 and siblings, report 105 section 4.2).
 constexpr uintptr_t kTexturedMask = 0x0056FE20;     // gpl_surfaceClassTexturedMaskLive
 constexpr uintptr_t kClassTextured = 0x00872154;    // gpl_materialClassTextured, a byte

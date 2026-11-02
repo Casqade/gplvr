@@ -55,7 +55,6 @@ constexpr uintptr_t     kNullNodeStore = 0x00481AAB;
 constexpr unsigned char kNullNodeOpcode[] = {0xC7, 0x43, 0x04};
 
 // Reference-link data, placed through rebase().
-constexpr uintptr_t kPolygonsDrawn = 0x0086A0E4;   // gpl_statGfxPolysDrawn
 constexpr uintptr_t kModelViewSlot = 0x0056FE28;   // -> the current 4x4 model-view, row-major
 constexpr uintptr_t kProjectionSlot = 0x0056FE2C;  // -> the 4x4 projection
 
@@ -68,7 +67,6 @@ constexpr uint32_t kMaxListsPerPass = 128;
 constexpr long kMaxPalettes = 512;
 
 using SetColourFn = int(__cdecl*)(int handle, int slot, uint32_t colour);
-using NodeHandlerFn = void(__fastcall*)(const void* node, void* unused);
 
 // -- the colormaps, as GPL sets them ---------------------------------------------------------------
 
@@ -81,24 +79,17 @@ struct Palette {
 Palette           g_palettes[kMaxPalettes];
 volatile long     g_paletteCount = 0;
 uintptr_t         g_setColourSlot = 0;
-volatile uint32_t g_setCalls = 0;
-volatile uint32_t g_setBadSlot = 0;
-volatile uint32_t g_paletteResets = 0;
 
 // Replaces the five `call [colormapSetColor]` of gpl_flagmanBindModel (cdecl, the caller pops).
 // Runs on the thread that latches the frame, before the walk that draws it reads the colours.
 int __cdecl setColourWrapper(int handle, int slot, uint32_t colour) {
-    ++g_setCalls;
     if (slot >= 0 && slot < 16) {
         long     count = g_paletteCount;
         Palette* entry = nullptr;
         for (long i = 0; i < count && !entry; ++i)
             if (g_palettes[i].handle == static_cast<uint32_t>(handle)) entry = &g_palettes[i];
         if (!entry) {
-            if (count >= kMaxPalettes) {
-                ++g_paletteResets;
-                count = 0;
-            }
+            if (count >= kMaxPalettes) count = 0;
             entry = &g_palettes[count];
             entry->mask = 0;
             entry->handle = static_cast<uint32_t>(handle);
@@ -106,8 +97,6 @@ int __cdecl setColourWrapper(int handle, int slot, uint32_t colour) {
         }
         entry->colours[slot] = colour;
         entry->mask |= 1u << slot;
-    } else {
-        ++g_setBadSlot;
     }
     SetColourFn original = *reinterpret_cast<SetColourFn const*>(g_setColourSlot);
     return original ? original(handle, slot, colour) : 0;
@@ -128,34 +117,19 @@ bool paletteOf(uint32_t handle, uint32_t colours[16]) {
 
 // -- state -----------------------------------------------------------------------------------------
 
-// Once a second.
-struct Second {
-    uint32_t reached = 0;   // flagman XFORMs the walk dispatched
-    uint32_t drawn = 0;     // lists made for the car renderer
-    uint32_t nothing = 0;   // kind 0, the null frame: neither draws anything
-    uint32_t repeats = 0;   // a flagman reached again in the same pass (drawn again, as GPL does)
-    // Left to GPL, by reason.
-    uint32_t countBad = 0;
-    uint32_t notMaterial = 0;
-    uint32_t noPalette = 0;
-    uint32_t readFault = 0;
-    uint32_t notBillboard = 0;
-    uint32_t noObject = 0;
-    uint32_t notLeaf = 0;
-    uint32_t noColours = 0;
-    uint32_t noRenderer = 0;
-    uint32_t arenaFull = 0;
-    // Debug view 12: GPL's draws of the flagmen, and what gplvr would have drawn of each.
-    uint32_t gplCalls = 0;
-    uint32_t compared = 0;
-    uint32_t matched = 0;
-    uint64_t gplPolygons = 0;
-    uint64_t expected = 0;
-    bool     differed = false;
-    uint32_t firstMaterial = 0;
-    uint32_t firstFrame = 0;
-    uint32_t firstGpl = 0;
-    uint32_t firstExpected = 0;
+// Why a flagman was left to GPL. Each is logged the first time it happens.
+enum LeftToGpl : int {
+    kLeftCountBad,      // the flagman count is out of range
+    kLeftNotMaterial,   // the XFORM's child is not a MATERIAL
+    kLeftNoPalette,     // the MATERIAL has no colormap word
+    kLeftReadFault,     // a read faulted
+    kLeftNotBillboard,  // the frame is not a BILLBOARD
+    kLeftNoObject,      // the frame's object is not baked
+    kLeftNotLeaf,       // the frame is not a baked sprite leaf
+    kLeftNoColours,     // GPL has not set all 16 colours of the colormap
+    kLeftNoRenderer,    // the car renderer is not up for this pass
+    kLeftArenaFull,     // past kMaxListsPerPass lists this pass
+    kLeftKinds
 };
 
 struct State {
@@ -164,19 +138,17 @@ struct State {
     uintptr_t countAddress = 0;
     uintptr_t objectsAddress = 0;
     uintptr_t nullNode = 0;
-    uintptr_t polygonsDrawn = 0;
     uintptr_t modelViewSlot = 0;
     uintptr_t projectionSlot = 0;
 
     std::vector<baked::CarDrawList> lists;
     uint32_t                        count = 0;
     std::vector<uint32_t>           seen;  // the XFORMs reached this pass
-    Second                          second;
+    bool                            leftSaid[kLeftKinds] = {};
     bool                            firstLogged = false;
 };
 
-State             g_flag;
-volatile uint32_t g_gplDraws = 0;
+State g_flag;
 
 template <typename T>
 T at(uintptr_t address) {
@@ -185,8 +157,20 @@ T at(uintptr_t address) {
     return value;
 }
 
-uint32_t polygonsDrawn() {
-    return *reinterpret_cast<const volatile uint32_t*>(g_flag.polygonsDrawn);
+// A flagman left to GPL: false, for flagmanDispatch to return, logged the first time each reason
+// occurs.
+bool leaveToGpl(State& s, LeftToGpl why) {
+    if (!s.leftSaid[why]) {
+        s.leftSaid[why] = true;
+        static const char* const kWhy[kLeftKinds] = {
+            "the flagman count is out of range", "the XFORM's child is not a MATERIAL",
+            "the MATERIAL has no colormap word", "a read faulted",
+            "the frame is not a BILLBOARD", "the frame's object is not baked",
+            "the frame is not a baked sprite leaf", "GPL has not set all 16 colours of its colormap",
+            "the car renderer is not up for this pass", "past the lists a pass holds"};
+        logf("baked flagmen: a flagman left to GPL (first time) -- %s", kWhy[why]);
+    }
+    return false;
 }
 
 // gpl_matrixTranslateEuler(t, r): T(t) * Rz * Ry * Rx (CarWalk.cpp, poseMatrix).
@@ -202,7 +186,7 @@ void poseMatrix(const float w[6], float m[12]) {
 
 // -- reading GPL's memory --------------------------------------------------------------------------
 // Everything a dispatch reads, in one guarded function that holds no C++ objects (so __try is
-// legal): a track reload frees the MATERIALs, and a fault there is counted as a refusal.
+// legal): a track reload frees the MATERIALs, and a fault there is a refusal.
 
 enum ReadStatus {
     kReadNotFlagman = 0,
@@ -274,14 +258,6 @@ uintptr_t operandAfter(uintptr_t site, unsigned char opcode) {
     return at<uint32_t>(site + 1);
 }
 
-int readCount(uintptr_t countAddress) {
-    __try {
-        return *reinterpret_cast<const int*>(countAddress);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return -1;
-    }
-}
-
 void logFirst(const FlagmanRead& read, const baked::CarObject& object, uint32_t frameOffset,
               const uint32_t colours[16]) {
     char   palette[16 * 9 + 1] = {};
@@ -301,23 +277,16 @@ void logFirst(const FlagmanRead& read, const baked::CarObject& object, uint32_t 
 
 void flagmenInstall() {
     State& s = g_flag;
-    if (s.installTried || g_options.bakedRenderer == 0 || g_options.bakedFlagmen == 0) return;
+    if (s.installTried) return;
     s.installTried = true;
-    if (g_options.bakedCars != 3) {
-        logf("baked flagmen: NOT on -- they are drawn by the car renderer, which needs bakedCars = "
-             "3 (it is %d); GPL draws the flagmen",
-             g_options.bakedCars);
-        return;
-    }
     if (!carBakeBind()) {
         logf("baked flagmen: NOT on -- the car bake is not bound; GPL draws the flagmen");
         return;
     }
-    s.polygonsDrawn = rebase(kPolygonsDrawn);
     s.modelViewSlot = rebase(kModelViewSlot);
     s.projectionSlot = rebase(kProjectionSlot);
     uintptr_t slot = rebase(kColormapSetColor);
-    if (!s.polygonsDrawn || !s.modelViewSlot || !s.projectionSlot || !slot) {
+    if (!s.modelViewSlot || !s.projectionSlot || !slot) {
         logf("baked flagmen: NOT on -- rebase refused one of the game's addresses (%s); GPL draws "
              "the flagmen",
              rebaseSummary());
@@ -389,9 +358,7 @@ void flagmenInstall() {
     logf("baked flagmen: on -- colormapSetColor (slot %08X) wrapped at the 5 calls of "
          "gpl_flagmanBindModel %08X; flagman count %08X, flagman array %08X, gpl_nullNode %08X. "
          "In a baked main pass gplvr draws each flagman's sprite with the 16 colours GPL set, at "
-         "its place in GPL's walk; anything it cannot resolve stays GPL's. Watch `baked flagmen:` "
-         "(left to GPL all 0) and `baked: flagmen drawn` (runs drawn == lists); debug view 12 lets "
-         "GPL draw them and checks the polygon count",
+         "its place in GPL's walk; anything it cannot resolve stays GPL's",
          static_cast<unsigned>(slot), static_cast<unsigned>(kBindModel),
          static_cast<unsigned>(s.countAddress), static_cast<unsigned>(s.objectsAddress),
          static_cast<unsigned>(s.nullNode));
@@ -407,35 +374,29 @@ const baked::CarDrawList* flagmenPassLists(uint32_t& count) {
     return count ? g_flag.lists.data() : nullptr;
 }
 
-void flagmenSetGplDraws(bool gplDraws) { g_gplDraws = gplDraws ? 1u : 0u; }
-
-bool flagmanDispatch(const unsigned char* node, void* stock) {
+bool flagmanDispatch(const unsigned char* node, void*) {
     State& s = g_flag;
     if (!s.on) return false;
     auto        xform = reinterpret_cast<uintptr_t>(node);
     FlagmanRead read;
     int         status = readFlagman(s, xform, read);
     if (status == kReadNotFlagman) return false;
-    Second& t = s.second;
     switch (status) {
     case kReadFlagman: break;
-    case kReadCountBad: ++t.countBad; return false;
-    case kReadNotMaterial: ++t.notMaterial; return false;
-    case kReadNoPalette: ++t.noPalette; return false;
-    default: ++t.readFault; return false;
+    case kReadCountBad: return leaveToGpl(s, kLeftCountBad);
+    case kReadNotMaterial: return leaveToGpl(s, kLeftNotMaterial);
+    case kReadNoPalette: return leaveToGpl(s, kLeftNoPalette);
+    default: return leaveToGpl(s, kLeftReadFault);
     }
-    ++t.reached;
+    // A flagman reached again in the same pass is drawn again, as GPL does.
     bool repeat = false;
     for (uint32_t seen : s.seen) repeat = repeat || seen == xform;
-    if (repeat)
-        ++t.repeats;
-    else if (s.seen.size() < kMaxListsPerPass)
-        s.seen.push_back(static_cast<uint32_t>(xform));
+    if (!repeat && s.seen.size() < kMaxListsPerPass) s.seen.push_back(static_cast<uint32_t>(xform));
 
     // What gplvr draws of it: nothing for the null frame (kind 0) or another negative type word,
     // else the frame's baked sprite leaf in that flagman's colours.
     bool                   nothing = read.frameType < 0;
-    uint32_t*              refusal = nullptr;
+    int                    refusal = -1;
     int32_t                object = -1;
     uint32_t               frameOffset = 0;
     baked::CarLeaf         leaf;
@@ -445,10 +406,10 @@ bool flagmanDispatch(const unsigned char* node, void* stock) {
         uintptr_t prim = 0;
         uint32_t  primSize = 0;
         if ((read.frameType & 0xFF) != kNodeBillboard) {
-            refusal = &t.notBillboard;
+            refusal = kLeftNotBillboard;
         } else if ((object = carBakeObjectOf(read.frame, prim, primSize)) < 0 ||
                    static_cast<size_t>(object) >= scene.objects.size()) {
-            refusal = &t.noObject;
+            refusal = kLeftNoObject;
         } else {
             const baked::CarObject& frameObject = scene.objects[static_cast<size_t>(object)];
             frameOffset = static_cast<uint32_t>(read.frame - prim);
@@ -456,51 +417,16 @@ bool flagmanDispatch(const unsigned char* node, void* stock) {
             if (index != baked::kNoCarLeaf) leaf = frameObject.leaves[index];
             if (index == baked::kNoCarLeaf || !(leaf.flags & baked::kCarLeafSprite) ||
                 (leaf.flags & baked::kCarLeafNoGeometry))
-                refusal = &t.notLeaf;
+                refusal = kLeftNotLeaf;
             else if (!paletteOf(read.palette, colours))
-                refusal = &t.noColours;
+                refusal = kLeftNoColours;
         }
     }
 
-    // Debug view 12: GPL draws it, and its polygon count is the contract for what gplvr draws.
-    if (g_gplDraws) {
-        uint32_t before = polygonsDrawn();
-        reinterpret_cast<NodeHandlerFn>(stock)(node, nullptr);
-        uint32_t drawn = polygonsDrawn() - before;
-        ++t.gplCalls;
-        t.gplPolygons += drawn;
-        if (!refusal) {
-            uint32_t expected = nothing ? 0u : 1u;
-            ++t.compared;
-            t.expected += expected;
-            if (drawn == expected) {
-                ++t.matched;
-            } else if (!t.differed) {
-                t.differed = true;
-                t.firstMaterial = read.material;
-                t.firstFrame = read.frame;
-                t.firstGpl = drawn;
-                t.firstExpected = expected;
-            }
-        }
-        return true;
-    }
-    if (refusal) {
-        ++*refusal;
-        return false;
-    }
-    if (!bakedPassDrawsCars()) {
-        ++t.noRenderer;
-        return false;
-    }
-    if (nothing) {
-        ++t.nothing;
-        return true;
-    }
-    if (s.count >= kMaxListsPerPass) {
-        ++t.arenaFull;
-        return false;
-    }
+    if (refusal >= 0) return leaveToGpl(s, static_cast<LeftToGpl>(refusal));
+    if (!bakedPassDrawsCars()) return leaveToGpl(s, kLeftNoRenderer);
+    if (nothing) return true;
+    if (s.count >= kMaxListsPerPass) return leaveToGpl(s, kLeftArenaFull);
 
     if (s.lists.size() <= s.count) s.lists.emplace_back();
     baked::CarDrawList& list = s.lists[s.count++];
@@ -521,48 +447,9 @@ bool flagmanDispatch(const unsigned char* node, void* stock) {
     list.frames.push_back(frame);
     list.materials.push_back(baked::CarMaterial{});
     baked::appendCarLeaf(list, static_cast<uint32_t>(object), leaf, 0, 0, read.colour);
-    ++t.drawn;
     if (!s.firstLogged) {
         s.firstLogged = true;
         logFirst(read, scene.objects[static_cast<size_t>(object)], frameOffset, colours);
-    }
-    return true;
-}
-
-bool flagmenFormat(char* out, size_t size, unsigned passes) {
-    State& s = g_flag;
-    if (!s.on || !size) return false;
-    Second t = s.second;
-    s.second = Second{};
-    uint32_t setCalls = g_setCalls;
-    g_setCalls = 0;
-    double   perPass = passes ? 1.0 / passes : 0.0;
-    int      flagmen = readCount(s.countAddress);
-    int used = std::snprintf(
-        out, size,
-        "per pass %.2f flagman XFORMs reached (of %d flagmen), %.2f drawn by gplvr, %.2f drawing "
-        "nothing (kind 0), %.2f reached again in the pass; left to GPL: flagman count out of "
-        "range %u, not a MATERIAL %u, no colormap word %u, read fault %u, frame not a BILLBOARD "
-        "%u, frame's object not baked %u, not a baked sprite leaf %u, colours not all set %u, car "
-        "renderer not up %u, past %u lists %u; colormaps recorded %ld (colormapSetColor calls "
-        "%u this second, slot out of range %u, table restarted %u); sprites found in objs %u",
-        t.reached * perPass, flagmen, t.drawn * perPass, t.nothing * perPass,
-        t.repeats * perPass, t.countBad, t.notMaterial, t.noPalette, t.readFault, t.notBillboard,
-        t.noObject, t.notLeaf, t.noColours, t.noRenderer, kMaxListsPerPass, t.arenaFull,
-        static_cast<long>(g_paletteCount), setCalls, static_cast<uint32_t>(g_setBadSlot),
-        static_cast<uint32_t>(g_paletteResets), carBakeTotals().folderObjs);
-    if (used < 0 || static_cast<size_t>(used) >= size) return true;
-    if (t.gplCalls) {
-        int more = std::snprintf(
-            out + used, size - static_cast<size_t>(used),
-            "; DEBUG VIEW 12, GPL drew them: %u calls, %u compared, polygons GPL-counted %llu == "
-            "expected %llu (contract), MATCHED on %u of %u",
-            t.gplCalls, t.compared, static_cast<unsigned long long>(t.gplPolygons),
-            static_cast<unsigned long long>(t.expected), t.matched, t.compared);
-        if (more > 0 && t.differed && static_cast<size_t>(used + more) < size)
-            std::snprintf(out + used + more, size - static_cast<size_t>(used + more),
-                          "; first difference: MATERIAL %08X frame %08X, GPL %u, expected %u",
-                          t.firstMaterial, t.firstFrame, t.firstGpl, t.firstExpected);
     }
     return true;
 }

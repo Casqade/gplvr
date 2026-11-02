@@ -1,7 +1,7 @@
 #pragma once
 
-// The baked mirror pass (docs/audit-2026-09-18/105-baked-renderer-rewrite.md section 4.18,
-// bakedMirrors = 1). gpl_sceneRender draws the rear view before the main view, from the camera in
+// The baked mirror pass (docs/audit-2026-09-18/105-baked-renderer-rewrite.md section 4.18).
+// gpl_sceneRender draws the rear view before the main view, from the camera in
 // p[43]: the register file switches to gpl_renderRegistersMirror (0x487766), the surface-class
 // masks to the mirror's (0x48777B, 0x487789), the selector camera to the mirror's position
 // (0x487809), the mirror camera is bound (0x487868; gpl_cameraBind writes its gpl_lodScreenScale
@@ -21,67 +21,27 @@
 //
 // Mirror detail 0 has no walk (a sorted loop calls the cars, 0x487BC2): nothing of it is baked.
 
-#include "baked/CarRenderer.h"
-#include "baked/Renderer.h"
-
-#include <cstddef>
-#include <cstdint>
-
 namespace gplvr {
 
-// From bakedPassBind once the pass is bound. Does nothing unless bakedMirrors is on; logs what it
-// did and why not.
+// From the baked pass's first bind (bakedPassBind's lazy half); logs what it did and why not.
 void bakedMirrorInstall();
 
-// Why a mirror walk was left to GPL, counted per second.
+// Why a mirror walk was left to GPL. Each is logged the first time it happens, except the
+// ordinary ones (bakedRenderer 0, the upload still running).
 enum MirrorRefusal : int {
-    kMirrorNotBound = 0,   // bakedRenderer off, or the baked pass not bound
+    kMirrorNotBound = 0,   // the baked pass not bound
     kMirrorNoParams,       // no scene parameter block yet
     kMirrorNoCamera,       // p[43] is null
     kMirrorNoFilter,       // the node filter could not be installed
-    kMirrorDrawingOff,     // bakedRendererKey turned the baked drawing off
+    kMirrorDrawingOff,     // bakedRenderer is 0
     kMirrorNoScene,        // no baked scene for this track yet
     kMirrorUploadStopped,  // the upload stopped for this scene
     kMirrorRendererDown,   // the renderer is not up in this context
     kMirrorUploading,      // the main passes have not finished the GPU upload
     kMirrorDirectPath,     // p[85] bit 0 clear: GPL draws into the mip, no rectangle in GL
     kMirrorNoRect,         // the mirror camera's surface has no rectangle
-    kMirrorCapture,        // the vanilla half of a capture
-    kMirrorByGpl,          // debug view 15
     kMirrorRefusalCount,
 };
 void bakedMirrorRefused(MirrorRefusal why);
-
-// One baked mirror pass, from bakedPassEndMirror. `drawn` false when the renderer did not draw it
-// (the cars and flagmen of a pass that has lists are then lost: `cars.listDraws` says how many).
-struct BakedMirrorPass {
-    bool                drawn = false;
-    bool                fog = false;
-    int                 rect[4] = {0, 0, 0, 0};
-    uint32_t            dispatches = 0;  // the visible list's entries: GPL's baked-item dispatches
-    uint32_t            repeats = 0;     // of them, items reached again in the pass
-    baked::DrawStats    stats;
-    bool                hadLists = false;
-    baked::CarPassStats cars;
-    double              cpuMilliseconds = 0.0;  // the pass's end: draw and composite
-};
-void bakedMirrorAccount(const BakedMirrorPass& pass);
-
-// Whether the flush at a baked mirror pass's start, which puts the background GPL has just
-// submitted (0x4878D4) into the framebuffer before the rectangle is copied in, reached roglv2
-// as a flush; `known` false when the residual hooks that see flushes are not installed.
-void bakedMirrorBackgroundFlush(bool known, bool flushed);
-
-// Debug view 15: the baked items GPL dispatched in one of its own mirror walks, for the line's
-// comparison with the baked passes' dispatches.
-void bakedMirrorObserved(size_t dispatches);
-
-// Baked mirror passes drawn since the last report: the residual and flagman lines divide by the
-// main and the mirror passes together.
-unsigned bakedMirrorPasses();
-
-// Once a second, from the baked pass's report: the mirror's lines, with its GPU times (null when
-// the context has no timer queries).
-void bakedMirrorReport(double seconds, const baked::GpuPassTimes* gpu);
 
 }  // namespace gplvr

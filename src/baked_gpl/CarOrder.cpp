@@ -1,6 +1,5 @@
 #include "baked_gpl/CarOrder.h"
 
-#include "Hooks.h"
 #include "Log.h"
 
 #include <emmintrin.h>
@@ -16,14 +15,15 @@ namespace {
 // (report 105 section 4.53; the probe's heaviest seconds differed from the nearest memo in 42-125,
 // section 4.52.1).
 constexpr uint32_t kOrderPatchMaxBits = 512;
-// One patched order in kPatchCheckEvery is emitted again whole and compared (section 4.53).
+// One patched order in kPatchCheckEvery is emitted again whole and compared (section 4.53); a
+// difference turns the patch off for that program.
 constexpr uint32_t kPatchCheckEvery = 64;
 // A patch's position in its base memo's order for a node the base did not visit.
 constexpr uint32_t kNoBase = 0xFFFFFFFFu;
 
 uint32_t g_orderKeys = 0;   // the last OrderMemo::key handed out
 uint32_t g_swapped = 0;     // order nodes put the other way round by the emission running
-uint32_t g_orderNodes = 0;  // order nodes emitRange visited (section 4.38)
+bool     g_saidCheck = false;  // a patch check that differed, logged once
 // The order's output, one index a draw of the largest program met; it only grows (report 105
 // section 4.36). The patch check's whole emission goes to its own.
 std::vector<uint32_t> g_orderScratch;
@@ -67,7 +67,6 @@ uint32_t* emitRange(const OrderSource& s, uint32_t begin, uint32_t end, uint32_t
     uint32_t          k = orderBegin;
     while (k < orderEnd) {
         const ShareOrder& o = orders[k];
-        ++g_orderNodes;
         out = copyDraws(s, from, o.begin, out);
         if (on(s, o.condition)) {
             if (on(s, o.onFront) == o.front) {
@@ -94,7 +93,6 @@ uint32_t* emitRuns(const OrderSource& s, uint32_t begin, uint32_t end, uint32_t 
     uint32_t          k = orderBegin;
     while (k < orderEnd) {
         const ShareOrder& o = orders[k];
-        ++g_orderNodes;
         out = copyDraws(s, from, o.begin, out);
         uint32_t* start = out;
         uint32_t  swapsBefore = g_swapped;
@@ -147,10 +145,9 @@ uint32_t differingBits(const uint8_t* a, const uint8_t* b, uint32_t n, uint32_t*
 }
 
 // Marks `node` and its enclosing nodes as reached by a changed bit, up to one already marked.
-void markUp(const OrderIndex& index, uint16_t node, uint32_t epoch, uint32_t& marked) {
+void markUp(const OrderIndex& index, uint16_t node, uint32_t epoch) {
     while (node != kNoOrderNode && g_mark[node] != epoch) {
         g_mark[node] = epoch;
-        ++marked;
         node = index.nodeParent[node];
     }
 }
@@ -165,9 +162,6 @@ struct Patch {
     OrderRun*          runs = nullptr;      // of the memo being filled
     uint32_t           epoch = 0;           // g_mark's for this patch
     const uint32_t*    limit = nullptr;     // one past the output buffer
-    uint32_t           visited = 0;
-    uint32_t           copiedRuns = 0;
-    uint32_t           copiedDraws = 0;
     bool               failed = false;
 };
 
@@ -184,7 +178,6 @@ uint32_t* patchRange(Patch& c, uint32_t begin, uint32_t end, uint32_t orderBegin
     uint32_t           k = orderBegin;
     while (k < orderEnd) {
         const ShareOrder& o = s.nodes[k];
-        ++c.visited;
         if (o.begin - from > static_cast<uint32_t>(c.limit - out)) {
             c.failed = true;
             return out;
@@ -213,8 +206,6 @@ uint32_t* patchRange(Patch& c, uint32_t begin, uint32_t end, uint32_t orderBegin
                 if (o.nested > k + 1)
                     std::memcpy(c.runs + k + 1, c.baseRuns + k + 1,
                                 (o.nested - k - 1) * sizeof(OrderRun));
-                ++c.copiedRuns;
-                c.copiedDraws += was.length;
             } else {
                 uint32_t swapsBefore = g_swapped;
                 bool     baseOn = o.condition < s.bitCount && c.baseBits[o.condition] != 0;
@@ -254,16 +245,10 @@ OrderMemo* leastRecent(OrderState& state, const OrderMemo* except) {
 
 // A memo filled with `drawOrder`, these bits' order, and its counts from the packed polygons.
 void fillMemo(OrderMemo& memo, const OrderSource& s, const std::vector<uint32_t>& drawOrder,
-              uint32_t swapped, bool runs, uint32_t now, OrderSecond& t) {
-    if (memo.key) {
-        ++t.refilled;
-        if (!memo.hits) ++t.unused;
-    }
+              bool runs, uint32_t now) {
     memo.on.assign(s.bits, s.bits + s.bitCount);
     memo.order = drawOrder;
     memo.hasRuns = runs;
-    memo.swapped = swapped;
-    memo.hits = 0;
     if (++g_orderKeys == 0) ++g_orderKeys;
     memo.key = g_orderKeys;
     uint32_t polygons = 0;
@@ -280,15 +265,15 @@ void fillMemo(OrderMemo& memo, const OrderSource& s, const std::vector<uint32_t>
 }
 
 // This miss's order patched from the memo with runs nearest in condition bits, into `drawOrder`,
-// and a memo other than the base filled with it: -1, or the OrderWhole why the caller emits it
-// whole. The order buffer holds s.draws + 1.
-int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
-               std::vector<uint32_t>& drawOrder, OrderTaken& taken, OrderSecond& t) {
-    uint64_t          findStart = __rdtsc();
+// and a memo other than the base (`filled`) filled with it. False when the caller emits it whole:
+// no memo with runs of the program's sizes, more than kOrderPatchMaxBits bits differ from every
+// one, or a run out of bounds. The order buffer holds s.draws + 1.
+bool patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
+                std::vector<uint32_t>& drawOrder, OrderMemo*& filled) {
     const OrderIndex& index = state.index;
     if (index.drawsFirst.size() != s.bitCount + 1u || index.nodesFirst.size() != s.bitCount + 1u ||
         index.drawNode.size() != s.draws || index.nodeParent.size() != s.nodeCount)
-        return kWholeSizes;
+        return false;
     // The most recently used memo with runs is compared first: it is likely the nearest, and each
     // other memo's comparison stops once it is no nearer.
     int recent = -1;
@@ -297,17 +282,15 @@ int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
         if (m.key && m.hasRuns && (recent < 0 || m.lastUsed > state.memos[recent].lastUsed))
             recent = j;
     }
-    if (recent < 0) return kWholeNoBase;
+    if (recent < 0) return false;
     const OrderMemo* base = nullptr;
     uint32_t         bits = 0;
     int              list = 0;  // g_changed[list]: the base's changed ids
-    bool             sized = false;
     for (int n = 0; n < kOrderMemos; ++n) {
         int              j = n == 0 ? recent : n - 1 < recent ? n - 1 : n;
         const OrderMemo& m = state.memos[j];
         if (!m.key || !m.hasRuns || m.on.size() != s.bitCount || m.runs.size() != s.nodeCount)
             continue;
-        sized = true;
         if (base && bits == 0) break;
         uint32_t cap = base ? bits - 1 : kOrderPatchMaxBits;
         uint32_t found = differingBits(m.on.data(), s.bits, s.bitCount, g_changed[1 - list], cap);
@@ -316,7 +299,7 @@ int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
         bits = found;
         list = 1 - list;
     }
-    if (!base) return sized ? kWholeTooMany : kWholeSizes;
+    if (!base) return false;
     // Every order node a changed bit reaches: the innermost node around each draw under it and
     // each node it is the condition or front side of, and the nodes around those.
     if (g_mark.size() < s.nodeCount) g_mark.resize(s.nodeCount, 0u);
@@ -324,13 +307,12 @@ int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
         std::fill(g_mark.begin(), g_mark.end(), 0u);
         g_markEpoch = 1;
     }
-    uint32_t marked = 0;
     for (uint32_t i = 0; i < bits; ++i) {
         uint32_t condition = g_changed[list][i];
         for (uint32_t e = index.drawsFirst[condition]; e < index.drawsFirst[condition + 1]; ++e)
-            markUp(index, index.drawNode[index.draws[e]], g_markEpoch, marked);
+            markUp(index, index.drawNode[index.draws[e]], g_markEpoch);
         for (uint32_t e = index.nodesFirst[condition]; e < index.nodesFirst[condition + 1]; ++e)
-            markUp(index, index.nodes[e], g_markEpoch, marked);
+            markUp(index, index.nodes[e], g_markEpoch);
     }
     OrderMemo* fill = leastRecent(state, base);
     fill->runs.resize(s.nodeCount);
@@ -346,16 +328,12 @@ int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
     uint32_t* first = g_orderScratch.data();
     c.limit = first + g_orderScratch.size();
     g_swapped = 0;
-    uint64_t  emitStart = __rdtsc();
     uint32_t* last = patchRange(c, 0, s.draws, 0, s.nodeCount, first, first, 0);
-    uint64_t  emitEnd = __rdtsc();
-    if (c.failed) return kWholeBounds;
+    if (c.failed) return false;
     drawOrder.assign(first, last);
-    uint64_t copyEnd = __rdtsc();
     uint32_t swapped = g_swapped;
     bool     patched = true;
     if (++g_patches % kPatchCheckEvery == 0) {
-        ++t.checks;
         if (g_orderCheck.size() < s.draws + 1u) g_orderCheck.resize(s.draws + 1u);
         g_swapped = 0;
         uint32_t* checkFirst = g_orderCheck.data();
@@ -365,33 +343,19 @@ int patchOrder(const OrderSource& s, OrderState& state, uint32_t now,
             (length && std::memcmp(checkFirst, drawOrder.data(), length * sizeof(uint32_t)) != 0)) {
             // The whole emission's order is used, and this program's are emitted whole until it is
             // rebuilt.
-            ++t.checksDiffered;
-            ++t.whole[kWholeCheck];
+            if (!g_saidCheck) {
+                g_saidCheck = true;
+                logf("baked cars: a patched draw order differed from the whole emission -- that "
+                     "program's orders are emitted whole until it is rebuilt (logged once)");
+            }
             drawOrder.assign(checkFirst, checkLast);
-            swapped = g_swapped;
             patched = false;
             state.patchOff = true;
         }
-        taken.checkTicks = __rdtsc() - copyEnd;
     }
-    uint64_t fillStart = __rdtsc();
-    fillMemo(*fill, s, drawOrder, swapped, patched, now, t);
-    taken.memo = fill;
-    taken.swapped = swapped;
-    if (!patched) return -1;
-    ++t.patched;
-    t.patchBits += bits;
-    t.patchMarked += marked;
-    t.patchVisited += c.visited;
-    t.patchNodes += s.nodeCount;
-    t.patchRuns += c.copiedRuns;
-    t.patchCopied += c.copiedDraws;
-    t.patchDrawn += drawOrder.size();
-    if (base == &state.memos[recent]) ++t.patchRecent;
-    t.patchFindTicks += emitStart - findStart;
-    t.patchEmitTicks += emitEnd - emitStart;
-    t.patchFillTicks += (copyEnd - emitEnd) + (__rdtsc() - fillStart);
-    return -1;
+    fillMemo(*fill, s, drawOrder, patched, now);
+    filled = fill;
+    return true;
 }
 
 // The draws and order nodes under [begin, end) and [orderBegin, orderEnd): each draw's innermost
@@ -414,10 +378,8 @@ void indexRange(OrderIndex& index, const ShareOrder* nodes, uint32_t begin, uint
 
 }  // namespace
 
-OrderTaken orderTake(const OrderSource& s, OrderState& state, bool verify, uint32_t now,
-                     std::vector<uint32_t>& drawOrder, OrderSecond& t) {
-    OrderTaken taken;
-    uint64_t   start = __rdtsc();
+OrderMemo* orderTake(const OrderSource& s, OrderState& state, bool verify, uint32_t now,
+                     std::vector<uint32_t>& drawOrder) {
     OrderMemo* memo = nullptr;
     if (!verify)
         for (OrderMemo& m : state.memos)
@@ -425,56 +387,28 @@ OrderTaken orderTake(const OrderSource& s, OrderState& state, bool verify, uint3
                 std::memcmp(m.on.data(), s.bits, s.bitCount) == 0)
                 memo = &m;
     if (memo) {
-        ++t.memoised;
-        ++memo->hits;
         drawOrder = memo->order;
         memo->lastUsed = now;
-        taken.memo = memo;
-        taken.swapped = memo->swapped;
-        return taken;
+        return memo;
     }
     if (g_orderScratch.size() < s.draws + 1u) g_orderScratch.resize(s.draws + 1u);
-    int whole = verify                       ? kWholeVerify
-                : !g_options.bakedOrderPatch ? kWholeOptionOff
-                : !state.index.built         ? kWholeNoIndex
-                : state.patchOff             ? kWholePatchOff
-                                             : -1;
+    // A verify walk's order, a program past the index's ids and one whose patch check differed
+    // are emitted whole.
+    bool runs = !verify && state.index.built && !state.patchOff;
     // A program the patch serves keeps runs in every memo it fills, whole or patched.
-    bool runs = whole < 0;
-    if (runs) whole = patchOrder(s, state, now, drawOrder, taken, t);
-    if (whole >= 0) {
-        ++t.whole[whole];
-        g_swapped = 0;
-        g_orderNodes = 0;
-        OrderMemo* fill = verify ? nullptr : leastRecent(state, nullptr);
-        uint32_t*  first = g_orderScratch.data();
-        uint64_t   emitStart = __rdtsc();
-        uint32_t*  last;
-        if (fill && runs) {
-            fill->runs.resize(s.nodeCount);
-            last = emitRuns(s, 0, s.draws, 0, s.nodeCount, first, fill->runs.data(), first);
-        } else {
-            last = emitRange(s, 0, s.draws, 0, s.nodeCount, first);
-        }
-        uint64_t emitEnd = __rdtsc();
-        drawOrder.assign(first, last);
-        taken.swapped = g_swapped;
-        if (fill) {
-            uint64_t copyEnd = __rdtsc();
-            fillMemo(*fill, s, drawOrder, g_swapped, runs, now, t);
-            t.emitTicks += emitEnd - emitStart;
-            t.copyTicks += copyEnd - emitEnd;
-            t.fillTicks += __rdtsc() - copyEnd;
-            ++t.timed;
-            t.draws += s.draws;
-            t.nodes += g_orderNodes;
-            t.emitted += drawOrder.size();
-            taken.memo = fill;
-        }
+    if (runs && patchOrder(s, state, now, drawOrder, memo)) return memo;
+    OrderMemo* fill = verify ? nullptr : leastRecent(state, nullptr);
+    uint32_t*  first = g_orderScratch.data();
+    uint32_t*  last;
+    if (fill && runs) {
+        fill->runs.resize(s.nodeCount);
+        last = emitRuns(s, 0, s.draws, 0, s.nodeCount, first, fill->runs.data(), first);
+    } else {
+        last = emitRange(s, 0, s.draws, 0, s.nodeCount, first);
     }
-    t.missTicks += __rdtsc() - start - taken.checkTicks;
-    ++t.misses;
-    return taken;
+    drawOrder.assign(first, last);
+    if (fill) fillMemo(*fill, s, drawOrder, runs, now);
+    return fill;
 }
 
 bool ordersNest(const std::vector<ShareOrder>& orders, uint32_t begin, uint32_t end,
@@ -546,41 +480,6 @@ size_t orderIndexBytes(const OrderIndex& index) {
     return (index.drawsFirst.capacity() + index.draws.capacity() + index.nodesFirst.capacity() +
             index.nodes.capacity() + index.drawNode.capacity() + index.nodeParent.capacity()) *
            sizeof(uint16_t);
-}
-
-void orderLogPatch(const OrderSecond& t, double perUs) {
-    if (!t.misses && !t.indexRefused) return;
-    uint32_t whole = 0;
-    for (uint32_t n : t.whole) whole += n;
-    double n = t.patched ? static_cast<double>(t.patched) : 1.0;
-    double timed = t.timed ? static_cast<double>(t.timed) : 1.0;
-    double find = static_cast<double>(t.patchFindTicks) / n / perUs;
-    double emit = static_cast<double>(t.patchEmitTicks) / n / perUs;
-    double fill = static_cast<double>(t.patchFillTicks) / n / perUs;
-    double wholeUs = static_cast<double>(t.emitTicks + t.copyTicks + t.fillTicks) / timed / perUs;
-    double share = t.patchNodes ? 100.0 * static_cast<double>(t.patchVisited) /
-                                      static_cast<double>(t.patchNodes)
-                                : 0.0;
-    logf("baked cars: the draw order patched from the nearest memo (report 105 section 4.53, "
-         "bakedOrderPatch %d) -- memo misses %u: patched %u, emitted whole %u (a verify walk's %u, "
-         "bakedOrderPatch 0 %u, program past the index's 16-bit ids %u, patch off after a check "
-         "differed %u, no memo with runs yet %u, no memo of the program's sizes %u, more than %u "
-         "bits changed %u, a run out of bounds %u (must be 0), the check differed %u (must be "
-         "0)); per patched miss: condition bits changed %.1f, order nodes they reach %.1f, order "
-         "nodes visited %.0f of %.0f (%.1f %%), runs copied whole %.1f holding %.0f of %.0f draws "
-         "drawn, the base the most recently used memo %.0f %%; a patched miss %.2f us = the base "
-         "and its changed bits %.2f + the patch %.2f + its copy and the memo's fill %.2f, a whole "
-         "emission %.2f us (emitRange, copy and fill, section 4.38); patched orders emitted again "
-         "whole %u (1 in %u), differing %u (must be 0); programs kept without an index %u",
-         g_options.bakedOrderPatch, t.misses, t.patched, whole, t.whole[kWholeVerify],
-         t.whole[kWholeOptionOff], t.whole[kWholeNoIndex], t.whole[kWholePatchOff],
-         t.whole[kWholeNoBase], t.whole[kWholeSizes], kOrderPatchMaxBits, t.whole[kWholeTooMany],
-         t.whole[kWholeBounds], t.whole[kWholeCheck], static_cast<double>(t.patchBits) / n,
-         static_cast<double>(t.patchMarked) / n, static_cast<double>(t.patchVisited) / n,
-         static_cast<double>(t.patchNodes) / n, share, static_cast<double>(t.patchRuns) / n,
-         static_cast<double>(t.patchCopied) / n, static_cast<double>(t.patchDrawn) / n,
-         100.0 * static_cast<double>(t.patchRecent) / n, find + emit + fill, find, emit, fill,
-         wholeUs, t.checks, kPatchCheckEvery, t.checksDiffered, t.indexRefused);
 }
 
 }  // namespace gplvr

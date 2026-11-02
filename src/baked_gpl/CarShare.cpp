@@ -1,19 +1,14 @@
 #include "baked_gpl/CarShare.h"
 
-#include "Hooks.h"
-#include "Log.h"
 #include "Stereo.h"
 
 #include "baked/CarScene.h"
-#include "baked_gpl/BakedPass.h"
 #include "baked_gpl/CarBake.h"
-#include "baked_gpl/CarUnion.h"
 
 #include <windows.h>
 
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <utility>
@@ -133,22 +128,9 @@ bool sameMaterial(const baked::CarMaterial& a, const baked::CarMaterial& b) {
 
 // -- state ---------------------------------------------------------------------------------------
 
-// Why the second eye walked a car the first eye had listed (or had not).
-enum Refused : int {
-    kNotListed,    // the first eye's pass of this kind did not list the car
-    kFirstEye,     // the first eye's walk of it was not shareable (ShareRefusal, counted there)
-    kInputs,       // the car's root, the pass's masks, MATERIAL state or lighting, or the bake moved
-    kRegisters,    // a register a selector read from the pass's file
-    kPose,         // a pose word or child pointer of an XFORM the walk entered
-    kSprite,       // a BILLBOARD colour (the helmet tint)
-    kGplMemo,      // GPL's vertex memo holds one of the walk's vertices
-    kPoolFull,     // GPL's vertex memo too full to scan
-    kNoPool,       // GPL's vertex memo was not placed at install
-    kFrames,       // the list's frames are not the walk's, or the tape names no walk frame
-    kFault,        // the replay faulted on a read
-    kRefusedCount
-};
-
+// The replay's answer: the walk would take the same path, a decision differs, or an input the tape
+// read moved (a register, a pose word or child pointer, a helmet colour, GPL's vertex memo holding
+// one of the walk's vertices or too full to scan, a frame the tape cannot place, a fault).
 enum ReplayResult {
     kReplayAgrees,
     kReplayDiffers,
@@ -159,61 +141,6 @@ enum ReplayResult {
     kReplayPoolFull,
     kReplayFrames,
     kReplayFault,
-};
-
-struct Second {
-    uint32_t passesFirst = 0;    // first-eye passes that recorded
-    uint32_t passesSecond = 0;   // second-eye passes with the first eye's lists of this frame
-    uint32_t passesAlone = 0;    // second-eye passes without (no such first-eye pass this frame)
-    uint32_t passesUnkeyed = 0;  // past the mirror slots, or outside the eye loop
-    uint32_t passesOff = 0;      // in the eye loop with bakedCarShare 0 or debug view 16
-    uint32_t tapes = 0;
-    uint32_t tapeRefused[kShareRefusalCount] = {};
-    uint64_t gates = 0;  // over the shareable tapes
-    uint64_t boxes = 0;
-    uint64_t selectors = 0;
-    uint64_t frames = 0;
-    uint64_t registers = 0;
-    uint64_t sprites = 0;
-    uint32_t calls = 0;  // first calls of a car in second-eye passes with lists
-    uint32_t reused = 0;
-    uint32_t reWalked = 0;
-    uint32_t differLists[3] = {};  // re-walked lists with a gate, a box, a selector differing
-    uint64_t differTotal[3] = {};  // decisions differing, by kind, over the re-walked lists
-    uint32_t differCount[4] = {};  // re-walked lists by decisions differing: 1, 2-3, 4-7, 8+
-    uint32_t verified = 0;
-    uint32_t mismatched = 0;
-    uint32_t verifyFaulted = 0;
-    uint32_t refused[kRefusedCount] = {};
-    int64_t  replayTicks = 0;
-    uint32_t replays = 0;
-    uint64_t poolEntries = 0;
-    uint32_t poolScans = 0;
-    // Scans that met a slot in the tape's address range whose source is none of its vertices,
-    // which the range alone refused (report 105 section 4.43).
-    uint32_t poolNarrowed = 0;
-    char     firstMismatch[256] = {};
-    // Eye-independent lists (report 105 section 4.22). First eye: its union walks, their margins,
-    // conditions and order nodes, the leaves of their lists it does not draw itself, the walks
-    // thrown away and done again deciding every gate, and recording passes with the union off.
-    uint32_t unionWalks = 0;
-    double   marginSum = 0.0;
-    uint64_t conditions = 0;
-    uint64_t orders = 0;
-    uint64_t unionLeaves = 0;
-    uint64_t otherLeaves = 0;
-    uint32_t unionRedone[kUnionRedoneCount] = {};
-    uint32_t unionOff = 0;
-    // Second eye: lists taken with conditions, their draws it does not draw, the order nodes whose
-    // plane passed between the eyes with both reordered sides drawn (and both blended), and the
-    // union lists verified.
-    uint32_t takenConditioned = 0;
-    uint64_t takenOff = 0;
-    uint64_t takenDraws = 0;
-    uint32_t ordersFlipped = 0;
-    uint32_t ordersFlippedBlended = 0;
-    uint32_t unionVerified = 0;
-    float    separationMax = 0.0f;  // the largest separation of the eyes measured, metres
 };
 
 // A first-eye pass's lists and tapes, kept for the second eye's pass of the same slot.
@@ -240,49 +167,38 @@ uint32_t               g_ordinalFrame = 0;
 int                    g_ordinalEye = -1;
 int                    g_mainOrdinal = 0;
 int                    g_mirrorOrdinal = 0;
-uint32_t               g_candidates = 0;
-baked::CarDrawList*    g_verify = nullptr;
-// The order nodes of the union list a verify walk is compared with (carShareVerifyOrders).
-const std::vector<ShareOrder>* g_verifyOrders = nullptr;
-Second                 g_second;
 
 // The separation of the two eyes' cameras at a car's dispatch, per slot: the largest measured
 // this second and in the last one. A union walk's margin follows it.
-float g_separationNow[kSlots] = {};
-float g_separationLast[kSlots] = {};
+float   g_separationNow[kSlots] = {};
+float   g_separationLast[kSlots] = {};
+int64_t g_separationSecond = 0;  // QueryPerformanceCounter at the start of `now`'s second
 
 // The replayed frames: clip from local and the eye, by walk frame id.
 float g_clips[kMaxFrames][16];
 float g_eyes[kMaxFrames][3];
-// The replayed tape's conditions for this eye, CarDrawList::conditionOn's layout, and its order
-// nodes this eye is on the other side of (with both sides drawn; of them, both blended).
+// The replayed tape's conditions for this eye, CarDrawList::conditionOn's layout.
 std::vector<uint8_t> g_conditionOn;
-uint32_t             g_orderFlips[2] = {};
 
 // GPL's vertex memo, as gplMemoSlot reads it: a vertex of the walk is GPL's when its record is
 // the source of a slot below the pool index. A source in [low, high] is looked up among the
-// walk's records (report 105 section 4.43); one that is not among them is counted.
-ReplayResult scanPool(const ShareTape& tape, const ShareCall& call, Second& t) {
+// walk's records (report 105 section 4.43).
+ReplayResult scanPool(const ShareTape& tape, const ShareCall& call) {
     if (tape.high < tape.low) return kReplayAgrees;
     int32_t used = at<int32_t>(call.poolIndex);
     if (used <= 0) return kReplayAgrees;
-    t.poolEntries += static_cast<uint32_t>(used);
-    ++t.poolScans;
     if (used > kMaxPoolScan) return kReplayPoolFull;
-    bool inRange = false;
     for (int32_t i = 0; i < used; ++i) {
         uint32_t source = at<uint32_t>(call.poolSources + 4u * static_cast<uint32_t>(i));
         if (source < tape.low || source > tape.high) continue;
         if (shareReadsVertex(tape, source)) return kReplayGplMemo;
-        inRange = true;
     }
-    if (inRange) ++t.poolNarrowed;
     return kReplayAgrees;
 }
 
 // The second eye's replay of a first-eye tape: the reads GPL may have moved, then every decision
-// from this eye's camera. Counts the decisions that differ, by kind, to the end of the tape.
-ReplayResult replay(const ShareTape& tape, const ShareCall& call, uint32_t differ[3], Second& t) {
+// from this eye's camera, to the first that differs.
+ReplayResult replay(const ShareTape& tape, const ShareCall& call) {
     for (const ShareRegister& r : tape.registers)
         if (floatBits(static_cast<float>(call.registers[r.index & 0x3FF])) != r.valueBits)
             return kReplayRegisters;
@@ -295,7 +211,7 @@ ReplayResult replay(const ShareTape& tape, const ShareCall& call, uint32_t diffe
     }
     for (const ShareSprite& s : tape.sprites)
         if (spriteColour(s.node) != s.colour) return kReplaySprite;
-    ReplayResult pool = scanPool(tape, call, t);
+    ReplayResult pool = scanPool(tape, call);
     if (pool != kReplayAgrees) return pool;
 
     std::memcpy(g_clips[0], call.clip, sizeof(g_clips[0]));
@@ -318,20 +234,12 @@ ReplayResult replay(const ShareTape& tape, const ShareCall& call, uint32_t diffe
     auto meets = [](uint16_t condition) {
         return condition < g_conditionOn.size() && g_conditionOn[condition] != 0;
     };
-    // Where this eye keeps the first eye's order although its own walk would not: an order node
-    // it meets, on the other side of the node's plane, with both reordered sides drawing.
-    g_orderFlips[0] = g_orderFlips[1] = 0;
-    for (const ShareOrder& o : tape.orders) {
-        if (!o.bothDrawn || !meets(o.condition)) continue;
-        if (o.frame >= frames) return kReplayFrames;
-        if (frontSide(g_eyes[o.frame], o.plane) == o.front) continue;
-        ++g_orderFlips[0];
-        if (o.bothBlended) ++g_orderFlips[1];
-    }
+    for (const ShareOrder& o : tape.orders)
+        if (o.bothDrawn && meets(o.condition) && o.frame >= frames) return kReplayFrames;
     for (const ShareGate& g : tape.gates) {
         if (!meets(g.condition)) continue;
         if (g.frame >= frames) return kReplayFrames;
-        if (frontSide(g_eyes[g.frame], g.plane) != g.front) ++differ[0];
+        if (frontSide(g_eyes[g.frame], g.plane) != g.front) return kReplayDiffers;
     }
     for (const ShareBox& b : tape.boxes) {
         if (!meets(b.condition)) continue;
@@ -342,7 +250,7 @@ ReplayResult replay(const ShareTape& tape, const ShareCall& call, uint32_t diffe
             vertexAt(word(b.node, 1 + corner), p);
             common &= frustumOutcode(g_clips[b.corner[corner]], p) << 6;
         }
-        if ((common != 0) != b.culled) ++differ[1];
+        if ((common != 0) != b.culled) return kReplayDiffers;
     }
     for (const ShareSelector& s : tape.selectors) {
         if (!meets(s.condition)) continue;
@@ -356,17 +264,16 @@ ReplayResult replay(const ShareTape& tape, const ShareCall& call, uint32_t diffe
         } else {
             value = s.kind == 1 ? call.dlong : call.dlat;
         }
-        if (selectorChoice(s.node, value) != s.chosen) ++differ[2];
+        if (selectorChoice(s.node, value) != s.chosen) return kReplayDiffers;
     }
-    return differ[0] || differ[1] || differ[2] ? kReplayDiffers : kReplayAgrees;
+    return kReplayAgrees;
 }
 
 // The tape reads GPL's graph exactly where the first eye's walk read it this frame, but a fault
 // ends the replay, not the game.
-ReplayResult replayGuarded(const ShareTape& tape, const ShareCall& call, uint32_t differ[3],
-                           Second& t) {
+ReplayResult replayGuarded(const ShareTape& tape, const ShareCall& call) {
     __try {
-        return replay(tape, call, differ, t);
+        return replay(tape, call);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return kReplayFault;
     }
@@ -400,14 +307,11 @@ void patchList(baked::CarDrawList& list, const baked::CarDrawList& fresh) {
         std::memcpy(list.frames[k].eye, g_eyes[k], sizeof(list.frames[k].eye));
 }
 
-ShareOutcome take(const ShareCall& call, baked::CarDrawList& list, Second& t) {
+ShareOutcome take(const ShareCall& call, baked::CarDrawList& list) {
     Store&   store = g_stores[g_pass.slot];
     uint32_t j = 0;
     while (j < store.count && (store.tapes[j].record != call.record || store.taken[j])) ++j;
-    if (j >= store.count) {
-        ++t.refused[kNotListed];
-        return kShareWalk;
-    }
+    if (j >= store.count) return kShareWalk;
     store.taken[j] = 1;
     const ShareTape&    tape = store.tapes[j];
     baked::CarDrawList& stored = store.lists[j];
@@ -422,123 +326,18 @@ ShareOutcome take(const ShareCall& call, baked::CarDrawList& list, Second& t) {
         if (std::isfinite(separation)) {
             float& now = g_separationNow[g_pass.slot];
             now = std::max(now, separation);
-            t.separationMax = std::max(t.separationMax, separation);
         }
     }
-    if (tape.refusal != kShareOk) {
-        ++t.refused[kFirstEye];
+    // The first eye's walk must have been shareable, GPL's vertex memo placed, the inputs the
+    // same, and the replay must agree; anything else walks the car.
+    if (tape.refusal != kShareOk || !call.poolIndex || !call.poolSources ||
+        !sameInputs(tape, call, list, stored) || stored.frames.size() != tape.frames.size() + 1 ||
+        replayGuarded(tape, call) != kReplayAgrees)
         return kShareWalk;
-    }
-    if (!call.poolIndex || !call.poolSources) {
-        ++t.refused[kNoPool];
-        return kShareWalk;
-    }
-    if (!sameInputs(tape, call, list, stored)) {
-        ++t.refused[kInputs];
-        return kShareWalk;
-    }
-    if (stored.frames.size() != tape.frames.size() + 1) {
-        ++t.refused[kFrames];
-        return kShareWalk;
-    }
-    uint32_t differ[3] = {};
-    switch (replayGuarded(tape, call, differ, t)) {
-    case kReplayAgrees: break;
-    case kReplayDiffers: {
-        ++t.reWalked;
-        uint32_t total = 0;
-        for (int kind = 0; kind < 3; ++kind) {
-            if (differ[kind]) ++t.differLists[kind];
-            t.differTotal[kind] += differ[kind];
-            total += differ[kind];
-        }
-        ++t.differCount[total == 1 ? 0 : total < 4 ? 1 : total < 8 ? 2 : 3];
-        return kShareWalk;
-    }
-    case kReplayRegisters: ++t.refused[kRegisters]; return kShareWalk;
-    case kReplayPose: ++t.refused[kPose]; return kShareWalk;
-    case kReplaySprite: ++t.refused[kSprite]; return kShareWalk;
-    case kReplayGplMemo: ++t.refused[kGplMemo]; return kShareWalk;
-    case kReplayPoolFull: ++t.refused[kPoolFull]; return kShareWalk;
-    case kReplayFrames: ++t.refused[kFrames]; return kShareWalk;
-    case kReplayFault: ++t.refused[kFault]; return kShareWalk;
-    }
     patchList(stored, list);
-    if (!tape.conditions.empty()) {
-        stored.conditionOn = g_conditionOn;
-        ++t.takenConditioned;
-        t.takenDraws += stored.draws.size();
-        for (const baked::CarDraw& draw : stored.draws)
-            if (!baked::carDrawOn(stored, draw)) ++t.takenOff;
-        t.ordersFlipped += g_orderFlips[0];
-        t.ordersFlippedBlended += g_orderFlips[1];
-    }
-    if (++g_candidates % kShareVerifyEvery == 0) {
-        g_verify = &stored;
-        g_verifyOrders = tape.orders.empty() ? nullptr : &tape.orders;
-        return kShareVerify;
-    }
+    if (!tape.conditions.empty()) stored.conditionOn = g_conditionOn;
     std::swap(list, stored);
-    ++t.reused;
     return kShareReused;
-}
-
-bool sameBits(const void* a, const void* b, size_t size) { return std::memcmp(a, b, size) == 0; }
-
-// Field by field, floats by their bits. False with the first difference in `why`.
-bool sameList(const baked::CarDrawList& a, const baked::CarDrawList& b, char* why, size_t size) {
-    auto differs = [&](const char* what, size_t index, size_t of) {
-        std::snprintf(why, size, "driver %d, %s %s: element %zu of %zu", b.driver,
-                      b.mirror ? "mirror" : "main", what, index, of);
-        return false;
-    };
-    if (a.driver != b.driver || a.cockpit != b.cockpit || a.overlay != b.overlay ||
-        a.mirror != b.mirror || a.flagman != b.flagman)
-        return differs("driver, cockpit, overlay, mirror or flagman", 0, 1);
-    if (!sameBits(a.rootModelView, b.rootModelView, sizeof(a.rootModelView)))
-        return differs("root model-view", 0, 1);
-    if (!sameBits(a.projection, b.projection, sizeof(a.projection)))
-        return differs("projection", 0, 1);
-    if (!sameBits(a.light, b.light, sizeof(a.light))) return differs("light", 0, 1);
-    if (a.walkSlot != b.walkSlot) return differs("walk slot", 0, 1);
-    if (!sameBits(a.palette, b.palette, sizeof(a.palette))) return differs("palette", 0, 1);
-    if (a.polygons != b.polygons || a.emptyLeaves != b.emptyLeaves ||
-        a.dynamicLeaves != b.dynamicLeaves)
-        return differs("leaf counts", 0, 1);
-    if (a.frames.size() != b.frames.size()) return differs("frame count", 0, b.frames.size());
-    for (size_t i = 0; i < a.frames.size(); ++i) {
-        const baked::CarFrame& x = a.frames[i];
-        const baked::CarFrame& y = b.frames[i];
-        if (!sameBits(x.rootFromLocal, y.rootFromLocal, sizeof(x.rootFromLocal)))
-            return differs("frame root from local", i, b.frames.size());
-        if (!sameBits(x.eye, y.eye, sizeof(x.eye))) return differs("frame eye", i, b.frames.size());
-        if (x.halfFrom != y.halfFrom) return differs("frame half vector", i, b.frames.size());
-    }
-    if (a.materials.size() != b.materials.size())
-        return differs("material count", 0, b.materials.size());
-    for (size_t i = 0; i < a.materials.size(); ++i)
-        if (!sameMaterial(a.materials[i], b.materials[i]))
-            return differs("material", i, b.materials.size());
-    if (a.draws.size() != b.draws.size()) return differs("draw count", 0, b.draws.size());
-    for (size_t i = 0; i < a.draws.size(); ++i) {
-        const baked::CarDraw& x = a.draws[i];
-        const baked::CarDraw& y = b.draws[i];
-        if (x.object != y.object || x.firstIndex != y.firstIndex || x.indexCount != y.indexCount ||
-            x.polygons != y.polygons || x.frame != y.frame || x.material != y.material ||
-            x.colour != y.colour || x.flags != y.flags || x.sprite != y.sprite)
-            return differs("draw", i, b.draws.size());
-    }
-    if (a.dynamicVertices.size() != b.dynamicVertices.size())
-        return differs("skinned vertex count", 0, b.dynamicVertices.size());
-    for (size_t i = 0; i < a.dynamicVertices.size(); ++i)
-        if (!sameBits(&a.dynamicVertices[i], &b.dynamicVertices[i], sizeof(baked::CarVertex)))
-            return differs("skinned vertex", i, b.dynamicVertices.size());
-    if (a.dynamicIndices.size() != b.dynamicIndices.size() ||
-        (!a.dynamicIndices.empty() &&
-         !sameBits(a.dynamicIndices.data(), b.dynamicIndices.data(),
-                   a.dynamicIndices.size() * sizeof(uint32_t))))
-        return differs("skinned indices", 0, b.dynamicIndices.size());
-    return true;
 }
 
 }  // namespace
@@ -641,7 +440,17 @@ void shareSprite(ShareTape& tape, uintptr_t node, uint32_t colour) {
 
 void carSharePassBegin(bool mirror, bool enabled, std::vector<baked::CarDrawList>& lists,
                        uint32_t count) {
-    Second& t = g_second;
+    // The separations measured this second become the last second's, which the margin keeps.
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    if (now.QuadPart - g_separationSecond >= frequency.QuadPart) {
+        g_separationSecond = now.QuadPart;
+        for (int slot = 0; slot < kSlots; ++slot) {
+            g_separationLast[slot] = g_separationNow[slot];
+            g_separationNow[slot] = 0.0f;
+        }
+    }
     if (g_pass.recording) {
         Store& store = g_stores[g_pass.slot];
         std::swap(store.lists, lists);
@@ -653,15 +462,10 @@ void carSharePassBegin(bool mirror, bool enabled, std::vector<baked::CarDrawList
         store.taken.assign(store.count, 0);
     }
     g_pass = Pass{};
-    g_verify = nullptr;
-    g_verifyOrders = nullptr;
 
     uint32_t frame = 0;
     int      eye = 0;
-    if (!stereoEyePass(frame, eye)) {
-        ++t.passesUnkeyed;
-        return;
-    }
+    if (!stereoEyePass(frame, eye)) return;
     if (frame != g_ordinalFrame || eye != g_ordinalEye) {
         g_ordinalFrame = frame;
         g_ordinalEye = eye;
@@ -669,41 +473,21 @@ void carSharePassBegin(bool mirror, bool enabled, std::vector<baked::CarDrawList
         g_mirrorOrdinal = 0;
     }
     int ordinal = mirror ? g_mirrorOrdinal++ : g_mainOrdinal++;
-    if (!enabled || !g_options.bakedCarShare || bakedPassCarsUnshared()) {
-        ++t.passesOff;
-        return;
-    }
-    if (eye < 0 || eye > 1 || (mirror ? ordinal >= kMaxMirrorSlots : ordinal != 0)) {
-        ++t.passesUnkeyed;
-        return;
-    }
+    if (!enabled) return;
+    if (eye < 0 || eye > 1 || (mirror ? ordinal >= kMaxMirrorSlots : ordinal != 0)) return;
     g_pass.frame = frame;
     g_pass.slot = mirror ? 1 + ordinal : 0;
     if (eye == 0) {
         g_pass.recording = true;
-        ++t.passesFirst;
-        if (carShareUnionMargin() <= 0.0f) ++t.unionOff;
         return;
     }
     const Store& store = g_stores[g_pass.slot];
     g_pass.reusing = store.valid && store.frame == frame;
-    if (g_pass.reusing)
-        ++t.passesSecond;
-    else
-        ++t.passesAlone;
 }
 
 ShareOutcome carShareTake(const ShareCall& call, baked::CarDrawList& list) {
     if (!g_pass.reusing) return kShareWalk;
-    Second& t = g_second;
-    ++t.calls;
-    LARGE_INTEGER start, end;
-    QueryPerformanceCounter(&start);
-    ShareOutcome outcome = take(call, list, t);
-    QueryPerformanceCounter(&end);
-    t.replayTicks += end.QuadPart - start.QuadPart;
-    ++t.replays;
-    return outcome;
+    return take(call, list);
 }
 
 ShareTape* carShareTapeBegin(const ShareCall& call, uint32_t slot) {
@@ -756,22 +540,14 @@ void carShareTapeSkip(const ShareCall& call, uint32_t slot) {
     tape.sprites.clear();
     tape.conditions.clear();
     tape.orders.clear();
-    ++g_second.tapes;
-    ++g_second.tapeRefused[kShareProgram];
 }
 
 float carShareUnionMargin() {
-    if (!g_pass.recording || !g_options.bakedCarUnion || bakedPassCarsUnconditioned()) return 0.0f;
+    if (!g_pass.recording) return 0.0f;
     float separation = std::max(g_separationNow[g_pass.slot], g_separationLast[g_pass.slot]);
     if (separation <= 0.0f) return kDefaultUnionMargin;
     return std::min(1.25f * separation + 0.002f, kMaxUnionMargin);
 }
-
-void carShareUnionRedone(UnionRedone reason) {
-    if (reason >= 0 && reason < kUnionRedoneCount) ++g_second.unionRedone[reason];
-}
-
-const std::vector<ShareOrder>* carShareVerifyOrders() { return g_verify ? g_verifyOrders : nullptr; }
 
 void shareSealVertices(ShareTape& tape) {
     std::sort(tape.vertices.begin(), tape.vertices.end());
@@ -787,130 +563,13 @@ bool shareReadsVertex(const ShareTape& tape, uint32_t record) {
 void carShareTapeEnd(ShareTape& tape, ShareRefusal refusal, baked::CarDrawList& list) {
     if (tape.refusal == kShareOk) tape.refusal = refusal;
     shareSealVertices(tape);
-    Second& t = g_second;
-    if (tape.margin > 0.0f) {
-        // The walking eye draws the sides it is on; the list keeps the others for other eyes.
-        if (!tape.conditions.empty()) {
-            list.conditionOn.assign(tape.conditions.size() + 1, 0);
-            list.conditionOn[0] = 1;
-            for (size_t k = 0; k < tape.conditions.size(); ++k)
-                list.conditionOn[k + 1] = tape.conditions[k].holds ? 1 : 0;
-        }
-        ++t.unionWalks;
-        t.marginSum += tape.margin;
-        t.conditions += tape.conditions.size();
-        t.orders += tape.orders.size();
-        t.unionLeaves += list.polygons;
-        for (const baked::CarDraw& draw : list.draws)
-            if (!baked::carDrawOn(list, draw)) t.otherLeaves += draw.polygons;
+    // The walking eye draws the sides it is on; the list keeps the others for other eyes.
+    if (tape.margin > 0.0f && !tape.conditions.empty()) {
+        list.conditionOn.assign(tape.conditions.size() + 1, 0);
+        list.conditionOn[0] = 1;
+        for (size_t k = 0; k < tape.conditions.size(); ++k)
+            list.conditionOn[k + 1] = tape.conditions[k].holds ? 1 : 0;
     }
-    ++t.tapes;
-    if (tape.refusal < kShareRefusalCount) ++t.tapeRefused[tape.refusal];
-    if (tape.refusal != kShareOk) return;
-    t.gates += tape.gates.size();
-    t.boxes += tape.boxes.size();
-    t.selectors += tape.selectors.size();
-    t.frames += tape.frames.size();
-    t.registers += tape.registers.size();
-    t.sprites += tape.sprites.size();
-}
-
-void carShareVerify(const baked::CarDrawList& walked, bool walkedWhole) {
-    Second& t = g_second;
-    const baked::CarDrawList* expected = g_verify;
-    g_verify = nullptr;
-    g_verifyOrders = nullptr;
-    if (!expected) return;
-    if (!walkedWhole) {
-        ++t.verifyFaulted;
-        return;
-    }
-    char why[sizeof(t.firstMismatch)];
-    // A union list holds more than this eye draws: compared by what each draws (CarUnion.h).
-    bool same = expected->conditionOn.empty() ? sameList(*expected, walked, why, sizeof(why))
-                                              : carUnionSameDrawn(*expected, walked, why,
-                                                                  sizeof(why));
-    if (!expected->conditionOn.empty()) ++t.unionVerified;
-    if (same) {
-        ++t.verified;
-        return;
-    }
-    if (!t.mismatched) std::memcpy(t.firstMismatch, why, sizeof(why));
-    ++t.mismatched;
-}
-
-void carShareSecond() {
-    Second& t = g_second;
-    if (t.passesFirst || t.passesSecond || t.passesAlone || t.passesOff) {
-        LARGE_INTEGER frequency;
-        QueryPerformanceFrequency(&frequency);
-        double reWalked = t.reWalked ? static_cast<double>(t.reWalked) : 1.0;
-        double replays = t.replays ? static_cast<double>(t.replays) : 1.0;
-        uint32_t shareable = t.tapeRefused[kShareOk];
-        double   tapes = shareable ? static_cast<double>(shareable) : 1.0;
-        uint32_t notShared = 0;
-        for (uint32_t n : t.refused) notShared += n;
-        logf("baked cars: shared between eyes -- the second eye's first calls %u: REUSED %u, "
-             "re-walked %u (a decision differed: lists with a gate %u, a box %u, a selector %u "
-             "differing; per re-walked list %.2f gates, %.2f boxes, %.2f selectors; lists by "
-             "decisions differing 1: %u, 2-3: %u, 4-7: %u, 8+: %u), verified %u, MISMATCH %u "
-             "(must be 0), verify walks faulted %u; not shared %u: not listed by the first eye "
-             "%u, its walk not shareable %u, pass inputs moved %u, registers moved %u, pose "
-             "moved %u, helmet colour moved %u, GPL's vertex memo holds a vertex %u (scans whose "
-             "slots in the walk's address range were none of its vertices, section 4.43: %u), "
-             "GPL's memo too full to scan %u (%.0f entries a scan), GPL's memo not placed %u, "
-             "frames %u, replay faulted %u; replay %.1f us a call",
-             t.calls, t.reused, t.reWalked, t.differLists[0], t.differLists[1], t.differLists[2],
-             t.differTotal[0] / reWalked, t.differTotal[1] / reWalked,
-             t.differTotal[2] / reWalked, t.differCount[0], t.differCount[1], t.differCount[2],
-             t.differCount[3], t.verified, t.mismatched, t.verifyFaulted, notShared,
-             t.refused[kNotListed], t.refused[kFirstEye], t.refused[kInputs],
-             t.refused[kRegisters], t.refused[kPose], t.refused[kSprite], t.refused[kGplMemo],
-             t.poolNarrowed, t.refused[kPoolFull],
-             t.poolScans ? static_cast<double>(t.poolEntries) / t.poolScans : 0.0,
-             t.refused[kNoPool], t.refused[kFrames], t.refused[kFault],
-             1e6 * static_cast<double>(t.replayTicks) / static_cast<double>(frequency.QuadPart) /
-                 replays);
-        logf("baked cars: shared between eyes, first eye -- %u tapes, %u shareable (not: walk "
-             "faulted %u, list contract %u, GPL's memo before the walk %u, frames %u, refused "
-             "leaves or overflow %u, cell planes %u, drawn from the car's kept list %u); per "
-             "shareable tape %.0f gates, %.1f boxes, "
-             "%.1f selectors, %.1f frames, %.1f register reads, %.1f sprites; passes: first eye "
-             "%u, second eye with the first eye's lists %u, without %u, unkeyed %u, sharing off "
-             "%u (bakedCarShare %d, debug view 16)",
-             t.tapes, shareable, t.tapeRefused[kShareFaulted], t.tapeRefused[kShareContract],
-             t.tapeRefused[kShareGplMemo], t.tapeRefused[kShareFrames],
-             t.tapeRefused[kShareLeaves], t.tapeRefused[kSharePlanes],
-             t.tapeRefused[kShareProgram], t.gates / tapes,
-             t.boxes / tapes, t.selectors / tapes, t.frames / tapes, t.registers / tapes,
-             t.sprites / tapes, t.passesFirst, t.passesSecond, t.passesAlone, t.passesUnkeyed,
-             t.passesOff, g_options.bakedCarShare);
-        if (t.mismatched)
-            logf("baked cars: shared between eyes, first MISMATCH this second -- %s",
-                 t.firstMismatch);
-        double walks = t.unionWalks ? static_cast<double>(t.unionWalks) : 1.0;
-        double taken = t.takenConditioned ? static_cast<double>(t.takenConditioned) : 1.0;
-        logf("baked cars: eye-independent lists -- first eye: %u union walks, margin %.3f m (eye "
-             "separation measured %.4f m), per list %.1f conditions, %.1f order nodes, %.1f of "
-             "%.1f leaves only another eye draws (%.1f%%); walked again deciding every gate: "
-             "memo %u, registers %u, conditions full %u; first-eye passes with the union off %u "
-             "(bakedCarUnion %d, debug view 17); second eye: %u lists taken with conditions, "
-             "%.1f of %.1f draws a list not its own; order nodes whose plane passed between the "
-             "eyes with both sides drawn %u (both blended %u): there the second eye keeps the "
-             "first eye's order; union lists verified %u (MISMATCH above)",
-             t.unionWalks, t.marginSum / walks, t.separationMax, t.conditions / walks,
-             t.orders / walks, t.otherLeaves / walks, t.unionLeaves / walks,
-             t.unionLeaves ? 100.0 * static_cast<double>(t.otherLeaves) / t.unionLeaves : 0.0,
-             t.unionRedone[kUnionMemo], t.unionRedone[kUnionRegister],
-             t.unionRedone[kUnionConditions], t.unionOff, g_options.bakedCarUnion,
-             t.takenConditioned, t.takenOff / taken, t.takenDraws / taken, t.ordersFlipped,
-             t.ordersFlippedBlended, t.unionVerified);
-    }
-    for (int slot = 0; slot < kSlots; ++slot) {
-        g_separationLast[slot] = g_separationNow[slot];
-        g_separationNow[slot] = 0.0f;
-    }
-    g_second = Second{};
 }
 
 }  // namespace gplvr

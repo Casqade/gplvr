@@ -1,7 +1,7 @@
 #pragma once
 
 // GPL's own draw of the cockpit while gplvr draws it over the eye image (report 105 section 4.50,
-// lever B of cockpit step 3, `bakedCockpitSkipGpl`). In step 2 (section 4.49) the node filter
+// lever B of cockpit step 3). In step 2 (section 4.49) the node filter
 // hands GPL no leaf of the cockpit, yet gpl_carRecordDraw still walks its control graph on every
 // call (~1.6 an eye), ~72 us each. What that walk leaves behind for later readers (IDA, comment
 // at 0x486E9C): the pose again, which gplvr's hook has already run for the record; and the
@@ -14,14 +14,14 @@
 // runs GPL's draw and compares the file it leaves with the file a skip would have left (the file
 // before, with the image written over it): the first call after the cockpit or the car set
 // changed, one call in kCheckEvery, and every call for a while after a check that differed, drew
-// anything or overflowed the image. Every refusal and every check outcome is counted.
+// anything or overflowed the image. The first check of each kind that failed is logged.
 
 #include <cstdint>
 
 namespace gplvr {
 
 enum CockpitGplDraw : int {
-    kCockpitGplRun,    // GPL's draw runs as in step 2 (counted by why)
+    kCockpitGplRun,    // GPL's draw runs as in step 2
     kCockpitGplSkip,   // skipped: the image's registers were written into the file
     kCockpitGplCheck,  // GPL's draw runs as a check: cockpitGplDrawChecked after it
 };
@@ -34,8 +34,5 @@ int cockpitGplDrawAsk(uintptr_t handle, uint32_t generation, uintptr_t registers
 // counter moved by (all three 0 in step 2).
 void cockpitGplDrawChecked(uintptr_t registers, uint32_t passed, uint32_t lines,
                            uint32_t polygons);
-
-// Once a second, from CarWalk's report: the `baked cars: GPL's cockpit draw skipped` line.
-void cockpitGplDrawSecond();
 
 }  // namespace gplvr

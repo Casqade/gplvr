@@ -43,26 +43,18 @@ int redirectImports(HMODULE module, const ImportRedirect* hooks, int count);
 // Installs the hooks once. Logs what it did; refuses when any hooked byte is not stock.
 void residualInstall();
 
-// How GPL's blob shadows are tested over the baked track (report 105 section 4.8): by GPL's walk
-// order at their car's place, as the walk-order phase tests its own content; by depth with the
-// margin, as everything else; or not at all (debug views 9 and 10).
-enum ResidualShadowTest : int {
-    kShadowUntested = 0,
-    kShadowByWalkOrder = 1,
-    kShadowByDepth = 2,
-};
-
 // The composited pass just drawn: its depth texture, its rect in the bound framebuffer's
 // window pixels, the near plane and the depth convention. The next roglv2 flush -- the one that
 // paints what GPL submitted during this pass -- is tested against it. `orderTexture` is the
-// pass's solid order (Renderer::orderTexture), for the shadows' walk-order test.
+// pass's solid order (Renderer::orderTexture): GPL's blob shadows are tested by GPL's walk order
+// at their car's place against it (report 105 section 4.8), and by depth with the margin, as
+// everything else, without it.
 struct ResidualPass {
     unsigned depthTexture = 0;
     unsigned orderTexture = 0;
     int      rect[4] = {0, 0, 0, 0};
     float    nearPlane = 0.125f;
     bool     reversedZ = true;
-    int      shadowTest = kShadowByWalkOrder;
 };
 void residualArm(const ResidualPass& pass);
 
@@ -70,18 +62,6 @@ void residualArm(const ResidualPass& pass);
 // glClear-bracketed flush may not come -- so a later flush of another pass is not tested against
 // this pass's depth and rectangle. True when there was one.
 bool residualDisarm();
-
-// roglv2 flushes seen so far (each opens with its glClear of depth), never reset; 0 while the
-// hooks are not installed. A caller compares two readings to learn whether a call flushed.
-unsigned residualFlushCount();
-
-// roglv2 flushes since the last baked pass drew (its residualArm), or -1 before the first one:
-// 0 means the next flush is GPL's first draw after a baked pass.
-int residualFlushesSinceBakedPass();
-
-// The polygons roglv2's z-buffer drawer holds for its next flush (its submission count since the
-// last one), or -1 when the numbering was not verified or the current drawer is another one.
-int residualQueuedPolygons();
 
 // Brackets the baked main walk, so a flush inside it is counted: whatever roglv2 paints then
 // lands under the baked image, which the composite draws over it.
@@ -91,14 +71,8 @@ void residualWalkEnd();
 // Around one call of GPL's that draws a car's blob shadow, inside the baked walk: the polygons it
 // submits to roglv2 are recorded by their submission numbers, with `slot` -- where GPL's walk was
 // at the call (Renderer::visible's size) -- and the flush tests them by that place instead of by
-// depth. `gplPolygons` is what GPL's own counter moved by over the call: an upper bound for the
-// log, since the counter also counts polygons the clipper drops.
-// Outside a baked walk both do nothing.
+// depth. Outside a baked walk both do nothing.
 void residualShadowBegin();
-void residualShadowEnd(unsigned slot, unsigned gplPolygons);
-
-// One line for the once-a-second report, `passes` main passes in the window. False when
-// nothing is installed.
-bool residualFormat(char* out, unsigned size, unsigned passes);
+void residualShadowEnd(unsigned slot);
 
 }  // namespace gplvr

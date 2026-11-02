@@ -21,6 +21,11 @@
 // record, the listener slot and the copy -- is read and written on the sim thread alone, the
 // thread GPL itself writes them on.
 //
+// The copy rides the car's body, turned by GPL's look left/right, before the head goes on top.
+// GPL's view also carries its driver's head lagging and tipping against the body over bumps and
+// kerbs, and swaying with the player's dynamics; the picture keeps that, but in the sound it
+// swings the car's own engine, almost straight below the ear, from side to side.
+//
 // Pan only, as GPL computes it: front and back are folded together and height is ignored, so a
 // turned head moves sounds between the ears and nothing sounds behind or above.
 //

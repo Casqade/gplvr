@@ -52,101 +52,10 @@ struct CarLighting {
     float diffuse = 0.3f;    // kd
 };
 
-// One pass, for the host's once-a-second report.
-struct CarPassStats {
-    bool     prepared = false;
-    bool     drawn = false;
-    bool     hidden = false;  // debug view kDebugWithoutCars
-    uint32_t lists = 0;
-    uint32_t listDraws = 0;    // CarDraws over all lists that this pass's eye draws
-    // Draws of eye-independent lists left out because their condition does not hold for this
-    // pass's eye (report 105 section 4.22), and of them, conditions past the list's table.
-    uint32_t conditionedOff = 0;
-    uint32_t badCondition = 0;
-    uint32_t commands = 0;     // indirect commands issued per phase: must equal listDraws
-    uint32_t multiDraws = 0;   // glMultiDrawElementsIndirect calls: the cores, then one per translucent run
-    uint32_t cars = 0;         // cars with draws
-    uint32_t checkerDraws = 0;  // passes drawn with the UV checker (debug view 8)
-    // Phase 1 in the walk-order phase: runs prepared (one per car with draws), runs the track
-    // renderer drew, runs it placed after all its own walk-order content, and the sums of the
-    // runs' slots and of the pass's visible counts, for the mean place in the walk.
-    uint32_t walkRuns = 0;
-    uint32_t walkRunsDrawn = 0;
-    uint32_t walkRunsAtEnd = 0;
-    uint64_t walkSlotSum = 0;
-    uint64_t walkVisibleSum = 0;
-    uint32_t frames = 0;
-    // Lists whose dispatch frame was found to be world space, so the poses alone place the car;
-    // and lists placed through GPL's own model-view instead (Renderer.h ViewInputs).
-    uint32_t worldLists = 0;
-    uint32_t composedLists = 0;
-    uint32_t lightDisagrees = 0;  // a list's light direction differs from the pass's
-    // Refused or degraded, by reason.
-    uint32_t emptyLists = 0;         // no draws: nothing of the car survived GPL's decisions
-    uint32_t badObject = 0;          // a draw naming an object that is not uploaded
-    uint32_t badFrame = 0;           // a draw naming a frame its list does not have
-    uint32_t badMaterial = 0;        // a draw naming a material its list does not have
-    uint32_t withoutTexture = 0;     // a textured draw whose texture has no handle (drawn flat)
-    uint32_t badSprite = 0;          // a sprite run whose .srb texture has no handle (dropped)
-    uint32_t tableFull = 0;          // draws past the buffer textures' size (dropped)
-    uint32_t dynamicVertices = 0;    // skinned corners uploaded this pass (CarDrawList dynamic)
-    uint32_t dynamicDraws = 0;       // draws of skinned leaves
-    float    maxRotationError = 0.0f;     // |eyeFromRoot rotation - I|, largest this pass
-    float    maxTranslationError = 0.0f;  // |eyeFromRoot translation + eye|, metres
-    double   prepareMicroseconds = 0.0;
-    double   uploadMicroseconds = 0.0;  // of prepare: the geometry, frames, rows and commands to GL
-    double   drawMicroseconds = 0.0;
-    // Kept lists (CarDrawList::contentKey, report 105 sections 4.26, 4.29): those in the pass,
-    // those whose rows and commands came from the cache, those built into it, and those it could
-    // not serve (a refused draw, no room); of the cached, those built again to check, and checks
-    // that differed. `badOrder`: a drawOrder index past its list's draws (not drawn).
-    // `ordersReused`: cached lists whose drawOrder's rows came as emitted for an earlier list
-    // (section 4.29.1).
-    uint32_t badOrder = 0;
-    uint32_t ordersReused = 0;
-    uint32_t keyedLists = 0;
-    uint32_t cachedLists = 0;
-    uint32_t cacheStored = 0;
-    uint32_t cacheRefused = 0;
-    uint32_t cacheChecked = 0;
-    uint32_t cacheMismatched = 0;
-    // Kept lists that came without their draws (CarDrawList::drawsElided, report 105 section
-    // 4.27), and of them those whose pinned rows were gone or found no room: drawn nothing.
-    uint32_t elidedLists = 0;
-    uint32_t elidedLost = 0;
-    // The flagmen (CarDrawList::flagman; report 105 section 4.13), also counted in the totals
-    // above: their lists and commands, their walk-order runs prepared and drawn, the palette rows
-    // uploaded, sprites of theirs drawn with the colormap their own .srb carries, and sprites
-    // refused because their texture kept palette indices and the list has no palette (a car's).
-    uint32_t flagmanLists = 0;
-    uint32_t flagmanCommands = 0;
-    uint32_t flagmanRuns = 0;
-    uint32_t flagmanRunsDrawn = 0;
-    uint32_t paletteRows = 0;
-    uint32_t flagmanOwnColours = 0;
-    uint32_t indexedWithoutPalette = 0;
-};
-
-// Report 105 section 4.49: an overlay list (CarDrawList::overlay) as prepare made it and
-// drawOverlay drew it. Its leaves are drawn + empty + conditionedOff + refused == listPolygons.
-struct CarOverlayStats {
-    uint32_t lists = 0;
-    uint32_t commands = 0;
-    uint32_t polygons = 0;        // leaves its commands draw
-    uint32_t glass = 0;           // of them under CarMaterial::liveMirror
-    uint32_t empty = 0;           // leaves without geometry: counted, nothing to draw
-    uint32_t conditionedOff = 0;  // leaves of draws the pass's eye does not draw
-    uint32_t refused = 0;         // leaves of draws prepare refused (a bad row, past the table)
-    uint32_t listPolygons = 0;    // the lists' leaves
-    bool     copied = false;      // the live mirror texture copied for the glass
-    double   microseconds = 0.0;
-};
-
 // What drawOverlay did.
 enum CarOverlayOutcome : int {
     kOverlayDrawn,
     kOverlayNone,        // no overlay list was prepared this pass
-    kOverlayHidden,      // debug view 7 hides the cars, the overlay with them
     kOverlayNotReady,    // drawSolid never ran for the pass: its cars were not drawn
     kOverlayNoCommands,  // every draw of the overlay was refused or off for this eye
 };
@@ -156,17 +65,6 @@ enum LiveMirrorRefusal : int {
     kLiveMirrorReady,
     kLiveMirrorNoSize,  // GL reports no size or format for the texture
     kLiveMirrorNoCopy,  // the copy texture, its framebuffers or its bindless handle failed
-};
-
-// Since the last takeTotals.
-struct CarUploadTotals {
-    uint32_t objects = 0;
-    uint32_t textures = 0;
-    uint32_t textureFailures = 0;  // no GL name or no bindless handle
-    uint32_t rebuilds = 0;         // the geometry buffers grown, everything uploaded again
-    size_t   vertexBytes = 0;      // all uploaded geometry so far (not reset)
-    size_t   textureBytes = 0;     // all uploaded texture levels so far (not reset)
-    double   milliseconds = 0.0;
 };
 
 class CarRenderer : public SolidHook {
@@ -201,9 +99,8 @@ public:
     uint32_t walkOrderSlot(uint32_t run) const override;
     void     drawWalkOrderRun(uint32_t run, uint32_t position,
                               const SolidHookContext& context) override;
-    // After the pass: what it did. A prepared pass the renderer never called back for is
-    // reported with `drawn` false. An overlay the pass prepared is kept for drawOverlay.
-    CarPassStats finishPass();
+    // After the pass: forgets its commands. An overlay the pass prepared is kept for drawOverlay.
+    void finishPass();
 
     // Report 105 section 4.49. Before prepare: the GL texture the glass of an overlay list samples
     // (CarMaterial::liveMirror), and whether its t is flipped as roglv2 flips mirror.mip's. It is
@@ -214,19 +111,14 @@ public:
     bool overlayPrepared() const { return overlayLists_ != 0; }
     // The overlay lists of the prepared pass, once the rest of the pass is on screen: into the
     // draw framebuffer `framebuffer` at `rect` (GL window pixels), in list order, depth test off,
-    // blended as roglv2 blends, with the pass's uniforms. Consumes the overlay.
-    int drawOverlay(GLuint framebuffer, const int rect[4], CarOverlayStats& stats);
+    // blended as roglv2 blends, with the pass's uniforms. Consumes the overlay. A CarOverlayOutcome.
+    int drawOverlay(GLuint framebuffer, const int rect[4]);
     // Forgets an overlay no drawOverlay took.
     void discardOverlay();
-
-    CarUploadTotals takeTotals();
 
     // The first prepared list's dispatch check, once per session: GPL's model-view and
     // projection at the car's dispatch against the pass's own view. Empty after it was taken.
     std::string takeFrameCheck();
-
-    // Kept lists' rows and commands held now (CachedList).
-    uint32_t cachedListCount() const { return static_cast<uint32_t>(cache_.size()); }
 
     // Whether the cache holds the rows of a kept list with this key and frame count; if so they
     // are pinned for the next prepare and `draws` is their count, so the list may come without its
@@ -262,7 +154,9 @@ private:
     const GpuTexture* texture(const CarScene& scene, int32_t index);
     void uploadTexture(const Texture& texture, GpuTexture& out);
     void ensureDrawIndices(uint32_t count);
-    void checkFrame(const CarDrawList& list, const ViewInputs& view, const float eyeFromRoot[12]);
+    // `world`: the dispatch frame was found to be world space, so the poses alone place the car.
+    void checkFrame(const CarDrawList& list, const ViewInputs& view, const float eyeFromRoot[12],
+                    bool world);
 
     // The rows and commands of one drawOrder, in its order and with its ranks, relative as
     // CachedList's but with base instances from 0 (report 105 section 4.29.1).
@@ -271,7 +165,6 @@ private:
         std::vector<uint32_t> words;
         std::vector<Command>  commands;
         std::vector<uint32_t> dynamic;  // the commands of skinned draws
-        uint32_t              withoutTexture = 0;
         uint32_t              lastUsed = 0;  // prepares_
     };
     // As CarProgram's order memos (report 105 section 4.36).
@@ -285,7 +178,7 @@ private:
         std::vector<CarDraw>  draws;     // the program's, for the runs (carDrawContinues)
         std::vector<uint32_t> words;     // a row a draw
         std::vector<Command>  commands;  // a command a draw
-        std::vector<uint8_t>  kinds;     // a draw's kCachedDynamic | kCachedWithoutTexture
+        std::vector<uint8_t>  kinds;     // a draw's kCachedDynamic
         uint32_t frames = 0;             // the list's frame count
         // prepares_ of the last prepare that used it, or of the next one when pinned; at or above
         // prepares_ it is in use and is not evicted.
@@ -293,13 +186,12 @@ private:
         Emitted  emitted[kEmittedOrders];
     };
     static constexpr uint8_t kCachedDynamic = 1;
-    static constexpr uint8_t kCachedWithoutTexture = 2;
     // One draw's row (`words`, the frame word relative to its list) and its command, relative as
-    // CachedList's: false, counted in `stats`, when it is refused. `dynamic`: a skinned draw;
-    // `palette`: its average word is to name its list's palette row (a flagman's indexed sprite).
+    // CachedList's: false when it is refused (a missing object, frame, material or sprite
+    // texture). `dynamic`: a skinned draw; `palette`: its average word is to name its list's
+    // palette row (a flagman's indexed sprite).
     bool drawRow(const CarScene& scene, const CarDrawList& list, const CarDraw& draw,
-                 uint32_t rank, CarPassStats& stats, uint32_t* words, Command& command,
-                 bool& dynamic, bool& palette);
+                 uint32_t rank, uint32_t* words, Command& command, bool& dynamic, bool& palette);
     bool buildCached(const CarScene& scene, const CarDrawList& list, CachedList& out);
     // `list`'s drawOrder from `cached`: the draws it names, with their runs' ranks.
     void emitOrder(const CachedList& cached, const CarDrawList& list, Emitted& out);
@@ -341,8 +233,6 @@ private:
     GLint  uOffsetStep_ = -1;
     GLint  uPhase_ = -1;
     GLint  uDepthBias_ = -1;
-    GLint  uUvView_ = -1;
-    GLint  uChecker_ = -1;
     GLint  uSolidOrder_ = -1;
     GLint  uSolidDepth_ = -1;
     GLint  uOrderTest_ = -1;
@@ -371,9 +261,9 @@ private:
     size_t                  verticesUsed_ = 0;
     size_t                  indicesUsed_ = 0;
     std::vector<GpuTexture> textures_;
-    CarUploadTotals         totals_;
 
     // The prepared pass.
+    bool prepared_ = false;
     std::vector<const CarDrawList*> passLists_;  // the cars', then the flagmen's
     std::vector<float>    frames_;    // 16 floats a frame: three rows, then the half vector
     // 8 words a draw, then the flagmen's palettes, 16 words (four texels) each.
@@ -392,19 +282,17 @@ private:
     std::vector<CarRange> carRanges_;
     // carRanges_ by slot, far to near among equal slots: the walk-order runs.
     std::vector<CarRange> walkRuns_;
-    // drawSolid ran this pass, so the walk-order runs may be drawn (in debug view 7 too, where
-    // only the flagmen's are left).
+    // drawSolid ran this pass, so the walk-order runs may be drawn.
     bool runsReady_ = false;
     // Report 105 section 4.49: the overlay lists' commands, after every other list's in commands_
     // (phase 0 and the walk-order runs leave them out); drawSolid set the program's uniforms for
-    // them (`overlayReady_`) or hid them (debug view 7); the checker texture of debug view 8.
-    uint32_t        overlayLists_ = 0;
-    uint32_t        overlayFirst_ = 0;
-    uint32_t        overlayCount_ = 0;
-    bool            overlayReady_ = false;
-    bool            overlayHidden_ = false;
-    GLuint          overlayChecker_ = 0;
-    CarOverlayStats overlay_;
+    // them (`overlayReady_`); `overlayGlass_`: one of them draws the glass (CarMaterial::
+    // liveMirror), so drawOverlay copies the live mirror texture first.
+    uint32_t overlayLists_ = 0;
+    uint32_t overlayFirst_ = 0;
+    uint32_t overlayCount_ = 0;
+    bool     overlayReady_ = false;
+    bool     overlayGlass_ = false;
     // The live mirror texture and the renderer's copy of it, with its bindless handle and the
     // read and draw framebuffers of the copy.
     GLuint   mirrorSource_ = 0;
@@ -421,7 +309,6 @@ private:
     CarLighting           lighting_;
     bool                  framesChecked_ = false;
     std::string           frameCheck_;
-    CarPassStats          pass_;
 
     // By contentKey (a kept program).
     std::unordered_map<uint32_t, CachedList> cache_;

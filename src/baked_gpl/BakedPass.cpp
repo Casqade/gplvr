@@ -2,10 +2,10 @@
 
 #include "baked_gpl/BakedMirror.h"
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarProgram.h"
 #include "baked_gpl/CarWalk.h"
 #include "baked_gpl/Flagmen.h"
 #include "baked_gpl/ResidualDepth.h"
-#include "baked_gpl/UvOverlay.h"
 #include "baked_gpl/TrackBake.h"
 
 #include "DataRebase.h"
@@ -13,7 +13,6 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
-#include "Paths.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
@@ -23,8 +22,6 @@
 #include "baked/Scene.h"
 
 #include <windows.h>
-
-#include <intrin.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -66,9 +63,10 @@ constexpr HookedType kHookedTypes[] = {
     {0x20, 0x004CEFA0},  // POLY_TC
 };
 
-// Hooked only to count what GPL still draws while the baked renderer is on (report 67b): the lit
-// polygon types, which the bake does not make items of yet. Each is installed only if the table
-// still holds the stock handler; a missing one costs a counter, never the renderer.
+// The lit polygon types, which the bake does not make items of: hooked so the filter sees every
+// leaf of the cockpit's draw (bakedCockpitGlassOnly), and otherwise handed to GPL. Each is
+// installed only if the table still holds the stock handler; a missing one keeps the cockpit
+// GPL's (bakedFilterSeesEveryLeaf), never the renderer.
 constexpr HookedType kCountedTypes[] = {
     {0x1D, 0x004CEE60},  // POLY_FN
     {0x1E, 0x004CEEC0},  // POLY_FCN
@@ -114,10 +112,6 @@ constexpr uint64_t kUploadAddressFloor = 256ull << 20;
 // the start grid and the s/f line, up to 38.5 mm under their road, which a lift would slide half
 // a metre at 10 m. Everything else, the groove first, is lifted onto its road (report 64's hybrid).
 constexpr uint32_t kBiasSurfaceClasses = 1u << 10;
-// The racing groove (TrackBake.cpp, kDecalSurfaceClasses), blended twice when
-// bakedGrooveLayers = 2 (report 68's top update: vanilla measured as twice at one spot, once at
-// two others).
-constexpr uint32_t kGrooveSurfaceClasses = 1u << 20;
 
 struct Addresses {
     uintptr_t nodeTable = 0;
@@ -136,67 +130,9 @@ struct Addresses {
     uintptr_t diffuse = 0;
 };
 
-// Stage 2b, once a second: what the car renderer did in the baked passes.
-struct CarSecond {
-    unsigned passes = 0;      // passes with lists prepared
-    unsigned notDrawn = 0;    // prepared, and the renderer never called back: cars missing
-    unsigned hidden = 0;      // debug view 7
-    uint64_t lists = 0;
-    uint64_t listDraws = 0;
-    uint64_t commands = 0;    // per phase, summed over the drawn passes
-    uint64_t cars = 0;        // cars with draws
-    uint64_t multiDraws = 0;  // one for the cores and one per translucent run, a pass
-    unsigned checkerPasses = 0;  // drawn with the UV checker (debug view 8)
-    // The cars' translucent runs in the track's walk-order phase (CarPassStats).
-    uint64_t walkRuns = 0;
-    uint64_t walkRunsDrawn = 0;
-    uint64_t walkRunsAtEnd = 0;
-    uint64_t walkSlotSum = 0;
-    uint64_t walkVisibleSum = 0;
-    uint64_t drawnListDraws = 0;  // list draws of those passes, the contract's other side
-    uint64_t frames = 0;
-    unsigned worldLists = 0;
-    unsigned composedLists = 0;
-    unsigned lightDisagrees = 0;
-    unsigned emptyLists = 0;
-    unsigned badObject = 0;
-    unsigned badFrame = 0;
-    unsigned badMaterial = 0;
-    unsigned withoutTexture = 0;
-    unsigned badSprite = 0;
-    unsigned tableFull = 0;
-    uint64_t dynamicVertices = 0;
-    uint64_t dynamicDraws = 0;
-    uint64_t conditionedOff = 0;  // draws of eye-independent lists this eye does not draw
-    unsigned badCondition = 0;
-    // The flagmen's lists in the same passes (CarPassStats), drawn or hidden by view 7 alike.
-    uint64_t flagmanLists = 0;
-    uint64_t flagmanCommands = 0;
-    uint64_t flagmanRuns = 0;
-    uint64_t flagmanRunsDrawn = 0;
-    uint64_t paletteRows = 0;
-    unsigned flagmanOwnColours = 0;
-    unsigned indexedWithoutPalette = 0;
-    float    maxRotationError = 0.0f;
-    float    maxTranslationError = 0.0f;
-    double   prepareMicroseconds = 0.0;
-    double   uploadMicroseconds = 0.0;
-    double   drawMicroseconds = 0.0;
-    // The kept lists' prepare cache (CarPassStats, report 105 section 4.26).
-    uint64_t keyedLists = 0;
-    uint64_t cachedLists = 0;
-    uint64_t cacheStored = 0;
-    uint64_t cacheRefused = 0;
-    unsigned cacheChecked = 0;
-    unsigned cacheMismatched = 0;
-    uint64_t elidedLists = 0;  // report 105 section 4.27
-    unsigned elidedLost = 0;
-    unsigned badOrder = 0;      // report 105 section 4.29
-    uint64_t ordersReused = 0;  // section 4.29.1
-};
-
 // Why a main pass that listed an overlay did not draw it (report 105 section 4.49): the cockpit
-// is missing from that eye, since GPL's draw of it handed GPL no leaf.
+// is missing from that eye, since GPL's draw of it handed GPL no leaf. Each is logged the first
+// time it happens.
 enum OverlayLost : int {
     kLostNotDrawn,    // the pass's cars were not drawn (no camera, no scene, drawSolid never ran)
     kLostNoCommands,  // every draw of the overlay was refused or off for this eye
@@ -204,31 +140,18 @@ enum OverlayLost : int {
     kLostKinds
 };
 
-// Report 105 section 4.49, once a second: the cockpit drawn over the eye image.
-struct OverlaySecond {
-    unsigned asked = 0;                       // bakedCockpitOverlayReady calls
-    unsigned refused[kOverlayRefusals] = {};  // of them refused: step 1 instead
-    unsigned listed = 0;      // main passes whose car lists held an overlay list
-    unsigned drawn = 0;
-    unsigned hidden = 0;      // debug view 7
-    unsigned lost[kLostKinds] = {};
-    unsigned flushed = 0;        // walk ends whose flush painted GPL's queued polygons
-    unsigned armsUnflushed = 0;  // residual arms no flush took (nothing GPL drew was queued)
-    unsigned framebufferMoved = 0;  // another draw framebuffer bound at the walk's end
-    unsigned copied = 0;      // drawn overlays with glass whose mirror.mip copy was made
-    unsigned copyFailed = 0;  // and those whose copy failed: the glass showed the last copy
-    uint64_t commands = 0;
-    uint64_t polygons = 0;
-    uint64_t glass = 0;
-    uint64_t empty = 0;
-    uint64_t conditionedOff = 0;
-    uint64_t refusedPolygons = 0;
-    uint64_t listPolygons = 0;
-    double   microseconds = 0.0;
+// Why a pass that wanted the renderer was left to GPL. Each is logged the first time it happens;
+// the upload's own lines say when it starts, finishes or stops.
+enum PassRefusal : int {
+    kRefusedNoScene,   // no baked scene for this track yet
+    kRefusedRenderer,  // the renderer is not up in this context
+    kRefusedRect,      // the camera's surface has no rectangle
+    kPassRefusals
 };
 
 struct State {
     bool      bound = false;
+    bool      bindTried = false;
     Addresses at;
     void**    bitmapWidthSlot = nullptr;
     void**    bitmapHeightSlot = nullptr;
@@ -252,93 +175,32 @@ struct State {
     bool            rendererFailed = false;
     bool            ready = false;
 
-    // Stage 2b (bakedCars = 3): the cars' renderer, drawn inside the track's pass.
+    // The cars' renderer, drawn inside the track's pass.
     baked::CarRenderer cars;
     bool               carsBound = false;   // the lighting addresses placed
     bool               carsFailed = false;  // it could not start: GPL draws the cars
-    CarSecond          carSecond;
     // Report 105 section 4.49: a main pass whose car lists held an overlay list, waiting for the
     // walk's end (bakedPassMainWalkDone), with the draw framebuffer and rect it was composited into.
     bool               overlayPending = false;
     baked::GLint       overlayFramebuffer = 0;
     int                overlayRect[4] = {0, 0, 0, 0};
-    OverlaySecond      overlaySecond;
-
-    bool drawEnabled = true;
-    bool keyLast = false;
-
-    // bakedDebugKey: which part of the baked draw is shown (baked::DebugView).
-    int  debugView = baked::kDebugNone;
-    bool debugKeyLast = false;
-
-    // bakedCaptureKey: 0 idle, 1 the next frame is GPL's own, 2 the next frame is baked. The
-    // views of the frame's main passes are kept until the frame ends.
-    int              capture = 0;
-    bool             captureKeyLast = false;
-    BakedCaptureView captureViews[2];
-    int              captureCount = 0;
 
     // The rectangles drawn from the bake this frame, for bakedMarkFrameEnd.
     int markRects[2][4] = {};
     int markCount = 0;
-
-    // The capture probe (bakedProbeWrite): the items GPL dispatched in the vanilla frame, in its
-    // order; the baked frame's visible items, and its per-pixel order numbers (Renderer::
-    // readProbe).
-    std::vector<uint32_t> probeVanilla;
-    bool                  probeVanillaReady = false;
-    std::vector<uint32_t> probeBaked;
-    std::vector<uint32_t> probeSolid;
-    std::vector<uint32_t> probeWalk;
-    int                   probeWidth = 0;
-    int                   probeHeight = 0;
-    bool                  probeBakedReady = false;
-
-    // Debug view 15: the baked items GPL dispatched in its own mirror walk (BakedMirror.h).
-    std::vector<uint32_t> mirrorObserved;
-
-    // A capture's mirror rectangles (bakedCaptureMirrorRect): the pass open now, its rect, and
-    // the passes of this half so far.
-    bool        mirrorCaptureOpen = false;
-    int         mirrorCaptureRect[4] = {0, 0, 0, 0};
-    const char* mirrorCaptureHalf = "";
-    unsigned    mirrorCapturePass = 0;
 
     // The pass being collected. The frame inputs are read before the walk: the car draws inside
     // it rewrite gpl_lodScreenScale and material registers (report 44).
     int                rect[4] = {0, 0, 0, 0};
     baked::FrameInputs frame;
 
-    // Once a second while drawing.
-    LARGE_INTEGER windowStart = {};
-    unsigned      passes = 0;
-    unsigned      fogPasses = 0;
-    uint64_t      visible = 0;
-    uint64_t      ranges = 0;
-    uint64_t      draws = 0;
-    uint64_t      overlayRanges = 0;
-    uint64_t      overlayLevels = 0;
-    uint64_t      decalRanges = 0;
-    uint64_t      spriteRanges = 0;
-    uint64_t      orderedRanges = 0;
-    uint64_t      orderedDraws = 0;
-    uint64_t      orderedMicroseconds = 0;
-    uint64_t      orderedBatchBinds = 0;
-    uint64_t      orderedTextureBinds = 0;
-    uint64_t      orderedProgramSwitches = 0;
-    uint64_t      orderedUniformCalls = 0;
-    uint64_t      evaluateMicroseconds = 0;
-    uint64_t      solidMicroseconds = 0;
-    uint64_t      compositeMicroseconds = 0;
-    int64_t       drawTicks = 0;
-    uint64_t      repeatDispatches = 0;
-    // Passes the baked drawing was wanted for and could not do, by reason: no scene yet, the
-    // renderer not up, the upload still running, the upload stopped for this scene, no rectangle.
-    unsigned refusedNoScene = 0;
-    unsigned refusedRenderer = 0;
-    unsigned refusedUpload = 0;
-    unsigned refusedStopped = 0;
-    unsigned refusedRect = 0;
+    // The refusals already logged once (PassRefusal, BakedOverlayRefusal, OverlayLost).
+    bool passRefusalSaid[kPassRefusals] = {};
+    bool overlayRefusalSaid[kOverlayRefusals] = {};
+    bool overlayLostSaid[kLostKinds] = {};
+    bool listsLostSaid = false;
+    // The live bakedRenderer the last pass saw, so a switch is logged once.
+    int  modeSeen = -1;
     // The scene generation (trackBakeSceneGeneration) whose upload was stopped, 0 for none: its
     // GPU copy is released and GPL draws that track until another scene lands.
     uint32_t stoppedGeneration = 0;
@@ -348,9 +210,6 @@ State g_state;
 
 // The filter's inputs, as plain globals: it runs for every hooked node GPL dispatches.
 volatile unsigned char g_collecting = 0;
-// The probe's vanilla half: the filter appends every item GPL dispatches and lets GPL draw it.
-volatile unsigned char g_observing = 0;
-std::vector<uint32_t>* g_observed = nullptr;
 uintptr_t              g_primBegin = 0;
 uintptr_t              g_primEnd = 0;
 const baked::Scene*    g_filterScene = nullptr;
@@ -358,15 +217,6 @@ baked::Renderer*       g_filterRenderer = nullptr;
 const volatile uint8_t* g_sortGroupReverse = nullptr;
 void*                  g_stockHandlers[256] = {};
 bool                   g_itemTypes[256] = {};  // node types that can be baked items
-// Node dispatches the filter handed to GPL's stock handler during a baked main walk, by node
-// type: [0] nodes inside the track's PRIM (refused items, or no item at all), [1] nodes outside
-// it (the object files of refused instances, cars, flagmen, debris -- anything drawn from
-// another object or from memory GPL built); [2] both kinds during a baked mirror walk.
-uint32_t               g_stockCalls[3][256] = {};
-// Debug view 6 (baked::kDebugWithoutGpl): the filter skips every dispatch it would hand to GPL,
-// except while the car hook draws the cockpit (bakedCockpitDraw).
-volatile unsigned char g_withoutGpl = 0;
-volatile unsigned char g_cockpitDraw = 0;
 // Report 105 section 4.48: while set, GPL's draw of the cockpit keeps only these leaves, its
 // mirror glass (bakedCockpitGlassOnly); and what the filter passed and dropped meanwhile.
 const uintptr_t*       g_glassOnly = nullptr;
@@ -376,23 +226,10 @@ uint32_t               g_glassDropped = 0;
 uint32_t               g_glassLines = 0;
 // Set by installFilter when the lit polygon types are hooked too.
 bool                   g_everyLeafHooked = false;
-// Stage 2b: set with g_collecting when the car renderer will draw this pass's car lists.
+// Set with g_collecting when the car renderer will draw this pass's car lists.
 volatile unsigned char g_carsReady = 0;
 // Set with g_collecting when the pass is a mirror pass (bakedPassBeginMirror).
 volatile unsigned char g_mirrorPass = 0;
-// Set with g_observing when the observation is debug view 15's of a mirror walk, not the probe's.
-bool                   g_observingMirror = false;
-// Report 105 section 4.44: the filter's calls, and the TSC ticks of one in kFilterSampleEvery, by
-// where they ran (BakedTimeKind).
-constexpr uint32_t     kFilterSampleEvery = 16;
-uint32_t               g_filterSample = 0;
-uint64_t               g_filterCalls[kBakedTimeKinds] = {};
-uint64_t               g_filterSampledTicks[kBakedTimeKinds] = {};
-// Report 105 section 4.46: each baked pass's walk window, beginPass to endPass, in
-// QueryPerformanceCounter ticks, main and mirror.
-int64_t                g_windowStart = 0;
-int64_t                g_windowTicks[2] = {};
-uint32_t               g_windowPasses[2] = {};
 
 bool readable(const void* address, size_t bytes) {
     MEMORY_BASIC_INFORMATION info = {};
@@ -486,10 +323,9 @@ bool installFilter(State& s) {
             std::snprintf(counted + used, sizeof(counted) - used, " %02X", hooked.type));
     }
     g_everyLeafHooked = countedHooked == sizeof(kCountedTypes) / sizeof(kCountedTypes[0]);
-    logf("baked: counting only (never baked, always drawn by GPL):%s",
-         used ? counted : " none -- the entries were not stock");
+    logf("baked: lit polygon types seen by the filter (never baked, always drawn by GPL):%s",
+         used ? counted : " none -- the entries were not stock, so GPL draws the cockpit");
     residualInstall();
-    uvOverlayInstall();
     return true;
 }
 
@@ -646,9 +482,7 @@ bool ensureRenderer(State& s) {
             s.rendererFailed = true;
             return false;
         }
-        s.renderer.setMergedDraws(g_options.bakedMergedDraws != 0);
-        s.renderer.setKeepLargerTarget(g_options.bakedMirrors != 0);
-        if (g_options.bakedCars == 3 && s.carsBound && !s.carsFailed && !s.cars.initialised()) {
+        if (s.carsBound && !s.carsFailed && !s.cars.initialised()) {
             if (!s.cars.init(s.gl, error)) {
                 logf("baked cars: the car renderer could not start (%s) -- GPL draws the cars",
                      error.c_str());
@@ -824,251 +658,26 @@ void spriteFacing(bool& verticalFacesEye, bool& screenFacesEye) {
     screenFacesEye = readable(screen, 5) && std::memcmp(screen, kScreenStock, 5) != 0;
 }
 
-void recordCaptureView(State& s, const SceneParams* params) {
-    if (s.captureCount >= 2) return;
-    BakedCaptureView& view = s.captureViews[s.captureCount++];
-    std::memcpy(view.rect, s.rect, sizeof(view.rect));
-    view.eye[0] = params->eyeX;
-    view.eye[1] = params->eyeY;
-    view.eye[2] = params->eyeZ;
-    // Camera to world: its first column is the camera's forward axis.
-    view.forward[0] = params->orientation[0];
-    view.forward[1] = params->orientation[3];
-    view.forward[2] = params->orientation[6];
-    view.dlong = readValue<float>(s.at.dlong);
-    view.dlat = readValue<float>(s.at.dlat);
+// A refusal of a pass that wanted the renderer, logged the first time each reason occurs.
+void sayRefusal(State& s, PassRefusal why) {
+    if (s.passRefusalSaid[why]) return;
+    s.passRefusalSaid[why] = true;
+    static const char* const kWhy[kPassRefusals] = {
+        "no baked scene for this track yet (the bake is running, or failed: see above)",
+        "the renderer is not up in this GL context",
+        "the camera's surface has no rectangle"};
+    logf("baked: a pass left to GPL (first time) -- %s", kWhy[why]);
 }
 
-void reportSecond(State& s) {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!s.windowStart.QuadPart) s.windowStart = now;
-    LARGE_INTEGER frequency;
-    QueryPerformanceFrequency(&frequency);
-    int64_t elapsed = now.QuadPart - s.windowStart.QuadPart;
-    if (elapsed < frequency.QuadPart) return;
-    double seconds = static_cast<double>(elapsed) / frequency.QuadPart;
-    if (s.passes) {
-        double passes = s.passes;
-        logf("baked: passes %.1f/s (%u with fog), items visible %.0f per pass (of %zu), ranges "
-             "%.0f, draws %.0f, decal ranges %.0f, overlay ranges %.0f in %.1f levels (%s), "
-             "sprite ranges %.0f, walk-order ranges %.0f in %.0f draws (%.3f ms), repeat "
-             "dispatches %.1f, draw cpu %.2f ms per pass, %s depth",
-             passes / seconds, s.fogPasses, s.visible / passes,
-             trackBakeScene() ? trackBakeScene()->items.size() : 0u, s.ranges / passes,
-             s.draws / passes,
-             s.decalRanges / passes, s.overlayRanges / passes, s.overlayLevels / passes,
-             s.debugView == baked::kDebugOverlaysUnlayered
-                 ? "debug view 11: one colour run for all, depth after"
-                 : "each level's depth, then its colour",
-             s.spriteRanges / passes,
-             s.orderedRanges / passes, s.orderedDraws / passes,
-             s.orderedMicroseconds / 1000.0 / passes, s.repeatDispatches / passes,
-             1000.0 * static_cast<double>(s.drawTicks) / frequency.QuadPart / passes,
-             s.renderer.reversedZ() ? "reversed-Z" : "24-bit");
-        double drawCpu = 1000.0 * static_cast<double>(s.drawTicks) / frequency.QuadPart / passes;
-        double evaluate = s.evaluateMicroseconds / 1000.0 / passes;
-        double solid = s.solidMicroseconds / 1000.0 / passes;
-        double ordered = s.orderedMicroseconds / 1000.0 / passes;
-        double composite = s.compositeMicroseconds / 1000.0 / passes;
-        logf("baked: cpu per pass %.3f ms (%s) = evaluate %.3f + solid %.3f + walk-order %.3f "
-             "(%s) + composite %.3f + rest %.3f | walk-order phase per pass: %.0f draws, %.0f "
-             "batch changes, %.0f texture binds, %.0f program switches, %.0f uniform calls",
-             drawCpu, s.renderer.mergedDraws() ? "merged draws" : "batch by batch", evaluate,
-             solid, ordered,
-             s.debugView == baked::kDebugWalkOrderNoDraws ? "NO draw calls, state made (view 4)"
-             : s.debugView == baked::kDebugWalkOrderNoGl  ? "NO GL calls at all (view 5)"
-             : s.debugView == baked::kDebugWithoutWalkOrder ? "phase skipped (view 2)"
-                                                            : "all GL calls",
-             composite, drawCpu - evaluate - solid - ordered - composite,
-             s.orderedDraws / passes, s.orderedBatchBinds / passes,
-             s.orderedTextureBinds / passes, s.orderedProgramSwitches / passes,
-             s.orderedUniformCalls / passes);
-        baked::GpuPassTimes gpu;
-        if (s.renderer.takeGpuTimes(gpu)) {
-            if (gpu.passes) {
-                double timed = gpu.passes;
-                logf("baked: gpu per pass %.3f ms = copy in + solid %.3f + walk-order %.3f "
-                     "(order test %s) + copy out %.3f, over %u timed passes (%u untimed, their "
-                     "queries still in flight)",
-                     (gpu.solidMs + gpu.orderedMs + gpu.copyOutMs) / timed, gpu.solidMs / timed,
-                     gpu.orderedMs / timed,
-                     s.debugView == baked::kDebugWalkOrderByDepth ? "OFF, depth alone (view 3)"
-                     : s.debugView == baked::kDebugWalkOrderOverAll ? "OFF, no test (view 1)"
-                     : s.debugView == baked::kDebugWithoutWalkOrder ? "phase skipped (view 2)"
-                     : s.debugView == baked::kDebugWalkOrderNoDraws ? "no draws (view 4)"
-                     : s.debugView == baked::kDebugWalkOrderNoGl    ? "no GL calls (view 5)"
-                                                                     : "on",
-                     gpu.copyOutMs / timed, gpu.passes, gpu.untimed);
-                bakedLogGpuSpans("baked", gpu);
-            } else {
-                logf("baked: gpu -- no timed pass came back this second (%u untimed)",
-                     gpu.untimed);
-            }
-        }
-        // Their counters run in the mirror passes too (bakedMirrors = 1), so "per pass" is per
-        // baked pass, main and mirror.
-        unsigned bakedPasses = s.passes + bakedMirrorPasses();
-        char     residual[1000];
-        if (residualFormat(residual, sizeof(residual), bakedPasses)) logf("baked: %s", residual);
-        char flagmen[1024];
-        if (flagmenFormat(flagmen, sizeof(flagmen), bakedPasses))
-            logf("baked flagmen: %s", flagmen);
-        char overlay[256];
-        if (uvOverlayFormat(overlay, sizeof(overlay)))
-            logf("baked: %s; the baked cars drew with it in %u passes", overlay,
-                 s.carSecond.checkerPasses);
-        // What GPL itself still drew during those walks, per pass: it lands on top of the baked
-        // image, tested only by the residual-depth program (report 67c).
-        char text[2][512];
-        for (int where = 0; where < 2; ++where) {
-            size_t used = 0;
-            text[where][0] = '\0';
-            for (int type = 0; type < 256; ++type) {
-                uint32_t calls = g_stockCalls[where][type];
-                if (!calls || used + 24 >= sizeof(text[where])) continue;
-                used += static_cast<size_t>(std::snprintf(text[where] + used,
-                                                          sizeof(text[where]) - used, " %02X x %.1f",
-                                                          type, calls / passes));
-            }
-        }
-        logf("baked: GPL drew during the walk, per pass, node type x count -- inside the track "
-             "PRIM:%s; outside it (the objects of refused instances, cars, flagmen, debris):%s",
-             text[0][0] ? text[0] : " nothing", text[1][0] ? text[1] : " nothing");
-    }
-    const CarSecond& c = s.carSecond;
-    if (c.passes) {
-        baked::CarUploadTotals up = s.cars.takeTotals();
-        double passes = c.passes;
-        logf("baked: cars %.1f lists a pass over %u passes (%u NOT drawn, %u hidden by view 7), "
-             "%.1f draws a list; commands issued %llu == list draws %llu of the drawn passes "
-             "(contract), %.1f cars a pass in %.1f multi-draws; "
-             "cpu per pass prepare %.3f ms + draw %.3f ms; "
-             "placed by the poses alone %u lists, through GPL's model-view %u (largest error "
-             "rotation %.5f, translation %.4f m), light disagreeing %u; refused: empty lists %u, "
-             "draws naming a missing object %u / frame %u / material %u, sprites without a "
-             "texture %u, past the table %u; textured draws drawn flat (texture missing) %u; "
-             "uploads this second %u objects, %u textures (%u failed), %u buffer rebuilds in "
-             "%.1f ms; on the GPU %.1f MiB geometry, %.1f MiB textures; skinned: %.1f draws "
-             "and %.1f vertices streamed a pass; draws of eye-independent lists left out for "
-             "this eye %.1f a pass (of them naming a condition the list lacks %u, must be 0)",
-             c.lists / passes, c.passes, c.notDrawn, c.hidden,
-             c.lists ? static_cast<double>(c.listDraws) / c.lists : 0.0,
-             static_cast<unsigned long long>(c.commands),
-             static_cast<unsigned long long>(c.drawnListDraws),
-             static_cast<double>(c.cars) / passes, static_cast<double>(c.multiDraws) / passes,
-             c.prepareMicroseconds / 1000.0 / passes,
-             c.drawMicroseconds / 1000.0 / passes, c.worldLists, c.composedLists,
-             c.maxRotationError, c.maxTranslationError, c.lightDisagrees, c.emptyLists,
-             c.badObject, c.badFrame, c.badMaterial, c.badSprite, c.tableFull, c.withoutTexture,
-             up.objects, up.textures, up.textureFailures, up.rebuilds, up.milliseconds,
-             up.vertexBytes / 1048576.0, up.textureBytes / 1048576.0,
-             static_cast<double>(c.dynamicDraws) / passes,
-             static_cast<double>(c.dynamicVertices) / passes,
-             static_cast<double>(c.conditionedOff) / passes, c.badCondition);
-        logf("baked: cars' translucent runs in the walk-order phase -- %llu drawn of %llu "
-             "(contract: equal), %llu after all of the track's walk-order content; mean place in "
-             "the walk %.2f of the visible list",
-             static_cast<unsigned long long>(c.walkRunsDrawn),
-             static_cast<unsigned long long>(c.walkRuns),
-             static_cast<unsigned long long>(c.walkRunsAtEnd),
-             c.walkVisibleSum ? static_cast<double>(c.walkSlotSum) / c.walkVisibleSum : 0.0);
-        logf("baked: cars' prepare cache (report 105 sections 4.26, 4.29: a program's rows, every "
-             "draw, the eye's draws by index) -- kept lists %.1f a pass: rows from the cache %.1f "
-             "(of them built into it this pass %.1f; their draw order as emitted before %.1f, "
-             "section 4.29.1), built as before %.1f (no room or a refused draw); came without "
-             "their draws %.1f (section 4.27), of them with their rows gone, drawn nothing %u (must "
-             "be 0); draw indices past the program %u (must be 0); checked against a fresh build "
-             "%u, MISMATCH %u (must be 0); programs held %u; prepare %.3f ms a pass = sent to GL "
-             "%.3f + the rest %.3f",
-             static_cast<double>(c.keyedLists) / passes,
-             static_cast<double>(c.cachedLists) / passes,
-             static_cast<double>(c.cacheStored) / passes,
-             static_cast<double>(c.ordersReused) / passes,
-             static_cast<double>(c.cacheRefused) / passes,
-             static_cast<double>(c.elidedLists) / passes, c.elidedLost, c.badOrder, c.cacheChecked,
-             c.cacheMismatched, s.cars.cachedListCount(), c.prepareMicroseconds / 1000.0 / passes,
-             c.uploadMicroseconds / 1000.0 / passes,
-             (c.prepareMicroseconds - c.uploadMicroseconds) / 1000.0 / passes);
-        if (c.flagmanLists || c.indexedWithoutPalette)
-            logf("baked: flagmen drawn -- %.2f lists a pass, %llu commands, walk-order runs %llu "
-                 "drawn of %llu (contract: equal; in view 7 too); %.2f palette rows a pass; "
-                 "sprites with a colormap of their own %u; refused: car sprites of palette "
-                 "indices without a palette %u",
-                 static_cast<double>(c.flagmanLists) / passes,
-                 static_cast<unsigned long long>(c.flagmanCommands),
-                 static_cast<unsigned long long>(c.flagmanRunsDrawn),
-                 static_cast<unsigned long long>(c.flagmanRuns),
-                 static_cast<double>(c.paletteRows) / passes, c.flagmanOwnColours,
-                 c.indexedWithoutPalette);
-    }
-    s.carSecond = CarSecond{};
-    const OverlaySecond& v = s.overlaySecond;
-    if (v.asked || v.listed) {
-        unsigned refused = 0;
-        for (unsigned n : v.refused) refused += n;
-        logf("baked: the cockpit over the eye image (report 105 section 4.49) -- asked %u, step 1 "
-             "instead %u: not a baked main pass with the car renderer %u, mirror.mip's handle "
-             "reaches no GL texture %u, the mip there lacks mirror.mip's t flip %u, GL gives it no "
-             "size %u, no copy of it %u; overlays listed %u: drawn %u (%.0f us each), hidden by "
-             "view 7 %u, NOT drawn, the cockpit missing: pass not drawn %u, every draw refused %u, "
-             "no walk end %u; GPL's queued polygons flushed first %u, arms no flush took %u, "
-             "framebuffer moved %u; mirror.mip copied %u, copy failed %u; commands %llu; leaves "
-             "drawn %llu (glass %llu) + without geometry %llu + off for this eye %llu + refused "
-             "%llu = %llu of the lists' %llu (contract: equal, refused 0)",
-             v.asked, refused, v.refused[kOverlayNoRenderer], v.refused[kOverlayNoMip],
-             v.refused[kOverlayNotFlipped], v.refused[kOverlayNoSize], v.refused[kOverlayNoCopy],
-             v.listed, v.drawn, v.drawn ? v.microseconds / v.drawn : 0.0, v.hidden,
-             v.lost[kLostNotDrawn], v.lost[kLostNoCommands], v.lost[kLostNoWalkEnd], v.flushed,
-             v.armsUnflushed, v.framebufferMoved, v.copied, v.copyFailed,
-             static_cast<unsigned long long>(v.commands),
-             static_cast<unsigned long long>(v.polygons), static_cast<unsigned long long>(v.glass),
-             static_cast<unsigned long long>(v.empty),
-             static_cast<unsigned long long>(v.conditionedOff),
-             static_cast<unsigned long long>(v.refusedPolygons),
-             static_cast<unsigned long long>(v.polygons + v.empty + v.conditionedOff +
-                                             v.refusedPolygons),
-             static_cast<unsigned long long>(v.listPolygons));
-    }
-    s.overlaySecond = OverlaySecond{};
-    if (s.refusedNoScene || s.refusedRenderer || s.refusedUpload || s.refusedStopped ||
-        s.refusedRect)
-        logf("baked: passes not baked in %.1f s -- no scene yet %u, renderer not up %u, upload "
-             "running %u, upload stopped %u, no rectangle %u%s",
-             seconds, s.refusedNoScene, s.refusedRenderer, s.refusedUpload, s.refusedStopped,
-             s.refusedRect, s.drawEnabled ? "" : " (drawing is toggled off)");
-    if (g_options.bakedMirrors) {
-        unsigned mirrorPasses = bakedMirrorPasses();
-        char     text[512];
-        size_t   used = 0;
-        text[0] = '\0';
-        for (int type = 0; type < 256 && mirrorPasses; ++type) {
-            uint32_t calls = g_stockCalls[2][type];
-            if (!calls || used + 24 >= sizeof(text)) continue;
-            used += static_cast<size_t>(std::snprintf(text + used, sizeof(text) - used,
-                                                      " %02X x %.1f", type,
-                                                      static_cast<double>(calls) / mirrorPasses));
-        }
-        if (mirrorPasses)
-            logf("baked mirrors: GPL drew during the baked mirror walks, per pass, node type x "
-                 "count:%s",
-                 text[0] ? text : " nothing");
-        baked::GpuPassTimes mirrorGpu;
-        bool mirrorTimed = s.renderer.takeGpuTimes(mirrorGpu, baked::kPassMirror);
-        bakedMirrorReport(seconds, mirrorTimed ? &mirrorGpu : nullptr);
-    }
-    std::memset(g_stockCalls, 0, sizeof(g_stockCalls));
-    s.windowStart = now;
-    s.passes = s.fogPasses = 0;
-    s.visible = s.ranges = s.draws = 0;
-    s.overlayRanges = s.overlayLevels = s.decalRanges = s.spriteRanges = 0;
-    s.orderedRanges = s.orderedDraws = s.orderedMicroseconds = 0;
-    s.orderedBatchBinds = s.orderedTextureBinds = s.orderedProgramSwitches = 0;
-    s.orderedUniformCalls = 0;
-    s.evaluateMicroseconds = s.solidMicroseconds = s.compositeMicroseconds = 0;
-    s.repeatDispatches = 0;
-    s.drawTicks = 0;
-    s.refusedNoScene = s.refusedRenderer = s.refusedUpload = s.refusedStopped = s.refusedRect = 0;
+void sayOverlayLost(State& s, OverlayLost why) {
+    if (s.overlayLostSaid[why]) return;
+    s.overlayLostSaid[why] = true;
+    static const char* const kWhy[kLostKinds] = {
+        "the pass's cars were not drawn", "every draw of it was refused or off for this eye",
+        "the next pass began before the walk's end drew it"};
+    logf("baked: the cockpit over the eye image NOT drawn, the cockpit missing from that eye "
+         "(first time) -- %s",
+         kWhy[why]);
 }
 
 // Ends the scene's upload for good: its GPU copy goes, and the context is forgotten so the next
@@ -1085,13 +694,15 @@ void stopUpload(State& s, const char* why) {
 
 }  // namespace
 
-void bakedPassBind(const Binding& binding) {
-    State& s = g_state;
-    if (s.bound || g_options.bakedRenderer == 0) return;
-    s.bitmapWidthSlot = binding.raster.bitmapWidth;
-    s.bitmapHeightSlot = binding.raster.bitmapHeight;
-    s.backBufferSlot = binding.raster.screenGetBackBuffer;
+namespace {
 
+// The game's addresses placed, then the car, flagman and mirror hooks. At bind when the ini asks
+// for the renderer; else at the first pass that wants it (the VR menu switched it on), on the
+// render thread before GPL's walk -- the code the hooks patch is GPL's drawing and frame latch,
+// which that thread runs and is not inside then. Once; a refusal leaves every later pass to GPL.
+void bindNow(State& s) {
+    if (s.bindTried) return;
+    s.bindTried = true;
     Addresses& at = s.at;
     at.nodeTable = rebase(kNodeTable);
     at.classVisible = rebase(kClassVisibleMask);
@@ -1113,15 +724,15 @@ void bakedPassBind(const Binding& binding) {
          s.bound ? "bound" : "NOT bound, nothing will be drawn from the bake",
          static_cast<unsigned>(at.nodeTable), static_cast<unsigned>(kNodeTable),
          placed ? "placed" : "NOT placed (rebase refused one)", raster ? "found" : "MISSING");
-    if (s.bound && g_options.bakedCars == 3) {
+    if (s.bound) {
         at.lightingOn = rebase(kLightingOn);
         at.specularOn = rebase(kSpecularOn);
         at.ambient = rebase(kAmbient);
         at.diffuse = rebase(kDiffuse);
         s.carsBound = at.lightingOn && at.specularOn && at.ambient && at.diffuse;
         if (!s.carsBound)
-            logf("baked cars: stage 2b NOT on -- rebase refused one of the lighting addresses "
-                 "(%s); GPL draws the cars",
+            logf("baked cars: NOT on -- rebase refused one of the lighting addresses (%s); GPL "
+                 "draws the cars",
                  rebaseSummary());
     }
     if (s.bound) {
@@ -1131,33 +742,58 @@ void bakedPassBind(const Binding& binding) {
     }
 }
 
+}  // namespace
+
+void bakedPassBind(const Binding& binding) {
+    State& s = g_state;
+    s.bitmapWidthSlot = binding.raster.bitmapWidth;
+    s.bitmapHeightSlot = binding.raster.bitmapHeight;
+    s.backBufferSlot = binding.raster.screenGetBackBuffer;
+    if (g_options.bakedRenderer != 0) bindNow(s);
+}
+
 namespace {
 
+// The live bakedRenderer (the VR menu switches it between frames), and a switch logged. Back on
+// after passes GPL drew alone, the kept car programs are dropped: no pass followed the cars
+// meanwhile, so each is built again from its first call rather than trusted to a replay.
+int liveMode(State& s) {
+    int mode = g_options.bakedRenderer;
+    if (mode != s.modeSeen) {
+        if (s.modeSeen >= 0)
+            logf("baked: renderer now %s", mode == 0   ? "GPL's own (vanilla)"
+                                           : mode == 1 ? "gplvr's"
+                                                       : "gplvr's, its rectangles marked red");
+        if (s.modeSeen == 0 && mode != 0) carProgramDropAll();
+        s.modeSeen = mode;
+    }
+    return mode;
+}
+
 // A main pass (from p[2]) or, with `mirror`, a mirror pass (from p[43]; report 105 section 4.18).
-// The two differ only in their camera, their eye, the refusals they count, and that the capture,
-// the probe and the GPU upload belong to the main passes. The mirror's frame inputs -- registers,
-// masks, LOD scale, selector camera -- are GPL's globals as gpl_sceneRender set them for the
-// mirror before its walk, read here as the main pass reads its own.
+// The two differ only in their camera, their eye, the refusals they log, and that the GPU upload
+// belongs to the main passes. The mirror's frame inputs -- registers, masks, LOD scale, selector
+// camera -- are GPL's globals as gpl_sceneRender set them for the mirror before its walk, read here
+// as the main pass reads its own.
 bool beginPass(State& s, SceneParams* params, bool mirror) {
-    // A main pass refused here counts in its own counter (or in none, as before); a mirror pass by
-    // its reason.
-    auto refuse = [mirror](unsigned* mainCount, MirrorRefusal why) {
+    // A main pass refused here is logged by its own reason (or not at all, as before); a mirror
+    // pass by the mirror's.
+    auto refuse = [&s, mirror](int mainReason, MirrorRefusal why) {
         if (mirror)
             bakedMirrorRefused(why);
-        else if (mainCount)
-            ++*mainCount;
+        else if (mainReason >= 0)
+            sayRefusal(s, static_cast<PassRefusal>(mainReason));
         return false;
     };
     // An overlay the last main pass's walk end never drew (report 105 section 4.49).
     if (s.overlayPending) {
         s.overlayPending = false;
-        ++s.overlaySecond.lost[kLostNoWalkEnd];
+        sayOverlayLost(s, kLostNoWalkEnd);
         s.cars.discardOverlay();
     }
     void* camera = mirror ? params->mirrorCamera : params->camera;
-    if (!camera) return refuse(nullptr, kMirrorNoCamera);
-    if (!installFilter(s)) return refuse(nullptr, kMirrorNoFilter);
-    reportSecond(s);
+    if (!camera) return refuse(-1, kMirrorNoCamera);
+    if (!installFilter(s)) return refuse(-1, kMirrorNoFilter);
     // Before any walk of this pass: the car bake drops itself when GPL has released or reused
     // anything it was made from (report 105 section 4.20).
     carBakePassBegin();
@@ -1172,15 +808,17 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         logf("baked: the track's scene was dropped (GPL loaded a track again) -- its GPU copy is "
              "released");
     }
-    if (!s.drawEnabled) return refuse(nullptr, kMirrorDrawingOff);
+    // bakedRenderer 0, from the ini or the VR menu: GPL draws this pass, and everything above
+    // keeps the bake's own state in step with GPL's for when it comes back on.
+    if (liveMode(s) == 0) return refuse(-1, kMirrorDrawingOff);
 
     const baked::Scene* scene = trackBakeScene();
     const unsigned char* prim = nullptr;
     unsigned             primSize = 0;
-    if (!scene || !trackBakePrim(prim, primSize)) return refuse(&s.refusedNoScene, kMirrorNoScene);
+    if (!scene || !trackBakePrim(prim, primSize)) return refuse(kRefusedNoScene, kMirrorNoScene);
     if (s.stoppedGeneration && s.stoppedGeneration == trackBakeSceneGeneration())
-        return refuse(&s.refusedStopped, kMirrorUploadStopped);
-    if (!ensureRenderer(s)) return refuse(&s.refusedRenderer, kMirrorRendererDown);
+        return refuse(-1, kMirrorUploadStopped);
+    if (!ensureRenderer(s)) return refuse(kRefusedRenderer, kMirrorRendererDown);
     uint32_t generation = trackBakeSceneGeneration();
     if (scene != s.scene || generation != s.sceneGeneration) {
         // A new track: the GPU copy of the old one goes before anything of the new one is drawn.
@@ -1189,14 +827,12 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         s.sceneGeneration = generation;
         s.ready = false;
         s.context = nullptr;
-        if (!ensureRenderer(s)) return refuse(&s.refusedRenderer, kMirrorRendererDown);
+        if (!ensureRenderer(s)) return refuse(kRefusedRenderer, kMirrorRendererDown);
     }
-    // Debug view 8 on GPL's own draws too, the vanilla half of a capture included.
-    uvOverlaySet(s.renderer.uvCheckerTexture(), s.debugView == baked::kDebugUvChecker);
 
     // The upload is paced by the main passes alone, so its per-pass budget and its log are as
     // they were without mirrors.
-    if (mirror && !s.ready) return refuse(nullptr, kMirrorUploading);
+    if (mirror && !s.ready) return refuse(-1, kMirrorUploading);
     if (!s.ready) {
         if (!s.renderer.uploadedGeometryBytes()) {
             bool                 found = false;
@@ -1204,8 +840,6 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
             s.renderer.setTextureFilter(filter);
             s.cars.setTextureFilter(filter, s.renderer.anisotropy());
             s.renderer.setBiasClasses(kBiasSurfaceClasses);
-            s.renderer.setTwoLayerClasses(
-                g_options.bakedGrooveLayers == 2 ? kGrooveSurfaceClasses : 0u);
             logf("baked: texture filter %s -- trilinear %s, anisotropy %d (driver gives %d)",
                  found ? "from roglv2's RasterV2 settings" : "roglv2's defaults (settings not found)",
                  filter.trilinear ? "on" : "off", filter.anisotropy, s.renderer.anisotropy());
@@ -1222,16 +856,11 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
                           freeBytes / 1048576.0, kUploadAddressFloor / 1048576.0,
                           s.renderer.uploadedTextureBytes() / 1048576.0);
             stopUpload(s, why);
-            ++s.refusedStopped;
             return false;
         }
         if (!s.renderer.upload(*scene, kUploadBytesPerPass)) {
-            if (s.renderer.uploadFailed()) {
+            if (s.renderer.uploadFailed())
                 stopUpload(s, "a texture could not be read again (the line above)");
-                ++s.refusedStopped;
-                return false;
-            }
-            ++s.refusedUpload;
             return false;
         }
         logf("baked: GPU upload done -- %.0f MiB of address space free",
@@ -1241,10 +870,8 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         bool screenFacesEye = false;
         spriteFacing(verticalFacesEye, screenFacesEye);
         s.renderer.setSpriteFacing(verticalFacesEye, screenFacesEye);
-        logf("baked: drawing -- %s ('%c' toggles); sprites turned as GPL's drawers are in this "
-             "process: vertical-axis ones face %s, screen-aligned ones %s",
-             s.drawEnabled ? "ON" : "OFF",
-             g_options.bakedRendererKey ? static_cast<char>(g_options.bakedRendererKey) : '-',
+        logf("baked: drawing; sprites turned as GPL's drawers are in this process: vertical-axis "
+             "ones face %s, screen-aligned ones %s",
              verticalFacesEye ? "the eye" : "the view plane (stock)",
              screenFacesEye ? "the eye" : "the view plane (stock)");
     }
@@ -1252,63 +879,17 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
     // The mirror is drawn into a rectangle of a framebuffer only on the copy-out path: p[85] bit 0
     // is what gpl_sceneRender tests before bitmapDraw copies that rectangle into mirror.mip
     // (0x487C31). Without it GPL renders into the mip's own bitmap, which has no place in GL.
-    if (mirror && !(params->mirrorFlags & 1u)) return refuse(nullptr, kMirrorDirectPath);
+    if (mirror && !(params->mirrorFlags & 1u)) return refuse(-1, kMirrorDirectPath);
 
     // The camera's surface: a bitmap instance of the frame, the mirror's at (0, 0) of it (gpl_
     // simFrameRender's mirror camera, and Stereo.cpp's pane cameras alike).
     void* surface = nullptr;
     std::memcpy(&surface, camera, sizeof(surface));
-    if (!surfaceRect(s, surface, s.rect)) return refuse(&s.refusedRect, kMirrorNoRect);
-
-    if (mirror) {
-        if (s.capture) {
-            s.mirrorCaptureOpen = true;
-            std::memcpy(s.mirrorCaptureRect, s.rect, sizeof(s.rect));
-            s.mirrorCaptureHalf = s.capture == 1 ? "vanilla" : "baked";
-            // The rectangle before and after the background GPL has just submitted (0x4878D4)
-            // reaches it, in both halves, so GPL's own background can be set beside the baked
-            // pass's. The baked half's flush below then finds nothing queued.
-            bakedCaptureMirrorRect(s.rect, s.mirrorCaptureHalf, s.mirrorCapturePass, "0-pre");
-            rasterFlushPending();
-            bakedCaptureMirrorRect(s.rect, s.mirrorCaptureHalf, s.mirrorCapturePass, "0-bg");
-        }
-        // The vanilla half of a capture is GPL's in its mirrors too.
-        if (s.capture == 1) return refuse(nullptr, kMirrorCapture);
-        // Debug view 15: GPL draws the mirror, and the filter notes the baked items it
-        // dispatches.
-        if (s.debugView == baked::kDebugMirrorsByGpl) {
-            s.mirrorObserved.clear();
-            g_filterScene = scene;
-            g_primBegin = reinterpret_cast<uintptr_t>(prim);
-            g_primEnd = g_primBegin + primSize;
-            g_observed = &s.mirrorObserved;
-            g_observingMirror = true;
-            g_observing = 1;
-            return refuse(nullptr, kMirrorByGpl);
-        }
-    }
-
-    // The first half of a capture: GPL draws this frame alone, from the same kind of pass, and
-    // the filter only notes the items GPL dispatches, in its order (the probe's vanilla half).
-    if (s.capture && !mirror) recordCaptureView(s, params);
-    if (s.capture == 1 && !mirror) {
-        if (!s.probeVanillaReady) {
-            s.probeVanilla.clear();
-            g_filterScene = scene;
-            g_primBegin = reinterpret_cast<uintptr_t>(prim);
-            g_primEnd = g_primBegin + primSize;
-            g_observed = &s.probeVanilla;
-            g_observing = 1;
-        }
-        return false;
-    }
+    if (!surfaceRect(s, surface, s.rect)) return refuse(kRefusedRect, kMirrorNoRect);
 
     // Flush roglv2's open batch, so the horizon gpl_objDrawRootNode has just submitted is in the
     // colour buffer before the baked scene is composited over it.
-    unsigned flushesBefore = residualFlushCount();
     rasterFlushPending();
-    if (mirror)
-        bakedMirrorBackgroundFlush(flushesBefore != 0, residualFlushCount() != flushesBefore);
     readFrameInputs(s.at, s.frame);
 
     g_filterScene = scene;
@@ -1321,43 +902,17 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
     // lists (report 105 section 4.54).
     carWalkPassBegin(mirror, mirror ? stereoMirrorPaneOf(camera) : -1);
     flagmenPassBegin();
-    bool cars = g_options.bakedCars == 3 && s.cars.initialised();
+    bool cars = s.cars.initialised();
     s.renderer.setSolidHook(cars ? &s.cars : nullptr);
     g_carsReady = cars ? 1 : 0;
     g_mirrorPass = mirror ? 1 : 0;
     g_collecting = 1;
     residualWalkBegin();
-    LARGE_INTEGER windowStart;
-    QueryPerformanceCounter(&windowStart);
-    g_windowStart = windowStart.QuadPart;
     return true;
 }
 
-// The pass beginPass opened, if it opened one: its draw, the residual test of GPL's flush, and the
-// per-second sums -- a mirror pass's into BakedMirror.cpp's, so the main pass lines stay the main
-// passes'.
+// The pass beginPass opened, if it opened one: its draw and the residual test of GPL's flush.
 void endPass(State& s, SceneParams* params, bool mirror) {
-    if (g_collecting) {
-        LARGE_INTEGER windowEnd;
-        QueryPerformanceCounter(&windowEnd);
-        int kind = g_mirrorPass ? 1 : 0;
-        g_windowTicks[kind] += windowEnd.QuadPart - g_windowStart;
-        ++g_windowPasses[kind];
-    }
-    if (g_observing) {
-        g_observing = 0;
-        if (g_observingMirror) {
-            // As the baked pass counts them: only items the bake keeps.
-            g_observingMirror = false;
-            size_t kept = 0;
-            for (uint32_t item : s.mirrorObserved)
-                if (item < g_filterScene->items.size() && g_filterScene->items[item].enabled)
-                    ++kept;
-            bakedMirrorObserved(kept);
-        } else {
-            s.probeVanillaReady = true;
-        }
-    }
     bool collected = g_collecting != 0;
     bool cars = g_carsReady != 0;
     g_collecting = 0;
@@ -1374,25 +929,19 @@ void endPass(State& s, SceneParams* params, bool mirror) {
     bool overlayListed = false;
     for (uint32_t l = 0; l < carListCount && !mirror; ++l)
         overlayListed = overlayListed || carLists[l].overlay;
-    if (overlayListed) ++s.overlaySecond.listed;
     void* cameraObject = !params ? nullptr : mirror ? params->mirrorCamera : params->camera;
     if (!cameraObject || !s.scene) {
-        if (overlayListed) ++s.overlaySecond.lost[kLostNotDrawn];
+        if (overlayListed) sayOverlayLost(s, kLostNotDrawn);
         // GPL skipped the bodies of these cars and these flagmen in the walk, and they will not
         // be drawn.
-        if (mirror) {
-            BakedMirrorPass lost;
-            lost.hadLists = listCount != 0;
-            lost.cars.listDraws = listCount;
-            bakedMirrorAccount(lost);
-        } else if (listCount) {
-            ++s.carSecond.notDrawn;
+        if (listCount && !s.listsLostSaid) {
+            s.listsLostSaid = true;
+            logf("baked: a %s pass ended with no camera or scene -- its %u car and flagman lists "
+                 "were NOT drawn (first time)",
+                 mirror ? "mirror" : "main", listCount);
         }
         return;
     }
-
-    LARGE_INTEGER start;
-    QueryPerformanceCounter(&start);
 
     // The mirror's eye and basis are what gpl_sceneRender hands gpl_setViewTransform for its walk
     // (p+0xB0, and the eulers of p+0x104: 0x4878C9); the main pass's p[3..5] and p[24..32].
@@ -1412,11 +961,6 @@ void endPass(State& s, SceneParams* params, bool mirror) {
     if (!(view.nearPlane > 0.0f)) view.nearPlane = 0.125f;
 
     readFog(s.gl, s.frame.fog);
-    s.renderer.setDebug(static_cast<baked::DebugView>(s.debugView));
-    s.renderer.setPassClass(mirror ? baked::kPassMirror : baked::kPassMain);
-    // The probe's baked half: the second frame of a capture, its first main pass.
-    bool probe = !mirror && s.capture == 2 && !s.probeBakedReady;
-    s.renderer.setProbe(probe);
     if (listCount) {
         baked::CarLighting lighting;
         lighting.on = readValue<uint8_t>(s.at.lightingOn) != 0;
@@ -1432,115 +976,24 @@ void endPass(State& s, SceneParams* params, bool mirror) {
                  lighting.on ? "on" : "OFF", lighting.specular ? "on" : "off", lighting.ambient,
                  lighting.diffuse, check.c_str());
     }
-    // A capture's baked mirror: the rectangle the composite copies in, and what it copies back.
-    bool mirrorCapture = mirror && s.mirrorCaptureOpen;
-    if (mirrorCapture)
-        bakedCaptureMirrorRect(s.rect, s.mirrorCaptureHalf, s.mirrorCapturePass, "1-in");
-    baked::DrawStats stats;
-    bool             drawn = s.renderer.drawComposited(*s.scene, view, s.frame, s.rect, stats);
-    if (mirrorCapture)
-        bakedCaptureMirrorRect(s.rect, s.mirrorCaptureHalf, s.mirrorCapturePass, "2-out");
+    bool drawn = s.renderer.drawComposited(*s.scene, view, s.frame, s.rect);
     if (drawn) {
-        if (probe) {
-            s.probeBaked = s.renderer.visible();
-            s.probeBakedReady = s.renderer.readProbe(s.probeSolid, s.probeWalk, s.probeWidth,
-                                                     s.probeHeight);
-        }
         // What GPL submitted during this walk is flushed by roglv2 after this; test it against
         // the depth just drawn (report 67c).
         ResidualPass pass;
         pass.depthTexture = s.renderer.depthTexture();
         pass.orderTexture = s.renderer.orderTexture();
-        pass.shadowTest = s.debugView == baked::kDebugShadowsByDepth    ? kShadowByDepth
-                          : s.debugView == baked::kDebugShadowsUntested ? kShadowUntested
-                                                                        : kShadowByWalkOrder;
         std::memcpy(pass.rect, s.rect, sizeof(pass.rect));
         pass.nearPlane = view.nearPlane;
         pass.reversedZ = s.renderer.reversedZ();
         residualArm(pass);
-        // The mark goes on the frame; a mirror's rectangle is copied out of it before then.
-        if (!mirror && s.markCount < 2)
+        // bakedRenderer = 2: the mark goes on the frame; a mirror's rectangle is copied out of it
+        // before then.
+        if (!mirror && g_options.bakedRenderer == 2 && s.markCount < 2)
             std::memcpy(s.markRects[s.markCount++], s.rect, sizeof(s.rect));
     }
-    if (mirror) {
-        BakedMirrorPass pass;
-        pass.drawn = drawn;
-        pass.fog = s.frame.fog.on;
-        std::memcpy(pass.rect, s.rect, sizeof(pass.rect));
-        pass.dispatches = static_cast<uint32_t>(s.renderer.visible().size());
-        pass.repeats = pass.dispatches - std::min(pass.dispatches, stats.itemsVisible);
-        pass.stats = stats;
-        pass.hadLists = listCount != 0;
-        if (listCount) pass.cars = s.cars.finishPass();
-        LARGE_INTEGER end;
-        QueryPerformanceCounter(&end);
-        LARGE_INTEGER frequency;
-        QueryPerformanceFrequency(&frequency);
-        pass.cpuMilliseconds =
-            1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) / frequency.QuadPart;
-        bakedMirrorAccount(pass);
-        return;
-    }
-    if (listCount) {
-        baked::CarPassStats c = s.cars.finishPass();
-        CarSecond&          t = s.carSecond;
-        ++t.passes;
-        t.flagmanLists += c.flagmanLists;
-        t.flagmanCommands += c.flagmanCommands;
-        t.flagmanRuns += c.flagmanRuns;
-        t.flagmanRunsDrawn += c.flagmanRunsDrawn;
-        t.paletteRows += c.paletteRows;
-        t.flagmanOwnColours += c.flagmanOwnColours;
-        t.indexedWithoutPalette += c.indexedWithoutPalette;
-        if (c.hidden)
-            ++t.hidden;
-        else if (!c.drawn && c.listDraws)
-            ++t.notDrawn;
-        t.lists += c.lists;
-        t.listDraws += c.listDraws;
-        if (c.drawn) {
-            t.commands += c.commands;
-            t.cars += c.cars;
-            t.multiDraws += c.multiDraws;
-            t.checkerPasses += c.checkerDraws;
-            t.walkRuns += c.walkRuns;
-            t.walkRunsDrawn += c.walkRunsDrawn;
-            t.walkRunsAtEnd += c.walkRunsAtEnd;
-            t.walkSlotSum += c.walkSlotSum;
-            t.walkVisibleSum += c.walkVisibleSum;
-            t.drawnListDraws += c.listDraws;
-        }
-        t.frames += c.frames;
-        t.worldLists += c.worldLists;
-        t.composedLists += c.composedLists;
-        t.lightDisagrees += c.lightDisagrees;
-        t.emptyLists += c.emptyLists;
-        t.badObject += c.badObject;
-        t.badFrame += c.badFrame;
-        t.badMaterial += c.badMaterial;
-        t.withoutTexture += c.withoutTexture;
-        t.badSprite += c.badSprite;
-        t.tableFull += c.tableFull;
-        t.dynamicVertices += c.dynamicVertices;
-        t.dynamicDraws += c.dynamicDraws;
-        t.conditionedOff += c.conditionedOff;
-        t.badCondition += c.badCondition;
-        t.maxRotationError = std::max(t.maxRotationError, c.maxRotationError);
-        t.maxTranslationError = std::max(t.maxTranslationError, c.maxTranslationError);
-        t.prepareMicroseconds += c.prepareMicroseconds;
-        t.uploadMicroseconds += c.uploadMicroseconds;
-        t.drawMicroseconds += c.drawMicroseconds;
-        t.keyedLists += c.keyedLists;
-        t.cachedLists += c.cachedLists;
-        t.cacheStored += c.cacheStored;
-        t.cacheRefused += c.cacheRefused;
-        t.cacheChecked += c.cacheChecked;
-        t.cacheMismatched += c.cacheMismatched;
-        t.elidedLists += c.elidedLists;
-        t.elidedLost += c.elidedLost;
-        t.badOrder += c.badOrder;
-        t.ordersReused += c.ordersReused;
-    }
+    if (listCount) s.cars.finishPass();
+    if (mirror) return;
     // The overlay waits for the walk's end, where GPL has submitted everything of the pass; it
     // goes where the composite went.
     if (overlayListed) {
@@ -1548,36 +1001,18 @@ void endPass(State& s, SceneParams* params, bool mirror) {
         s.gl.getIntegerv(baked::gl::kDrawFramebufferBinding, &s.overlayFramebuffer);
         std::memcpy(s.overlayRect, s.rect, sizeof(s.overlayRect));
     }
-
-    LARGE_INTEGER end;
-    QueryPerformanceCounter(&end);
-    ++s.passes;
-    if (s.frame.fog.on) ++s.fogPasses;
-    s.visible += stats.itemsVisible;
-    s.ranges += stats.rangesDrawn;
-    s.draws += stats.draws;
-    s.overlayRanges += stats.overlayRanges;
-    s.overlayLevels += stats.overlayLevels;
-    s.decalRanges += stats.decalRanges;
-    s.spriteRanges += stats.spriteRanges;
-    s.orderedRanges += stats.orderedRanges;
-    s.orderedDraws += stats.orderedDraws;
-    s.orderedMicroseconds += stats.orderedMicroseconds;
-    s.orderedBatchBinds += stats.orderedBatchBinds;
-    s.orderedTextureBinds += stats.orderedTextureBinds;
-    s.orderedProgramSwitches += stats.orderedProgramSwitches;
-    s.orderedUniformCalls += stats.orderedUniformCalls;
-    s.evaluateMicroseconds += stats.evaluateMicroseconds;
-    s.solidMicroseconds += stats.solidMicroseconds;
-    s.compositeMicroseconds += stats.compositeMicroseconds;
-    s.drawTicks += end.QuadPart - start.QuadPart;
 }
 
 }  // namespace
 
 bool bakedPassBegin(void* sceneParams) {
     State& s = g_state;
-    if (g_options.bakedRenderer == 0 || !s.bound || !sceneParams) return false;
+    if (!sceneParams) return false;
+    if (!s.bound) {
+        if (g_options.bakedRenderer == 0) return false;
+        bindNow(s);
+        if (!s.bound) return false;
+    }
     return beginPass(s, static_cast<SceneParams*>(sceneParams), false);
 }
 
@@ -1587,7 +1022,7 @@ void bakedPassEnd(void* sceneParams) {
 
 bool bakedPassBeginMirror(void* sceneParams) {
     State& s = g_state;
-    if (g_options.bakedRenderer == 0 || !s.bound) {
+    if (!s.bound) {
         bakedMirrorRefused(kMirrorNotBound);
         return false;
     }
@@ -1600,199 +1035,6 @@ bool bakedPassBeginMirror(void* sceneParams) {
 
 void bakedPassEndMirror(void* sceneParams) {
     endPass(g_state, static_cast<SceneParams*>(sceneParams), true);
-}
-
-void bakedPassMirrorWalkDone(bool baked) {
-    State& s = g_state;
-    if (!s.mirrorCaptureOpen) return;
-    s.mirrorCaptureOpen = false;
-    // GPL's own pass is flushed here instead of in bitmapDraw: nothing is submitted in between.
-    if (!baked) rasterFlushPending();
-    bakedCaptureMirrorRect(s.mirrorCaptureRect, s.mirrorCaptureHalf, s.mirrorCapturePass,
-                           baked ? "3-final" : "final");
-    ++s.mirrorCapturePass;
-}
-
-void bakedPassPollKey() {
-    State& s = g_state;
-    if (g_options.bakedRenderer == 0) return;
-    if (g_options.bakedRendererKey) {
-        bool down = (GetAsyncKeyState(g_options.bakedRendererKey) & 0x8000) != 0;
-        if (down && !s.keyLast) {
-            s.drawEnabled = !s.drawEnabled;
-            logf("baked: drawing %s", s.drawEnabled ? "ON -- the track comes from the baked scene"
-                                                    : "OFF -- the game draws the track itself");
-        }
-        s.keyLast = down;
-    }
-    if (g_options.bakedDebugKey) {
-        bool down = (GetAsyncKeyState(g_options.bakedDebugKey) & 0x8000) != 0;
-        if (down && !s.debugKeyLast) {
-            s.debugView = (s.debugView + 1) % baked::kDebugViewCount;
-            static const char* const kNames[baked::kDebugViewCount] = {
-                "normal",
-                "the walk-order phase WITHOUT its test, over everything baked (what appears "
-                "only now was hidden by the solid surfaces)",
-                "WITHOUT the walk-order phase (sprites, lines, translucent polygons, standing "
-                "cutouts and object cutouts left out)",
-                "the walk-order phase tested by DEPTH alone, without GPL's order between items "
-                "(the test before the order test)",
-                "TIMING: the walk-order phase makes its state calls but NO draw calls (looks "
-                "like view 2)",
-                "TIMING: the walk-order phase makes NO GL calls, only its bookkeeping (looks "
-                "like view 2)",
-                "WITHOUT GPL: the main pass is the bake and the cockpit only -- GPL's cars, blob "
-                "shadows, lit track polygons, refused items and flagmen are not drawn; what GPL "
-                "emits outside its node table (particles, skid marks) still is; with bakedCars = "
-                "3 the cars gplvr draws itself stay",
-                "WITHOUT gplvr's CARS: normal, except the cars gplvr draws itself (bakedCars = "
-                "3) are left out; their blob shadows stay",
-                "UV CHECKER: every texture, the baked renderer's and GPL's alike, drawn as one "
-                "checker (cells of 1/8 UV with dark lines, red rising with u, green with v, a "
-                "white square in the cell at UV 0,0), so both halves of a capture show how each "
-                "polygon's UVs land",
-                "SHADOWS BY DEPTH: normal, except GPL's blob shadows are tested by the residual "
-                "depth test with its margin, as before report 105 section 4.8, instead of by "
-                "GPL's walk order at their car's place",
-                "SHADOWS UNTESTED: normal, except GPL's blob shadows are not tested at all -- "
-                "drawn over everything baked, so a shadow missing here was never drawn by GPL",
-                "OVERLAYS UNLAYERED: normal, except the overlay phase draws the colour of every "
-                "level before any overlay depth, so overlays are tested against the base "
-                "surfaces only and a later level paints over a nearer earlier one (before report "
-                "105 section 4.10)",
-                "FLAGMEN BY GPL: normal, except the flagmen and the starter are drawn by GPL as "
-                "before report 105 section 4.13, and each of GPL's draws of them is checked "
-                "against what gplvr would have drawn (the `baked flagmen:` line's DEBUG VIEW 12 "
-                "part)",
-                "UNCLIPPED: normal, except the merged draws do not clip at GPL's near plane, so "
-                "colour, alpha and fog are interpolated over the whole triangle and extrapolated "
-                "past the eye where a corner lies behind it (before report 105 section 4.16; the "
-                "black groove at monza10k's braking zones)",
-                "TWO-SIDED: normal, except the merged draws show both faces of a two-sided panel "
-                "and its overlay levels decide between them, so a back face can cover the advert "
-                "(before report 105 section 4.17; monza10k's blue banner showing its back)",
-                "MIRRORS BY GPL: normal main passes, and every mirror walk drawn by GPL as before "
-                "report 105 section 4.18 (bakedMirrors = 1; with 0 the mirrors are GPL's anyway): "
-                "the `baked mirrors: DEBUG VIEW 15` line counts the baked items GPL dispatched, "
-                "and GPL's mirror cars are walked beside its draw and checked against its polygon "
-                "count (the `baked cars: N car draws` line)",
-                "CARS UNSHARED: normal, except in VR the second eye walks every car itself "
-                "instead of taking the first eye's draw list (bakedCarShare, report 105 section "
-                "4.21); the picture must not change, only the walk time",
-                "CARS UNCONDITIONED: normal, except in VR the first eye decides every gate of a "
-                "car itself, so the second eye walks the car again wherever one differs "
-                "(bakedCarUnion off, report 105 section 4.22); the first eye's picture must not "
-                "change, the second eye's only where an order node's plane passes between the "
-                "eyes",
-                "CARS UNKEPT: normal, except no car list is kept across frames: the first eye "
-                "walks every car again each frame (bakedCarProgram off, report 105 section "
-                "4.23); the picture must not change, only the walk time"};
-            g_withoutGpl = s.debugView == baked::kDebugWithoutGpl;
-            flagmenSetGplDraws(s.debugView == baked::kDebugFlagmenByGpl);
-            uvOverlaySet(s.renderer.uvCheckerTexture(), s.debugView == baked::kDebugUvChecker);
-            logf("baked: debug view %d -- %s", s.debugView, kNames[s.debugView]);
-        }
-        s.debugKeyLast = down;
-    }
-    if (g_options.bakedCaptureKey) {
-        bool down = (GetAsyncKeyState(g_options.bakedCaptureKey) & 0x8000) != 0;
-        if (down && !s.captureKeyLast && !s.capture) {
-            if (s.drawEnabled && s.ready) {
-                s.capture = 1;
-                s.captureCount = 0;
-            } else {
-                logf("baked: capture refused -- baked drawing is %s",
-                     s.drawEnabled ? "not ready yet" : "toggled off");
-            }
-        }
-        s.captureKeyLast = down;
-    }
-}
-
-const char* bakedCaptureTake(BakedCaptureView views[2], int& count) {
-    State& s = g_state;
-    count = 0;
-    if (!s.capture) return nullptr;
-    // A frame with no main pass -- a menu, a replay cut -- is not half of a capture; wait for
-    // the next one that has one.
-    if (!s.captureCount) return nullptr;
-    count = s.captureCount;
-    for (int i = 0; i < count; ++i) {
-        views[i] = s.captureViews[i];
-        views[i].debugView = s.debugView;
-    }
-    s.captureCount = 0;
-    s.mirrorCapturePass = 0;
-    const char* half = s.capture == 1 ? "vanilla" : "baked";
-    s.capture = s.capture == 1 ? 2 : 0;
-    return half;
-}
-
-namespace {
-
-// One item per line: its place in the list, its index, its node and what the bake knows of it.
-// `origin` is the item's own origin in world space; an item in world space has 0 there, and the
-// first piece's centre places it instead.
-void writeItems(const char* path, const std::vector<uint32_t>& items, const baked::Scene& scene) {
-    FILE* file = nullptr;
-    if (fopen_s(&file, path, "w") != 0 || !file) {
-        logf("baked: probe -- could not write %s", path);
-        return;
-    }
-    std::fprintf(file, "# position item key type band enabled origin_x origin_y origin_z "
-                       "centre_x centre_y centre_z pieces ordered\n");
-    for (size_t position = 0; position < items.size(); ++position) {
-        uint32_t index = items[position];
-        if (index >= scene.items.size()) continue;
-        const baked::Item& item = scene.items[index];
-        const float*       m = item.itemFromWorld;
-        float origin[3] = {-(m[0] * m[3] + m[4] * m[7] + m[8] * m[11]),
-                           -(m[1] * m[3] + m[5] * m[7] + m[9] * m[11]),
-                           -(m[2] * m[3] + m[6] * m[7] + m[10] * m[11])};
-        float centre[3] = {0.0f, 0.0f, 0.0f};
-        if (item.pieceCount)
-            std::memcpy(centre, scene.pieces[item.firstPiece].centre, sizeof(centre));
-        std::fprintf(file, "%zu %u 0x%X 0x%02X %u %d %.2f %.2f %.2f %.2f %.2f %.2f %u %d\n",
-                     position + 1, index, item.key, item.nodeType, item.band, item.enabled ? 1 : 0,
-                     origin[0], origin[1], origin[2], centre[0], centre[1], centre[2],
-                     item.pieceCount, item.orderRoot != baked::kNoOrder ? 1 : 0);
-    }
-    std::fclose(file);
-}
-
-}  // namespace
-
-void bakedProbeWrite(unsigned number) {
-    State& s = g_state;
-    if (!s.scene || !trackBakeScene() || s.sceneGeneration != trackBakeSceneGeneration()) return;
-    char path[MAX_PATH];
-    if (s.probeVanillaReady) {
-        sprintf_s(path, "%sgplvr-capture%u-vanilla-items.txt", pathsOwnDirectory(), number);
-        writeItems(path, s.probeVanilla, *s.scene);
-        logf("baked: probe %u vanilla -- %zu item dispatches written to %s", number,
-             s.probeVanilla.size(), path);
-        s.probeVanillaReady = false;
-        return;
-    }
-    if (!s.probeBakedReady) return;
-    s.probeBakedReady = false;
-    sprintf_s(path, "%sgplvr-capture%u-baked-items.txt", pathsOwnDirectory(), number);
-    writeItems(path, s.probeBaked, *s.scene);
-    sprintf_s(path, "%sgplvr-capture%u-baked-order.bin", pathsOwnDirectory(), number);
-    FILE* file = nullptr;
-    if (fopen_s(&file, path, "wb") != 0 || !file) {
-        logf("baked: probe %u baked -- could not write %s", number, path);
-        return;
-    }
-    // "GPLVRPRB", width, height, then the solid and the walk-order numbers, bottom row first.
-    int32_t size[2] = {s.probeWidth, s.probeHeight};
-    std::fwrite("GPLVRPRB", 1, 8, file);
-    std::fwrite(size, sizeof(size), 1, file);
-    std::fwrite(s.probeSolid.data(), sizeof(uint32_t), s.probeSolid.size(), file);
-    std::fwrite(s.probeWalk.data(), sizeof(uint32_t), s.probeWalk.size(), file);
-    std::fclose(file);
-    logf("baked: probe %u baked -- %zu visible items and %dx%d order numbers written to %s",
-         number, s.probeBaked.size(), s.probeWidth, s.probeHeight, path);
 }
 
 void bakedMarkFrameEnd() {
@@ -1813,34 +1055,19 @@ void bakedMarkFrameEnd() {
     gl.getFloatv(baked::gl::kColorClearValue, clearColour);
     gl.getBooleanv(baked::gl::kColorWritemask, colourMask);
 
-    // The debug view's number in 3x5 cells, top row first, bit 14 the top-left cell.
-    static const uint16_t kDigits[10] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9,
-                                         0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF};
-    int view = std::min(std::max(s.debugView, 0), 99);
-    int digits[2] = {view / 10, view % 10};
-    int first = view < 10 ? 1 : 0;
-
+    // A square of kMarkCells cells, one cell in from the top right corner.
+    constexpr int kMarkCells = 5;
     gl.enable(baked::gl::kScissorTest);
     gl.colorMask(1, 1, 1, 1);
     gl.clearColor(1.0f, 0.0f, 0.0f, 1.0f);
     for (int i = 0; i < count; ++i) {
         const int* rect = s.markRects[i];
         int cell = std::max(2, rect[3] / 300);
-        int width = (2 - first) * 4 * cell - cell;
-        if (width + 2 * cell > rect[2] || 7 * cell > rect[3]) continue;
+        int side = kMarkCells * cell;
+        if (side + 2 * cell > rect[2] || side + 2 * cell > rect[3]) continue;
         // GL window coordinates: the top edge is y + height.
-        int left = rect[0] + rect[2] - cell - width;
-        int top = rect[1] + rect[3] - cell;
-        for (int d = first; d < 2; ++d) {
-            uint16_t bits = kDigits[digits[d]];
-            int      x0 = left + (d - first) * 4 * cell;
-            for (int row = 0; row < 5; ++row)
-                for (int column = 0; column < 3; ++column) {
-                    if (!(bits & (1u << (14 - row * 3 - column)))) continue;
-                    gl.scissor(x0 + column * cell, top - (row + 1) * cell, cell, cell);
-                    gl.clear(baked::gl::kColorBufferBit);
-                }
-        }
+        gl.scissor(rect[0] + rect[2] - cell - side, rect[1] + rect[3] - cell - side, side, side);
+        gl.clear(baked::gl::kColorBufferBit);
     }
 
     gl.clearColor(clearColour[0], clearColour[1], clearColour[2], clearColour[3]);
@@ -1849,32 +1076,16 @@ void bakedMarkFrameEnd() {
     if (!scissor) gl.disable(baked::gl::kScissorTest);
 }
 
-bool bakedPassWithoutGpl() { return g_collecting && g_withoutGpl; }
-
 bool bakedPassCollecting() { return g_collecting != 0; }
 
 bool bakedPassDrawsCars() { return g_collecting && g_carsReady; }
 
 bool bakedPassMirror() { return g_collecting && g_mirrorPass; }
 
-bool bakedPassMirrorsByGpl() {
-    return g_options.bakedMirrors && g_state.debugView == baked::kDebugMirrorsByGpl;
-}
-
-bool bakedPassCarsUnshared() { return g_state.debugView == baked::kDebugCarsUnshared; }
-
-bool bakedPassCarsUnkept() { return g_state.debugView == baked::kDebugCarsUnkept; }
-
-bool bakedPassCarsUnconditioned() {
-    return g_state.debugView == baked::kDebugCarsUnconditioned;
-}
-
 unsigned bakedPassWalkPosition() {
     if (!g_collecting || !g_filterRenderer) return 0;
     return static_cast<unsigned>(g_filterRenderer->visible().size());
 }
-
-void bakedCockpitDraw(bool drawing) { g_cockpitDraw = drawing ? 1 : 0; }
 
 void bakedCockpitGlassOnly(const uintptr_t* glass, uint32_t count) {
     g_glassOnly = glass;
@@ -1893,9 +1104,7 @@ void bakedCockpitGlassTake(uint32_t& passed, uint32_t& dropped, uint32_t& lines)
 bool bakedFilterSeesEveryLeaf() { return g_everyLeafHooked; }
 
 int bakedCockpitOverlayReady(uint32_t mirrorMip) {
-    State&         s = g_state;
-    OverlaySecond& o = s.overlaySecond;
-    ++o.asked;
+    State& s = g_state;
     int    refusal = kOverlayReady;
     bool   flipT = false;
     GLuint texture = 0;
@@ -1915,7 +1124,15 @@ int bakedCockpitOverlayReady(uint32_t mirrorMip) {
         else if (copy != baked::kLiveMirrorReady)
             refusal = kOverlayNoCopy;
     }
-    if (refusal != kOverlayReady) ++o.refused[refusal];
+    if (refusal != kOverlayReady && !s.overlayRefusalSaid[refusal]) {
+        s.overlayRefusalSaid[refusal] = true;
+        static const char* const kWhy[kOverlayRefusals] = {
+            "not a baked main pass with the car renderer", "mirror.mip's handle reaches no GL texture",
+            "the mip there lacks mirror.mip's t flip", "GL gives that texture no size",
+            "the car renderer could not copy it"};
+        logf("baked: the cockpit over the eye image refused, step 1 instead (first time) -- %s",
+             kWhy[refusal]);
+    }
     return refusal;
 }
 
@@ -1923,85 +1140,21 @@ void bakedPassMainWalkDone() {
     State& s = g_state;
     if (!s.overlayPending) return;
     s.overlayPending = false;
-    OverlaySecond& o = s.overlaySecond;
     // Everything GPL submitted in the pass goes to the frame first, under the residual test the
     // pass armed; an arm no flush took is dropped, as the mirror walk's end does.
-    unsigned flushes = residualFlushCount();
     rasterFlushPending();
-    if (residualFlushCount() != flushes) ++o.flushed;
-    if (residualDisarm()) ++o.armsUnflushed;
-    baked::GLint bound = 0;
-    s.gl.getIntegerv(baked::gl::kDrawFramebufferBinding, &bound);
-    if (bound != s.overlayFramebuffer) ++o.framebufferMoved;
-    baked::CarOverlayStats stats;
+    residualDisarm();
     int outcome = s.cars.drawOverlay(static_cast<baked::GLuint>(s.overlayFramebuffer),
-                                     s.overlayRect, stats);
-    switch (outcome) {
-    case baked::kOverlayDrawn: ++o.drawn; break;
-    case baked::kOverlayHidden: ++o.hidden; return;
-    case baked::kOverlayNoCommands: ++o.lost[kLostNoCommands]; return;
-    default: ++o.lost[kLostNotDrawn]; return;
-    }
-    if (stats.glass) ++(stats.copied ? o.copied : o.copyFailed);
-    o.commands += stats.commands;
-    o.polygons += stats.polygons;
-    o.glass += stats.glass;
-    o.empty += stats.empty;
-    o.conditionedOff += stats.conditionedOff;
-    o.refusedPolygons += stats.refused;
-    o.listPolygons += stats.listPolygons;
-    o.microseconds += stats.microseconds;
-}
-
-int bakedTimeKind() { return !g_collecting ? kBakedOutside : g_mirrorPass ? kBakedMirror : kBakedMain; }
-
-void bakedFilterTake(uint64_t calls[kBakedTimeKinds], uint64_t ticks[kBakedTimeKinds]) {
-    for (int kind = 0; kind < kBakedTimeKinds; ++kind) {
-        calls[kind] = g_filterCalls[kind];
-        ticks[kind] = g_filterSampledTicks[kind] * kFilterSampleEvery;
-        g_filterCalls[kind] = 0;
-        g_filterSampledTicks[kind] = 0;
-    }
-}
-
-void bakedPassWindowsTake(int64_t ticks[2], uint32_t passes[2]) {
-    for (int kind = 0; kind < 2; ++kind) {
-        ticks[kind] = g_windowTicks[kind];
-        passes[kind] = g_windowPasses[kind];
-        g_windowTicks[kind] = 0;
-        g_windowPasses[kind] = 0;
-    }
+                                     s.overlayRect);
+    if (outcome == baked::kOverlayNoCommands)
+        sayOverlayLost(s, kLostNoCommands);
+    else if (outcome != baked::kOverlayDrawn)
+        sayOverlayLost(s, kLostNotDrawn);
 }
 
 bool bakedCarRowsPinned(uint32_t key, uint32_t frames, uint32_t& draws) {
     if (!g_collecting || !bakedPassDrawsCars()) return false;
     return g_state.cars.pinRows(key, frames, draws);
-}
-
-void bakedLogGpuSpans(const char* who, const baked::GpuPassTimes& gpu) {
-    static const char* const kNames[baked::GpuPassTimes::kSpanCount] = {
-        "copy in", "clears", "track", "cars", "soft edges", "walk-order", "copy out"};
-    if (!gpu.passes) return;
-    double n = gpu.passes;
-    char   spans[400] = "";
-    int    used = 0;
-    double total = 0.0;
-    double busy = 0.0;
-    for (int span = 0; span < baked::GpuPassTimes::kSpanCount; ++span) {
-        int wrote = std::snprintf(spans + used, sizeof(spans) - used, "%s%s %.3f/%.3f",
-                                  span ? " + " : "", kNames[span], gpu.spanMs[span] / n,
-                                  gpu.busyMs[span] / n);
-        if (wrote < 0 || wrote >= static_cast<int>(sizeof(spans)) - used) break;
-        used += wrote;
-        total += gpu.spanMs[span] / n;
-        busy += gpu.busyMs[span] / n;
-    }
-    logf("%s: gpu spans per pass, %u passes, each ending in glFlush -- %s = %.3f/%.3f ms (each: "
-         "GPU time / the part the GPU cannot have spent waiting for the CPU to issue it); the CPU "
-         "issued the pass in %.3f ms, the GPU reached its start %.3f ms after the CPU issued it, "
-         "and began %u of the %u passes only after the CPU had issued all of it",
-         who, gpu.passes, spans, total, busy, gpu.issueMs / n, gpu.lagMs / n, gpu.queued,
-         gpu.passes);
 }
 
 namespace {
@@ -2013,25 +1166,15 @@ void* filterNode(const unsigned char* node) {
     void*         stock = g_stockHandlers[type];
     auto          address = reinterpret_cast<uintptr_t>(node);
     bool          inside = address >= g_primBegin && address < g_primEnd;
-    // A copy (baked::Item::copyOf) stands for its original, in both modes.
-    auto original = [](int32_t item) {
-        uint32_t copyOf = g_filterScene->items[static_cast<size_t>(item)].copyOf;
-        return copyOf != baked::kNoCopy ? copyOf : static_cast<uint32_t>(item);
-    };
-    if (!g_collecting) {
-        if (g_observing && inside && g_itemTypes[type]) {
-            int32_t item = g_filterScene->findItem(static_cast<uint32_t>(address - g_primBegin));
-            if (item >= 0) g_observed->push_back(original(item));
-        }
-        return stock;
-    }
+    if (!g_collecting) return stock;
     if (inside && g_itemTypes[type]) {
         int32_t item = g_filterScene->findItem(static_cast<uint32_t>(address - g_primBegin));
         if (item >= 0 && g_filterScene->items[static_cast<size_t>(item)].enabled) {
-            uint32_t target = original(item);
+            // A copy (baked::Item::copyOf) stands for its original.
+            uint32_t copyOf = g_filterScene->items[static_cast<size_t>(item)].copyOf;
+            uint32_t target = copyOf != baked::kNoCopy ? copyOf : static_cast<uint32_t>(item);
             if (g_filterScene->items[target].enabled) {
-                bool reverse = *g_sortGroupReverse != 0;
-                if (!g_filterRenderer->markVisible(target, reverse)) ++g_state.repeatDispatches;
+                g_filterRenderer->markVisible(target, *g_sortGroupReverse != 0);
                 return nullptr;
             }
         }
@@ -2052,23 +1195,12 @@ void* filterNode(const unsigned char* node) {
             ++g_glassLines;
         }
     }
-    if (g_withoutGpl && !g_cockpitDraw) return nullptr;
-    ++g_stockCalls[g_mirrorPass ? 2 : inside ? 0 : 1][type];
     return stock;
 }
 
 }  // namespace
 }  // namespace gplvr
 
-// One call in kFilterSampleEvery is timed (report 105 section 4.44); a single call is shorter
-// than QueryPerformanceCounter's tick, hence the TSC.
 extern "C" void* __cdecl gplvrBakedNodeFilter(const unsigned char* node) {
-    using namespace gplvr;
-    int kind = bakedTimeKind();
-    ++g_filterCalls[kind];
-    if (++g_filterSample % kFilterSampleEvery) return filterNode(node);
-    uint64_t start = __rdtsc();
-    void*    handler = filterNode(node);
-    g_filterSampledTicks[kind] += __rdtsc() - start;
-    return handler;
+    return gplvr::filterNode(node);
 }

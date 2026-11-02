@@ -1,8 +1,8 @@
 #pragma once
 
 // The car walk shared between the eyes (docs/audit-2026-09-18/105-baked-renderer-rewrite.md
-// section 4.21, `bakedCarShare`). In VR each eye is one gpl_sceneRender, the left eye first, and
-// in stage 2b each pass walks every car it draws into a draw list (CarWalk.cpp). Both eyes of a
+// section 4.21). In VR each eye is one gpl_sceneRender, the left eye first, and each pass walks
+// every car it draws into a draw list (CarWalk.cpp). Both eyes of a
 // frame pose a car from the same render record, so of what a list holds only these can differ
 // between them:
 // - the walk's eye-dependent decisions: the eye's side of every gate (SIDEGATE, SIDEPICK, BSP4,
@@ -17,13 +17,12 @@
 // the pass's register file, the pass's masks and MATERIAL state. The second eye's pass replays
 // the tape from its own camera instead of walking. When every read and every decision agree, the
 // walk would take the same path and build the same list, so the first eye's list is taken with
-// its camera fields replaced; otherwise the car is walked as before. One taken list in
-// kShareVerifyEvery is walked anyway and compared with the replaced list field by field.
+// its camera fields replaced; otherwise the car is walked as before.
 //
 // Mirror passes share the same way, each mirror pass with the first eye's mirror pass of the same
 // place in the eye's order, apart from the main passes.
 //
-// Eye-independent lists (report 105 section 4.22, `bakedCarUnion`): the first eye's walk takes
+// Eye-independent lists (report 105 section 4.22): the first eye's walk takes
 // every gate whose plane passes within the union margin of its eye -- the measured separation of
 // the two eyes, with room to spare -- both ways. Each side's subtree is walked under a condition
 // (ShareCondition: the plane, the walk frame, the side, the enclosing condition), its draws carry
@@ -46,8 +45,6 @@ namespace gplvr {
 // A kept list's walk (report 105 section 4.23) takes every gate of a cars18 car both ways: up to
 // ~3,700 conditions at 3 m.
 constexpr uint32_t kMaxShareConditions = 16384;
-
-constexpr uint32_t kShareVerifyEvery = 64;
 
 // Why a first-eye walk's list cannot be shared, decided as it is walked.
 enum ShareRefusal : uint8_t {
@@ -221,11 +218,6 @@ struct ShareTape {
     // A kept list's walk only (report 105 section 4.23): its skinned leaves.
     std::vector<ShareSkin> skins;
     std::vector<uint16_t>  skinFrames;
-    // And its wheel XFORMs (section 4.30): those whose every model it walked, and those it walked
-    // as GPL's pose left them (a child none of the wheel's models, a pop that keeps the memo, a
-    // full tape).
-    uint16_t wheelsSwitched = 0;
-    uint16_t wheelsAsPosed = 0;
     // And the cockpit's mirror glass, listed with GPL's live UVs (section 4.50).
     std::vector<ShareGlass> glass;
 };
@@ -315,12 +307,12 @@ struct ShareCall {
 enum ShareOutcome {
     kShareWalk,    // walk the car as before
     kShareReused,  // `list` now holds the first eye's list with this eye's camera fields
-    kShareVerify,  // walk the car, then hand the list to carShareVerify
 };
 
 // From carWalkPassBegin, before the arena is emptied: a pass that recorded hands its lists (the
 // arena's first `count`) and tapes to its store, swapping vectors, and the new pass learns its
-// eye and its place in the eye. `enabled`: stage 2b is on.
+// eye and its place in the eye. `enabled`: the car hook is installed. Also ages the eye
+// separations the union margin follows, once a second.
 void carSharePassBegin(bool mirror, bool enabled, std::vector<baked::CarDrawList>& lists,
                        uint32_t count);
 
@@ -339,7 +331,7 @@ void carShareTapeSkip(const ShareCall& call, uint32_t slot);
 // The margin a union walk of this pass takes gates both ways within, metres: 1.25 x the largest
 // separation of the eyes measured over the last two seconds in this pass's slot, plus 2 mm, at
 // most kMaxUnionMargin; kDefaultUnionMargin before any is measured. 0 when the walk decides every
-// gate: not a recording pass, bakedCarUnion 0, debug view 17.
+// gate: not a recording pass.
 constexpr float kDefaultUnionMargin = 0.1f;
 constexpr float kMaxUnionMargin = 0.5f;
 float carShareUnionMargin();
@@ -356,16 +348,5 @@ enum UnionRedone : int {
     kUnionTooBig,
     kUnionRedoneCount
 };
-void carShareUnionRedone(UnionRedone reason);
-
-// While the second eye's pass walks a car to verify a union list: the first eye's order nodes,
-// whose order the walk keeps (the list it is compared with keeps it). Null otherwise.
-const std::vector<ShareOrder>* carShareVerifyOrders();
-
-// After the walk carShareTake asked for: compares it with the list that would have been taken.
-void carShareVerify(const baked::CarDrawList& walked, bool walkedWhole);
-
-// Once a second, from CarWalk's per-second report.
-void carShareSecond();
 
 }  // namespace gplvr

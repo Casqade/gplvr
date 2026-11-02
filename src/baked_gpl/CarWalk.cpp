@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <intrin.h>
 #include <algorithm>
 #include <vector>
 
@@ -54,7 +53,6 @@ constexpr unsigned kWheelModels = 3;
 constexpr int kRegisterCount = 1024;  // selectors and SETREG index registers & 0x3FF
 constexpr int kMaxDepth = 512;
 constexpr int kMaxSelectorCases = 4096;
-constexpr int kMaxInstancesLogged = 32;
 
 using TeamInstanceFn = void*(__cdecl*)(int driver);
 using PoseFn = void(__cdecl*)(void* instance, void* record);
@@ -104,7 +102,6 @@ struct Frame {
 
 constexpr int      kMaxKnownObjects = 16;
 constexpr uint16_t kNoFrameId = 0xFFFF;
-constexpr int      kMaxSkinnedObjects = 16;
 // A kept list's walk (report 105 section 4.23): the halves of its order nodes, and the leaves it
 // may hold before it gives up (cars18 needs at most ~6,200 at 3 m).
 constexpr uint16_t kMaxRegions = 8192;
@@ -118,9 +115,11 @@ struct Walk {
     float    dlong = 0.0f;
     float    dlat = 0.0f;
     int32_t  registers[kRegisterCount] = {};
-    WalkCounts counts;
+    // The polygons the walk reached, as GPL's counter would move for the same draw: one per
+    // polygon node and one per sprite. The list must hold them all (shareRefusal).
+    uint32_t polygons = 0;
     // The cell's user planes take part in the decisions (GPL's own walk of one cell's record);
-    // false for a whole-car list in stage 2b.
+    // false for a whole-car list.
     bool     cellPlanes = true;
     bool     lightingOn = false;  // gpl_lightingOn: lit leaves memoise their normals
 
@@ -132,21 +131,14 @@ struct Walk {
     // in (Frame::id; 0 for GPL's own memo, taken as the dispatch frame).
     uint16_t cornerFrame[kMaxSkinCorners];
     uint16_t normalFrame[kMaxSkinCorners];
-    // Skinned leaves of the first list per object, for the instance log line.
-    int32_t  skinnedObject[kMaxSkinnedObjects];
-    uint32_t skinnedLeaves[kMaxSkinnedObjects];
-    int      skinnedObjects = 0;
     // The objects this walk has found its leaves in, [prim, prim + size): GPL's memory does not
     // change during a walk, so carBakeObjectOf is asked once per object and walk.
     uintptr_t knownPrim[kMaxKnownObjects];
     uint32_t  knownSize[kMaxKnownObjects];
     int32_t   knownObject[kMaxKnownObjects];
     int       knownObjects = 0;
-    // Sampled walks (kProfileEvery) time their parts in TSC ticks.
-    bool      profile = false;
-    WalkTicks ticks;
 
-    // Stage 2 (bakedCars = 2): the list the walk fills, the MATERIAL state it fills it with --
+    // The list the walk fills, the MATERIAL state it fills it with --
     // the current CarMaterial and the texture list a slot indexes -- and the object the last
     // leaf was found in, [prim, prim + primSize).
     baked::CarDrawList* list = nullptr;
@@ -181,8 +173,6 @@ struct Walk {
     // for the eyes that condition holds for.
     uint8_t  registerUniform[kRegisterCount];
     uint16_t registerCondition[kRegisterCount];
-    // A verify walk of a union list: the first eye's order nodes, whose child order it keeps.
-    const std::vector<ShareOrder>* orders = nullptr;
 
     // A kept list's walk (report 105 section 4.23, CarProgram.h): a union walk whose list serves
     // later frames and both eyes. Every gate within `unionMargin` -- every gate with `everyGate`,
@@ -207,15 +197,14 @@ struct Walk {
     uint16_t  regionDepth[kMaxRegions];
     uint16_t  registerRegion[kRegisterCount];  // the region of a register's last eye-dependent write
 
-    // A kept list's walk with configurations (report 105 section 4.24, bakedCarConfigs): every
-    // configuration gate (CarConfig.h) is decided for this eye, `configGate` the last one met. A
-    // hazard that names the gates whose sides it depends on teaches them to CarConfig and the walk
-    // goes on, so one walk learns every such gate it meets (`learnedGates` new ones); a hazard
-    // that names none (nothing to name, a full set: `unlearned`, by UnionRedone) ends it.
+    // A kept list's walk with configurations (report 105 section 4.24): every configuration gate
+    // (CarConfig.h) is decided for this eye, `configGate` the last one met. A hazard that names the
+    // gates whose sides it depends on teaches them to CarConfig and the walk goes on, so one walk
+    // learns every such gate it meets (`learnedGates` new ones); a hazard that names none (nothing
+    // to name, a full set) ends it.
     bool      learn = false;
     uintptr_t configGate = 0;
     uint32_t  learnedGates = 0;
-    uint32_t  unlearned[kUnionRedoneCount] = {};
 };
 
 // -- GPL's vertex and normal memos ----------------------------------------------------------------
@@ -242,7 +231,6 @@ uint16_t canonOf(const Walk& walk, uint16_t id) {
 void unionHazard(Walk& walk, UnionRedone reason, bool named = false) {
     ++walk.unionHazards[reason];
     if (!walk.program || named) return;
-    if (walk.learn) ++walk.unlearned[reason];
     walk.abort = true;
 }
 
@@ -465,10 +453,8 @@ struct Transformed {
 };
 
 void transformVertex(Walk& walk, uintptr_t record, const Frame& frame, Transformed& out) {
-    uint64_t start = walk.profile ? __rdtsc() : 0;
     uintptr_t gplSlot = 0;
     uint16_t  id = resolveVertex(walk, record, frame, gplSlot);
-    if (walk.profile) walk.ticks.memo += __rdtsc() - start;
     out.frame = id;
     if (id == kGplMemoFrame) {
         out.w = at<float>(gplSlot + 12);
@@ -503,7 +489,7 @@ bool selectorTakes(uint32_t op, float value, float threshold) {
     }
 }
 
-// -- stage 2: the draw list ----------------------------------------------------------------------
+// -- the draw list -------------------------------------------------------------------------------
 
 // An XFORM's poses under its parent's (root from local).
 void enterRoot(const Frame& parent, const float m[12], Frame& child) {
@@ -744,18 +730,6 @@ void emitSkinned(Walk& walk, int32_t objectIndex, const baked::CarObject& object
     }
     baked::appendDynamicCarLeaf(*walk.list, leaf, corners, count, frame.index, walk.material,
                                 walk.condition);
-    ++walk.skin.leaves;
-    ++walk.skin.byType[type];
-    walk.skin.dynamicVertices += count;
-    for (int i = 0; i < walk.skinnedObjects; ++i)
-        if (walk.skinnedObject[i] == objectIndex) {
-            ++walk.skinnedLeaves[i];
-            return;
-        }
-    if (walk.skinnedObjects < kMaxSkinnedObjects) {
-        walk.skinnedObject[walk.skinnedObjects] = objectIndex;
-        walk.skinnedLeaves[walk.skinnedObjects++] = 1;
-    }
 }
 
 // One polygon or BILLBOARD node: its leaf in the bake of the object that holds it, appended under
@@ -775,8 +749,7 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
         return;
     }
     if (node - walk.prim >= walk.primSize) {
-        uint64_t start = walk.profile ? __rdtsc() : 0;
-        int      known = 0;
+        int known = 0;
         while (known < walk.knownObjects && node - walk.knownPrim[known] >= walk.knownSize[known])
             ++known;
         if (known < walk.knownObjects) {
@@ -791,7 +764,6 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
                 walk.knownObject[walk.knownObjects++] = walk.object;
             }
         }
-        if (walk.profile) walk.ticks.object += __rdtsc() - start;
         if (walk.object < 0) {
             walk.prim = 0;
             walk.primSize = 0;
@@ -838,9 +810,7 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
     if (walk.unionMargin > 0.0f && mayBlend(walk, scene, leaf)) ++walk.blendedLeaves;
     if (walk.program && walk.list->polygons >= kMaxProgramLeaves) unionHazard(walk, kUnionTooBig);
     if (skinned && !(leaf.flags & baked::kCarLeafNoGeometry)) {
-        uint64_t start = walk.profile ? __rdtsc() : 0;
         emitSkinned(walk, walk.object, object, leaf, node, type, frame);
-        if (walk.profile) walk.ticks.skinned += __rdtsc() - start;
         return;
     }
     uint32_t colour = 0;
@@ -999,30 +969,19 @@ bool visitBothWays(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame,
     return true;
 }
 
-// A BSP4 or BSP3_ASYM decided for this eye, in the child order of side `order`: this eye's, or in
-// a verify walk of a union list the first eye's (walk.orders). w3 and BSP4's w4 are drawn on this
-// eye's side either way.
+// A BSP4 or BSP3_ASYM decided for this eye, in the child order of its side.
 void visitOrdered(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, int depth,
-                  bool front, bool order) {
+                  bool front) {
     unsigned other = type == 0x08 ? 5 : 4;
-    if (order) {
+    if (front) {
         visitChild(walk, node, other, frame, depth);
-        if (front) visitChild(walk, node, 3, frame, depth);
+        visitChild(walk, node, 3, frame, depth);
         visitChild(walk, node, 2, frame, depth);
-        if (type == 0x08 && !front) visitChild(walk, node, 4, frame, depth);
     } else {
         visitChild(walk, node, 2, frame, depth);
-        if (type == 0x08 && !front) visitChild(walk, node, 4, frame, depth);
+        if (type == 0x08) visitChild(walk, node, 4, frame, depth);
         visitChild(walk, node, other, frame, depth);
-        if (front) visitChild(walk, node, 3, frame, depth);
     }
-}
-
-bool orderSide(const Walk& walk, uintptr_t node, const Frame& frame, bool front) {
-    if (!walk.orders) return front;
-    for (const ShareOrder& o : *walk.orders)
-        if (o.node == node && o.frameKey == frame.key) return o.front;
-    return front;
 }
 
 // SETREG in a union walk: a write under a condition gives the register a value that depends on
@@ -1056,7 +1015,6 @@ void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const 
     if (!known || type == 0x16 || child.id == 0 || child.id == kNoFrameId ||
         child.id > tape.frames.size() || tape.frames[child.id - 1u].node != node ||
         tape.conditions.size() + kWheelModels > kMaxShareConditions) {
-        ++tape.wheelsAsPosed;
         visitChild(walk, node, 8, child, depth);
         return;
     }
@@ -1079,7 +1037,6 @@ void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const 
     ShareFrame& shared = tape.frames[child.id - 1u];
     shared.switchFirst = first;
     shared.switchCount = static_cast<uint16_t>(count);
-    ++tape.wheelsSwitched;
     for (unsigned m = 0; m < count; ++m) {
         if (m > 0) {
             memoUndo(g_vertexMemo, vertexMark);
@@ -1094,16 +1051,11 @@ void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const 
 // One node, as gpl_sceneNodeRenderTable 0x570330 dispatches it. `rootChild` replaces word 1 of the
 // root MATERIAL, as gpl_carRecordDraw points it at the `car` or `cockpit` handle for the dispatch.
 void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t rootChild) {
-    WalkCounts& counts = walk.counts;
     if (walk.abort) return;
-    if (depth > kMaxDepth) {
-        ++counts.depthLimit;
-        return;
-    }
+    if (depth > kMaxDepth) return;
     int32_t typeWord = at<int32_t>(node);
     if (typeWord < 0) return;  // every dispatcher skips a negative type word (gpl_nullNode)
     uint8_t type = static_cast<uint8_t>(typeWord);
-    if (type < 0x24) ++counts.byType[type];
 
     switch (type) {
     case 0x00: case 0x01: case 0x02: case 0x10: case 0x12: case 0x1A: case 0x23:
@@ -1119,20 +1071,17 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x03:
-        ++counts.sprites;
-        ++counts.polygons;
+        ++walk.polygons;
         if (walk.list) emitLeaf(walk, node, type, frame, false);
         return;
 
     case 0x04: {  // GROUP
-        ++counts.controls;
         uint32_t count = word(node, 1);
         for (uint32_t i = 0; i < count; ++i) visitChild(walk, node, 2 + i, frame, depth);
         return;
     }
 
     case 0x05: {  // MATERIAL: gpl_renderNodeDispatch 0x4CE740 by flags & 0x3F
-        ++counts.controls;
         uint32_t flags = word(node, 2);
         bool     handled = ((kMaterialHandlers >> (flags & 0x3F)) & 1) != 0;
         // The class follows the texture words (one texture or a slot: 1; a list: its count + 1)
@@ -1147,10 +1096,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         // skip the whole subtree when the class is not visible in this pass.
         if (handled && (flags & 4)) {
             uint32_t surfaceClass = word(node, classWord);
-            if (!(walk.classVisible & (1u << (surfaceClass & 31)))) {
-                ++counts.classHidden;
-                return;
-            }
+            if (!(walk.classVisible & (1u << (surfaceClass & 31)))) return;
         }
         uintptr_t child = rootChild ? rootChild : word(node, 1);
         if (!walk.list || !handled) {
@@ -1168,50 +1114,37 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x06:  // SIDEGATE
-        ++counts.controls;
-        ++counts.gates;
         if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
         if (gateFront(walk, frame, node)) visitChild(walk, node, 2, frame, depth);
         return;
     case 0x07:  // SIDEPICK
-        ++counts.controls;
-        ++counts.gates;
         if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
         visitChild(walk, node, gateFront(walk, frame, node) ? 2 : 3, frame, depth);
         return;
     case 0x08:    // BSP4: front 5, 3, 2; back 2, 4, 5 (gpl_nodePlane08Four 0x4D76B0)
     case 0x09: {  // BSP3_ASYM: front 4, 3, 2; back 2, 4
-        ++counts.controls;
-        ++counts.gates;
         if (nearGate(walk, frame, node) && visitBothWays(walk, node, type, frame, depth)) return;
         bool front = gateFront(walk, frame, node);
-        visitOrdered(walk, node, type, frame, depth, front, orderSide(walk, node, frame, front));
+        visitOrdered(walk, node, type, frame, depth, front);
         return;
     }
     case 0x0A:  // BSP3: every child from either side; the order does not change the count
-        ++counts.controls;
-        ++counts.gates;
         visitChild(walk, node, 2, frame, depth);
         visitChild(walk, node, 3, frame, depth);
         visitChild(walk, node, 4, frame, depth);
         return;
     case 0x0B:  // BSP2
-        ++counts.controls;
-        ++counts.gates;
         visitChild(walk, node, 2, frame, depth);
         visitChild(walk, node, 3, frame, depth);
         return;
 
     case 0x0C:  // ALTSET
-        ++counts.controls;
         visitChild(walk, node, 1, frame, depth);
         return;
 
     case 0x0D:
     case 0x13:
     case 0x16: {  // XFORM: gpl_nodePoseRender 0x4CC650, child at word 8
-        ++counts.controls;
-        ++counts.transforms;
         float pose[12];
         poseMatrix(node, pose);
         Frame child;
@@ -1262,12 +1195,10 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x0E:  // SUBOBJECT: gpl_objDrawRootNode(word 1 = the Obj3d)
-        ++counts.controls;
         visit(walk, at<uint32_t>(word(node, 1) + kObjectRoot), frame, depth + 1, 0);
         return;
 
     case 0x0F: {  // SORTGROUP with no dynamic records: the static child, then the elements
-        ++counts.controls;
         visitChild(walk, node, 10, frame, depth);
         uint32_t count = word(node, 15);
         for (uint32_t i = 0; i < count; ++i) visitChild(walk, node, 19 + 4 * i, frame, depth);
@@ -1275,8 +1206,6 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x11: {  // SELECTOR: gpl_nodeSelectorRender 0x4CF9B0, value by gpl_lodEvaluateVariable
-        ++counts.controls;
-        ++counts.selectors;
         uint32_t kind = word(node, 1);
         uint32_t param = word(node, 2);
         uint32_t op = word(node, 3);
@@ -1295,7 +1224,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         }
         case 1: value = walk.dlong; break;
         case 2: value = walk.dlat; break;
-        case 3: ++counts.clockSelectors; break;
+        case 3: break;  // the clock, taken as case value 0
         case 4: value = static_cast<float>(walk.registers[param & 0x3FF]); break;
         default: break;
         }
@@ -1319,10 +1248,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
                           fromWrite);
         if (op == 5) {
             long long index = std::llrint(value);
-            if (index < 0 || index >= count) {
-                ++counts.indexOutOfRange;
-                return;
-            }
+            if (index < 0 || index >= count) return;  // GPL reads garbage there
             visitChild(walk, node, 6 + 2 * static_cast<unsigned>(index), frame, depth);
             return;
         }
@@ -1336,7 +1262,6 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x14: {  // SETREG: gpl_nodeRegisterWrite_type20 0x4CFA50
-        ++counts.setRegisters;
         uint32_t index = word(node, 1) & 0x3FF;
         auto     value = static_cast<int32_t>(word(node, 2));
         if (walk.unionMargin > 0.0f) unionWrite(walk, index, value);
@@ -1348,7 +1273,6 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x15: {  // LINE: gpl_lineDraw3d memoises both ends (0x4C7E68, 0x4C7E7A)
-        ++counts.lines;
         uintptr_t gplSlot = 0;
         resolveVertex(walk, word(node, 2), frame, gplSlot);
         resolveVertex(walk, word(node, 3), frame, gplSlot);
@@ -1356,7 +1280,6 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x18: {  // SPHERECULL: the user planes only (gpl_nodeSphereCull 0x4D7120)
-        ++counts.controls;
         if (walk.planeMask) {
             Transformed centre;
             transformVertex(walk, word(node, 1), frame, centre);
@@ -1364,10 +1287,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
             for (int i = 0; i < 6; ++i) {
                 if (!(walk.planeMask & (1u << i))) continue;
                 float distance = centre.planes[i];
-                if (radius + distance < 0.0f && distance - radius < 0.0f) {
-                    ++counts.sphereCulled;
-                    return;
-                }
+                if (radius + distance < 0.0f && distance - radius < 0.0f) return;
             }
         }
         visitChild(walk, node, 3, frame, depth);
@@ -1375,7 +1295,6 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     }
 
     case 0x19: {  // BOXCULL: 8 corners, culled when all share an outcode bit (0x4D7210)
-        ++counts.controls;
         uint32_t common = 2047;
         uint16_t corners[8];
         for (unsigned corner = 0; corner < 8; ++corner) {
@@ -1400,41 +1319,19 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
             visitUnder(walk, node, 9, frame, depth, drawn);
             return;
         }
-        if (common) {
-            ++counts.boxCulled;
-            return;
-        }
+        if (common) return;
         visitChild(walk, node, 9, frame, depth);
         return;
     }
 
     case 0x1B: case 0x1C: case 0x1D: case 0x1E: case 0x1F: case 0x20: case 0x21: case 0x22: {
-        ++counts.polygons;
-        if (walk.profile) {
-            uint64_t start = __rdtsc();
-            bool     skinned = resolveCorners(walk, node, type, frame);
-            uint64_t resolved = __rdtsc();
-            walk.ticks.memo += resolved - start;
-            if (walk.list) emitLeaf(walk, node, type, frame, skinned);
-            walk.ticks.emit += __rdtsc() - resolved;
-            if (!walk.list && skinned) {
-                ++walk.skin.leaves;
-                ++walk.skin.byType[type];
-            }
-            return;
-        }
+        ++walk.polygons;
         bool skinned = resolveCorners(walk, node, type, frame);
-        if (walk.list) {
-            emitLeaf(walk, node, type, frame, skinned);
-        } else if (skinned) {
-            ++walk.skin.leaves;
-            ++walk.skin.byType[type];
-        }
+        if (walk.list) emitLeaf(walk, node, type, frame, skinned);
         return;
     }
 
     default:
-        ++counts.unknownTypes;
         return;
     }
 }
@@ -1478,11 +1375,6 @@ struct PassArena {
 
 struct State {
     bool      installed = false;
-    bool      stage2 = false;  // bakedCars >= 2 and the bake bound
-    // bakedCars = 2: every walk fills a draw list. In stage 2b only the cars gplvr draws get one.
-    bool      listsForAll = false;
-    // bakedCars = 3 with the body dispatch wrapped: cars in baked main passes are gplvr's.
-    bool      stage3 = false;
     CarDrawFn body = nullptr;  // gpl_renderNodeDispatch, the body dispatch's own target
     PassArena arena;
     Addresses at;
@@ -1490,52 +1382,33 @@ struct State {
     TeamInstanceFn teamInstance = nullptr;
     PoseFn    pose = nullptr;
     ShadowFn  shadow = nullptr;
-    bool      shadowWrapped = false;
-
-    int64_t       windowStart = 0;
-    Second        second;
-    void*         instancesLogged[kMaxInstancesLogged] = {};
-    bool          instancesLoggedCockpit[kMaxInstancesLogged] = {};
-    int           instancesLoggedCount = 0;
+    // Logged once each: a car's or the cockpit's walk faulted, the cockpit was drawn whole by GPL
+    // (CockpitWhole), a car past kMaxListsPerPass.
+    bool      saidFaulted = false;
+    bool      saidCockpitWhole[kCockpitWholeKinds] = {};
+    bool      saidArenaFull = false;
 };
 
 State g_car;
 
-// Polygons the shadow calls emitted during the current car draw.
-volatile uint32_t g_shadowPolygons = 0;
-
-// Stage 2b: set around GPL's draw of a car gplvr draws, so the body dispatch returns at once --
-// kSkipMain in a main pass, kSkipMirror in a mirror pass; and how often it did, per second.
-constexpr uint32_t kSkipMain = 1;
-constexpr uint32_t kSkipMirror = 2;
-volatile uint32_t  g_skipBody = 0;
-uint32_t           g_bodySkipped = 0;
-uint32_t           g_bodySkippedMirror = 0;
+// Set around GPL's draw of a car gplvr draws, so the body dispatch returns at once.
+volatile uint32_t g_skipBody = 0;
 
 uint32_t polygonsDrawn() { return *reinterpret_cast<const volatile uint32_t*>(g_car.at.polygonsDrawn); }
 
 // Replaces the rel32 of the body dispatch at 0x48703F: ecx is the root MATERIAL, nothing is on
 // the stack, as gpl_renderNodeDispatch takes it.
 void __fastcall bodyWrapper(void* node, void*) {
-    if (g_skipBody) {
-        if (g_skipBody == kSkipMirror)
-            ++g_bodySkippedMirror;
-        else
-            ++g_bodySkipped;
-        return;
-    }
+    if (g_skipBody) return;
     g_car.body(node, nullptr);
 }
 
 // In a baked main pass the residual flush also learns which of its polygons this call submitted
 // and where GPL's walk was, to test them by that place (ResidualDepth.h, report 105 section 4.8).
 int __cdecl shadowWrapper(void* record, void* node) {
-    uint32_t before = polygonsDrawn();
     residualShadowBegin();
-    int      result = g_car.shadow(record, node);
-    uint32_t emitted = polygonsDrawn() - before;
-    residualShadowEnd(bakedPassWalkPosition(), emitted);
-    g_shadowPolygons += emitted;
+    int result = g_car.shadow(record, node);
+    residualShadowEnd(bakedPassWalkPosition());
     return result;
 }
 
@@ -1576,12 +1449,10 @@ void beginWalk(Walk& walk, const Frame& root) {
     walk.frames[0] = root;
     walk.frameCount = 1;
     walk.skin = SkinCounts{};
-    walk.skinnedObjects = 0;
     walk.knownObjects = 0;
-    walk.ticks = WalkTicks{};
 }
 
-// Stage 2: an empty list for this draw, holding the root frame and the MATERIAL state GPL has at
+// An empty list for this draw, holding the root frame and the MATERIAL state GPL has at
 // the car's dispatch as its first frame and material.
 void beginList(const Addresses& a, Walk& walk, baked::CarDrawList& list, const Frame& frame,
                const float projection[16], const float modelView[16]) {
@@ -1624,31 +1495,10 @@ bool walkGuarded(Walk& walk, uintptr_t root, uintptr_t rootChild, const Frame& f
     }
 }
 
-// A team instance's first draw as a car and as the cockpit, each logged once (CarWalkReport.cpp).
-void logInstance(State& s, void* instance, int driver, bool cockpit, const Walk& walk,
-                 const baked::CarDrawList* list) {
-    for (int i = 0; i < s.instancesLoggedCount; ++i)
-        if (s.instancesLogged[i] == instance && s.instancesLoggedCockpit[i] == cockpit) return;
-    if (s.instancesLoggedCount >= kMaxInstancesLogged) return;
-    s.instancesLoggedCockpit[s.instancesLoggedCount] = cockpit;
-    s.instancesLogged[s.instancesLoggedCount++] = instance;
-    carwalk::logInstance(instance, driver, cockpit, walk.counts, walk.emit, walk.skin,
-                         walk.skinnedObject, walk.skinnedLeaves, walk.skinnedObjects, list);
-}
-
-// The per-second report (CarWalkReport.cpp).
-void reportSecond(State& s) {
-    if (!carwalk::reportSecond(s.second, s.windowStart, s.stage3, g_bodySkipped,
-                               g_bodySkippedMirror))
-        return;
-    g_bodySkipped = 0;
-    g_bodySkippedMirror = 0;
-}
-
 // A walk with the pass's decisions as GPL holds them at this call: the cell's clip planes, the
 // class mask, the LOD scale, the selector camera and a copy of the pass's register file.
 void setupWalk(const Addresses& a, Walk& walk, uintptr_t registers) {
-    walk.counts = WalkCounts{};
+    walk.polygons = 0;
     walk.planeMask = at<uint32_t>(a.planeMask) & 63u;
     walk.classVisible = at<uint32_t>(a.classVisible);
     walk.lodScale = at<float>(a.lodScale);
@@ -1663,7 +1513,6 @@ void setupWalk(const Addresses& a, Walk& walk, uintptr_t registers) {
     walk.tape = nullptr;
     walk.unionMargin = 0.0f;
     walk.condition = 0;
-    walk.orders = nullptr;
 }
 
 // A union walk's state (report 105 section 4.22), with `margin` from the tape: 0 decides every
@@ -1679,7 +1528,6 @@ void beginUnion(Walk& walk, float margin) {
     walk.learn = false;
     walk.configGate = 0;
     walk.learnedGates = 0;
-    std::memset(walk.unlearned, 0, sizeof(walk.unlearned));
     walk.wheelDepth = 0;
     walk.region = 0;
     walk.regionCount = 1;
@@ -1701,13 +1549,13 @@ int firstHazard(const Walk& walk) {
 
 // A kept list's walk (report 105 section 4.23): a union walk with `margin` (0: every gate both
 // ways) and the instance's four wheel XFORMs (report 103 section 1: I+116, 124, 132, 140, whose
-// w5 the pose turns by the spin angle) with their models (section 4.30). With bakedCarConfigs it
-// decides the configuration gates (section 4.24).
+// w5 the pose turns by the spin angle) with their models (section 4.30). It decides the
+// configuration gates (section 4.24).
 void beginProgram(Walk& walk, float margin, uintptr_t instance) {
     beginUnion(walk, margin > 0.0f ? margin : kMaxUnionMargin);
     walk.program = true;
     walk.everyGate = margin <= 0.0f;
-    walk.learn = g_options.bakedCarConfigs != 0;
+    walk.learn = true;
     for (unsigned i = 0; i < 4; ++i) {
         walk.wheels[i] = at<uint32_t>(instance + kInstanceWheels + 8 * i);
         for (unsigned m = 0; m < kWheelModels; ++m)
@@ -1747,7 +1595,7 @@ ShareRefusal shareRefusal(const Walk& walk, const baked::CarDrawList& list, bool
     const EmitCounts& e = walk.emit;
     if (!walked) return kShareFaulted;
     // The cockpit's glass is left to GPL (report 105 section 4.48); a car has none.
-    if (list.polygons + e.glass != walk.counts.polygons) return kShareContract;
+    if (list.polygons + e.glass != walk.polygons) return kShareContract;
     if (walk.skin.liveCorners || walk.skin.liveNormals) return kShareGplMemo;
     if (walk.skin.frameOverflow) return kShareFrames;
     if (e.noObject || e.notLeaf || e.typeDiffers || e.overflow || e.slotNoList ||
@@ -1759,14 +1607,14 @@ ShareRefusal shareRefusal(const Walk& walk, const baked::CarDrawList& list, bool
 // How a pass's list of a car or the cockpit came to be (listOurs; kListEmpty: CarPassView.h).
 enum ListOutcome { kListFailed, kListRefused, kListEmpty, kListWalked, kListTaken, kListKept };
 
-// Stage 2b: the list of a car's first call this pass, in the pass's arena -- the whole car,
+// The list of a car's first call this pass, in the pass's arena -- the whole car,
 // without the cell's clip planes, which only cut GPL's per-cell copies: taken from its kept
 // program or from the first eye, else walked. `glassTexture` is mirror.mip's handle for the
 // cockpit (report 105 section 4.48), whose glass the walk leaves to GPL, and 0 for a car; with
 // `overlay` (step 2, section 4.49) the glass is listed and the list drawn over the eye image. A
 // walk that faulted, or a cockpit list that does not hold every polygon walked but the glass
 // left to GPL, is not listed and adds the record to the pass's failed ones.
-ListOutcome listOurs(State& s, OursSecond& o, uintptr_t record, int driver, uintptr_t instance,
+ListOutcome listOurs(State& s, uintptr_t record, int driver, uintptr_t instance,
                      uintptr_t root, uintptr_t handle, uintptr_t registers, bool mirror,
                      uint32_t glassTexture, bool overlay) {
     PassArena& arena = s.arena;
@@ -1813,39 +1661,19 @@ ListOutcome listOurs(State& s, OursSecond& o, uintptr_t record, int driver, uint
     walk.tape = program == kProgramBuild ? carProgramTapeBegin(share, programMargin) : nullptr;
     if (program == kProgramBuild && !walk.tape) program = kProgramWalk;
     if (program == kProgramWalk) walk.tape = carShareTapeBegin(share, arena.count);
-    // A verify walk of an eye-independent list keeps the first eye's order where that list does.
-    if (shared == kShareVerify) walk.orders = carShareVerifyOrders();
 
-    static uint32_t walks = 0;
-    LARGE_INTEGER   walkStart, walkEnd;
-    QueryPerformanceCounter(&walkStart);
     if (program == kProgramBuild)
         beginProgram(walk, programMargin, instance);
     else
         beginUnion(walk, walk.tape ? walk.tape->margin : 0.0f);
     beginWalk(walk, frame);
-    walk.profile = ++walks % kProfileEvery == 0;
-    uint64_t tscStart = walk.profile ? __rdtsc() : 0;
-    bool     walked = walkGuarded(walk, root, handle, frame);
-    if (walk.profile) {
-        walk.ticks.total = __rdtsc() - tscStart;
-        ++o.profiled;
-        o.ticks.memo += walk.ticks.memo;
-        o.ticks.emit += walk.ticks.emit;
-        o.ticks.skinned += walk.ticks.skinned;
-        o.ticks.object += walk.ticks.object;
-        o.ticks.total += walk.ticks.total;
-    }
-    walk.profile = false;
-    int redone = firstHazard(walk);
+    bool walked = walkGuarded(walk, root, handle, frame);
+    int  redone = firstHazard(walk);
     // A kept list's walk the car's program cannot keep (a hazard, a fault, a refused leaf) is
     // thrown away, and the car is walked as in section 4.22, with CarShare's tape.
     if (walk.program) {
-        LARGE_INTEGER built;
-        QueryPerformanceCounter(&built);
         if (carProgramTapeEnd(*walk.tape, walked ? redone : -1, shareRefusal(walk, list, walked),
-                              list, built.QuadPart - walkStart.QuadPart, walk.learnedGates,
-                              walk.unlearned)) {
+                              list, walk.learnedGates)) {
             carShareTapeSkip(share, arena.count);
             walk.tape = nullptr;
         } else {
@@ -1862,9 +1690,8 @@ ListOutcome listOurs(State& s, OursSecond& o, uintptr_t record, int driver, uint
     }
     // A union walk whose list cannot say what an eye draws (a memoised frame or a register that
     // depends on a side, or no room for the conditions) is thrown away, and the car is walked
-    // again deciding every gate, as at bakedCarUnion = 0 (report 105 section 4.22).
+    // again deciding every gate (report 105 section 4.22).
     if (walked && walk.unionMargin > 0.0f && redone >= 0) {
-        carShareUnionRedone(static_cast<UnionRedone>(redone));
         setupWalk(s.at, walk, registers);
         walk.planeMask = 0;
         walk.cellPlanes = false;
@@ -1876,103 +1703,64 @@ ListOutcome listOurs(State& s, OursSecond& o, uintptr_t record, int driver, uint
         beginWalk(walk, frame);
         walked = walkGuarded(walk, root, handle, frame);
     }
-    QueryPerformanceCounter(&walkEnd);
-    o.walkTicks += walkEnd.QuadPart - walkStart.QuadPart;
-    addSkinCounts(o.skin, walk.skin);
     ShareRefusal refusal = shareRefusal(walk, list, walked);
     if (walk.tape) carShareTapeEnd(*walk.tape, refusal, list);
     walk.tape = nullptr;
-    walk.orders = nullptr;
-    if (shared == kShareVerify) carShareVerify(list, walked);
-    if (program == kProgramVerify)
-        carProgramVerify(list, walked, walkEnd.QuadPart - walkStart.QuadPart);
+    if (program == kProgramVerify) carProgramVerify(list, walked);
     if (!walked) {
-        ++o.walkFailed;
+        if (!s.saidFaulted) {
+            s.saidFaulted = true;
+            logf("baked cars: a walk of driver %d's %s faulted -- GPL draws it whole on its later "
+                 "calls of the pass (logged once)",
+                 driver, glassTexture ? "cockpit" : "car");
+        }
         arena.failed.push_back(record);
         return kListFailed;
-    }
-    addEmitCounts(o.emit, walk.emit);
-    uint32_t covered = list.polygons + walk.emit.glass;
-    if (covered != walk.counts.polygons && !o.differed) {
-        o.differed = true;
-        o.driver = driver;
-        o.firstLeaves = covered;
-        o.firstWalked = walk.counts.polygons;
     }
     // A car's list is drawn with what it holds; a cockpit list missing a polygon is not, and GPL
     // draws the cockpit whole (report 105 section 4.48).
     if (glassTexture && (refusal == kShareContract || refusal == kShareLeaves)) {
-        ++o.refused;
         arena.failed.push_back(record);
         return kListRefused;
     }
     arena.records[arena.count++] = record;
-    ++o.lists;
-    o.leaves += list.polygons;
-    o.glass += walk.emit.glass;
-    o.walked += walk.counts.polygons;
-    o.draws += list.draws.size();
-    if (covered == walk.counts.polygons) ++o.matched;
-    logInstance(s, reinterpret_cast<void*>(instance), driver, glassTexture != 0, walk, &list);
     return kListWalked;
 }
 
-// Stage 2b: a car call in a baked main pass. Every call runs GPL's draw with the body dispatch
+// A car call in a baked main or mirror pass. Every call runs GPL's draw with the body dispatch
 // skipped, so the pose, the helmet tint, register 11 and the blob shadow (clipped to this call's
 // cell) stay GPL's. The car's first call this pass then makes its list (listOurs). The walk comes
 // AFTER GPL's draw because that draw writes this car's helmet colour into the BILLBOARDs of the
 // team model all cars of the team share (0x486ECB), and leaves the MATERIAL state as its body
 // dispatch would see it. A car whose walk faulted is drawn by GPL whole on its later calls this
-// pass (its first call lost the body: counted), as is a car past the arena's limit. A mirror pass
-// (bakedMirrors = 1) is the same with the mirror's registers and camera, counted apart.
+// pass (its first call lost the body), as is a car past the arena's limit. A mirror pass is the
+// same with the mirror's registers and camera.
 void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uintptr_t root,
               uintptr_t handle, uintptr_t registers, bool mirror) {
-    OursSecond& o = mirror ? s.second.mirrorCars : s.second.cars;
-    PassArena&  arena = s.arena;
-    auto        record = reinterpret_cast<uintptr_t>(recordPointer);
-    ++o.calls;
+    PassArena& arena = s.arena;
+    auto       record = reinterpret_cast<uintptr_t>(recordPointer);
     bool listed = false;
     for (uint32_t i = 0; i < arena.count && !listed; ++i) listed = arena.records[i] == record;
     bool failed = false;
     for (size_t i = 0; i < arena.failed.size() && !listed && !failed; ++i)
         failed = arena.failed[i] == record;
     bool fresh = !listed && !failed && arena.count < kMaxListsPerPass;
-    if (listed)
-        ++o.deduped;
-    else if (!failed && !fresh)
-        ++o.arenaFull;
-
-    // Debug view 6 leaves GPL's draw of every car out, blob shadow included.
-    bool leftOut = bakedPassWithoutGpl();
-    if (leftOut) {
-        ++o.leftOut;
-    } else {
-        g_shadowPolygons = 0;
-        uint32_t before = polygonsDrawn();
-        bool     skip = listed || fresh;
-        g_skipBody = !skip ? 0u : mirror ? kSkipMirror : kSkipMain;
-        LARGE_INTEGER originalStart, originalEnd;
-        QueryPerformanceCounter(&originalStart);
-        s.original(recordPointer, nullptr);
-        QueryPerformanceCounter(&originalEnd);
-        g_skipBody = 0;
-        uint32_t shadow = g_shadowPolygons;
-        s.second.shadow += shadow;
-        if (skip) {
-            ++o.bodyCalls;
-            o.gplPolygons += polygonsDrawn() - before - shadow;
-            ++o.originalCalls;
-            o.originalTicks += originalEnd.QuadPart - originalStart.QuadPart;
-        }
+    if (!listed && !failed && !fresh && !s.saidArenaFull) {
+        s.saidArenaFull = true;
+        logf("baked cars: more than %u cars in one pass -- GPL draws the rest whole (logged once)",
+             kMaxListsPerPass);
     }
+
+    g_skipBody = listed || fresh ? 1u : 0u;
+    s.original(recordPointer, nullptr);
+    g_skipBody = 0;
     if (!fresh) return;
     ListOutcome made =
-        listOurs(s, o, record, driver, instance, root, handle, registers, mirror, 0, false);
-    if (made == kListFailed && !leftOut) ++o.bodyLost;
+        listOurs(s, record, driver, instance, root, handle, registers, mirror, 0, false);
     if (made >= kListWalked) carProgramListed(arena.lists[arena.count - 1]);
 }
 
-// Report 105 section 4.48 (bakedCockpit = 1): the player's cockpit in a baked main pass is
+// Report 105 section 4.48: the player's cockpit in a baked main pass is
 // gplvr's but for its mirror glass. Its first call this pass makes its list as a car's is made
 // (listOurs: walked whole, or the first eye's taken; in step 2 also its kept program, section
 // 4.50), the glass left out.
@@ -1981,19 +1769,17 @@ void drawOurs(State& s, void* recordPointer, int driver, uintptr_t instance, uin
 // and the residual flush tests the glass against the baked depth, the cockpit's included. The
 // walk comes BEFORE GPL's draw, unlike a car's: the cockpit's branch of GPL's draw (0x487032)
 // only points the root's word 1 at the handle, which the walk does itself, and the filter needs
-// the glass the walk finds. A cockpit gplvr cannot list is drawn whole by GPL on every call of
-// the pass, counted by why (CockpitWhole). Step 2 (bakedCockpitOverlay, section 4.49): when the
-// pass can draw it over its eye image, the list holds the glass too and GPL's draw hands GPL no
-// leaf; it still runs, for the registers the cockpit's SETREG nodes write and for any line, unless
-// CockpitDraw.h skips it and writes those registers itself (section 4.50).
+// the glass the walk finds. A cockpit call outside a baked main pass, or one gplvr cannot list, is
+// drawn whole by GPL on every call of the pass (CockpitWhole; a refusal is logged once by why).
+// Step 2 (section 4.49): when the pass can draw it over its eye image, the list holds the glass
+// too and GPL's draw hands GPL no leaf; it still runs, for the registers the cockpit's SETREG
+// nodes write and for any line, unless CockpitDraw.h skips it and writes those registers itself
+// (section 4.50).
 void drawCockpit(State& s, void* recordPointer, int driver, uintptr_t instance, uintptr_t root,
                  uintptr_t handle, uintptr_t registers, bool mainPass) {
-    CockpitSecond& c = s.second.cockpitOurs;
-    OursSecond&    o = s.second.cockpitList;
-    PassArena&     arena = s.arena;
-    auto           record = reinterpret_cast<uintptr_t>(recordPointer);
-    uint32_t       mirrorMip = s.at.mirrorMip ? at<uint32_t>(s.at.mirrorMip) : 0;
-    ++c.calls;
+    PassArena& arena = s.arena;
+    auto       record = reinterpret_cast<uintptr_t>(recordPointer);
+    uint32_t   mirrorMip = s.at.mirrorMip ? at<uint32_t>(s.at.mirrorMip) : 0;
     int whole = arena.cockpitWhole;
     if (!mainPass)
         whole = kCockpitNotMainFile;
@@ -2005,26 +1791,30 @@ void drawCockpit(State& s, void* recordPointer, int driver, uintptr_t instance, 
         whole = kCockpitNoMirrorMip;
     bool listed = false;
     for (uint32_t i = 0; i < arena.count && !listed; ++i) listed = arena.records[i] == record;
-    if (whole < 0 && listed) {
-        ++o.deduped;
-    } else if (whole < 0 && arena.count >= kMaxListsPerPass) {
+    if (whole < 0 && !listed && arena.count >= kMaxListsPerPass) {
         whole = kCockpitArenaFull;
-    } else if (whole < 0) {
+    } else if (whole < 0 && !listed) {
         cockpitGlassFor(handle, carBakeGeneration());
-        arena.cockpitOverlay =
-            g_options.bakedCockpitOverlay && bakedCockpitOverlayReady(mirrorMip) == kOverlayReady;
-        if (g_options.bakedCockpitOverlay && !arena.cockpitOverlay) ++c.stepOne;
-        ListOutcome made = listOurs(s, o, record, driver, instance, root, handle, registers, false,
+        arena.cockpitOverlay = bakedCockpitOverlayReady(mirrorMip) == kOverlayReady;
+        ListOutcome made = listOurs(s, record, driver, instance, root, handle, registers, false,
                                     mirrorMip, arena.cockpitOverlay);
-        if (made == kListTaken) ++c.taken;
-        if (made == kListKept) ++c.kept;
-        if (made != kListFailed && made != kListRefused && arena.cockpitOverlay) ++c.overlayLists;
         if (made == kListFailed) arena.cockpitWhole = whole = kCockpitFaulted;
         if (made == kListRefused) arena.cockpitWhole = whole = kCockpitRefused;
     }
-    if (whole >= 0) ++c.whole[whole];
+    // Outside a baked main pass the cockpit is GPL's as a matter of course.
+    if (whole > kCockpitNotMainFile && !s.saidCockpitWhole[whole]) {
+        static const char* const kWhy[kCockpitWholeKinds] = {
+            "",
+            "",
+            "the node filter does not see the lit polygon types",
+            "mirror.mip's handle is not known",
+            "past the pass's list limit",
+            "its walk faulted",
+            "its list did not hold every polygon walked but the glass"};
+        s.saidCockpitWhole[whole] = true;
+        logf("baked cars: GPL draws the cockpit whole -- %s (logged once)", kWhy[whole]);
+    }
 
-    // Debug view 6 keeps GPL's draw of the cockpit (bakedCockpitDraw).
     static const uintptr_t kNoLeaf = 0;
     bool             ours = whole < 0;
     bool             overlay = ours && arena.cockpitOverlay;
@@ -2035,41 +1825,20 @@ void drawCockpit(State& s, void* recordPointer, int driver, uintptr_t instance, 
     uint32_t         count = 0;
     const uintptr_t* glass = overlay ? &kNoLeaf : cockpitGlassNodes(count);
     uint32_t         before = polygonsDrawn();
-    LARGE_INTEGER    drawStart, drawEnd;
-    QueryPerformanceCounter(&drawStart);
-    bakedCockpitDraw(true);
     if (ours) bakedCockpitGlassOnly(glass, count);
     s.original(recordPointer, nullptr);
     if (ours) bakedCockpitGlassOnly(nullptr, 0);
-    bakedCockpitDraw(false);
-    QueryPerformanceCounter(&drawEnd);
-    int64_t ticks = drawEnd.QuadPart - drawStart.QuadPart;
-    ++s.second.cockpitCalls;
-    s.second.cockpitTicks += ticks;
     if (!ours) return;
+    // What the filter handed GPL in that draw; GPL's skip check reads it (CockpitDraw.h).
     uint32_t passed = 0, dropped = 0, lines = 0;
     bakedCockpitGlassTake(passed, dropped, lines);
-    if (overlay) {
-        uint32_t polygons = polygonsDrawn() - before;
-        ++c.overlayCalls;
-        c.overlayTicks += ticks;
-        c.overlayPassed += passed;
-        c.overlayDropped += dropped;
-        c.overlayLines += lines;
-        c.overlayGplPolygons += polygons;
-        if (gpl == kCockpitGplCheck) cockpitGplDrawChecked(registers, passed, lines, polygons);
-        return;
-    }
-    ++c.glassCalls;
-    c.glassTicks += ticks;
-    c.glassPassed += passed;
-    c.dropped += dropped;
-    c.lines += lines;
-    c.gplPolygons += polygonsDrawn() - before;
-    c.glassNodes = count;
+    if (gpl == kCockpitGplCheck)
+        cockpitGplDrawChecked(registers, passed, lines, polygonsDrawn() - before);
 }
 
-void carDrawCall(void* recordPointer) {
+// GPL's car draw, through the car vtable slot. A call outside a baked pass of its kind (the
+// renderer switched to vanilla, a pass it refused, a pass of another kind) goes to GPL whole.
+void __fastcall carDraw(void* recordPointer, void*) {
     State& s = g_car;
     auto record = reinterpret_cast<uintptr_t>(recordPointer);
     int  driver = at<int32_t>(record + kRecordDriver);
@@ -2087,160 +1856,16 @@ void carDrawCall(void* recordPointer) {
     bool      mainPass = registers == s.at.registersMain;
     // The register file names the pass (gpl_sceneRender switches it at 0x487766 and 0x487C9C); a
     // call is gplvr's only inside a baked pass of the same kind.
-    bool bakedKind = mainPass || (mirror && g_options.bakedMirrors);
-    // bakedCockpitCheck (step 0, below) takes precedence over bakedCockpit.
-    if (s.stage3 && cockpit && g_options.bakedCockpit && !g_options.bakedCockpitCheck) {
+    if (cockpit) {
         drawCockpit(s, recordPointer, driver, instance, root, handle, registers, mainPass);
-        reportSecond(s);
         return;
     }
-    if (s.stage3 && bakedKind && !cockpit) {
-        OursSecond& o = mirror ? s.second.mirrorCars : s.second.cars;
-        if (!bakedPassCollecting() || bakedPassMirror() != mirror) {
-            ++o.mainOutside;
-        } else {
-            ++o.mainInside;
-            if (bakedPassDrawsCars()) {
-                drawOurs(s, recordPointer, driver, instance, root, handle, registers, mirror);
-                reportSecond(s);
-                return;
-            }
-        }
-    }
-    // bakedCars = 3 does not verify what GPL draws itself (mirror passes, the cockpit, car calls
-    // outside a baked pass): it is counted and handed to GPL unwalked. Levels 1 and 2 walk and
-    // compare every draw, and so does debug view 15 for the mirror cars (bakedMirrors = 1): GPL
-    // draws the mirror then, and the walk with the mirror's registers, masks and LOD scale is
-    // checked against GPL's polygon counter.
-    bool mirrorContract = mirror && !cockpit && bakedPassMirrorsByGpl();
-    // bakedCockpitCheck (report 105 section 4.47, step 0): the cockpit is walked into a list and
-    // compared with GPL's draw of it, as at levels 1 and 2, while GPL still draws it.
-    bool cockpitCheck = cockpit && g_options.bakedCockpitCheck;
-    if (s.stage3 && !mirrorContract && !cockpitCheck) {
-        OursSecond& o = s.second.cars;
-        ++o.passedThrough;
-        if (cockpit)
-            ++o.passedCockpit;
-        else if (mirror)
-            ++o.passedMirror;
-        else
-            ++o.passedOther;
-        // Debug view 6 leaves every car but the cockpit out of the main pass.
-        bool          leftOut = !cockpit && bakedPassWithoutGpl();
-        LARGE_INTEGER drawStart, drawEnd;
-        QueryPerformanceCounter(&drawStart);
-        if (cockpit) bakedCockpitDraw(true);
-        if (!leftOut) s.original(recordPointer, nullptr);
-        if (cockpit) bakedCockpitDraw(false);
-        QueryPerformanceCounter(&drawEnd);
-        if (cockpit) {
-            ++s.second.cockpitCalls;
-            s.second.cockpitTicks += drawEnd.QuadPart - drawStart.QuadPart;
-        }
-        reportSecond(s);
+    if ((mainPass || mirror) && bakedPassCollecting() && bakedPassMirror() == mirror &&
+        bakedPassDrawsCars()) {
+        drawOurs(s, recordPointer, driver, instance, root, handle, registers, mirror);
         return;
     }
-
-    static Walk walk;
-    setupWalk(s.at, walk, registers);
-    Frame frame;
-    float projection[16], modelView[16];
-    rootFrame(s.at, frame, projection, modelView);
-
-    static baked::CarDrawList list;
-    walk.list = nullptr;
-    if (s.stage2 && (s.listsForAll || cockpitCheck)) {
-        beginList(s.at, walk, list, frame, projection, modelView);
-        list.driver = driver;
-        list.cockpit = cockpit;
-        list.mirror = mirror;
-    }
-
-    LARGE_INTEGER walkStart, walkEnd;
-    QueryPerformanceCounter(&walkStart);
-    beginWalk(walk, frame);
-    bool walked = walkGuarded(walk, root, handle, frame);
-    QueryPerformanceCounter(&walkEnd);
-    addSkinCounts(s.second.skin, walk.skin);
-
-    // Debug view 6 leaves every car but the cockpit out of the main pass, blob shadow included.
-    bool leftOut = !cockpit && bakedPassWithoutGpl();
-    g_shadowPolygons = 0;
-    uint32_t before = polygonsDrawn();
-    if (cockpit) bakedCockpitDraw(true);
-    if (!leftOut) s.original(recordPointer, nullptr);
-    if (cockpit) bakedCockpitDraw(false);
-    uint32_t shadow = g_shadowPolygons;
-    uint32_t gpl = polygonsDrawn() - before - shadow;
-
-    Second& t = s.second;
-    ++t.draws;
-    if (cockpit) ++t.cockpitDraws;
-    if (mirror)
-        ++t.mirrorDraws;
-    else if (registers == s.at.registersMain)
-        ++t.mainDraws;
-    t.walkTicks += walkEnd.QuadPart - walkStart.QuadPart;
-    t.shadow += shadow;
-    if (!walked) {
-        ++t.walkFailed;
-    } else if (leftOut) {
-        ++t.leftOut;
-    } else {
-        t.ours += walk.counts.polygons;
-        t.gpl += gpl;
-        addCounts(t.sums, walk.counts);
-        if (walk.counts.polygons == gpl) {
-            ++t.matched;
-            if (cockpit) ++t.cockpitMatched;
-        } else if (!t.differed) {
-            t.differed = true;
-            t.driver = driver;
-            t.instance = reinterpret_cast<void*>(instance);
-            t.cockpit = cockpit;
-            t.mirror = mirror;
-            t.planeMask = walk.planeMask;
-            t.first = walk.counts;
-            t.firstGpl = gpl;
-        }
-        if (walk.list) {
-            // The contract of stage 2: every polygon the walk counts is a leaf of the list.
-            EmitSecond& e = t.emit;
-            ++e.draws;
-            e.leaves += list.polygons;
-            e.walked += walk.counts.polygons;
-            e.ranges += list.draws.size();
-            e.frames += list.frames.size();
-            e.materials += list.materials.size();
-            e.emptyLeaves += list.emptyLeaves;
-            addEmitCounts(e.counts, walk.emit);
-            if (list.polygons == walk.counts.polygons) {
-                ++e.matched;
-            } else if (!e.differed) {
-                e.differed = true;
-                e.driver = driver;
-                e.cockpit = cockpit;
-                e.mirror = mirror;
-                e.firstLeaves = list.polygons;
-                e.firstWalked = walk.counts.polygons;
-                e.first = walk.emit;
-            }
-        }
-        logInstance(s, reinterpret_cast<void*>(instance), driver, cockpit, walk, walk.list);
-    }
-    reportSecond(s);
-}
-
-// GPL's car draw: every call timed by where it ran (report 105 section 4.46), so the baked passes'
-// walk windows can be told apart from the car calls inside them.
-void __fastcall carDraw(void* recordPointer, void*) {
-    int           kind = bakedTimeKind();
-    LARGE_INTEGER start, end;
-    QueryPerformanceCounter(&start);
-    carDrawCall(recordPointer);
-    QueryPerformanceCounter(&end);
-    g_car.second.callTicks[kind] += end.QuadPart - start.QuadPart;
-    ++g_car.second.callCount[kind];
+    s.original(recordPointer, nullptr);
 }
 
 // The rel32 target of the `call` at `site`, or 0 when the byte there is not E8.
@@ -2253,7 +1878,7 @@ uintptr_t callTarget(uintptr_t site) {
 
 void carWalkInstall() {
     State& s = g_car;
-    if (s.installed || g_options.bakedRenderer == 0 || g_options.bakedCars == 0) return;
+    if (s.installed) return;
 
     Addresses& a = s.at;
     a.polygonsDrawn = rebase(kPolygonsDrawn);
@@ -2270,14 +1895,26 @@ void carWalkInstall() {
     a.registersMain = rebase(kRegistersMain);
     a.registersMirror = rebase(kRegistersMirror);
     a.lightingOn = rebase(kLightingOn);
+    a.texturedMask = rebase(kTexturedMask);
+    a.classTextured = rebase(kClassTextured);
+    a.surfaceClass = rebase(kSurfaceClass);
+    a.textureList = rebase(kTextureList);
+    a.specularExponent = rebase(kSpecularExponent);
+    a.specular = rebase(kSpecular);
+    a.lightLocal = rebase(kLightLocal);
+    a.mirrorMip = rebase(kMirrorMip);
 
+    // Every check comes before the first patch, so a refusal leaves GPL drawing every car.
     // GPL's own vertex memo, for what it memoised before a walk (CarMemo.h).
     carMemoGplBind();
     uintptr_t slot = rebase(kCarVtableSlot);
     if (!a.polygonsDrawn || !a.eyeLocal || !a.planeMask || !a.planes || !a.modelViewSlot ||
         !a.projectionSlot || !a.lodScale || !a.classVisible || !a.backgroundTable || !a.dlong ||
-        !a.dlat || !a.registersMain || !a.registersMirror || !slot) {
-        logf("baked cars: NOT installed -- rebase refused one of the game's addresses (%s)",
+        !a.dlat || !a.registersMain || !a.registersMirror || !slot || !a.texturedMask ||
+        !a.classTextured || !a.surfaceClass || !a.textureList || !a.specularExponent ||
+        !a.specular || !a.lightLocal) {
+        logf("baked cars: NOT installed -- rebase refused one of the game's addresses (%s); GPL "
+             "draws the cars",
              rebaseSummary());
         return;
     }
@@ -2316,97 +1953,61 @@ void carWalkInstall() {
              static_cast<unsigned>(pose), static_cast<unsigned>(kPoseFunction),
              static_cast<unsigned>(poseData));
     }
-    s.teamInstance = reinterpret_cast<TeamInstanceFn>(team);
-    s.pose = reinterpret_cast<PoseFn>(pose);
-    s.original = reinterpret_cast<CarDrawFn>(kCarRecordDraw);
-    s.shadow = reinterpret_cast<ShadowFn>(kShadowFunction);
-
-    // The shadow wrappers first, so the count is clean from the first hooked draw.
-    unsigned wrapped = 0;
-    for (uintptr_t site : kShadowCalls) {
-        if (callTarget(site) != kShadowFunction) continue;
-        auto rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&shadowWrapper) - (site + 5));
-        if (patchBytes(reinterpret_cast<void*>(site + 1), &rel, sizeof(rel))) ++wrapped;
-    }
-    s.shadowWrapped = wrapped == sizeof(kShadowCalls) / sizeof(kShadowCalls[0]);
-
-    void* hook = reinterpret_cast<void*>(&carDraw);
-    if (!patchBytes(reinterpret_cast<void*>(slot), &hook, sizeof(hook))) {
-        logf("baked cars: NOT installed -- could not write the car vtable slot %08X",
-             static_cast<unsigned>(slot));
-        return;
-    }
-    s.installed = true;
-    logf("baked cars: stage 1 installed on the car vtable slot %08X -- every car GPL draws is "
-         "walked first (team lookup %08X, pose %08X); shadow calls wrapped %u of 2%s. Watch the "
-         "per-second `baked cars:` lines: MATCHED should equal the walks that did not fault",
-         static_cast<unsigned>(slot), static_cast<unsigned>(team), static_cast<unsigned>(pose),
-         wrapped, s.shadowWrapped ? "" : " -- GPL's count then includes the shadow");
-
-    if (g_options.bakedCars < 2) return;
-    a.texturedMask = rebase(kTexturedMask);
-    a.classTextured = rebase(kClassTextured);
-    a.surfaceClass = rebase(kSurfaceClass);
-    a.textureList = rebase(kTextureList);
-    a.specularExponent = rebase(kSpecularExponent);
-    a.specular = rebase(kSpecular);
-    a.lightLocal = rebase(kLightLocal);
-    if (!a.texturedMask || !a.classTextured || !a.surfaceClass || !a.textureList ||
-        !a.specularExponent || !a.specular || !a.lightLocal) {
-        logf("baked cars: stage 2 NOT on -- rebase refused one of the MATERIAL state or light "
-             "addresses (%s); stage 1 runs alone",
-             rebaseSummary());
-        return;
-    }
-    if (!carBakeBind()) return;
-    s.stage2 = true;
-    s.listsForAll = true;
-    if (g_options.bakedCars < 3) {
-        logf("baked cars: stage 2 on -- each walk also fills a draw list from car objects baked "
-             "out of GPL's memory on first sight (one `baked cars: object` line each); the "
-             "per-second `baked cars: stage 2` line should say MATCHED on every list. Nothing is "
-             "drawn from them yet");
-        return;
-    }
-
-    // Stage 2b: the body dispatch must be the call report 105 section 4.3 read, behind the
-    // `mov ecx, esi` that hands it the root MATERIAL; otherwise GPL keeps drawing every car.
+    // The body dispatch must be the call report 105 section 4.3 read, behind the `mov ecx, esi`
+    // that hands it the root MATERIAL.
     uintptr_t body = callTarget(kBodyCall);
     if (body != kNodeDispatch ||
         std::memcmp(reinterpret_cast<const void*>(kBodyCall - sizeof(kBodyCallBefore)),
                     kBodyCallBefore, sizeof(kBodyCallBefore)) != 0) {
-        logf("baked cars: stage 2b NOT on -- the body dispatch at %08X reaches %08X (expected "
-             "%08X behind 8B CE); stage 2a runs, GPL draws every car",
+        logf("baked cars: NOT installed -- the body dispatch at %08X reaches %08X (expected %08X "
+             "behind 8B CE); GPL draws the cars",
              static_cast<unsigned>(kBodyCall), static_cast<unsigned>(body),
              static_cast<unsigned>(kNodeDispatch));
         return;
     }
+    if (!carBakeBind()) return;
+    s.teamInstance = reinterpret_cast<TeamInstanceFn>(team);
+    s.pose = reinterpret_cast<PoseFn>(pose);
+    s.original = reinterpret_cast<CarDrawFn>(kCarRecordDraw);
+    s.shadow = reinterpret_cast<ShadowFn>(kShadowFunction);
     s.body = reinterpret_cast<CarDrawFn>(kNodeDispatch);
+
+    // The body wrapper and the shadow wrappers pass every call through until the slot is ours.
     auto rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&bodyWrapper) - (kBodyCall + 5));
     if (!patchBytes(reinterpret_cast<void*>(kBodyCall + 1), &rel, sizeof(rel))) {
-        logf("baked cars: stage 2b NOT on -- could not write the body dispatch at %08X; stage 2a "
-             "runs, GPL draws every car",
+        logf("baked cars: NOT installed -- could not write the body dispatch at %08X; GPL draws "
+             "the cars",
              static_cast<unsigned>(kBodyCall));
         return;
     }
-    s.listsForAll = false;
-    s.stage3 = true;
-    a.mirrorMip = rebase(kMirrorMip);
-    logf("baked cars: stage 2b on -- body dispatch %08X wrapped; in a baked main pass gplvr draws "
-         "each car from one list a pass and GPL draws only its shadow; mirrors, the cockpit (but "
-         "for its glass gplvr's at bakedCockpit = 1) and car calls outside a baked pass stay "
-         "GPL's, counted and not walked. Watch "
-         "`baked cars: stage 2b` (calls OUTSIDE 0, contract MATCHED, GPL polygons 0) and `baked: "
-         "cars` (commands == list draws)",
-         static_cast<unsigned>(kBodyCall));
+    unsigned wrapped = 0;
+    for (uintptr_t site : kShadowCalls) {
+        if (callTarget(site) != kShadowFunction) continue;
+        auto shadowRel =
+            static_cast<int32_t>(reinterpret_cast<uintptr_t>(&shadowWrapper) - (site + 5));
+        if (patchBytes(reinterpret_cast<void*>(site + 1), &shadowRel, sizeof(shadowRel))) ++wrapped;
+    }
+    void* hook = reinterpret_cast<void*>(&carDraw);
+    if (!patchBytes(reinterpret_cast<void*>(slot), &hook, sizeof(hook))) {
+        logf("baked cars: NOT installed -- could not write the car vtable slot %08X; GPL draws "
+             "the cars",
+             static_cast<unsigned>(slot));
+        return;
+    }
+    s.installed = true;
+    logf("baked cars: installed on the car vtable slot %08X (team lookup %08X, pose %08X), body "
+         "dispatch %08X wrapped, shadow calls wrapped %u of 2 -- in a baked pass gplvr draws each "
+         "car and the cockpit, GPL only the shadows; car calls outside one stay GPL's",
+         static_cast<unsigned>(slot), static_cast<unsigned>(team), static_cast<unsigned>(pose),
+         static_cast<unsigned>(kBodyCall), wrapped);
     carProgramInstall();
 }
 
 void carWalkPassBegin(bool mirror, int pane) {
     PassArena& arena = g_car.arena;
     // The pass that ends keeps its lists for the other eye; the arena may get other vectors back.
-    carSharePassBegin(mirror, g_car.stage3, arena.lists, arena.count);
-    carProgramPassBegin(mirror, g_car.stage3, pane);
+    carSharePassBegin(mirror, g_car.installed, arena.lists, arena.count);
+    carProgramPassBegin(mirror, g_car.installed, pane);
     arena.records.resize(arena.lists.size());
     arena.count = 0;
     arena.failed.clear();

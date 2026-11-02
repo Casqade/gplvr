@@ -249,18 +249,6 @@ void glInteropUnregister(const GlFunctions& gl, HANDLE interopDevice,
 // only have been its own. Which call in the sequence failed is reported for the first few
 // frames after every texture recreation, so a failure names itself instead of arriving as
 // a black headset.
-// Write one rectangle of the framebuffer bound for READING to an uncompressed 24-bit TGA
-// in gplvr's own folder -- the caller binds the source; see dumpEyeRect in Hooks.cpp. This is
-// a diagnostic: it exists so that "the pixels are in the frame" can be
-// looked at rather than argued about. TGA because its default origin is bottom-left,
-// which is GL's, so the rows go out in the order they come back with no flip to get wrong.
-//
-// Called at publish time with each eye's own rect, it shows exactly what the headset was
-// handed -- not the combined side-by-side the monitor shows, which is the picture that
-// has been misleading this investigation.
-bool glDumpRectToTga(const GlFunctions& gl, int x, int y, int width, int height,
-                     const char* path);
-
 // glReadPixels into a tightly packed buffer of width * bytesPerPixel per row, whatever pack
 // state the game left: alignment 1, no row length or skips, restored afterwards. GL pads each
 // row to GL_PACK_ALIGNMENT, so a width whose row is not a multiple of it writes past a tight

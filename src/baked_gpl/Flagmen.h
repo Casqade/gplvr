@@ -15,7 +15,8 @@
 // takes the 16 colours GPL last gave the colormap -- recorded at the five colormapSetColor calls
 // of gpl_flagmanBindModel, which this module wraps -- and records a one-sprite CarDrawList with
 // the XFORM's pose and the walk's place. CarRenderer paints it in the walk-order phase there, the
-// indices looked up in that palette. Anything it cannot resolve is left to GPL, counted.
+// indices looked up in that palette. Anything it cannot resolve is left to GPL, and the first time
+// of each reason is logged.
 
 #include <cstddef>
 #include <cstdint>
@@ -26,8 +27,7 @@ struct CarDrawList;
 
 namespace gplvr {
 
-// From bakedPassBind, after carWalkInstall. Does nothing unless bakedRenderer, bakedFlagmen and
-// bakedCars = 3; logs what it installed or why not.
+// From the baked pass's first bind, after carWalkInstall; logs what it installed or why not.
 void flagmenInstall();
 
 // bakedPassBegin opens a new pass; bakedPassEnd reads its lists, in the order GPL's walk reached
@@ -37,16 +37,8 @@ const baked::CarDrawList* flagmenPassLists(uint32_t& count);
 
 // From the node filter while a baked pass (main or mirror) is collected, for an XFORM inside the
 // track's PRIM that is no baked item. True when the dispatch was taken (gplvr draws the flagman,
-// or it draws nothing, or debug view 12 had GPL draw it already): the filter then skips GPL's
-// handler. False for any other XFORM, and for a flagman left to GPL.
+// or it draws nothing): the filter then skips GPL's handler. False for any other XFORM, and for a
+// flagman left to GPL.
 bool flagmanDispatch(const unsigned char* node, void* stock);
-
-// Debug view 12: GPL draws every flagman, and each draw is compared with what gplvr would have
-// drawn, against gpl_statGfxPolysDrawn.
-void flagmenSetGplDraws(bool gplDraws);
-
-// Once a second: the per-second line, without its "baked flagmen: " prefix. False when there is
-// nothing to say. Resets the counters.
-bool flagmenFormat(char* out, size_t size, unsigned passes);
 
 }  // namespace gplvr

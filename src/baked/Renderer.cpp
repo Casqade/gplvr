@@ -159,18 +159,13 @@ flat in uint v_order;
 uniform sampler2D u_texture;
 uniform int u_textured;
 uniform int u_gouraud;
-// Debug view 8: every texture is the UV checker.
-uniform int u_uvChecker;
-uniform sampler2D u_checker;
 uniform float u_alphaRef;
 // Fragments at or above this alpha are left to the core pass (report 67b); 2 keeps all.
 uniform float u_alphaCeiling;
-// 1 for a batch blended as if twice over each pixel (Renderer::setTwoLayerClasses).
-uniform int u_twoLayers;
 // x: 0 no fog, 1 GL_EXP, 2 GL_EXP2; y: the density.
 uniform vec2 u_fog;
 uniform vec3 u_fogColour;
-// 0 no test; 1 the item order, then depth within one item; 2 depth alone.
+// 0 no test; 1 the item order, then depth within one item.
 uniform int u_orderTest;
 uniform usampler2D u_solidOrder;  // the order number of the solid surface at each pixel, 0 none
 uniform sampler2D u_solidDepth;
@@ -181,11 +176,9 @@ layout(location = 0) out vec4 o_colour;
 layout(location = 1) out uint o_order;
 bool hiddenBySolid(float slope) {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
-    if (u_orderTest == 1) {
-        // A car (kHookOrder) is compared by depth alone.
-        uint solid = texelFetch(u_solidOrder, pixel, 0).r;
-        if (solid < 0x80000000u && v_order != solid) return v_order < solid;
-    }
+    // A car (kHookOrder) is compared by depth alone.
+    uint solid = texelFetch(u_solidOrder, pixel, 0).r;
+    if (solid < 0x80000000u && v_order != solid) return v_order < solid;
     float z = gl_FragCoord.z;
     float unit = u_orderDepth.w > 0.5 ? z * exp2(-23.0) : exp2(-24.0);
     z += u_orderDepth.x * (u_orderDepth.y * slope + u_orderDepth.z * unit);
@@ -195,12 +188,9 @@ void main() {
     float slope = max(abs(dFdx(gl_FragCoord.z)), abs(dFdy(gl_FragCoord.z)));
     o_order = v_order;
     vec4 shade = u_gouraud != 0 ? v_colour : vec4(1.0);
-    vec4 colour = u_textured == 0 ? v_flat * shade
-                : u_uvChecker != 0 ? texture(u_checker, v_uv) * shade
-                                   : texture(u_texture, v_uv) * shade;
+    vec4 colour = u_textured == 0 ? v_flat * shade : texture(u_texture, v_uv) * shade;
     if (colour.a < u_alphaRef || colour.a >= u_alphaCeiling) discard;
     if (u_orderTest != 0 && hiddenBySolid(slope)) discard;
-    if (u_twoLayers != 0) colour.a *= 2.0 - colour.a;
     if (u_fog.x > 0.5) {
         float depth = u_fog.y * v_fogW;
         float kept = clamp(exp(-(u_fog.x > 1.5 ? depth * depth : depth)), 0.0, 1.0);
@@ -221,7 +211,6 @@ struct SavedState {
     GLint     solidDepthTexture = 0;
     GLint     itemOrderTexture = 0;
     GLint     batchTableTexture = 0;
-    GLint     checkerTexture = 0;
     GLboolean depthTest = 0;
     GLint     depthFunc = 0;
     GLboolean depthMask = 1;
@@ -254,8 +243,6 @@ void saveState(const GlApi& gl, bool clipControl, SavedState& s) {
     gl.getIntegerv(gl::kTextureBindingBuffer, &s.itemOrderTexture);
     gl.activeTexture(kBatchTableUnit);
     gl.getIntegerv(gl::kTextureBindingBuffer, &s.batchTableTexture);
-    gl.activeTexture(kCheckerUnit);
-    gl.getIntegerv(gl::kTextureBinding2D, &s.checkerTexture);
     s.depthTest = gl.isEnabled(gl::kDepthTest);
     gl.getIntegerv(gl::kDepthFunc, &s.depthFunc);
     gl.getBooleanv(gl::kDepthWritemask, &s.depthMask);
@@ -297,8 +284,6 @@ void restoreState(const GlApi& gl, bool clipControl, const SavedState& s) {
     gl.depthMask(s.depthMask);
     gl.depthFunc(static_cast<GLenum>(s.depthFunc));
     setEnabled(gl, gl::kDepthTest, s.depthTest);
-    gl.activeTexture(kCheckerUnit);
-    gl.bindTexture(gl::kTexture2D, static_cast<GLuint>(s.checkerTexture));
     gl.activeTexture(kBatchTableUnit);
     gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.batchTableTexture));
     gl.activeTexture(kItemOrderUnit);
@@ -486,7 +471,6 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     }
 
     if (!buildProgram(error)) return false;
-    buildUvChecker();
     bindless_ = bindless_ && gl_.getTextureHandle && gl_.makeTextureHandleResident &&
                 gl_.makeTextureHandleNonResident;
     const char* merged = "OFF: the driver has no ARB_bindless_texture";
@@ -498,16 +482,11 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
                      : "OFF: the merged program did not build";
     }
 
-    timersOn_ = gl_.genQueries && gl_.deleteQueries && gl_.queryCounter &&
-                gl_.getQueryObjectiv && gl_.getQueryObjectui64v && gl_.getInteger64v;
-    if (timersOn_) gl_.genQueries(kTimerSets * kMarkCount, &timerQueries_[0][0]);
-
     logf("baked: GL %d.%d on \"%s\" -- %s depth, max texture %d, max anisotropy %.0f, max "
-         "texture buffer %d texels, GPU pass timing %s",
+         "texture buffer %d texels",
          major, minor, renderer ? reinterpret_cast<const char*>(renderer) : "?",
          reversedZ_ ? "reversed-Z float" : "24-bit fixed (no clip control)", maxTextureSize_,
-         maxAnisotropy_, maxTextureBufferSize_,
-         timersOn_ ? "on" : "OFF (no timer queries)");
+         maxAnisotropy_, maxTextureBufferSize_);
     logf("baked: merged draws -- %s%s%s", merged, mergedError.empty() ? "" : ": ",
          mergedError.c_str());
     initialised_ = true;
@@ -583,8 +562,6 @@ bool Renderer::buildProgram(std::string& error) {
     uSpriteFog_ = gl_.getUniformLocation(spriteProgram_, "u_fog");
     uSpriteFogColour_ = gl_.getUniformLocation(spriteProgram_, "u_fogColour");
     uAlphaCeiling_ = gl_.getUniformLocation(program_, "u_alphaCeiling");
-    uTwoLayers_ = gl_.getUniformLocation(program_, "u_twoLayers");
-    uSpriteTwoLayers_ = gl_.getUniformLocation(spriteProgram_, "u_twoLayers");
     uFog_ = gl_.getUniformLocation(program_, "u_fog");
     uFogColour_ = gl_.getUniformLocation(program_, "u_fogColour");
 
@@ -597,70 +574,9 @@ bool Renderer::buildProgram(std::string& error) {
     uTextured_ = gl_.getUniformLocation(program_, "u_textured");
     uGouraud_ = gl_.getUniformLocation(program_, "u_gouraud");
     uAlphaRef_ = gl_.getUniformLocation(program_, "u_alphaRef");
-    uUvChecker_[0] = gl_.getUniformLocation(program_, "u_uvChecker");
-    uChecker_[0] = gl_.getUniformLocation(program_, "u_checker");
-    uUvChecker_[1] = gl_.getUniformLocation(spriteProgram_, "u_uvChecker");
-    uChecker_[1] = gl_.getUniformLocation(spriteProgram_, "u_checker");
     findOrderUniforms(program_, order_);
     findOrderUniforms(spriteProgram_, spriteOrder_);
     return true;
-}
-
-// Debug view 8's checker (Renderer.h, uvCheckerTexture): every level drawn from the same rule,
-// so the grid stays a grid down the pyramid.
-void Renderer::buildUvChecker() {
-    constexpr int kSize = 256;
-    GLint previousUnit = 0;
-    GLint previousTexture = 0;
-    gl_.getIntegerv(gl::kActiveTexture, &previousUnit);
-    gl_.activeTexture(kCheckerUnit);
-    gl_.getIntegerv(gl::kTextureBinding2D, &previousTexture);
-    GLint unpack = 4;
-    GLint rowLength = 0;
-    gl_.getIntegerv(gl::kUnpackAlignment, &unpack);
-    gl_.getIntegerv(gl::kUnpackRowLength, &rowLength);
-    gl_.pixelStorei(gl::kUnpackAlignment, 1);
-    gl_.pixelStorei(gl::kUnpackRowLength, 0);
-    gl_.genTextures(1, &checker_);
-    gl_.bindTexture(gl::kTexture2D, checker_);
-    std::vector<uint8_t> pixels;
-    int level = 0;
-    for (int size = kSize; size >= 1; size /= 2, ++level) {
-        pixels.assign(static_cast<size_t>(size) * size * 4, 0);
-        int cell = size / 8;
-        for (int y = 0; y < size; ++y)
-            for (int x = 0; x < size; ++x) {
-                uint8_t* p = pixels.data() + (static_cast<size_t>(y) * size + x) * 4;
-                bool line = cell >= 4 && (x % cell == 0 || y % cell == 0);
-                bool odd = cell > 0 && ((x / cell + y / cell) & 1);
-                bool origin = cell >= 4 && x < cell && y < cell && x > cell / 4 && y > cell / 4 &&
-                              x < cell * 3 / 4 && y < cell * 3 / 4;
-                uint8_t base = odd ? 96 : 160;
-                // BGRA: blue the checker, green v, red u.
-                p[0] = line ? 0 : base;
-                p[1] = line ? 0 : static_cast<uint8_t>(255 * y / size);
-                p[2] = line ? 0 : static_cast<uint8_t>(255 * x / size);
-                p[3] = 255;
-                if (origin) p[0] = p[1] = p[2] = 255;
-            }
-        gl_.texImage2D(gl::kTexture2D, level, static_cast<GLint>(gl::kRgba8), size, size, 0,
-                       gl::kBgra, gl::kUnsignedByte, pixels.data());
-    }
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureBaseLevel, 0);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxLevel, level - 1);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMinFilter, gl::kLinearMipmapLinear);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter, gl::kLinear);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapS, gl::kRepeat);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT, gl::kRepeat);
-    gl_.pixelStorei(gl::kUnpackRowLength, rowLength);
-    gl_.pixelStorei(gl::kUnpackAlignment, unpack);
-    gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(previousTexture));
-    gl_.activeTexture(static_cast<GLenum>(previousUnit));
-}
-
-void Renderer::setUvCheckerUniforms(int program) {
-    gl_.uniform1i(uUvChecker_[program], debug_ == kDebugUvChecker && checker_ ? 1 : 0);
-    gl_.uniform1i(uChecker_[program], static_cast<GLint>(kCheckerUnit - gl::kTexture0));
 }
 
 void Renderer::findOrderUniforms(GLuint program, OrderUniforms& uniforms) {
@@ -688,20 +604,10 @@ void Renderer::release(bool contextAlive) {
         if (spriteVertexArray_) gl_.deleteVertexArrays(1, &spriteVertexArray_);
         if (program_) gl_.deleteProgram(program_);
         if (spriteProgram_) gl_.deleteProgram(spriteProgram_);
-        if (checker_) gl_.deleteTextures(1, &checker_);
-        if (timersOn_) gl_.deleteQueries(kTimerSets * kMarkCount, &timerQueries_[0][0]);
     }
     initialised_ = false;
-    timersOn_ = false;
-    std::memset(timerQueries_, 0, sizeof(timerQueries_));
-    std::memset(timerPending_, 0, sizeof(timerPending_));
-    timerNext_ = 0;
-    timerSet_ = -1;
-    timerMarks_ = 0;
-    for (GpuPassTimes& times : gpuTimes_) times = GpuPassTimes{};
     program_ = 0;
     spriteProgram_ = 0;
-    checker_ = 0;
     vertexArray_ = vertexBuffer_ = indexBuffer_ = 0;
     itemBuffer_ = orderTableBuffer_ = orderTableTexture_ = 0;
     orderOfItem_.clear();
@@ -715,7 +621,6 @@ void Renderer::release(bool contextAlive) {
     readMilliseconds_ = readWorstCall_ = 0.0;
     uploadError_.clear();
     framebuffer_ = colourBuffer_ = depthTexture_ = orderTexture_ = orderFramebuffer_ = 0;
-    walkOrderTexture_ = 0;
     targetWidth_ = targetHeight_ = 0;
 }
 
@@ -840,8 +745,8 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
             oneSidedVertices += span.count;
         }
         logf("baked: one-sided -- %zu faces of two-sided panels (%u vertices) drawn only while "
-             "they face the eye by the merged draws; debug view 14 and the batch-by-batch "
-             "fallback draw them from both sides; %u past the vertices (a bake fault, must be 0)",
+             "they face the eye by the merged draws; the batch-by-batch fallback draws them from "
+             "both sides; %u past the vertices (a bake fault, must be 0)",
              scene.oneSided.size() - oneSidedOutside, oneSidedVertices, oneSidedOutside);
         gl_.genBuffers(1, &itemBuffer_);
         gl_.bindBuffer(gl::kArrayBuffer, itemBuffer_);
@@ -993,7 +898,6 @@ void Renderer::beginPass(const Scene& scene) {
     }
     visible_.clear();
     visibleReverse_.clear();
-    visibleItems_ = 0;
 }
 
 // The items GPL's walk reached, down to ranges: each item's gates and selectors are evaluated
@@ -1172,21 +1076,10 @@ void Renderer::appendOrder(const Scene& scene, const Item& item, uint32_t node,
             if (orderDrawRank(data.type, front, children[i].word) == rank) visit(children[i]);
 }
 
-void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
-                    DrawStats& stats) {
-    stats = DrawStats{};
-    stats.itemsVisible = visibleCount();
+void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInputs& frame) {
     if (!initialised_ || !uploadComplete_ || visible_.empty()) return;
 
-    auto microsecondsSince = [](std::chrono::steady_clock::time_point start) {
-        return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - start)
-                                         .count());
-    };
-    auto evaluateStart = std::chrono::steady_clock::now();
     evaluate(scene, view, frame);
-    stats.evaluateMicroseconds = microsecondsSince(evaluateStart);
-    auto solidStart = std::chrono::steady_clock::now();
 
     // clip = P' * V * (p - eye), the eye subtracted in the shader. V: camera-local = R^T.
     // P': GPL's rows 0 and 3, row 1 negated (GPL's y grows downward), and a depth row of our own
@@ -1253,9 +1146,6 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     gl_.uniform1i(order_.solidOrder, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
     gl_.uniform1i(order_.solidDepth, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
     gl_.uniform1i(order_.test, 0);
-    setUvCheckerUniforms(0);
-    gl_.activeTexture(kCheckerUnit);
-    gl_.bindTexture(gl::kTexture2D, checker_);
     gl_.activeTexture(kTextureUnit);
 
     gl_.enable(gl::kDepthTest);
@@ -1274,25 +1164,16 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     setWrites(true, true);
 
     if (mergedDraws()) {
-        drawMergedPhases(scene, view, frame, columnMajor, stats, solidStart);
+        drawMergedPhases(scene, view, frame, columnMajor);
         restoreState(gl_, clipControl_, saved);
         return;
     }
 
     GLuint boundTexture = 0;
-    // GL state calls, counted for the walk-order phase's report.
-    uint32_t batchBinds = 0;
-    uint32_t textureBinds = 0;
-    uint32_t programSwitches = 0;
-    uint32_t uniformCalls = 0;
-    // The timing views turn these off inside the walk-order phase (DebugView).
-    bool submitDraws = true;
-    bool submitState = true;
     // The uniforms bindBatch sets belong to whichever program is in use.
     GLint texturedLocation = uTextured_;
     GLint alphaRefLocation = uAlphaRef_;
     GLint alphaCeilingLocation = uAlphaCeiling_;
-    GLint twoLayersLocation = uTwoLayers_;
     // Which fragments of a non-opaque batch a draw keeps (report 67b): every one with alpha
     // above 0, only the core of alpha 0.5 and above (the draw that writes depth), or only the
     // fringe below 0.5 (drawn blended without depth after the core).
@@ -1302,20 +1183,11 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
         skip = batch.surfaceClass >= 0 &&
                !(frame.classVisible & (1u << static_cast<uint32_t>(batch.surfaceClass)));
         if (skip) return;
-        ++batchBinds;
-        uniformCalls += 4;
         // A sprite binds its own texture whatever its surface class says (report 67); a line is
         // never textured.
         bool textured = batch.texture >= 0 &&
                         (batch.kind == kBatchSprites || batch.surfaceClass < 0 ||
                          (frame.classTextured & (1u << static_cast<uint32_t>(batch.surfaceClass))));
-        if (!submitState) {
-            if (textured && textures_[static_cast<size_t>(batch.texture)] != boundTexture) {
-                boundTexture = textures_[static_cast<size_t>(batch.texture)];
-                ++textureBinds;
-            }
-            return;
-        }
         gl_.uniform1i(texturedLocation, textured ? 1 : 0);
         // roglv2 alpha-tests with GREATER and a reference of ZERO (glAlphaFunc(0x204, 0.0) at
         // 0x20009D60, the only such call in the DLL), so a cutout texture keeps every texel the
@@ -1331,15 +1203,11 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
         float ceiling = !opaque && alphaPart == kAlphaFringe ? kCoreAlpha : 2.0f;
         gl_.uniform1f(alphaRefLocation, ref);
         gl_.uniform1f(alphaCeilingLocation, ceiling);
-        bool twoLayers = !opaque && batch.surfaceClass >= 0 &&
-                         ((twoLayerClasses_ >> static_cast<uint32_t>(batch.surfaceClass)) & 1u);
-        gl_.uniform1i(twoLayersLocation, twoLayers ? 1 : 0);
         if (textured) {
             GLuint name = textures_[static_cast<size_t>(batch.texture)];
             if (name != boundTexture) {
                 gl_.bindTexture(gl::kTexture2D, name);
                 boundTexture = name;
-                ++textureBinds;
             }
         }
     };
@@ -1358,10 +1226,8 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // Issues the pending multi-draw: the runs gathered since the last batch or state change.
     auto flush = [&]() {
         if (counts_.empty()) return;
-        if (submitDraws)
-            gl_.multiDrawElements(mode, counts_.data(), gl::kUnsignedInt, offsets_.data(),
-                                  static_cast<GLsizei>(counts_.size()));
-        ++stats.draws;
+        gl_.multiDrawElements(mode, counts_.data(), gl::kUnsignedInt, offsets_.data(),
+                              static_cast<GLsizei>(counts_.size()));
         counts_.clear();
         offsets_.clear();
     };
@@ -1370,13 +1236,8 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // test compares, since the walk-order phase draws without a depth buffer.
     GLint orderTest = 0;
     bool  orderOffset = false;
-    // The program in GL, and the one the batches ask for: they differ only inside the no-GL
-    // timing view, which switches nothing.
-    bool spriteProgram = false;
-    bool spriteWanted = false;
+    bool  spriteProgram = false;  // the program in use
     auto applyOrder = [&]() {
-        uniformCalls += 2;
-        if (!submitState) return;
         const OrderUniforms& uniforms = spriteProgram ? spriteOrder_ : order_;
         gl_.uniform1i(uniforms.test, orderTest);
         gl_.uniform4f(uniforms.depth, reversedZ_ ? 1.0f : -1.0f,
@@ -1387,27 +1248,15 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // uniforms are set the first time it is used in this pass.
     bool spriteUniforms = false;
     auto useSprite = [&](bool sprite) {
-        if (sprite == spriteWanted) return;
-        spriteWanted = sprite;
-        ++programSwitches;
-        if (!submitState) {
-            applyOrder();
-            return;
-        }
-        if (sprite == spriteProgram) {
-            applyOrder();
-            return;
-        }
+        if (sprite == spriteProgram) return;
         spriteProgram = sprite;
         gl_.useProgram(sprite ? spriteProgram_ : program_);
         gl_.bindVertexArray(sprite ? spriteVertexArray_ : vertexArray_);
         texturedLocation = sprite ? uSpriteTextured_ : uTextured_;
         alphaRefLocation = sprite ? uSpriteAlphaRef_ : uAlphaRef_;
         alphaCeilingLocation = sprite ? uSpriteAlphaCeiling_ : uAlphaCeiling_;
-        twoLayersLocation = sprite ? uSpriteTwoLayers_ : uTwoLayers_;
         if (sprite && !spriteUniforms) {
             spriteUniforms = true;
-            uniformCalls += 14;
             gl_.uniformMatrix4fv(uSpriteClipFromView_, 1, 0, columnMajor);
             gl_.uniform3f(uSpriteEye_, view.eye[0], view.eye[1], view.eye[2]);
             // Camera to world: its columns are the camera's forward, left and up axes.
@@ -1431,7 +1280,6 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                           static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
             gl_.uniform1i(spriteOrder_.solidDepth,
                           static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
-            setUvCheckerUniforms(1);
         }
         applyOrder();
     };
@@ -1475,14 +1323,6 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                         static_cast<uintptr_t>(range.first) * sizeof(uint32_t)));
                 }
                 lastRange = r;
-                if (fringe) continue;  // counted once, in the first run
-                ++stats.rangesDrawn;
-                if (batch.kind == kBatchLines) ++stats.lineRanges;
-                if (sprite) {
-                    ++stats.spriteRanges;
-                    stats.spriteQuads += range.count / 6;
-                }
-                stats.indices += range.count;
             }
             flush();
             mode = gl::kTriangles;
@@ -1500,7 +1340,6 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // then s/f line, then grid boxes (Scene.cpp assignDecalLevels).
     if (!decals_.empty()) {
         std::sort(decals_.begin(), decals_.end());
-        uint32_t drawsBefore = stats.draws;
         setWrites(true, false);
         gl_.enable(gl::kPolygonOffsetFill);
         gl_.polygonOffset(reversedZ_ ? kOverlayOffsetFactor : -kOverlayOffsetFactor,
@@ -1527,15 +1366,11 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                     static_cast<uintptr_t>(range.first) * sizeof(uint32_t)));
             }
             lastRange = rangeIndex;
-            ++stats.rangesDrawn;
-            ++stats.decalRanges;
-            stats.indices += range.count;
         }
         flush();
         setDecalUniform(false, -1);
         gl_.disable(gl::kPolygonOffsetFill);
         setWrites(true, true);
-        stats.decalDraws = stats.draws - drawsBefore;
     }
 
     // Overlays: after every base surface and every decal, level by level, lifted and offset
@@ -1544,16 +1379,15 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // its colour depth-tested against them and everything below, not written: an overlay meets
     // the surfaces it was paired with on their plane, where the offset wins the tie, and is hidden
     // by any other surface nearer than that -- another overlay of the same level, or of a lower
-    // one, included (report 105 section 4.10). Debug view 11 draws every level's colour first and
-    // all the depth after, where overlays meet only the base depth.
+    // one, included (report 105 section 4.10).
     if (!overlays_.empty()) {
         std::sort(overlays_.begin(), overlays_.end());
-        uint32_t drawsBefore = stats.draws;
         gl_.enable(gl::kPolygonOffsetFill);
         gl_.polygonOffset(reversedZ_ ? kOverlayOffsetFactor : -kOverlayOffsetFactor,
                           reversedZ_ ? kOverlayOffsetUnits : -kOverlayOffsetUnits);
         gl_.uniform1f(uLift_, kOverlayLift);
-        auto drawOverlays = [&](size_t firstEntry, size_t endEntry, bool count) {
+        // `colour`: the colour run; else the depth run.
+        auto drawOverlays = [&](size_t firstEntry, size_t endEntry, bool colour) {
             uint32_t currentBatch = 0xFFFFFFFFu;
             bool     skip = false;
             uint32_t lastRange = 0xFFFFFFFFu;
@@ -1569,7 +1403,7 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                     lastRange = 0xFFFFFFFFu;
                     // The depth run leaves out the upright cutouts, which roglv2 paints without
                     // depth (report 67c).
-                    if (!count && scene.batches[range.batch].upright) skip = true;
+                    if (!colour && scene.batches[range.batch].upright) skip = true;
                 }
                 if (skip) continue;
                 if (lastRange != 0xFFFFFFFFu && lastRange + 1 == rangeIndex) {
@@ -1580,10 +1414,6 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                         static_cast<uintptr_t>(range.first) * sizeof(uint32_t)));
                 }
                 lastRange = rangeIndex;
-                if (!count) continue;
-                ++stats.rangesDrawn;
-                ++stats.overlayRanges;
-                stats.indices += range.count;
             }
             flush();
         };
@@ -1601,26 +1431,18 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
             setWrites(true, false);
             drawOverlays(firstEntry, endEntry, true);
         };
-        if (debug_ == kDebugOverlaysUnlayered) {
-            colourRun(0, overlays_.size());
-            depthRun(0, overlays_.size());
-            ++stats.overlayLevels;
-        } else {
-            for (size_t first = 0; first < overlays_.size();) {
-                size_t end = first + 1;
-                while (end < overlays_.size() && (overlays_[end] >> 56) == (overlays_[first] >> 56))
-                    ++end;
-                depthRun(first, end);
-                colourRun(first, end);
-                ++stats.overlayLevels;
-                first = end;
-            }
+        for (size_t first = 0; first < overlays_.size();) {
+            size_t end = first + 1;
+            while (end < overlays_.size() && (overlays_[end] >> 56) == (overlays_[first] >> 56))
+                ++end;
+            depthRun(first, end);
+            colourRun(first, end);
+            first = end;
         }
         gl_.uniform1f(uLift_, 0.0f);
         setDecalUniform(false, -1);
         gl_.disable(gl::kPolygonOffsetFill);
         setWrites(true, true);
-        stats.overlayDraws = stats.draws - drawsBefore;
     }
 
     // The host's own solid content (the cars), against everything solid of the track and under
@@ -1632,9 +1454,7 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // The soft edges of everything that wrote a solid core: every core and overlay is in the
     // buffer by now, so an edge blends over what lies behind it and hides nothing. Edges over
     // edges are in batch order, the one error left, and a small one (report 67c).
-    uint32_t fringeDrawsBefore = stats.draws;
     drawBase(true);
-    stats.fringeDraws = stats.draws - fringeDrawsBefore;
 
     // What roglv2 paints without depth, in the order GPL's walk reached it this pass
     // (Renderer::evaluate) -- vanilla's painter order among objects -- blended, no depth written.
@@ -1646,19 +1466,11 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
     // before them and show, and bushes behind a bank crest poke out in front of the slope GPL
     // draws after them and are hidden; real depth gets both wrong. The phase draws through the
     // colour buffer alone, so the shader can read the solid surfaces' depth and order.
-    stats.solidMicroseconds = microsecondsSince(solidStart);
-    timerMark(kMarkSolid);
     // The host's runs (the cars' translucent parts) go in at the place GPL's walk reached them,
     // whether or not the track has any walk-order content this pass.
     uint32_t hookRuns = hookWalkOrderRuns();
-    bool     trackRuns = !ordered_.empty() && debug_ != kDebugWithoutWalkOrder;
+    bool     trackRuns = !ordered_.empty();
     if (trackRuns || hookRuns) {
-        auto     orderedStart = std::chrono::steady_clock::now();
-        uint32_t orderedDrawsBefore = stats.draws;
-        uint32_t batchBindsBefore = batchBinds;
-        uint32_t textureBindsBefore = textureBinds;
-        uint32_t programSwitchesBefore = programSwitches;
-        uint32_t uniformCallsBefore = uniformCalls;
         uint32_t currentBatch = 0xFFFFFFFFu;
         bool     skip = false;
         uint32_t lastRange = 0xFFFFFFFFu;
@@ -1677,21 +1489,15 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
             }
         };
         gl_.bindFramebuffer(gl::kDrawFramebuffer, orderFramebuffer_);
-        if (probe_) {
-            GLenum both[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
-            gl_.drawBuffers(2, both);
-        }
         gl_.disable(gl::kDepthTest);
         gl_.activeTexture(kSolidOrderUnit);
         gl_.bindTexture(gl::kTexture2D, orderTexture_);
         gl_.activeTexture(kSolidDepthUnit);
         gl_.bindTexture(gl::kTexture2D, depthTexture_);
         gl_.activeTexture(kTextureUnit);
-        orderTest = debug_ == kDebugWalkOrderOverAll ? 0 : debug_ == kDebugWalkOrderByDepth ? 2 : 1;
+        orderTest = 1;
         orderOffset = false;
         applyOrder();
-        submitDraws = debug_ != kDebugWalkOrderNoDraws && debug_ != kDebugWalkOrderNoGl;
-        submitState = debug_ != kDebugWalkOrderNoGl;
         for (size_t at = 0; trackRuns && at < ordered_.size(); ++at) {
             drawHookRuns(at);
             uint32_t     rangeIndex = ordered_[at];
@@ -1722,35 +1528,13 @@ void Renderer::draw(const Scene& scene, const ViewInputs& view, const FrameInput
                     static_cast<uintptr_t>(range.first) * sizeof(uint32_t)));
             }
             lastRange = rangeIndex;
-            ++stats.rangesDrawn;
-            ++stats.orderedRanges;
-            stats.indices += range.count;
-            if (spriteWanted) {
-                ++stats.spriteRanges;
-                stats.spriteQuads += range.count / 6;
-            }
-            if (mode == gl::kLines) ++stats.lineRanges;
-            if (scene.batches[range.batch].upright) ++stats.uprightRanges;
         }
         // The last runs gathered are still pending, and the hook's runs placed after them.
         flush();
         drawHookRuns(static_cast<size_t>(-1));
-        stats.orderedMicroseconds = microsecondsSince(orderedStart);
-        stats.orderedDraws = stats.draws - orderedDrawsBefore;
-        stats.orderedBatchBinds = batchBinds - batchBindsBefore;
-        stats.orderedTextureBinds = textureBinds - textureBindsBefore;
-        stats.orderedProgramSwitches = programSwitches - programSwitchesBefore;
-        stats.orderedUniformCalls = uniformCalls - uniformCallsBefore;
-        submitDraws = true;
-        submitState = true;
-        timerMark(kMarkOrdered);
         orderTest = 0;
         orderOffset = false;
         applyOrder();
-        if (probe_) {
-            GLenum colourOnly = gl::kColorAttachment0;
-            gl_.drawBuffers(1, &colourOnly);
-        }
         gl_.bindFramebuffer(gl::kDrawFramebuffer, framebuffer_);
         gl_.enable(gl::kDepthTest);
         mode = gl::kTriangles;
@@ -1774,21 +1558,15 @@ SolidHookContext Renderer::hookContext(const float clipFromView[16], const ViewI
     context.reversedZ = reversedZ_;
     context.verticalFacesEye = verticalFacesEye_;
     context.screenFacesEye = screenFacesEye_;
-    context.debug = debug_;
-    context.uvChecker = checker_;
-    context.visibleCount = static_cast<uint32_t>(visible_.size());
-    context.orderedCount = static_cast<uint32_t>(ordered_.size());
     return context;
 }
 
 void Renderer::callSolidHook(const float clipFromView[16], const ViewInputs& view,
                              const FrameInputs& frame) {
-    timerMark(kMarkCarsBegin);
     if (solidHook_) {
         solidHook_->drawSolid(hookContext(clipFromView, view, frame));
         setWrites(true, true);
     }
-    timerMark(kMarkCarsEnd);
 }
 
 uint32_t Renderer::hookRunPosition(uint32_t run) const {
@@ -1807,8 +1585,9 @@ void Renderer::setWrites(bool colour, bool solid) {
 bool Renderer::ensureTarget(int width, int height) {
     if (framebuffer_ && width == targetWidth_ && height == targetHeight_) return true;
     // Every pass draws, copies and samples its target from (0, 0) in extents of its own rect, so a
-    // larger target holds it in its lower left corner.
-    if (keepLargerTarget_ && framebuffer_) {
+    // larger target holds it in its lower left corner. The target only grows, so passes of two sizes
+    // in one frame (the mirror's and the eye's) do not rebuild it each time.
+    if (framebuffer_) {
         if (width <= targetWidth_ && height <= targetHeight_) return true;
         width = std::max(width, targetWidth_);
         height = std::max(height, targetHeight_);
@@ -1852,13 +1631,6 @@ bool Renderer::ensureTarget(int width, int height) {
     gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapS, gl::kClampToEdge);
     gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT, gl::kClampToEdge);
     gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxLevel, 0);
-    gl_.genTextures(1, &walkOrderTexture_);
-    gl_.bindTexture(gl::kTexture2D, walkOrderTexture_);
-    gl_.texImage2D(gl::kTexture2D, 0, static_cast<GLint>(gl::kR32ui), width, height, 0,
-                   gl::kRedInteger, gl::kUnsignedInt, nullptr);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMinFilter, gl::kNearest);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter, gl::kNearest);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxLevel, 0);
     gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(previousTexture));
     gl_.activeTexture(static_cast<GLenum>(previousUnit));
 
@@ -1876,8 +1648,6 @@ bool Renderer::ensureTarget(int width, int height) {
     gl_.bindFramebuffer(gl::kFramebuffer, orderFramebuffer_);
     gl_.framebufferRenderbuffer(gl::kFramebuffer, gl::kColorAttachment0, gl::kRenderbuffer,
                                 colourBuffer_);
-    gl_.framebufferTexture2D(gl::kFramebuffer, gl::kColorAttachment1, gl::kTexture2D,
-                             walkOrderTexture_, 0);
     GLenum colourOnly = gl::kColorAttachment0;
     gl_.drawBuffers(1, &colourOnly);
     GLenum orderStatus = gl_.checkFramebufferStatus(gl::kFramebuffer);
@@ -1908,17 +1678,13 @@ void Renderer::destroyTarget() {
     if (colourBuffer_) gl_.deleteRenderbuffers(1, &colourBuffer_);
     if (depthTexture_) gl_.deleteTextures(1, &depthTexture_);
     if (orderTexture_) gl_.deleteTextures(1, &orderTexture_);
-    if (walkOrderTexture_) gl_.deleteTextures(1, &walkOrderTexture_);
     framebuffer_ = colourBuffer_ = depthTexture_ = orderTexture_ = orderFramebuffer_ = 0;
-    walkOrderTexture_ = 0;
     targetWidth_ = targetHeight_ = 0;
 }
 
 bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
-                              const FrameInputs& frame, const int rect[4], DrawStats& stats) {
-    stats = DrawStats{};
+                              const FrameInputs& frame, const int rect[4]) {
     if (!initialised_ || !uploadComplete_ || rect[2] <= 0 || rect[3] <= 0) return false;
-    auto compositeStart = std::chrono::steady_clock::now();
 
     GLint previousDraw = 0;
     GLint previousRead = 0;
@@ -1928,22 +1694,6 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.getIntegerv(gl::kViewport, viewport);
     GLboolean scissor = gl_.isEnabled(gl::kScissorTest);
     if (!ensureTarget(rect[2], rect[3])) return false;
-    passWidth_ = rect[2];
-    passHeight_ = rect[3];
-
-    timerSet_ = -1;
-    timerMarks_ = 0;
-    if (timersOn_) {
-        harvestTimers();
-        if (timerPending_[timerNext_]) {
-            ++gpuTimes_[passClass_].untimed;
-        } else {
-            timerSet_ = timerNext_;
-            timerClass_[timerSet_] = passClass_;
-            timerNext_ = (timerNext_ + 1) % kTimerSets;
-        }
-    }
-    timerMark(kMarkStart);
 
     gl_.disable(gl::kScissorTest);
 
@@ -1961,7 +1711,6 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.drawBuffers(1, &colourOnly);
     gl_.blitFramebuffer(rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3], 0, 0, rect[2],
                         rect[3], gl::kColorBufferBit, gl::kNearest);
-    timerMark(kMarkCopiedIn);
 
     gl_.bindFramebuffer(gl::kReadFramebuffer, framebuffer_);
     gl_.viewport(0, 0, rect[2], rect[3]);
@@ -1980,34 +1729,18 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.clear(gl::kDepthBufferBit);
     GLuint noOrder[4] = {0, 0, 0, 0};
     gl_.clearBufferuiv(gl::kColor, 1, noOrder);
-    if (probe_) {
-        gl_.bindFramebuffer(gl::kDrawFramebuffer, orderFramebuffer_);
-        gl_.drawBuffers(2, both);
-        gl_.clearBufferuiv(gl::kColor, 1, noOrder);
-        gl_.drawBuffers(1, &colourOnly);
-        gl_.bindFramebuffer(gl::kDrawFramebuffer, framebuffer_);
-    }
     gl_.clearDepth(depthClear);
     gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
     gl_.depthMask(depthMask);
-    timerMark(kMarkCleared);
 
-    auto drawStart = std::chrono::steady_clock::now();
-    draw(scene, view, frame, stats);
-    auto drawTime = std::chrono::steady_clock::now() - drawStart;
-    // A pass that drew nothing, or skipped the walk-order phase, still closes every span.
-    for (int mark = kMarkCarsBegin; mark <= kMarkOrdered; ++mark)
-        if (!(timerMarks_ & (1u << mark))) timerMark(static_cast<TimerMark>(mark));
+    draw(scene, view, frame);
 
     gl_.bindFramebuffer(gl::kDrawFramebuffer, static_cast<GLuint>(previousDraw));
     gl_.blitFramebuffer(0, 0, rect[2], rect[3], rect[0], rect[1], rect[0] + rect[2],
                         rect[1] + rect[3], gl::kColorBufferBit, gl::kNearest);
-    timerMark(kMarkEnd);
     // The pass's commands go to the GPU now: the driver otherwise held the cars' draws and the
     // GPU idled until a later flush (report 105 section 4.25.1).
     if (gl_.flush) gl_.flush();
-    if (timerSet_ >= 0) timerPending_[timerSet_] = true;
-    timerSet_ = -1;
 
     if (previousDraw == 0) {
         gl_.bindFramebuffer(gl::kReadFramebuffer, 0);
@@ -2016,113 +1749,6 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.bindFramebuffer(gl::kReadFramebuffer, static_cast<GLuint>(previousRead));
     gl_.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
     if (scissor) gl_.enable(gl::kScissorTest);
-    stats.compositeMicroseconds = static_cast<uint32_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - compositeStart - drawTime)
-            .count());
-    return true;
-}
-
-void Renderer::timerMark(TimerMark mark) {
-    if (timerSet_ < 0) return;
-    gl_.queryCounter(timerQueries_[timerSet_][mark], gl::kTimestamp);
-    auto now = std::chrono::steady_clock::now();
-    if (mark == kMarkStart) {
-        gl_.getInteger64v(gl::kTimestamp, &timerGlAtStart_);
-        timerCpuAtStart_ = now;
-    }
-    timerIssued_[timerSet_][mark] =
-        timerGlAtStart_ +
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now - timerCpuAtStart_).count();
-    timerMarks_ |= static_cast<uint8_t>(1u << mark);
-}
-
-void Renderer::harvestTimers() {
-    for (int set = 0; set < kTimerSets; ++set) {
-        if (!timerPending_[set]) continue;
-        bool ready = true;
-        for (int mark = 0; mark < kMarkCount && ready; ++mark) {
-            GLint available = 0;
-            gl_.getQueryObjectiv(timerQueries_[set][mark], gl::kQueryResultAvailable, &available);
-            ready = available != 0;
-        }
-        if (!ready) continue;
-        uint64_t at[kMarkCount] = {};
-        for (int mark = 0; mark < kMarkCount; ++mark)
-            gl_.getQueryObjectui64v(timerQueries_[set][mark], gl::kQueryResult, &at[mark]);
-        timerPending_[set] = false;
-        GpuPassTimes& times = gpuTimes_[timerClass_[set]];
-        ++times.passes;
-        times.solidMs += static_cast<double>(at[kMarkSolid] - at[kMarkStart]) * 1e-6;
-        times.orderedMs += static_cast<double>(at[kMarkOrdered] - at[kMarkSolid]) * 1e-6;
-        times.copyOutMs += static_cast<double>(at[kMarkEnd] - at[kMarkOrdered]) * 1e-6;
-
-        const int64_t* issued = timerIssued_[set];
-        for (int span = 0; span < GpuPassTimes::kSpanCount; ++span) {
-            auto gpu = static_cast<int64_t>(at[span + 1] - at[span]);
-            if (gpu < 0) gpu = 0;
-            // The GPU can have waited inside the span only until the CPU issued its last command.
-            int64_t waited = issued[span + 1] - static_cast<int64_t>(at[span]);
-            waited = std::min(std::max<int64_t>(waited, 0), gpu);
-            times.spanMs[span] += static_cast<double>(gpu) * 1e-6;
-            times.busyMs[span] += static_cast<double>(gpu - waited) * 1e-6;
-        }
-        times.issueMs += static_cast<double>(issued[kMarkEnd] - issued[kMarkStart]) * 1e-6;
-        times.lagMs += static_cast<double>(std::max<int64_t>(
-                           static_cast<int64_t>(at[kMarkStart]) - issued[kMarkStart], 0)) *
-                       1e-6;
-        if (static_cast<int64_t>(at[kMarkStart]) >= issued[kMarkEnd]) ++times.queued;
-    }
-}
-
-bool Renderer::readProbe(std::vector<uint32_t>& solid, std::vector<uint32_t>& walk, int& width,
-                         int& height) {
-    if (!framebuffer_ || !orderFramebuffer_ || !gl_.readPixels || passWidth_ <= 0) return false;
-    width = passWidth_;
-    height = passHeight_;
-    size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
-    solid.assign(pixels, 0);
-    walk.assign(pixels, 0);
-
-    GLint previousRead = 0;
-    GLint packBuffer = 0;
-    GLint pack[4] = {4, 0, 0, 0};
-    gl_.getIntegerv(gl::kReadFramebufferBinding, &previousRead);
-    gl_.getIntegerv(gl::kPixelPackBufferBinding, &packBuffer);
-    gl_.getIntegerv(gl::kPackAlignment, &pack[0]);
-    gl_.getIntegerv(gl::kPackRowLength, &pack[1]);
-    gl_.getIntegerv(gl::kPackSkipRows, &pack[2]);
-    gl_.getIntegerv(gl::kPackSkipPixels, &pack[3]);
-    gl_.bindBuffer(gl::kPixelPackBuffer, 0);
-    gl_.pixelStorei(gl::kPackAlignment, 4);
-    gl_.pixelStorei(gl::kPackRowLength, 0);
-    gl_.pixelStorei(gl::kPackSkipRows, 0);
-    gl_.pixelStorei(gl::kPackSkipPixels, 0);
-
-    // The read buffer belongs to the framebuffer object; the final copy of the next pass reads
-    // attachment 0 of framebuffer_, so both are put back.
-    gl_.bindFramebuffer(gl::kReadFramebuffer, framebuffer_);
-    gl_.readBuffer(gl::kColorAttachment1);
-    gl_.readPixels(0, 0, width, height, gl::kRedInteger, gl::kUnsignedInt, solid.data());
-    gl_.readBuffer(gl::kColorAttachment0);
-    gl_.bindFramebuffer(gl::kReadFramebuffer, orderFramebuffer_);
-    gl_.readBuffer(gl::kColorAttachment1);
-    gl_.readPixels(0, 0, width, height, gl::kRedInteger, gl::kUnsignedInt, walk.data());
-    gl_.readBuffer(gl::kColorAttachment0);
-
-    gl_.pixelStorei(gl::kPackSkipPixels, pack[3]);
-    gl_.pixelStorei(gl::kPackSkipRows, pack[2]);
-    gl_.pixelStorei(gl::kPackRowLength, pack[1]);
-    gl_.pixelStorei(gl::kPackAlignment, pack[0]);
-    gl_.bindBuffer(gl::kPixelPackBuffer, static_cast<GLuint>(packBuffer));
-    gl_.bindFramebuffer(gl::kReadFramebuffer, static_cast<GLuint>(previousRead));
-    return true;
-}
-
-bool Renderer::takeGpuTimes(GpuPassTimes& out, int passClass) {
-    if (!timersOn_ || passClass < 0 || passClass >= kPassClassCount) return false;
-    out = gpuTimes_[passClass];
-    gpuTimes_[passClass] = GpuPassTimes{};
     return true;
 }
 

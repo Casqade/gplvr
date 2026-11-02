@@ -172,7 +172,8 @@ DWORD WINAPI installThread(LPVOID) {
         return 0;
     }
     requestSceneRenderHook(binding);
-    // Flat mode too; does nothing unless bakedRenderer is on. Its patches go in on the render
+    // Flat mode too. Installs the car, flagman and mirror hooks now when bakedRenderer is on, and
+    // otherwise when the VR menu first switches it on; the node filter goes in on the render
     // thread, at the first baked main walk.
     bakedPassBind(binding);
 

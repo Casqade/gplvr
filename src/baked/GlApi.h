@@ -129,7 +129,7 @@ struct GlApi {
     void(BAKED_GLAPI* makeTextureHandleResident)(uint64_t) = nullptr;
     void(BAKED_GLAPI* makeTextureHandleNonResident)(uint64_t) = nullptr;
 
-    // GL 3.3 / ARB_timer_query. Optional: without them the pass is not timed on the GPU.
+    // GL 3.3 / ARB_timer_query. Optional, and nothing in the renderers uses them now.
     void(BAKED_GLAPI* genQueries)(GLsizei, GLuint*) = nullptr;
     void(BAKED_GLAPI* deleteQueries)(GLsizei, const GLuint*) = nullptr;
     void(BAKED_GLAPI* queryCounter)(GLuint, GLenum) = nullptr;

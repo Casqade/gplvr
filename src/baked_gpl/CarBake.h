@@ -1,6 +1,6 @@
 #pragma once
 
-// Baked cars, R2 stage 2 (docs/audit-2026-09-18/105-baked-renderer-rewrite.md section 4.2): the
+// Baked cars (docs/audit-2026-09-18/105-baked-renderer-rewrite.md section 4.2): the
 // car objects baked from GPL's own memory, one object at a time, the first time the car walk
 // (CarWalk.cpp) reaches a leaf of it.
 //
@@ -52,16 +52,12 @@ struct CarBakeTotals {
     uint32_t objectsRebaked = 0;  // an address that came back holding a different object
     // carBakePassBegin: drops of the whole bake, for an entry released or reused and for a track
     // reload no entry showed; track reloads seen; lookups that found a released entry in the last
-    // scan; checks made, the entries they read and their time.
+    // scan.
     uint32_t drops = 0;
     uint32_t dropsReleased = 0;
     uint32_t dropsTrack = 0;
     uint32_t trackReloads = 0;
     uint32_t staleLookups = 0;
-    uint32_t checks = 0;
-    uint32_t checksFull = 0;  // of them, every entry: the cache's head had moved
-    uint64_t checkedEntries = 0;
-    double   checkMicroseconds = 0.0;
     uint32_t textures = 0;
     uint32_t texturesMissing = 0;
     uint32_t sprites = 0;
@@ -73,8 +69,6 @@ struct CarBakeTotals {
     uint32_t folderByLoadOrder = 0;
     uint32_t folderAmbiguous = 0;
     uint32_t folderObjs = 0;  // in no folder of the car set, found in <home>\objs (the flagmen)
-    double   bakeMilliseconds = 0.0;  // object bakes, with the files their MATERIALs name
-    double   fileMilliseconds = 0.0;  // every texture and sprite file read and parsed
 };
 const CarBakeTotals& carBakeTotals();
 

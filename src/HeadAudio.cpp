@@ -31,6 +31,23 @@ constexpr unsigned char kSchedulerCallStock[5] = {0xE8, 0x0C, 0x47, 0x02, 0x00};
 constexpr uintptr_t kRetailCameraMode = 0x005FCC17;
 constexpr uintptr_t kRetailListenerSlot = 0x005FCC1B;
 constexpr uintptr_t kRetailViewRecord = 0x005FCC23;
+//   camera+8   the car the camera rides in (gpl_viewCompute 0x4546D0's car)
+constexpr uintptr_t kRetailCameraCar = 0x005FCC1F;
+
+// The car, as gpl_viewCompute reads it for cockpit cameras 1..3:
+//   car+780    its body record, the view record's layout (position +0, orientation +84)
+//   car+1160   the eye in the body's axes: the team's head rest plus the head's sway, which
+//              gpl_ffbFillControlState 0x4A21C0 adds from the player's dynamics each tick
+// The view's orientation is body * Euler(look yaw, head pitch, head roll): the yaw is GPL's
+// look left/right, pitch and roll the head's smoothed lag behind the body over bumps and kerbs.
+constexpr size_t kCarBody = 780;
+constexpr size_t kCarEye = 1160;
+
+// sub_46B970, __thiscall (car): the team model's head rest, car+1160 without the sway.
+constexpr uintptr_t     kHeadRestFn = 0x0046B970;
+constexpr unsigned char kHeadRestHead[7] = {0x8B, 0x81, 0x10, 0x03, 0x00, 0x00, 0x50};
+constexpr unsigned char kHeadRestTail[6] = {0x05, 0x1C, 0x01, 0x00, 0x00, 0xC3};
+constexpr size_t        kHeadRestTailAt = 0x18;
 
 // A listener slot is 21 packed bytes (gpl_sndListenerCreate 0x4E6F10). +0x11 is the unaligned
 // pointer to its data, read as *(entry + 17) by gpl_sndComputePitchPan and by nothing else.
@@ -101,6 +118,8 @@ const char* const kOutcomeName[kOutcomeCount] = {
 
 using SchedulerFn = void(__cdecl*)();
 using PitchPanFn = int(__cdecl*)(void* emitter, unsigned char* listener, float* pitch, float* pan);
+// A __thiscall taken as __fastcall: the car in ecx, edx unused.
+using HeadRestFn = const float*(__fastcall*)(const void* car, void* unused);
 
 struct State {
     // Set by the install thread, read by the render thread's publish.
@@ -115,6 +134,11 @@ struct State {
     uintptr_t cameraMode = 0;
     uintptr_t listenerSlot = 0;
     uintptr_t viewRecord = 0;
+    uintptr_t cameraCar = 0;
+
+    // Null when sub_46B970 does not hold its stock bytes: the listener then keeps the head's
+    // sway and drops only its lean.
+    HeadRestFn headRest = nullptr;
 
     long long frequency = 0;
 
@@ -127,6 +151,7 @@ struct State {
     unsigned  counts[kOutcomeCount] = {};
     unsigned  busy = 0;     // ticks that reused the previous pose because the lock was held
     unsigned  widened = 0;  // pans replaced by the wider curve
+    unsigned  leaned = 0;   // ticks that kept GPL's lean: the camera had no car
     Outcome   last = kOutcomeCount;
     int       transitionReports = 64;
     long long summaryAt = 0;
@@ -216,6 +241,38 @@ void readPose(State& s) {
     ReleaseSRWLockShared(&g_poseLock);
 }
 
+// The view without GPL's head motion, for the listener. The body's axes turned by the look yaw
+// GPL composed into `view`, so looking left or right still moves the sound with the picture,
+// and the eye `position` moved by the head's sway back to the head rest. The headset's own
+// rotation and offset go on top of these as they would on the view's. False, with nothing
+// written, when the camera has no car.
+bool steadyAxes(State& s, const float view[9], float axes[9], float position[3]) {
+    auto car = *reinterpret_cast<const unsigned char* const*>(s.cameraCar);
+    if (!car) return false;
+    auto body = *reinterpret_cast<const unsigned char* const*>(car + kCarBody);
+    if (!body) return false;
+
+    float bodyAxes[9];
+    std::memcpy(bodyAxes, body + kRecordOrientation, sizeof(bodyAxes));
+    float relative[9];
+    multiplyTransposed(bodyAxes, view, relative);
+    float yaw = std::atan2(relative[1 * 3 + 0], relative[0 * 3 + 0]);
+    float c = std::cos(yaw), sn = std::sin(yaw);
+    float look[9] = {c, -sn, 0, sn, c, 0, 0, 0, 1};
+    multiply(bodyAxes, look, axes);
+
+    if (s.headRest) {
+        const float* rest = s.headRest(car, nullptr);
+        float eye[3];
+        std::memcpy(eye, car + kCarEye, sizeof(eye));
+        float sway[3] = {eye[0] - rest[0], eye[1] - rest[1], eye[2] - rest[2]};
+        float moved[3];
+        apply(bodyAxes, sway, moved);
+        for (int i = 0; i < 3; ++i) position[i] -= moved[i];
+    }
+    return true;
+}
+
 // Whether to move the listener this tick, and if so the slot whose pointer to swap, with the
 // shadow record already written.
 Outcome prepare(State& s, unsigned char*& slot) {
@@ -244,10 +301,16 @@ Outcome prepare(State& s, unsigned char*& slot) {
     std::memcpy(orientation, s.shadow + kRecordOrientation, sizeof(orientation));
     std::memcpy(position, s.shadow + kRecordPosition, sizeof(position));
 
+    // The axes the head turns in: the car's body turned by GPL's look yaw alone, with the eye
+    // moved back to the head rest. The view's own when the camera has no car.
+    float axes[9];
+    std::memcpy(axes, orientation, sizeof(axes));
+    if (!steadyAxes(s, orientation, axes, position)) ++s.leaned;
+
     float turned[9];
-    multiply(orientation, s.pose.rotation, turned);
+    multiply(axes, s.pose.rotation, turned);
     float offset[3];
-    apply(orientation, s.pose.centre, offset);
+    apply(axes, s.pose.centre, offset);
     for (int i = 0; i < 3; ++i) position[i] += offset[i];
 
     std::memcpy(s.shadow + kRecordOrientation, turned, sizeof(turned));
@@ -278,14 +341,16 @@ void note(State& s, Outcome outcome) {
     s.summaryAt = t;
     logf("head audio: %u ticks in the last %.0f s -- applied %u, no pose %u, stale %u, not the "
          "cockpit %u, no listener %u, slot not the view's %u; the previous pose reused %u times; "
-         "%u pans widened",
+         "%u pans widened; %u ticks kept GPL's head lean (no car)",
          s.counts[kApplied] + s.counts[kNoPose] + s.counts[kStale] + s.counts[kNotCockpit] +
              s.counts[kNoListener] + s.counts[kNotTheView],
          kSummarySeconds, s.counts[kApplied], s.counts[kNoPose], s.counts[kStale],
-         s.counts[kNotCockpit], s.counts[kNoListener], s.counts[kNotTheView], s.busy, s.widened);
+         s.counts[kNotCockpit], s.counts[kNoListener], s.counts[kNotTheView], s.busy, s.widened,
+         s.leaned);
     std::memset(s.counts, 0, sizeof(s.counts));
     s.busy = 0;
     s.widened = 0;
+    s.leaned = 0;
 }
 
 // Stands in for the scheduler call, on the sim thread.
@@ -404,7 +469,8 @@ void headAudioInstall() {
     s.cameraMode = rebase(kRetailCameraMode);
     s.listenerSlot = rebase(kRetailListenerSlot);
     s.viewRecord = rebase(kRetailViewRecord);
-    if (!s.cameraMode || !s.listenerSlot || !s.viewRecord) {
+    s.cameraCar = rebase(kRetailCameraCar);
+    if (!s.cameraMode || !s.listenerSlot || !s.viewRecord || !s.cameraCar) {
         logf("head audio: the live view's globals cannot be placed in this image (deltas %s) -- "
              "not installed",
              rebaseSummary());
@@ -420,6 +486,15 @@ void headAudioInstall() {
         return;
     }
 
+    auto rest = reinterpret_cast<const uint8_t*>(kHeadRestFn);
+    if (std::memcmp(rest, kHeadRestHead, sizeof(kHeadRestHead)) == 0 &&
+        std::memcmp(rest + kHeadRestTailAt, kHeadRestTail, sizeof(kHeadRestTail)) == 0)
+        s.headRest = reinterpret_cast<HeadRestFn>(kHeadRestFn);
+    else
+        logf("head audio: %08X does not hold the stock head-rest lookup -- the listener drops "
+             "GPL's head lean but keeps its sway",
+             static_cast<unsigned>(kHeadRestFn));
+
     LARGE_INTEGER frequency;
     QueryPerformanceFrequency(&frequency);
     s.frequency = frequency.QuadPart;
@@ -432,9 +507,9 @@ void headAudioInstall() {
     }
     s.installed.store(true, std::memory_order_release);
     logf("head audio: installed at %08X -- in the cockpit the listener is the head, view record "
-         "%08X, listener slot pointer %08X",
+         "%08X, listener slot pointer %08X; GPL's head lean and sway left out%s",
          static_cast<unsigned>(kSchedulerCallSite), static_cast<unsigned>(s.viewRecord),
-         static_cast<unsigned>(s.listenerSlot));
+         static_cast<unsigned>(s.listenerSlot), s.headRest ? "" : " (lean only)");
 
     // The wider pan. Both calls or neither, so a voice cannot be started on one curve and
     // retargeted on the other. Taken whatever the width: the VR menu can raise it from 0 later.
@@ -475,6 +550,7 @@ void headAudioInstall() {
 bool headAudioWidthAdjustable() {
     return g_state.panInstalled.load(std::memory_order_acquire);
 }
+
 
 void headAudioPublish(const float car[9], const float levelled[9], const VrEye eyes[2]) {
     if (!g_state.installed.load(std::memory_order_acquire)) return;

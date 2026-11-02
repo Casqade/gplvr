@@ -89,6 +89,11 @@ struct Options {
     // corner of the frame, where a second pass leaves a square in the left eye. That was
     // vrMirrorOffscreen and there was never a reason to turn it off.
 
+    // EVERY HOTKEY BELOW (every option ending in Key) is a debug control: the VR menu has what
+    // each one toggles. Off, loadOptions sets all of them to 0, so none is polled, swallowed or
+    // checked for a clash; on, each reads its own line of gplvr.ini as before.
+    bool debugKeys = false;
+
     // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
     // VR only. While on, Left/Right turn the glasses, Up/Down tilt them and Page Up/Down
     // widen them, live in both, and those keys do not reach the game; the key again leaves
@@ -266,37 +271,10 @@ struct Options {
     // A/B has been run: it is faster and the picture is the same. The implementation stays
     // exactly as it was; only the two ways of turning it off are gone.
 
-    // Write each EYE's own rectangle to a .tga in gplvr's folder, at the moment the frame
-    // is handed to the headset. Not the combined side-by-side the monitor shows -- the
-    // actual clipped halves, which is the picture that settles whether something is in
-    // the frame or only appears to be. 0 = off.
-    int dumpEyesKey = 0;
-
-    // DRAW THE EXTRA (INTERPOLATED) RENDERS. 1 as always; 0 keeps blending and stops them.
-    //
-    // THIS EXISTS TO SEPARATE TWO THINGS frameRate = 0 TURNS OFF TOGETHER. A blending-only
-    // artifact can live in the blended VALUES or in what an extra render fails to redraw --
-    // it re-enters gpl_sceneRender alone, paints the world over a frame that already had its
-    // 2D in it, and gplvr puts back only the HUD, the cursor and the VR ray. Testing against
-    // frameRate = 0 cannot tell those apart, because it removes both at once; the 2026-10-09
-    // run did exactly that and came back "artifact absent", which fits either.
-    //
-    // With this at 0 and frameRate unchanged: an artifact that survives is in the values, one
-    // that goes is in the redraw. The `extra:` line says `SUPPRESSED on purpose` so a log can
-    // never be read as if the renders merely failed to find room.
-    int   vrExtraRenders = 1;
-
     // WHERE THE WORLD WALK IS CENTRED is no longer a setting. `fixEyeSegment` chose between
     // GPL's own lookup (0), report 84's containment fallback (1), the segment table on the
     // interpolated dlong (2) and mode 1 plus one answer a frame and a self-consistency test (3);
     // 3 cleared every artifact and is what walkLookupBody does unconditionally since 2026-10-19.
-
-    // Toggle `frameRate` between 0 and whatever the ini asked for, live. The A/B for anything
-    // that might be the blend's: 0 is vanilla pacing with no blend and no extra frames, and
-    // both `blendingEnabled()` and FlatFrames' `extraLimit()` read the option per call, so
-    // nothing has to be reinstalled. '7' is the key report 85 told people to use for this
-    // before the two options became one. 0 = off.
-    int frameRateKey = '7';
 
 
     // THE RESOLVED OpenGL swap interval: 0 and up is the value to pass to
@@ -626,150 +604,21 @@ struct Options {
 
     // The sim/render state ring (SimRing.h, docs/audit-2026-09-18/72-work-vs-wait.md section 6).
     // The sim thread publishes each finished tick's car sources into one of four slots.
-    // 0 off. 1 publishes and VERIFIES: the render thread rebuilds each car's render record from
-    // the ring and compares it with what GPL's own latch wrote, and nothing drawn changes.
-    // 2 writes the record from the ring instead of reading live sim state. GPL's tick wait and
-    // its lock bracket are still GPL's in both, so neither reclaims the wait yet -- that is
-    // stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
+    // 0 off. 1 writes each car's render record from the ring instead of reading live sim state.
+    // GPL's tick wait and its lock bracket are still GPL's, so it does not reclaim the wait yet --
+    // that is stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
     int simRing = 0;
 
     // The baked renderer (src/baked, src/baked_gpl; docs/audit-2026-09-18/105-baked-renderer-
-    // rewrite.md). 0 off: GPL draws everything. 1 bakes the track GPL loads on a worker thread,
-    // then draws it from the bake with real depth in every main pass; GPL draws the rest -- the
-    // horizon, cars, cockpit, flagmen, particles, lit polygons, the mirrors -- tested against
-    // that depth. Flat mode and VR.
-    int bakedRenderer = 0;
-    // Baked drawing off and on in the same session, for an A/B against GPL's own. 0 disables.
-    int bakedRendererKey = '5';
-    // An A/B capture: the next frame drawn by GPL alone and the one after it from the bake,
-    // each main pass written as gplvr-captureN-{vanilla,baked}.tga beside gplvr.dll with its
-    // camera and track position in the log. 0 disables.
-    int bakedCaptureKey = '8';
-    // Cycles what the baked draw shows: normal; the walk-order phase (sprites, lines, translucent
-    // polygons, standing and object cutouts) without its test; without the walk-order phase; the
-    // walk-order phase tested by depth alone, without GPL's order between items; two timing views
-    // of the walk-order phase, with its state calls but no draw calls, and with no GL calls.
-    // Tells a wrong order from content the solid surfaces hide. 0 disables.
-    int bakedDebugKey = '9';
-    // 1: the baked renderer draws each phase as one multi-draw, every texture through a bindless
-    // handle (needs ARB_bindless_texture; without it, as 0). 0: batch by batch, binding each
-    // batch's texture and state.
-    int bakedMergedDraws = 1;
-    // How many times the baked renderer blends the racing groove (surface class 20) over each
-    // pixel: 1 as GPL's kernel and roglv2 do, 2 as if twice. Vanilla measured once at two spots
-    // of spa67 and as twice at a third (report 68's top update); no mechanism for twice is known.
-    int bakedGrooveLayers = 1;
-    // Baked cars (report 105 section 4, R2). 0: GPL draws every car. 1, stage 1: every car GPL
-    // draws is also walked by gplvr's own control walk (CarWalk.cpp) with the same register, gate,
-    // selector and cull decisions, and its polygon count is checked against GPL's own counter for
-    // that draw; the picture does not change. 2, stage 2a: as 1, and the walk also fills a draw
-    // list per car draw from car objects baked out of GPL's memory (CarBake.cpp), checked against
-    // the walk's count; still nothing drawn from it. 3, stage 2b: in the baked main passes gplvr
-    // draws the cars itself from those lists (CarRenderer.cpp) and GPL's draw of each car keeps
-    // only its blob shadow; mirror passes and the cockpit (but with bakedCockpit) stay GPL's,
-    // counted but not walked (1 and 2 verify every draw). Needs bakedRenderer = 1.
-    int bakedCars = 0;
-    // The flagmen and the starter (report 105 section 4.13). 1: in the baked main passes gplvr
-    // draws them itself (Flagmen.cpp, through the car renderer, so it needs bakedCars = 3), each
-    // sprite in the 16 colours GPL sets for it and at its place in GPL's walk; whatever it cannot
-    // resolve stays GPL's. 0: GPL draws them, as before.
-    int bakedFlagmen = 1;
-    // The mirror passes (report 105 section 4.18). 1: gpl_sceneRender's mirror walk (0x487A4C)
-    // is baked as the main walk is -- GPL's mirror walk decides what is visible, gplvr draws the
-    // track, its objects and, with bakedCars = 3, the AI cars and the flagmen from the mirror
-    // camera, with the mirror's registers, masks and LOD scale, into the mirror's own rectangle
-    // with its own depth; GPL's leftovers are tested against that depth before the copy into
-    // mirror.mip. 0: GPL draws the mirrors, as before. Needs bakedRenderer = 1. Flat mode and VR.
-    int bakedMirrors = 0;
-    // The car walk shared between the eyes (report 105 section 4.21; baked_gpl/CarShare.cpp). 1:
-    // in VR, the second eye's pass takes each car's draw list from the first eye's pass of the
-    // same frame when every eye-dependent decision of its walk (gate sides, box culls, LOD
-    // selectors) comes out the same from the second eye and nothing else it read has moved, and
-    // walks the car again otherwise; one reuse in 64 is walked anyway and compared element by
-    // element. Debug view 16 turns it off live. 0: every eye walks every car, as before. Needs
-    // bakedCars = 3; does nothing in flat mode.
-    int bakedCarShare = 1;
-    // Eye-independent car lists (report 105 section 4.22; baked_gpl/CarShare.cpp, CarWalk.cpp).
-    // 1: with bakedCarShare, the first eye's walk takes every gate whose plane passes within the
-    // measured eye separation of its eye both ways, each side's draws under a condition that each
-    // eye's pass evaluates, so the second eye reuses the list where a gate differs instead of
-    // walking the car again; BSP4 / BSP3_ASYM keep the first eye's order. Debug view 17 turns it
-    // off live. 0: the first eye decides every gate, as in section 4.21.
-    int bakedCarUnion = 1;
-    // Car lists kept across frames (report 105 section 4.23; baked_gpl/CarProgram.cpp). 1: in
-    // every baked main pass, VR and flat, a car's list is walked once into a program that holds
-    // for any eye and pose of the same LOD -- every gate both ways (or within 0.3 m of the eye
-    // where the memo cannot be followed so), order nodes put in each eye's order -- and each later
-    // call re-poses and assembles it instead of walking, until a selection, a register, a child
-    // pointer, the helmet colour or a decided gate changes; one reuse in 64 is walked anyway and
-    // compared. Debug view 18 turns it off live. 0: the first eye walks every car every frame, as
-    // in section 4.22. Needs bakedCars = 3.
-    int bakedCarProgram = 1;
-    // Car lists kept in the mirror passes too (report 105 section 4.42; CarProgram.cpp). 1: with
-    // bakedCarProgram, the mirror passes keep and reuse car programs of their own, as the main
-    // passes do. 0: the first eye's mirror passes walk every car, the second eye's take its lists
-    // (section 4.21).
-    int bakedCarProgramMirrors = 1;
-    // A mirror car's reuse ends its run of builds (report 105 section 4.51; CarProgram.cpp). 1: a
-    // mirror car is backed off for rebuilding every pass only when its builds are not reused in
-    // between; it serves up to six cameras a frame (three glasses, two eyes), so builds on
-    // consecutive passes are how it gathers them. 0: counted in main passes, as a main car's.
-    int bakedMirrorChurnReset = 1;
-    // What a mirror car's kept lists are keyed by (report 105 section 4.54; CarProgram.cpp). 0: one
-    // set of programs a car for every glass and eye, as in section 4.42. 1: one set a car and glass
-    // (Stereo.cpp's pane), so the glasses' different directions and fields of view do not replay and
-    // rebuild each other's. 2: one set a car, glass and eye: a glass is 0.4-1.4 m from the eyes, so
-    // the two eyes' reflections look 3-10 degrees apart (section 4.55), but where both eyes need
-    // one configuration it is built twice, and the programs need about twice the memory (section
-    // 4.55.1). A pass whose glass (or eye) is not known keys by less, counted.
-    int bakedMirrorCarKey = 1;
-    // A mirror car whose root box (the BOXCULL around the whole model) the mirror's view culls is
-    // not listed and no kept list is tried for it (report 105 section 4.54; CarPassView.cpp): its
-    // list would be empty. One such call in 64 is walked as before and listed, and must come out
-    // empty; one that does not turns the skip off until the car set changes. 0: every mirror car
-    // is listed.
-    int bakedMirrorCarCull = 1;
-    // A kept car program's draw order patched from the nearest memo on a memo miss (report 105
-    // section 4.53; CarOrder.cpp). 1: the order nodes the changed condition bits reach are emitted
-    // again and every other node's run is copied from the memo, one patch in 64 checked against a
-    // whole emission. 0: every miss emits the whole order, as in section 4.38.
-    int bakedOrderPatch = 1;
-    // A check before gplvr draws the cockpit (report 105 section 4.47, step 0): with bakedCars = 3,
-    // each cockpit draw is also walked into a list and its polygons compared with GPL's counter
-    // (`baked cars: N car draws ... cockpit M of K` and the stage-2 lines). Costs a walk per
-    // cockpit call (~3 a frame): for a test run only. 0: the cockpit is handed to GPL unwalked.
-    int bakedCockpitCheck = 0;
-    // The cockpit drawn by gplvr (report 105 section 4.48, step 1). 1: in a baked main pass the
-    // player's cockpit is walked once (the second eye takes the first eye's list) into a list the
-    // car renderer draws with real depth, its translucent parts after all of the track's; GPL's
-    // own draw of it keeps only the mirror glass, which samples mirror.mip as before (step 2,
-    // bakedCockpitOverlay, takes the glass too and changes how the list is drawn). A cockpit
-    // gplvr cannot list is drawn whole by GPL, counted (`baked cars: the cockpit`). 0: GPL draws
-    // the cockpit. Needs bakedCars = 3; bakedCockpitCheck = 1 takes precedence.
-    int bakedCockpit = 1;
-    // The cockpit drawn over the eye image (report 105 section 4.49, step 2). 1: with
-    // bakedCockpit, the cockpit's list holds the mirror glass too (GPL's live UVs, a copy of
-    // mirror.mip's live texture) and is drawn after GPL's last flush of each baked main pass, in
-    // GPL's order without a depth test, as GPL's painter's order drew it; GPL's draw of it hands
-    // GPL no leaf. A pass that cannot is step 1's, counted (`baked: the cockpit over the eye
-    // image`). 0: step 1.
-    int bakedCockpitOverlay = 1;
-    // Cockpit step 3 (report 105 section 4.50), both with bakedCockpitOverlay's step 2.
-    // bakedCockpitProgram 1: the cockpit keeps lists across frames as a car does (bakedCarProgram),
-    // the glass's UVs taken from GPL at each reuse; a MISMATCH turns it off until the car set
-    // changes (`baked cars: the cockpit's kept list`). 0: walked every pass, as in step 2.
-    // bakedCockpitSkipGpl 1: GPL's own draw of the cockpit, which hands GPL nothing in step 2, is
-    // skipped and the registers it writes are written instead, checked against GPL's draw now and
-    // then (`baked cars: GPL's cockpit draw skipped`). 0: it runs on every call.
-    int bakedCockpitProgram = 1;
-    int bakedCockpitSkipGpl = 1;
-    // Car lists kept per configuration (report 105 section 4.24; baked_gpl/CarConfig.cpp,
-    // CarProgram.cpp). 1: with bakedCarProgram, a kept list's walk decides for its eye every gate
-    // with a register write below it and every gate an earlier build's hazard named (the sector
-    // planes of the stock-derived models), and a car keeps up to 8 lists, one a configuration of
-    // those gates and LOD; each call takes the one whose decisions hold. 0: one kept list a car
-    // with every gate both ways, as in section 4.23 (the stock-derived models then mostly walk).
-    int bakedCarConfigs = 1;
+    // rewrite.md), the VR menu's "Renderer". 0 vanilla: GPL draws everything and nothing of the
+    // renderer is installed. 1: gplvr bakes the track GPL loads on a worker thread and draws it,
+    // the other cars, the flagmen, the player's cockpit and the mirrors' track and cars itself,
+    // with real depth, every feature of report 105 on; GPL draws the rest -- the horizon,
+    // shadows, particles, lit polygons -- tested against that depth. Anything it cannot do falls
+    // back to GPL's own path. 2: as 1, and a red square in the top right corner of every
+    // rectangle it drew (BakedPass.h, bakedMarkFrameEnd). Read live: the menu switches it at
+    // any time; the first switch away from 0 installs it. Flat mode and VR.
+    int bakedRenderer = 1;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

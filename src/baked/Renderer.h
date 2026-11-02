@@ -10,7 +10,6 @@
 #include "baked/GlApi.h"
 #include "baked/Scene.h"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -53,75 +52,6 @@ struct FrameInputs {
     Fog            fog;
 };
 
-// A view of one part of the draw, for telling a wrong order from wrong depth (Renderer::setDebug).
-enum DebugView : uint8_t {
-    kDebugNone = 0,
-    // The walk-order phase without its test: in GPL's order over everything baked, the way roglv2
-    // paints it over whatever it submitted earlier. What appears only here was hidden by the
-    // solid surfaces.
-    kDebugWalkOrderOverAll = 1,
-    // Without the walk-order phase: what is left is the batched passes.
-    kDebugWithoutWalkOrder = 2,
-    // The walk-order phase tested by depth alone, as it was before the order test.
-    kDebugWalkOrderByDepth = 3,
-    // Timing views: the walk-order phase makes every state call but no draw call; and it makes
-    // no GL call at all, only its own bookkeeping. Both show what view 2 shows.
-    kDebugWalkOrderNoDraws = 4,
-    kDebugWalkOrderNoGl = 5,
-    // The bake drawn normally, and GPL's own 3D drawing in the main pass left out except the
-    // cockpit (BakedPass.cpp): whatever still lies over the bake was drawn by neither.
-    kDebugWithoutGpl = 6,
-    // Everything as normal except the cars the host draws itself (SolidHook, CarRenderer), which
-    // are left out; GPL's draw of them still keeps only their shadows.
-    kDebugWithoutCars = 7,
-    // Every texture replaced by the UV checker (uvCheckerTexture), in the baked programs and, by
-    // the host, in what GPL draws: both halves of a capture show the same grid (report 105
-    // section 4.7).
-    kDebugUvChecker = 8,
-    // Normal, except for GPL's blob shadows in the host's residual flush: tested by depth like
-    // everything else GPL draws there, as before report 105 section 4.8; and not tested at all.
-    // The renderer draws as normal in both.
-    kDebugShadowsByDepth = 9,
-    kDebugShadowsUntested = 10,
-    // Normal, except the overlay phase draws every level's colour before any of its depth, so an
-    // overlay is tested against the base surfaces only (before report 105 section 4.10).
-    kDebugOverlaysUnlayered = 11,
-    // Normal, except the host hands the flagmen back to GPL and checks GPL's polygon count
-    // against what it would have drawn (baked_gpl/Flagmen.cpp); the renderer draws as normal.
-    kDebugFlagmenByGpl = 12,
-    // Normal, except the merged program does not clip at GPL's near plane: colour, alpha and fog
-    // are interpolated over the whole triangle, which the GPU extrapolates past the eye when a
-    // corner lies behind it (before report 105 section 4.16).
-    kDebugUnclipped = 13,
-    // Normal, except the merged program draws the faces of two-sided panels from both sides, so
-    // the overlay levels alone decide between them (before report 105 section 4.17).
-    kDebugTwoSided = 14,
-    // Normal main passes, and the mirror passes drawn by GPL as before report 105 section 4.18:
-    // the host hands every mirror walk back to GPL and checks its mirror cars against GPL's own
-    // polygon count. The renderer draws as normal.
-    kDebugMirrorsByGpl = 15,
-    // Normal, except the second eye walks every car itself instead of taking the first eye's
-    // draw list (bakedCarShare, baked_gpl/CarShare.cpp; report 105 section 4.21). The renderer
-    // draws as normal.
-    kDebugCarsUnshared = 16,
-    // Normal, except the first eye decides every gate of a car's walk itself, so its draw list
-    // holds only what it draws and the second eye walks the car again wherever a gate differs
-    // (bakedCarUnion off, report 105 section 4.22). The renderer draws as normal.
-    kDebugCarsUnconditioned = 17,
-    // Normal, except no car list is kept across frames or passes (bakedCarProgram off,
-    // baked_gpl/CarProgram.cpp; report 105 section 4.23): the first eye walks every car again
-    // each frame, as in section 4.22. The renderer draws as normal.
-    kDebugCarsUnkept = 18,
-    kDebugViewCount = 19,
-};
-
-// The passes the GPU times are kept apart for (Renderer::setPassClass).
-enum PassClass : int {
-    kPassMain = 0,
-    kPassMirror = 1,
-    kPassClassCount = 2,
-};
-
 // What a host draws inside a pass with the renderer's own depth and order target (CarRenderer):
 // after the track's solid surfaces, decals and overlays, before the soft edges of the cutouts
 // and the walk-order phase, so both of those are tested against it. It runs with the private
@@ -134,10 +64,6 @@ struct SolidHookContext {
     bool               reversedZ = true;
     bool               verticalFacesEye = false;
     bool               screenFacesEye = false;
-    DebugView          debug = kDebugNone;
-    GLuint             uvChecker = 0;  // bound on kCheckerUnit for the pass (debug view 8)
-    uint32_t           visibleCount = 0;  // Renderer::visible().size() this pass
-    uint32_t           orderedCount = 0;  // runs of the walk-order phase this pass
 };
 
 class SolidHook {
@@ -158,69 +84,6 @@ public:
 
 protected:
     ~SolidHook() = default;
-};
-
-struct DrawStats {
-    uint32_t itemsVisible = 0;
-    uint32_t rangesDrawn = 0;
-    uint32_t draws = 0;
-    uint32_t indices = 0;
-    uint32_t overlayRanges = 0;  // ranges drawn as overlays (also in rangesDrawn)
-    uint32_t overlayDraws = 0;   // draws of the overlay phase (also in draws)
-    uint32_t overlayLevels = 0;  // overlay levels drawn, each its depth run, then its colour run
-    uint32_t decalRanges = 0;    // ranges drawn in the decal pass (also in rangesDrawn)
-    uint32_t decalDraws = 0;     // draws of the decal pass (also in draws)
-    uint32_t spriteRanges = 0;   // sprite ranges (also in rangesDrawn)
-    uint32_t spriteQuads = 0;    // sprite quads in them
-    uint32_t lineRanges = 0;     // LINE ranges (also in rangesDrawn)
-    uint32_t uprightRanges = 0;  // upright cutout ranges drawn in the walk-order phase
-    uint32_t fringeDraws = 0;    // draws of the soft-edge phase (also in draws)
-    uint32_t orderedRanges = 0;  // ranges of the walk-order phase
-    uint32_t orderedDraws = 0;   // its draws: one per run of one batch
-    uint32_t orderedMicroseconds = 0;  // CPU time of the phase's loop, the GL calls included
-    // The walk-order phase's GL state calls (the timing views count the calls they would make).
-    uint32_t orderedBatchBinds = 0;       // batch changes: bindBatch
-    uint32_t orderedTextureBinds = 0;     // glBindTexture
-    uint32_t orderedProgramSwitches = 0;  // glUseProgram + glBindVertexArray, polygon <-> sprite
-    uint32_t orderedUniformCalls = 0;     // glUniform*
-    // CPU time of the rest of the pass: evaluate (gates, selectors, pieces, order trees); the
-    // batched passes up to the walk-order phase (decals, overlays, soft edges, the order table);
-    // the composite (the target, the copy in and out, the clears).
-    uint32_t evaluateMicroseconds = 0;
-    uint32_t solidMicroseconds = 0;
-    uint32_t compositeMicroseconds = 0;
-};
-
-// GPU time of drawComposited, summed over the passes whose GL_TIMESTAMP queries came back since
-// the last takeGpuTimes. A span also holds any time the GPU waited for the CPU to issue it.
-struct GpuPassTimes {
-    uint32_t passes = 0;     // timed passes read back
-    uint32_t untimed = 0;    // passes not timed: every query set was still in flight
-    double   solidMs = 0.0;  // the copy in, the clears, the batched passes and the soft edges
-    double   orderedMs = 0.0;  // the walk-order phase with its order test
-    double   copyOutMs = 0.0;  // the copy back into the frame
-
-    // The same passes span by span. Every pass ends with a glFlush, so its commands reach the GPU
-    // by the end of the pass: without it the driver held the cars' draws and the GPU idled inside
-    // the cars' span until a later flush (report 105 section 4.25.1).
-    enum Span : int {
-        kSpanCopyIn,     // the copy into the private target
-        kSpanClears,     // depth and order cleared
-        kSpanTrack,      // evaluate, the opaque ranges, decals and overlays
-        kSpanCars,       // the solid hook: the cars' cores
-        kSpanEdges,      // the soft edges of the cutouts
-        kSpanWalkOrder,  // the walk-order phase
-        kSpanCopyOut,    // the copy back
-        kSpanCount
-    };
-    double spanMs[kSpanCount] = {};
-    // The part of each span the GPU cannot have spent waiting for the CPU: the span less the time
-    // from the GPU reaching its start to the CPU issuing its end, when that is positive. It
-    // assumes commands reach the GPU as they are issued, which holds up to the pass's flush.
-    double   busyMs[kSpanCount] = {};
-    double   issueMs = 0.0;  // CPU time from the pass's first mark to its last
-    double   lagMs = 0.0;    // from the CPU issuing the first mark to the GPU reaching it
-    uint32_t queued = 0;     // passes the GPU began after the CPU had issued all of them
 };
 
 // Texture sampling, as the host renderer configures it (roglv2: RasterV2 TrilinearFiltering and
@@ -253,17 +116,10 @@ public:
     // gap.md, 64): one bit per surface class 0..31 whose decals keep the author's position and
     // have their depth moved onto the road (bias); every other decal is lifted onto its road.
     void setBiasClasses(uint32_t classes) { biasClasses_ = classes; }
-    // One bit per surface class 0..31 whose translucent polygons are blended as if twice over
-    // each pixel: drawn once with alpha a(2 - a), which is the two blends exactly.
-    void setTwoLayerClasses(uint32_t classes) { twoLayerClasses_ = classes; }
-    // Takes effect from the next draw.
-    void setDebug(DebugView view) { debug_ = view; }
     // Merged draws (RendererMerged.cpp): one program and bindless textures, so a phase is one
-    // multi-draw whatever its batches. Used when wanted and the driver has
-    // ARB_bindless_texture; otherwise the renderer draws batch by batch. Takes effect from the
-    // next draw.
-    void setMergedDraws(bool wanted) { mergedWanted_ = wanted; }
-    bool mergedDraws() const { return mergedWanted_ && mergedReady_; }
+    // multi-draw whatever its batches. Used when the driver has ARB_bindless_texture and the
+    // merged program built; otherwise the renderer draws batch by batch.
+    bool mergedDraws() const { return mergedReady_; }
     // Which way GPL turns its sprites in this process (report 67b). Billboard.cpp, installed in
     // VR only, redirects both drawers to face the eye; stock GPL faces the view plane: the
     // vertical-axis sprite spans cross(up, camera forward), the screen-aligned one the camera's
@@ -277,11 +133,6 @@ public:
     const TextureFilter& textureFilter() const { return filter_; }
     // Called in every drawn pass at the point SolidHook describes; null for none.
     void setSolidHook(SolidHook* hook) { solidHook_ = hook; }
-    // The UV checker debug view 8 draws with: 256 x 256 with its pyramid, repeat, trilinear.
-    // Cells of 1/8 UV with a dark line between, red rising with u, green with v, and a white
-    // marker in the cell at the UV origin, so a stretch, a seam or a diagonal shows. 0 before
-    // init.
-    GLuint uvCheckerTexture() const { return checker_; }
 
     // Uploads the scene incrementally: geometry first, then textures until `byteBudget` bytes
     // have gone this call (at least one texture). True once everything is on the GPU. A track
@@ -301,73 +152,34 @@ public:
     // item's order number for the order test (Renderer::draw). markVisible is the hot path of a
     // host filter: a node lookup then this, thousands of times a pass.
     void beginPass(const Scene& scene);
-    // True when the item is new this pass; false for a repeat dispatch (report 68b.6), or for
-    // the original of a copy already reached (Item::copyOf). A repeat takes the item's latest
-    // place: GPL paints it again there, over everything drawn since, and its old entry in
-    // visible() becomes kNoVisible. `reverseSortGroups` is the host's
+    // A repeat dispatch (report 68b.6), or the original of a copy already reached (Item::copyOf),
+    // takes the item's latest place: GPL paints it again there, over everything drawn since, and
+    // its old entry in visible() becomes kNoVisible. `reverseSortGroups` is the host's
     // gpl_sortGroupReverseStaticOrder as the walk reaches the item, which orders the SORTGROUPs
     // inside it (Scene.h, OrderNode).
-    bool markVisible(uint32_t item, bool reverseSortGroups) {
-        bool fresh = stamps_[item] != passStamp_;
-        if (fresh) {
+    void markVisible(uint32_t item, bool reverseSortGroups) {
+        if (stamps_[item] != passStamp_)
             stamps_[item] = passStamp_;
-            ++visibleItems_;
-        } else {
+        else
             visible_[visibleAt_[item]] = kNoVisible;
-        }
         visibleAt_[item] = static_cast<uint32_t>(visible_.size());
         visible_.push_back(item);
         visibleReverse_.push_back(reverseSortGroups ? 1 : 0);
-        return fresh;
     }
-    uint32_t visibleCount() const { return visibleItems_; }
 
     // Draws the visible items with depth into `rect` (x, y, width, height, GL window pixels) of
     // the framebuffer bound for drawing, through a private colour + depth + order target: the
     // rect is copied in, the scene drawn with cleared depth and order, and the result copied back.
+    // The private target only grows, and a pass smaller than it draws in its lower left corner.
+    // Each pass ends with a glFlush.
     bool drawComposited(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
-                        const int rect[4], DrawStats& stats);
+                        const int rect[4]);
 
-    // The GPU times gathered so far for passes of `passClass`, and a reset. False when the
-    // context has no timer queries.
-    bool takeGpuTimes(GpuPassTimes& out, int passClass = kPassMain);
-    // Which class the next drawComposited's GPU time is kept under.
-    void setPassClass(int passClass) {
-        passClass_ = passClass >= 0 && passClass < kPassClassCount ? passClass : kPassMain;
-    }
-    // On: the private target only grows, and a pass smaller than it draws in its lower left
-    // corner, so passes of two sizes in one frame (the mirror's and the eye's) do not rebuild it
-    // each time. Off: it is rebuilt at every change of size.
-    void setKeepLargerTarget(bool keep) { keepLargerTarget_ = keep; }
-
-    // The capture probe: while on, each pass also keeps, per pixel, the order number of the
-    // topmost walk-order fragment, for readProbe.
-    void setProbe(bool on) { probe_ = on; }
-    // The last pass's per-pixel order numbers, bottom row first: the solid surface's, and the
-    // topmost walk-order fragment's (0 for none, or when the pass was not probed). Stalls on the
-    // GPU; for captures only.
-    bool readProbe(std::vector<uint32_t>& solid, std::vector<uint32_t>& walk, int& width,
-                   int& height);
     // The items of this pass in the order the host's walk last reached them: item visible()[n] has
     // order number n + 1; kNoVisible marks a place an item left for a later one.
     const std::vector<uint32_t>& visible() const { return visible_; }
 
 private:
-    // In pass order; mark n and n + 1 bound GpuPassTimes span n.
-    enum TimerMark : uint8_t {
-        kMarkStart,
-        kMarkCopiedIn,
-        kMarkCleared,
-        kMarkCarsBegin,
-        kMarkCarsEnd,
-        kMarkSolid,
-        kMarkOrdered,
-        kMarkEnd,
-        kMarkCount
-    };
-    static_assert(GpuPassTimes::kSpanCount == kMarkCount - 1, "one span between two marks");
-    // Room for two frames of VR with baked mirrors: two eyes and up to four mirror panes each.
-    static constexpr int kTimerSets = 16;
     // The fragment shader's order test (Renderer::draw), in both programs.
     struct OrderUniforms {
         GLint itemOrder = -1;
@@ -395,11 +207,8 @@ private:
         GLint batches = -1;
         GLint gouraud = -1;
         GLint alphaPart = -1;
-        GLint twoLayerClasses = -1;
         GLint fog = -1;
         GLint fogColour = -1;
-        GLint nearClip = -1;
-        GLint twoSided = -1;
         OrderUniforms order;
     };
 
@@ -414,8 +223,7 @@ private:
     void buildBatchTable(const Scene& scene);
     void releaseMerged(bool contextAlive);
     void drawMergedPhases(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
-                          const float clipFromView[16], DrawStats& stats,
-                          std::chrono::steady_clock::time_point solidStart);
+                          const float clipFromView[16]);
     void findOrderUniforms(GLuint program, OrderUniforms& uniforms);
     void callSolidHook(const float clipFromView[16], const ViewInputs& view,
                        const FrameInputs& frame);
@@ -425,17 +233,12 @@ private:
     uint32_t hookWalkOrderRuns() const { return solidHook_ ? solidHook_->walkOrderRuns() : 0; }
     uint32_t hookRunPosition(uint32_t run) const;
     // Draws the visible items into the private target, bound for drawing, inside its viewport.
-    void draw(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
-              DrawStats& stats);
+    void draw(const Scene& scene, const ViewInputs& view, const FrameInputs& frame);
     bool ensureTarget(int width, int height);
     void destroyTarget();
     // Which of the private target's attachments the next draws write: the colour, and depth with
     // the order number. A surface that writes depth writes its order too, and nothing else does.
     void setWrites(bool colour, bool solid);
-    // Records the GPU clock at `mark` of the pass being timed; nothing when it is not timed.
-    void timerMark(TimerMark mark);
-    // Reads back every query set whose results are available, without waiting.
-    void harvestTimers();
     bool uploadTexture(const Scene& scene, size_t index, GLuint& name, size_t& bytes);
     void evaluate(const Scene& scene, const ViewInputs& view, const FrameInputs& frame);
     // Appends the runs under order node `node` of `item` to ordered_, in GPL's order for this
@@ -452,20 +255,9 @@ private:
     float maxAnisotropy_ = 0.0f;  // 0 when the driver has no anisotropic filtering
     TextureFilter filter_;
     uint32_t      biasClasses_ = 0;
-    uint32_t      twoLayerClasses_ = 0;
-    DebugView     debug_ = kDebugNone;
     bool          verticalFacesEye_ = false;
     bool          screenFacesEye_ = false;
     SolidHook*    solidHook_ = nullptr;
-    GLuint        checker_ = 0;
-    // Per program: u_uvChecker (on or off) and u_checker (its unit): batch, sprite, merged,
-    // merged lines.
-    GLint         uUvChecker_[4] = {-1, -1, -1, -1};
-    GLint         uChecker_[4] = {-1, -1, -1, -1};
-    void          buildUvChecker();
-    // Sets the checker uniforms of `program` (0 batch, 1 sprite, 2 merged, 3 merged lines), in
-    // use.
-    void          setUvCheckerUniforms(int program);
 
     GLuint program_ = 0;
     GLint  uClipFromView_ = -1;
@@ -498,8 +290,6 @@ private:
     GLint  uSpriteFog_ = -1;
     GLint  uSpriteFogColour_ = -1;
     GLint  uAlphaCeiling_ = -1;
-    GLint  uTwoLayers_ = -1;
-    GLint  uSpriteTwoLayers_ = -1;
     GLuint spriteVertexArray_ = 0;
     OrderUniforms order_;
     OrderUniforms spriteOrder_;
@@ -510,7 +300,6 @@ private:
     // their geometry shaders clip triangles and lines at GPL's near plane (report 105 section
     // 4.16), and a draw takes the one for its primitive.
     bool                  bindless_ = false;
-    bool                  mergedWanted_ = true;
     bool                  mergedReady_ = false;
     GLuint                mergedProgram_ = 0;
     GLuint                mergedLineProgram_ = 0;
@@ -560,38 +349,14 @@ private:
     // The order number of the solid surface at each pixel (R32UI, attachment 1), 0 where none.
     GLuint orderTexture_ = 0;
     // The colour buffer alone: the walk-order phase draws through it and samples depth and order.
-    // Attachment 1 is the probe's walk-order texture, written only while probing.
     GLuint orderFramebuffer_ = 0;
-    GLuint walkOrderTexture_ = 0;
-    bool   probe_ = false;
-
-    // GPU timing: a ring of query sets, one set per timed pass, read back passes later.
-    bool         timersOn_ = false;
-    GLuint       timerQueries_[kTimerSets][kMarkCount] = {};
-    bool         timerPending_[kTimerSets] = {};
-    int          timerClass_[kTimerSets] = {};  // the PassClass each pending set was timed for
-    int          timerNext_ = 0;
-    int          timerSet_ = -1;  // the set this pass writes, -1 when untimed
-    uint8_t      timerMarks_ = 0;  // the marks this pass has written, one bit each
-    // When the CPU issued each mark, on the GL clock: GL_TIMESTAMP read once at the start mark,
-    // the later marks placed from it by the CPU clock.
-    int64_t      timerIssued_[kTimerSets][kMarkCount] = {};
-    int64_t      timerGlAtStart_ = 0;
-    std::chrono::steady_clock::time_point timerCpuAtStart_;
-    int          passClass_ = kPassMain;
-    GpuPassTimes gpuTimes_[kPassClassCount];
     int    targetWidth_ = 0;
     int    targetHeight_ = 0;
-    bool   keepLargerTarget_ = false;
-    // The rect size of the last drawComposited, the part of the target it drew (readProbe).
-    int    passWidth_ = 0;
-    int    passHeight_ = 0;
 
     std::vector<uint32_t> stamps_;
     uint32_t              passStamp_ = 0;
     std::vector<uint32_t> visible_;
     std::vector<uint32_t> visibleAt_;  // per item, its entry in visible_ while stamped this pass
-    uint32_t              visibleItems_ = 0;
     std::vector<uint8_t>  visibleReverse_;  // per visible_ entry, markVisible's reverseSortGroups
 
     // Per draw, reused.

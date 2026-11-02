@@ -6,7 +6,7 @@
 // the game process and gplvr-xr.exe inside the presenter.
 //
 // Everything gplvr reads or writes for itself is named against this -- gplvr.log, gplvr.ini,
-// gplvr_mirrors.ini, the eye dumps, gplvr-xr.exe and its OpenXR loader -- so the whole of gplvr
+// gplvr_mirrors.ini, gplvr-xr.exe and its OpenXR loader -- so the whole of gplvr
 // can live in one `gplvr` folder inside the game rather than scattered through it. The game's own
 // folder is a separate question and is not answered here; nothing in the mod reads a game file by
 // path, and the loader resolves the game executable itself.

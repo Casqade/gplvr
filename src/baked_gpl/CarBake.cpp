@@ -59,9 +59,7 @@ constexpr uint32_t kMaxRecords = 4u << 20;
 // How far resolveFolder looks along the cache for the files loaded around a name.
 constexpr int kMaxNeighbours = 4096;
 constexpr int kMaxNamedMisses = 16;
-// Pass begins after which the reload check logs what it has cost, once; and the drops it logs a
-// line for, after which it only counts them.
-constexpr uint32_t kCheckCostReportAfter = 1000;
+// The drops the reload check logs a line for, after which it only counts them.
 constexpr uint32_t kMaxDropLines = 32;
 // Entries the reload check reads at a pass begin while the cache's head has not moved.
 constexpr uint32_t kCheckSlice = 64;
@@ -247,7 +245,6 @@ struct State {
     RawEntry checkedHeadEntry = {};
     size_t   sliceAt = 0;
     bool     checkArmedLogged = false;
-    bool     checkCostLogged = false;
 };
 
 State g_bake;
@@ -519,9 +516,6 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
             if (file != byFile.end()) {
                 result = file->second;
             } else {
-                LARGE_INTEGER frequency, start, end;
-                QueryPerformanceFrequency(&frequency);
-                QueryPerformanceCounter(&start);
                 std::vector<uint8_t> bytes;
                 std::string          where;
                 std::string          error = "could not be read";
@@ -531,10 +525,6 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
                 if (result < 0)
                     namedMiss(s, kind, handle, from->name + "\\" + name, error.c_str());
                 byFile.emplace(key, result);
-                QueryPerformanceCounter(&end);
-                s.totals.fileMilliseconds += 1000.0 *
-                                             static_cast<double>(end.QuadPart - start.QuadPart) /
-                                             static_cast<double>(frequency.QuadPart);
             }
         }
     }
@@ -643,7 +633,6 @@ void bakeKnown(State& s, Known source) {
         QueryPerformanceCounter(&end);
         double milliseconds = 1000.0 * static_cast<double>(end.QuadPart - start.QuadPart) /
                               static_cast<double>(frequency.QuadPart);
-        s.totals.bakeMilliseconds += milliseconds;
         logObject(object, image.model.vertexCount(),
                   static_cast<uint32_t>(image.model.normals.size() / 3), resolved, missing,
                   milliseconds);
@@ -819,46 +808,23 @@ void followGame(State& s) {
              "never while driving",
              s.dependencies.size(), kCheckSlice);
     }
-    LARGE_INTEGER start, end;
-    QueryPerformanceCounter(&start);
     size_t count = s.dependencies.size();
     size_t changed = count;
-    size_t checked = 0;
     if (moved || count <= kCheckSlice) {
         changed = firstChanged(s.dependencies.data(), count);
-        checked = count;
-        ++s.totals.checksFull;
     } else {
         size_t first = s.sliceAt < count ? s.sliceAt : 0;
         size_t run = std::min<size_t>(kCheckSlice, count - first);
         size_t found = firstChanged(s.dependencies.data() + first, run);
         if (found < run) changed = first + found;
-        checked = run;
         if (changed == count && run < kCheckSlice) {
             size_t wrap = kCheckSlice - run;
             found = firstChanged(s.dependencies.data(), wrap);
             if (found < wrap) changed = found;
-            checked += wrap;
             s.sliceAt = wrap;
         } else {
             s.sliceAt = first + run;
         }
-    }
-    QueryPerformanceCounter(&end);
-    LARGE_INTEGER frequency;
-    QueryPerformanceFrequency(&frequency);
-    s.totals.checkMicroseconds += 1e6 * static_cast<double>(end.QuadPart - start.QuadPart) /
-                                  static_cast<double>(frequency.QuadPart);
-    ++s.totals.checks;
-    s.totals.checkedEntries += checked;
-    if (!s.checkCostLogged && s.totals.checks >= kCheckCostReportAfter) {
-        s.checkCostLogged = true;
-        logf("baked cars: reload check -- %u pass begins checked (%u of them every entry, the "
-             "cache's head having moved), %.0f cache entries and %.2f us a check on average; %zu "
-             "entries held now",
-             s.totals.checks, s.totals.checksFull,
-             static_cast<double>(s.totals.checkedEntries) / s.totals.checks,
-             s.totals.checkMicroseconds / s.totals.checks, count);
     }
     if (changed < count) {
         ++s.totals.dropsReleased;
@@ -876,8 +842,8 @@ bool carBakeBind() {
     s.carsetName = rebase(kCarsetDirName);
     if (!s.cacheHead || !s.carsetName) {
         s.refused = true;
-        logf("baked cars: stage 2 NOT bound -- rebase refused the resource cache or the car set "
-             "name (%s)",
+        logf("baked cars: the car bake NOT bound -- rebase refused the resource cache or the car "
+             "set name (%s)",
              rebaseSummary());
         return false;
     }
