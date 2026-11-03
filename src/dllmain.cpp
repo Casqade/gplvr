@@ -10,6 +10,7 @@
 // has no such shared namespace.
 
 #include "baked_gpl/BakedPass.h"
+#include "baked_gpl/CarBuildWorker.h"
 #include "Billboard.h"
 #include "BuildStamp.h"
 #include "CrashGuard.h"
@@ -172,7 +173,7 @@ DWORD WINAPI installThread(LPVOID) {
         return 0;
     }
     requestSceneRenderHook(binding);
-    // Flat mode too. Installs the car, flagman and mirror hooks now when bakedRenderer is on, and
+    // Flat mode too. Installs the car, flagman and mirror hooks now when rendererType() is on, and
     // otherwise when the VR menu first switches it on; the node filter goes in on the render
     // thread, at the first baked main walk.
     bakedPassBind(binding);
@@ -189,10 +190,9 @@ DWORD WINAPI installThread(LPVOID) {
         replayQuickMenuInstall();
     }
     // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
-    // Hud.cpp has not touched. In VR it takes stampDraw alone and only with vrGplText = 1 --
-    // Hud.cpp has already read the same option and left that one slot for it, so there is
-    // exactly one owner per slot and neither module can adopt the other's thunk as "the
-    // original". With vrGplText = 0 this declines and says so, and GPL's text stays roglv2's.
+    // Hud.cpp has not touched. In VR it takes stampDraw alone -- Hud.cpp has already left that
+    // one slot for it, so there is exactly one owner per slot and neither module can adopt the
+    // other's thunk as "the original".
     fastTextBind(binding);
 
     // Before the first menu-to-race transition, which is the moment the screenBegin
@@ -283,6 +283,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     } else if (reason == DLL_PROCESS_DETACH) {
         // Before the log closes, and before this module's code stops being callable.
         windowProcUnchain();
+        carBuildWorkerStop();
         crashGuardLogSummary();
         flagmanReplayLogSummary();
         drawnMarksLogSummary();

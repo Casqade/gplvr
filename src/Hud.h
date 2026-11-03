@@ -34,9 +34,9 @@
 // counter, which the split excludes, stayed. `destinationCanSplit` below now declines in VR for
 // exactly that reason, and everything GPL stamps goes through untouched.
 //
-// So GPL's stamped text is placed by the fast text path instead, behind `vrGplText = 1`: it
-// reads the glyph out of roglv2's own font and draws it as a quad of its own, which has a
-// position and a size, once per eye. With that on this file does not thunk stampDraw at all --
+// So in VR GPL's stamped text is placed by the fast text path instead: it reads the glyph out
+// of roglv2's own font and draws it as a quad of its own, which has a position and a size, once
+// per eye. This file therefore does not thunk stampDraw at all --
 // one owner per slot, because both modules re-assert per mode change and two would adopt each
 // other -- and the thunks it keeps call fastTextFlushNow() in place of the six globals the other
 // path gives up. See FastText.h.
@@ -67,14 +67,6 @@ void hudBind(const Binding& binding);
 void hudEnsureThunk();
 
 void hudBeginFrame();
-
-// The frame's stamped text, flushed. From the present hook, after GPL has issued every
-// stampDraw of the frame: logs new or changed strings under a per-second cap, and once a
-// second a summary of stamp calls and the strings they formed.
-//
-// Silent with `vrGplText = 1`: the stamp thunk is not installed then, so nothing is recorded
-// here and the `fast text:` lines carry the census instead.
-void hudEndFrame();
 
 // Re-issue this frame's HUD. Called after each EXTRA render, which re-enters
 // gpl_sceneRender underneath a HUD that has already been drawn and paints the world over

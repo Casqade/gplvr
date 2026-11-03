@@ -32,6 +32,8 @@
 // input that moved still makes it walk. A BSP4 or BSP3_ASYM taken both ways keeps the walking
 // eye's child order (ShareOrder): the second eye's list is its own walk with that order there.
 
+#include "baked_gpl/ProgramArena.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -184,6 +186,8 @@ struct ShareGlass {
     uint32_t  count;
 };
 
+// Its vectors are ArenaVectors: a kept program's copy of its build's tape lies in the program region
+// (ProgramArena.h, report 105 section 4.59); every other tape's come from the heap.
 struct ShareTape {
     uintptr_t record = 0;
     uintptr_t root = 0;
@@ -199,27 +203,27 @@ struct ShareTape {
     // `vertices` (report 105 section 4.43): sorted and unique once shareSealVertices has run.
     uintptr_t low = 0;
     uintptr_t high = 0;
-    std::vector<uint32_t> vertices;
+    ArenaVector<uint32_t> vertices;
     ShareRefusal refusal = kShareOk;
     uint32_t     written[32] = {};  // registers a SETREG of this walk wrote, one bit each
-    std::vector<ShareFrame>    frames;
-    std::vector<ShareGate>     gates;
-    std::vector<ShareBox>      boxes;
-    std::vector<ShareSelector> selectors;
-    std::vector<ShareRegister> registers;
-    std::vector<ShareSprite>   sprites;
+    ArenaVector<ShareFrame>    frames;
+    ArenaVector<ShareGate>     gates;
+    ArenaVector<ShareBox>      boxes;
+    ArenaVector<ShareSelector> selectors;
+    ArenaVector<ShareRegister> registers;
+    ArenaVector<ShareSprite>   sprites;
     // The union walk (report 105 section 4.22): its margin (0 when it decided every gate), its
     // conditions and its order nodes, and the eye in the dispatch frame, which the second eye's
     // call measures the eyes' separation from.
     float                       margin = 0.0f;
-    std::vector<ShareCondition> conditions;
-    std::vector<ShareOrder>     orders;
+    ArenaVector<ShareCondition> conditions;
+    ArenaVector<ShareOrder>     orders;
     float                       rootEye[3] = {};
     // A kept list's walk only (report 105 section 4.23): its skinned leaves.
-    std::vector<ShareSkin> skins;
-    std::vector<uint16_t>  skinFrames;
+    ArenaVector<ShareSkin> skins;
+    ArenaVector<uint16_t>  skinFrames;
     // And the cockpit's mirror glass, listed with GPL's live UVs (section 4.50).
-    std::vector<ShareGlass> glass;
+    ArenaVector<ShareGlass> glass;
 };
 
 // -- recording: from the walk while CarWalk's Walk::tape is set ----------------------------------
@@ -268,9 +272,10 @@ void shareSealVertices(ShareTape& tape);
 // tape with an address range and no records (not sealed) answers yes for any record.
 bool shareReadsVertex(const ShareTape& tape, uint32_t record);
 
-// An XFORM entered from frame `parent` as walk frame `id`, with the matrix the walk made of it.
-void shareFrame(ShareTape& tape, uintptr_t node, uint16_t parent, uint16_t id,
-                const float pose[12]);
+// An XFORM entered from frame `parent` as walk frame `id`, with the words the walk read of it
+// (w1-w6 and the child w8) and the matrix it made of them.
+void shareFrame(ShareTape& tape, uintptr_t node, const uint32_t words[7], uint16_t parent,
+                uint16_t id, const float pose[12]);
 void shareBox(ShareTape& tape, uintptr_t node, const uint16_t corner[8], bool culled,
               uint16_t condition);
 // A selector's value as the walk computed it; `frame` is the reference vertex's for kind 0. A
@@ -302,6 +307,7 @@ struct ShareCall {
     uint32_t       texturedMask = 0;
     uintptr_t      poolIndex = 0;    // GPL's vertex memo, 0 when CarWalk could not place it
     uintptr_t      poolSources = 0;
+    uintptr_t      instance = 0;     // the team instance (a worker build's snapshot reads it)
 };
 
 enum ShareOutcome {

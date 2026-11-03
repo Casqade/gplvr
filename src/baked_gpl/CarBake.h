@@ -30,6 +30,16 @@ int32_t carBakeObjectOf(uintptr_t node, uintptr_t& primAddress, uint32_t& primSi
 // it cannot be.
 int32_t carBakeTexture(uint32_t handle);
 
+// The car build worker's lookups (CarBuildWorker.h, report 105 section 4.61), inside its gate:
+// they bake, resolve and read nothing of GPL's, and leave what would to the render thread. The
+// object holding `node` as the last scan found and baked it: -1 with `unbaked` when no scan found
+// it or it is not baked yet, -1 alone when its bake failed (as carBakeObjectOf answers). The
+// texture of `handle` as carBakeTexture resolved it: `known` false when it never has. Every write
+// of what they read holds a CarBuildPause.
+int32_t carBakeObjectBaked(uintptr_t node, uintptr_t& primAddress, uint32_t& primSize,
+                           bool& unbaked);
+int32_t carBakeTextureResolved(uint32_t handle, bool& known);
+
 // At the begin of every baked pass, main or mirror, before any walk: checks the resource cache
 // entries the bake was made from -- each object it baked, each mip and sprite handle it resolved;
 // all of them when the cache's head moved since the last check, else a slice in turn -- and drops

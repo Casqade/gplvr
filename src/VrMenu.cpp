@@ -371,8 +371,8 @@ MenuRow g_rows[] = {
     {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
      "what is in the car with you: the mirrors and pribluda's panel", kTabCockpit},
     {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "what a frame costs: the frame rate, the renderer, the render scale and how often the "
-     "mirrors and the panel are redrawn",
+     "what a frame costs: the frame rate, the renderer, the render scale, and how often and "
+     "from where the mirrors and the panel are redrawn",
      kTabPerformance},
     {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
      "text and screens: GPL's own text, its menus in the headset, and the monitor window",
@@ -401,13 +401,6 @@ MenuRow g_rows[] = {
 
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
      "aim the rear-view glasses and set how wide they see", kTabCockpit},
-    {"Per-eye mirrors", kRowToggleBool, kCommandNone, &g_options.perEyeMirror, nullptr,
-     nullptr, 0, 1, 1,
-     "on, each eye renders both glasses from its own viewpoint, so the reflection has depth "
-     "like the rest of the frame -- and costs a second pair of renders. Off renders them "
-     "once from the head centre and shares them. To turn mirrors OFF entirely, set Mirror "
-     "update rate on the Performance tab to off",
-     kTabCockpit},
     {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
      "off skips the HUD pass entirely -- the panel goes from the headset and the monitor, "
      "and its cost goes with it. Runtime only: nothing is written and it is back on next "
@@ -439,7 +432,7 @@ MenuRow g_rows[] = {
      "instead of copies, and costs one tick of latency. Vsync follows this and is not a "
      "separate setting",
      kTabPerformance},
-    {"Renderer", kRowNamedInt, kCommandNone, nullptr, &g_options.bakedRenderer, nullptr, 0, 2,
+    {"Renderer", kRowNamedInt, kCommandNone, nullptr, &g_options.vrRendererType, nullptr, 0, 2,
      1,
      "who draws the world. Vanilla is GPL's own renderer, as it ships. GPL VR is gplvr's: the "
      "track, the other cars, the flagmen, your cockpit and the mirrors drawn with real depth "
@@ -460,6 +453,16 @@ MenuRow g_rows[] = {
      "reflection only changes at the sim's rate anyway. Off goes further: nothing renders "
      "it and the glasses are filled with black",
      kTabPerformance},
+    {"Mirrors", kRowNamedInt, kCommandNone, nullptr, &g_options.mirrorMode, nullptr,
+     kMirrorSharedHeadCentre, kMirrorPerGlass, 1,
+     "how the mirror is rendered, cheapest on the left. Shared, flat renders one view astern "
+     "that every glass shows its part of, once from the head centre for both eyes: one "
+     "render, but the reflection has no depth and sits on the glass. Shared renders that view "
+     "from each eye, so it has depth like the rest of the frame: two renders whatever the car "
+     "has, each glass a little softer. Per glass renders each glass on its own from each eye: "
+     "the sharpest, two renders per glass every frame. Mirror setup aims each glass in all "
+     "three",
+     kTabPerformance},
     {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
      &g_options.pribludaUpdateRate, nullptr, 1, 4, 1,
      "redraw the panel on one frame in N. The last image stays up in between, so a lower "
@@ -467,18 +470,12 @@ MenuRow g_rows[] = {
      "HUD row on the Cockpit tab",
      kTabPerformance, pribludaRowOffered},
 
-    // Both rows need vrGplText = 1, which is read when the game starts and is not a row: it
-    // decides which module takes GPL's stampDraw global at install time, and a switch that
-    // cannot act until the next run does not belong on a page whose other rows act as you move
-    // them. With it off these two move nothing, and the help says so rather than leaving a
-    // driver to work out why a slider does nothing.
     {"GPL text size", kRowChoiceInt, kCommandNone, nullptr, &g_options.vrGplTextScale, nullptr,
      1, 4, 1,
      "how much bigger GPL's own text is drawn -- the pause prompt, the F1 help line, \"car "
      "must be stopped\". Not its fps counter, which GPL draws onto the window and the headset "
      "never sees. Whole steps, because the letters are tiny bitmaps and 2 makes each dot a 2x2 "
-     "block while a half step would come out ragged. Needs vrGplText = 1 in gplvr.ini; with "
-     "that off GPL draws its own text and nothing here reaches it",
+     "block while a half step would come out ragged",
      kTabDisplay},
     {"GPL text inset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrGplTextInset, 0.1f, 1.0f, 0.05f,
@@ -488,7 +485,7 @@ MenuRow g_rows[] = {
      "moves the line and not the letters in it, so the spacing stays GPL's, and a line that "
      "would land on the one above it is moved down until it clears. Turn it down as you turn "
      "the size up -- a line too big to fit in one eye is dropped rather than spilling into "
-     "the other. Needs vrGplText = 1",
+     "the other",
      kTabDisplay},
     {"Menu size in headset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrMenuScale, 0.05f, 1.0f, 0.05f,
@@ -496,10 +493,11 @@ MenuRow g_rows[] = {
      "behind them, so at 1.00 they fill the whole view a few centimetres from your face. "
      "Takes effect as you move it",
      kTabDisplay},
-    {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr, 0,
-     3, 1,
-     "what the game window on the monitor shows: both eyes side by side, one eye, or off. Off "
-     "leaves the window black and saves the copy into it. The headset is unaffected",
+    {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
+     kMonitorOff, kMonitorBoth, 1,
+     "what the game window on the monitor shows: off, the left or the right eye, or both eyes "
+     "side by side. Off leaves the window black and saves the copy into it. The headset is "
+     "unaffected",
      kTabDisplay},
 };
 
@@ -1274,9 +1272,9 @@ int rowAt(float u, float v) {
 const char* namedValue(const MenuRow& row) {
     if (row.intValue == &g_options.vrMonitorEye) {
         switch (*row.intValue) {
-            case 0: return "off";
-            case 2: return "left eye";
-            case 3: return "right eye";
+            case kMonitorOff: return "off";
+            case kMonitorLeft: return "left eye";
+            case kMonitorRight: return "right eye";
             default: return "both eyes";
         }
     }
@@ -1289,7 +1287,14 @@ const char* namedValue(const MenuRow& row) {
             default: return "unlimited";
         }
     }
-    if (row.intValue == &g_options.bakedRenderer) {
+    if (row.intValue == &g_options.mirrorMode) {
+        switch (*row.intValue) {
+            case kMirrorShared: return "shared";
+            case kMirrorSharedHeadCentre: return "shared, flat";
+            default: return "per glass";
+        }
+    }
+    if (row.intValue == &g_options.vrRendererType) {
         switch (*row.intValue) {
             case 0: return "Vanilla";
             case 1: return "GPL VR";
@@ -1335,8 +1340,34 @@ void rowValueText(const MenuRow& row, char* out, size_t size) {
     }
 }
 
+// A rate row's values in the order the stick and the bar move through them, cheapest first: off
+// where the row has it, then one frame in `high`, and so on up to every frame -- so right is
+// better on every row of the page. The rank runs 0 to high - low.
+int rateRank(const MenuRow& row, int value) {
+    int low = static_cast<int>(row.low);
+    int high = static_cast<int>(row.high);
+    if (value <= 0) return 0;
+    if (value > high) value = high;
+    return (low <= 0 ? 1 : 0) + high - value;
+}
+
+int rateValue(const MenuRow& row, int rank) {
+    int low = static_cast<int>(row.low);
+    int high = static_cast<int>(row.high);
+    int hasOff = low <= 0 ? 1 : 0;
+    if (rank < 0) rank = 0;
+    if (rank > high - low) rank = high - low;
+    if (hasOff && rank == 0) return 0;
+    return high - (rank - hasOff);
+}
+
 // The row's value as a 0-to-1 position, for the slider bar. -1 for a row that has none.
 float rowFraction(const MenuRow& row) {
+    if (row.kind == kRowRateInt && row.intValue) {
+        int span = static_cast<int>(row.high - row.low);
+        if (span <= 0) return -1.0f;
+        return static_cast<float>(rateRank(row, *row.intValue)) / static_cast<float>(span);
+    }
     if (row.kind == kRowSliderFloat && row.floatValue) {
         const float span = row.high - row.low;
         if (span <= 0.0f) return -1.0f;
@@ -1574,10 +1605,10 @@ void saveSettings() {
     // above without a line here saves silently as nothing, which is the one way this can go
     // quietly wrong -- so they are kept in the same order to make the omission visible.
     writeInt("vrHudLayer", g_options.vrHudLayer);
-    writeInt("perEyeMirror", g_options.perEyeMirror ? 1 : 0);
     writeInt("mirrorUpdateRate", g_options.mirrorUpdateRate);
+    writeInt("mirrorMode", g_options.mirrorMode);
     writeInt("frameRate", g_options.frameRate);
-    writeInt("bakedRenderer", g_options.bakedRenderer);
+    writeInt("vrRendererType", g_options.vrRendererType);
     writeInt("pribludaUpdateRate", g_options.pribludaUpdateRate);
     writeFloat("vrRenderScale", g_options.vrRenderScale);
     writeFloat("vrMenuScale", g_options.vrMenuScale);
@@ -1598,17 +1629,17 @@ void saveSettings() {
         return;
     }
     notice("saved to gplvr.ini");
-    logf("vr menu: saved to %s -- vrHudLayer=%d perEyeMirror=%d mirrorUpdateRate=%d "
-         "frameRate=%d bakedRenderer=%d pribludaUpdateRate=%d vrRenderScale=%.3f "
-         "vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d vrGplTextInset=%.3f "
-         "vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f vrHeadAudioWidth=%.3f "
-         "vrMonitorEye=%d",
-         path, g_options.vrHudLayer, g_options.perEyeMirror ? 1 : 0, g_options.mirrorUpdateRate,
-         g_options.frameRate, g_options.bakedRenderer, g_options.pribludaUpdateRate,
-         g_options.vrRenderScale,
-         g_options.vrMenuScale, g_options.vrHudBackdropOpacity, g_options.vrGplTextScale,
-         g_options.vrGplTextInset, g_options.vrGamma, g_options.vrHorizonLock,
-         g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
+    logf("vr menu: saved to %s -- vrHudLayer=%d mirrorUpdateRate=%d mirrorMode=%d "
+         "frameRate=%d vrRendererType=%d pribludaUpdateRate=%d "
+         "vrRenderScale=%.3f vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
+         "vrGplTextInset=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
+         "vrHeadAudioWidth=%.3f vrMonitorEye=%d",
+         path, g_options.vrHudLayer, g_options.mirrorUpdateRate, g_options.mirrorMode,
+         g_options.frameRate, g_options.vrRendererType,
+         g_options.pribludaUpdateRate, g_options.vrRenderScale, g_options.vrMenuScale,
+         g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextInset,
+         g_options.vrGamma, g_options.vrHorizonLock, g_options.vrWorldScale,
+         g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
 }
 
 // Every write to a row's option goes through one of these two, so a rule about what a setting
@@ -1669,8 +1700,12 @@ void dragRow(int row, float u) {
         if (value != *item.floatValue) *item.floatValue = value;
         return;
     }
-    if ((item.kind == kRowChoiceInt || item.kind == kRowRateInt ||
-         item.kind == kRowNamedInt) && item.intValue) {
+    if (item.kind == kRowRateInt && item.intValue) {
+        int span = static_cast<int>(item.high - item.low);
+        setRowInt(item, rateValue(item, static_cast<int>(std::floor(fraction * span + 0.5f))));
+        return;
+    }
+    if ((item.kind == kRowChoiceInt || item.kind == kRowNamedInt) && item.intValue) {
         const int low = static_cast<int>(item.low);
         const int high = static_cast<int>(item.high);
         int value = low + static_cast<int>(std::floor(fraction * (high - low) + 0.5f));
@@ -1772,8 +1807,11 @@ void adjustWithStick(const VrHandInput& hand, float seconds) {
                                  g_state.frequency);
     if (!step) return;
 
-    if ((item.kind == kRowChoiceInt || item.kind == kRowRateInt ||
-         item.kind == kRowNamedInt) && item.intValue) {
+    if (item.kind == kRowRateInt && item.intValue) {
+        setRowInt(item, rateValue(item, rateRank(item, *item.intValue) + step));
+        return;
+    }
+    if ((item.kind == kRowChoiceInt || item.kind == kRowNamedInt) && item.intValue) {
         const int low = static_cast<int>(item.low);
         const int high = static_cast<int>(item.high);
         // A row whose useful values are coarse says so in `step`, so one push is one useful

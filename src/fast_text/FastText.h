@@ -23,7 +23,7 @@
 //   - a glyph whose bitmap is not an 8-bit colour-index image;
 //   - anything unreadable, and anything at all once the atlas is full.
 //
-// IN VR THIS IS ALSO WHERE GPL'S TEXT IS PLACED, behind `vrGplText = 1`.
+// IN VR THIS IS ALSO WHERE GPL'S TEXT IS PLACED.
 //
 // GPL anchors its notices to the corners of its 2560x1440 layout -- "PRESS F1 FOR HELP" at
 // (5, 143), "PRESS PAUSE TO RESUME" at (2, 1310) -- and in VR those coordinates land in the
@@ -39,12 +39,11 @@
 // centre keeps the spacing GPL authored inside the line. vrGplTextScale and vrGplTextInset are
 // the two knobs.
 //
-// NEITHER KNOB AT ITS DEFAULT MAKES THIS A NO-OP. `vrGplText = 1` is already the whole fix on
-// its own: the same glyph is drawn into BOTH eye rects at vrHudDepth's disparity, where before
-// there was one copy in the left eye's periphery at infinity. Scale 1 keeps the glyph the size
-// GPL authored and inset 1.0 keeps its distance from the middle at the size GPL authored, so
-// the defaults change neither -- but the eye it lands in, and the depth, change the moment the
-// option is on.
+// NEITHER KNOB AT ITS DEFAULT MAKES THIS A NO-OP. Placement alone is already the whole fix:
+// the same glyph is drawn into BOTH eye rects at vrHudDepth's disparity, where roglv2 left one
+// copy in the left eye's periphery at infinity. Scale 1 keeps the glyph the size GPL authored
+// and inset 1.0 keeps its distance from the middle at the size GPL authored, so the defaults
+// change neither -- but the eye it lands in, and the depth, do change.
 //
 // A RUN NEVER LANDS ON ANOTHER. The inset pulls each line's position toward the middle while
 // the scale grows its glyphs, so two notices GPL drew a line apart -- "car must be stopped" over

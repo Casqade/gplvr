@@ -8,6 +8,7 @@
 #include "baked/CarScene.h"
 #include "baked_gpl/BakedPass.h"
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarBuildWorker.h"
 #include "baked_gpl/CarConfig.h"
 #include "baked_gpl/CarMemo.h"
 #include "baked_gpl/CarPoseWrapper.h"
@@ -49,6 +50,14 @@ constexpr unsigned kInstanceCockpit = 152;   // I+152, the `cockpit` handle's XF
 constexpr unsigned kInstanceWheels = 116;
 constexpr unsigned kInstanceWheelModels = 52;
 constexpr unsigned kWheelModels = 3;
+// The instance's nodes gpl_carModelPoseFromRecord 0x46D490 and gpl_carRecordDraw rewrite per car
+// (report 103 section 1): the wheels and hubframes, `car`, `cockpit`, `shifter`, the arms and
+// elbows, the seven dials, `steer`, `head`, headSRB0..3 (the helmet colour, w2) and `shadow`.
+constexpr unsigned kPosedOffsets[] = {116, 120, 124, 128, 132, 136, 140, 144, 148, 152,
+                                      156, 160, 164, 168, 172, 176, 180, 184, 188, 192,
+                                      196, 200, 204, 208, 216, 220, 224, 228, 232};
+static_assert(sizeof(kPosedOffsets) / sizeof(kPosedOffsets[0]) <= kCarPosedNodes,
+              "a snapshot holds every posed node");
 
 constexpr int kRegisterCount = 1024;  // selectors and SETREG index registers & 0x3FF
 constexpr int kMaxDepth = 512;
@@ -73,6 +82,12 @@ uint32_t floatBits(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+float bitsFloat(uint32_t bits) {
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 // -- the walk ------------------------------------------------------------------------------------
@@ -102,6 +117,8 @@ struct Frame {
 
 constexpr int      kMaxKnownObjects = 16;
 constexpr uint16_t kNoFrameId = 0xFFFF;
+
+struct Detached;
 // A kept list's walk (report 105 section 4.23): the halves of its order nodes, and the leaves it
 // may hold before it gives up (cars18 needs at most ~6,200 at 3 m).
 constexpr uint16_t kMaxRegions = 8192;
@@ -205,7 +222,91 @@ struct Walk {
     bool      learn = false;
     uintptr_t configGate = 0;
     uint32_t  learnedGates = 0;
+
+    // GPL's vertex and normal memos as this walk emulates them (beginWalk): CarWalk's own, or the
+    // worker's for a build there.
+    Memo* vertexMemo = nullptr;
+    Memo* normalMemo = nullptr;
+    // A build on the worker (report 105 section 4.61, carWalkDetached); null on the render thread.
+    Detached* detached = nullptr;
+    // emitSkinned's corners.
+    baked::CarVertex skinCorners[kMaxSkinCorners];
 };
+
+// A build on the worker: its snapshot, what it could not do there, the gates its hazards named
+// (CarConfig is the render thread's to write), and its own texture cache.
+struct Detached {
+    const CarBuildSnapshot* snapshot = nullptr;
+    int                     need = kDetachedOk;
+    uintptr_t               needAt = 0;
+    std::vector<uintptr_t>* learned = nullptr;
+    struct Cached {
+        uint32_t handle;
+        int32_t  texture;
+        bool     valid;
+    };
+    Cached textures[256] = {};
+};
+
+// What the worker could not do: the walk ends, and the car is built on the render thread next.
+void detachedNeed(Walk& walk, int need, uintptr_t at) {
+    if (walk.detached->need == kDetachedOk) {
+        walk.detached->need = need;
+        walk.detached->needAt = at;
+    }
+    walk.abort = true;
+}
+
+// A worker build's checkpoint, at every node (CarBuildWorker.h): out while the render thread
+// closes the gate or pauses it, and on only while its epoch and the car bake it began on hold.
+bool detachedGoOn(Walk& walk) {
+    int check = carBuildCheckpoint(walk.detached->snapshot->epoch);
+    if (check == kCarBuildGoOn ||
+        (check == kCarBuildResumed && carBakeGeneration() == walk.detached->snapshot->generation))
+        return true;
+    detachedNeed(walk, kDetachedCancelled, 0);
+    return false;
+}
+
+// The words GPL's pose and draw rewrite per car: the snapshot's on the worker, else GPL's own.
+uint32_t posedWord(const Walk& walk, uintptr_t node, unsigned index) {
+    if (walk.detached) {
+        const CarBuildSnapshot& s = *walk.detached->snapshot;
+        for (uint32_t i = 0; i < s.posedCount; ++i)
+            if (s.posed[i].node == node) return s.posed[i].words[index];
+    }
+    uint32_t value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(node + 4u * index), sizeof(value));
+    return value;
+}
+
+// An XFORM's words 1-6 and its child (w8).
+void xformWords(const Walk& walk, uintptr_t node, uint32_t words[7]) {
+    for (unsigned i = 0; i < 6; ++i) words[i] = posedWord(walk, node, 1 + i);
+    words[6] = posedWord(walk, node, 8);
+}
+
+// carConfigDecides, and carConfigLearn's answer; on the worker read only (CarConfig.h), with the
+// gates this walk has named so far counted as learned.
+bool configDecides(Walk& walk, uintptr_t node) {
+    if (!walk.detached) return carConfigDecides(node);
+    const std::vector<uintptr_t>& learned = *walk.detached->learned;
+    if (std::find(learned.begin(), learned.end(), node) != learned.end()) return true;
+    bool decides = false;
+    if (!carConfigAnswered(node, decides)) detachedNeed(walk, kDetachedScan, node);
+    return decides;
+}
+
+int configLearn(Walk& walk, uintptr_t node) {
+    if (!walk.detached) return carConfigLearn(node);
+    std::vector<uintptr_t>& learned = *walk.detached->learned;
+    if (!node) return -1;
+    if (std::find(learned.begin(), learned.end(), node) != learned.end()) return 0;
+    int known = carConfigKnownLearned(node, static_cast<uint32_t>(learned.size()));
+    if (known != 0) return known > 0 ? 0 : -1;
+    learned.push_back(node);
+    return 1;
+}
 
 // -- GPL's vertex and normal memos ----------------------------------------------------------------
 //
@@ -251,7 +352,7 @@ bool blameConditions(Walk& walk, uint16_t writer, uint16_t reader) {
         uintptr_t node = c.node;
         if (c.kind == kConditionBox)
             node = c.plane < tape.boxes.size() ? tape.boxes[c.plane].node : 0;
-        int learned = carConfigLearn(node);
+        int learned = configLearn(walk, node);
         if (learned < 0) return false;
         walk.learnedGates += static_cast<uint32_t>(learned);
         named = true;
@@ -269,7 +370,7 @@ bool blameRegions(Walk& walk, uint16_t writer, uint16_t reader) {
     while (writer != 0 && !regionWithin(walk, reader, writer)) {
         uint16_t order = walk.regionOrder[writer];
         if (order >= tape.orders.size()) return false;
-        int learned = carConfigLearn(tape.orders[order].node);
+        int learned = configLearn(walk, tape.orders[order].node);
         if (learned < 0) return false;
         walk.learnedGates += static_cast<uint32_t>(learned);
         named = true;
@@ -322,36 +423,38 @@ uint16_t unionHeld(Walk& walk, uint16_t held, uint16_t heldCondition, uint16_t h
 
 uint16_t resolveVertex(Walk& walk, uintptr_t record, const Frame& frame, uintptr_t& gplSlot) {
     auto     key = static_cast<uint32_t>(record);
-    uint32_t entry = memoEntry(g_vertexMemo, key);
+    Memo&    memo = *walk.vertexMemo;
+    uint32_t entry = memoEntry(memo, key);
     uint16_t held = 0, heldCondition = 0, heldRegion = 0;
-    if (memoAlive(g_vertexMemo, entry, key, held, heldCondition, heldRegion))
+    if (memoAlive(memo, entry, key, held, heldCondition, heldRegion))
         return heldCondition == walk.condition && heldRegion == walk.region
                    ? held
                    : unionHeld(walk, held, heldCondition, heldRegion, frame);
-    gplSlot = carMemoGplSlot(record, walk.skin.staleWords);
+    // A build on the worker takes GPL's memo as empty: each take's scanPool reads the live one.
+    gplSlot = walk.detached ? 0 : carMemoGplSlot(record, walk.skin.staleWords);
     if (walk.tape) shareVertex(*walk.tape, record, gplSlot != 0);
     if (gplSlot) return kGplMemoFrame;
-    memoStore(g_vertexMemo, entry, key, frame.id, walk.condition, walk.region,
-              walk.skin.vertexOverflow);
+    memoStore(memo, entry, key, frame.id, walk.condition, walk.region, walk.skin.vertexOverflow);
     return frame.id;
 }
 
 // A NORM record lit by gpl_normalLightCached 0x4CFA70: the frame of its first lighting, kept the
-// same way. A memo word GPL set before the walk is taken as the dispatch frame's (0).
+// same way. A memo word GPL set before the walk is taken as the dispatch frame's (0); a build on
+// the worker takes GPL's memo as empty.
 uint16_t resolveNormal(Walk& walk, uintptr_t record, const Frame& frame) {
     auto     key = static_cast<uint32_t>(record);
-    uint32_t entry = memoEntry(g_normalMemo, key);
+    Memo&    memo = *walk.normalMemo;
+    uint32_t entry = memoEntry(memo, key);
     uint16_t held = 0, heldCondition = 0, heldRegion = 0;
-    if (memoAlive(g_normalMemo, entry, key, held, heldCondition, heldRegion))
+    if (memoAlive(memo, entry, key, held, heldCondition, heldRegion))
         return heldCondition == walk.condition && heldRegion == walk.region
                    ? held
                    : unionHeld(walk, held, heldCondition, heldRegion, frame);
-    if (at<uint32_t>(record) != 0) {
+    if (!walk.detached && at<uint32_t>(record) != 0) {
         ++walk.skin.liveNormals;
         return 0;
     }
-    memoStore(g_normalMemo, entry, key, frame.id, walk.condition, walk.region,
-              walk.skin.normalOverflow);
+    memoStore(memo, entry, key, frame.id, walk.condition, walk.region, walk.skin.normalOverflow);
     return frame.id;
 }
 
@@ -361,10 +464,10 @@ const Frame& frameOf(const Walk& walk, uint16_t id, const Frame& current) {
 }
 
 // gpl_matrixTranslateEuler(t, r): T(t) * Rz * Ry * Rx, the same 3x4 as Scene.cpp's poseMatrix,
-// which places every track object (report 57 section 1.2).
-void poseMatrix(uintptr_t node, float m[12]) {
-    float tx = wordFloat(node, 1), ty = wordFloat(node, 2), tz = wordFloat(node, 3);
-    float yaw = wordFloat(node, 4), pitch = wordFloat(node, 5), roll = wordFloat(node, 6);
+// which places every track object (report 57 section 1.2). `words`: the XFORM's (xformWords).
+void poseMatrix(const uint32_t words[7], float m[12]) {
+    float tx = bitsFloat(words[0]), ty = bitsFloat(words[1]), tz = bitsFloat(words[2]);
+    float yaw = bitsFloat(words[3]), pitch = bitsFloat(words[4]), roll = bitsFloat(words[5]);
     float cz = std::cos(yaw), sz = std::sin(yaw);
     float cy = std::cos(pitch), sy = std::sin(pitch);
     float cx = std::cos(roll), sx = std::sin(roll);
@@ -505,8 +608,8 @@ void enterRoot(const Frame& parent, const float m[12], Frame& child) {
 
 // An XFORM's child frame in the list (its root from local already set), and its eye. GPL rebuilds
 // the half vector only when a rotation ran, and gpl_matrixTranslateEuler skips an angle that is
-// exactly 0 (report 103 section 4).
-void enterFrame(Walk& walk, const Frame& parent, uintptr_t node, Frame& child) {
+// exactly 0 (report 103 section 4). `words`: the XFORM's (xformWords).
+void enterFrame(Walk& walk, const Frame& parent, const uint32_t words[7], Frame& child) {
     baked::CarDrawList& list = *walk.list;
     if (list.frames.size() >= 0xFFFF) {
         ++walk.emit.overflow;
@@ -514,8 +617,8 @@ void enterFrame(Walk& walk, const Frame& parent, uintptr_t node, Frame& child) {
         child.halfFrom = parent.halfFrom;
         return;
     }
-    bool rotates = wordFloat(node, 4) != 0.0f || wordFloat(node, 5) != 0.0f ||
-                   wordFloat(node, 6) != 0.0f;
+    bool rotates = bitsFloat(words[3]) != 0.0f || bitsFloat(words[4]) != 0.0f ||
+                   bitsFloat(words[5]) != 0.0f;
     child.index = static_cast<uint16_t>(list.frames.size());
     child.halfFrom = rotates ? child.index : parent.halfFrom;
     baked::CarFrame out;
@@ -542,6 +645,22 @@ int32_t textureOf(uint32_t handle) {
     if (slot.valid && slot.handle == handle && slot.generation == generation) return slot.texture;
     int32_t texture = carBakeTexture(handle);
     slot = Cached{handle, texture, carBakeGeneration(), true};
+    return texture;
+}
+
+// The same for a walk: on the worker from CarBake's answers so far (one generation a build), and a
+// handle never resolved ends the walk for the render thread.
+int32_t textureFor(Walk& walk, uint32_t handle) {
+    if (!walk.detached) return textureOf(handle);
+    Detached::Cached& slot = walk.detached->textures[(handle * 2654435761u) >> 24];
+    if (slot.valid && slot.handle == handle) return slot.texture;
+    bool    known = false;
+    int32_t texture = carBakeTextureResolved(handle, known);
+    if (!known) {
+        detachedNeed(walk, kDetachedTexture, handle);
+        return -1;
+    }
+    slot = Detached::Cached{handle, texture, true};
     return texture;
 }
 
@@ -583,7 +702,7 @@ void applyMaterial(Walk& walk, uintptr_t node, uint32_t flags, unsigned classWor
     const baked::CarMaterial& current = list.materials[walk.material];
     if (sameMaterial(material, current)) return;
     if (material.textureHandle != current.textureHandle) {
-        material.texture = textureOf(material.textureHandle);
+        material.texture = textureFor(walk, material.textureHandle);
         if (material.texture < 0 && material.textureHandle) ++walk.emit.unresolved;
         material.liveMirror = walk.glassOurs && material.textureHandle == walk.glassTexture;
     }
@@ -691,7 +810,7 @@ void emitSkinned(Walk& walk, int32_t objectIndex, const baked::CarObject& object
                              walk.material, 0, walk.condition);
         return;
     }
-    static baked::CarVertex corners[kMaxSkinCorners];
+    baked::CarVertex* corners = walk.skinCorners;
     bool lit = (leaf.flags & baked::kCarLeafLit) != 0;
     // A kept list re-makes these corners from its re-posed frames each pass (CarProgram.cpp).
     if (walk.program) {
@@ -756,13 +875,22 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
             walk.prim = walk.knownPrim[known];
             walk.primSize = walk.knownSize[known];
             walk.object = walk.knownObject[known];
+        } else if (walk.detached) {
+            // The worker bakes nothing: an object not baked yet is the render thread's to bake.
+            bool unbaked = false;
+            walk.object = carBakeObjectBaked(node, walk.prim, walk.primSize, unbaked);
+            if (unbaked) {
+                detachedNeed(walk, kDetachedObject, node);
+                return;
+            }
         } else {
             walk.object = carBakeObjectOf(node, walk.prim, walk.primSize);
-            if (walk.object >= 0 && walk.knownObjects < kMaxKnownObjects) {
-                walk.knownPrim[walk.knownObjects] = walk.prim;
-                walk.knownSize[walk.knownObjects] = walk.primSize;
-                walk.knownObject[walk.knownObjects++] = walk.object;
-            }
+        }
+        if (known >= walk.knownObjects && walk.object >= 0 &&
+            walk.knownObjects < kMaxKnownObjects) {
+            walk.knownPrim[walk.knownObjects] = walk.prim;
+            walk.knownSize[walk.knownObjects] = walk.primSize;
+            walk.knownObject[walk.knownObjects++] = walk.object;
         }
         if (walk.object < 0) {
             walk.prim = 0;
@@ -814,7 +942,8 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
         return;
     }
     uint32_t colour = 0;
-    if (type == 0x03) colour = (word(node, 0) & 0x200) ? word(node, 2) : 0xFFFFFFFFu;
+    if (type == 0x03)
+        colour = (posedWord(walk, node, 0) & 0x200) ? posedWord(walk, node, 2) : 0xFFFFFFFFu;
     if (walk.tape && type == 0x03) shareSprite(*walk.tape, node, colour);
     baked::appendCarLeaf(*walk.list, static_cast<uint32_t>(walk.object), leaf, frame.index,
                          walk.material, colour, walk.condition);
@@ -843,7 +972,7 @@ void visitChild(Walk& walk, uintptr_t node, unsigned index, const Frame& frame, 
 // A kept list's walk with configurations decides every configuration gate (CarConfig.h).
 bool nearGate(Walk& walk, const Frame& frame, uintptr_t node) {
     if (walk.unionMargin <= 0.0f) return false;
-    if (walk.learn && carConfigDecides(node)) {
+    if (walk.learn && configDecides(walk, node)) {
         walk.configGate = node;
         return false;
     }
@@ -1005,17 +1134,17 @@ void unionWrite(Walk& walk, uint32_t index, int32_t value) {
 // XFORM's pop would. The model GPL's pose set goes last, so what its subtree leaves (a register)
 // is what GPL's walk would leave. Walked as posed when the child is none of the models (a lost
 // wheel, another layout), when the XFORM's pop keeps the memo (0x16), or the tape is full.
-void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const Frame& child,
-                int depth, size_t vertexMark, size_t normalMark) {
+// `current`: the child GPL's pose set (xformWords).
+void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, uintptr_t current,
+                const Frame& child, int depth, size_t vertexMark, size_t normalMark) {
     ShareTape& tape = *walk.tape;
-    uintptr_t  current = word(node, 8);
     const uintptr_t* models = walk.wheelModels[wheel];
     bool       known = false;
     for (unsigned m = 0; m < kWheelModels; ++m) known = known || models[m] == current;
     if (!known || type == 0x16 || child.id == 0 || child.id == kNoFrameId ||
         child.id > tape.frames.size() || tape.frames[child.id - 1u].node != node ||
         tape.conditions.size() + kWheelModels > kMaxShareConditions) {
-        visitChild(walk, node, 8, child, depth);
+        visit(walk, current, child, depth + 1, 0);
         return;
     }
     // GPL's order of the distinct models, the current one moved last.
@@ -1039,8 +1168,8 @@ void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const 
     shared.switchCount = static_cast<uint16_t>(count);
     for (unsigned m = 0; m < count; ++m) {
         if (m > 0) {
-            memoUndo(g_vertexMemo, vertexMark);
-            memoUndo(g_normalMemo, normalMark);
+            memoUndo(*walk.vertexMemo, vertexMark);
+            memoUndo(*walk.normalMemo, normalMark);
         }
         walk.condition = static_cast<uint16_t>(first + m);
         visit(walk, order[m], child, depth + 1, 0);
@@ -1052,6 +1181,7 @@ void visitWheel(Walk& walk, uintptr_t node, uint8_t type, unsigned wheel, const 
 // root MATERIAL, as gpl_carRecordDraw points it at the `car` or `cockpit` handle for the dispatch.
 void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t rootChild) {
     if (walk.abort) return;
+    if (walk.detached && !detachedGoOn(walk)) return;
     if (depth > kMaxDepth) return;
     int32_t typeWord = at<int32_t>(node);
     if (typeWord < 0) return;  // every dispatcher skips a negative type word (gpl_nullNode)
@@ -1145,8 +1275,10 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
     case 0x0D:
     case 0x13:
     case 0x16: {  // XFORM: gpl_nodePoseRender 0x4CC650, child at word 8
+        uint32_t words[7];
+        xformWords(walk, node, words);
         float pose[12];
-        poseMatrix(node, pose);
+        poseMatrix(words, pose);
         Frame child;
         std::memcpy(child.planes, frame.planes, sizeof(child.planes));
         enterPose(frame, pose, walk.planeMask, child);
@@ -1156,7 +1288,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         child.node = node;
         child.key = ((frame.key ^ static_cast<uint32_t>(node)) * 2654435761u) ^ (frame.key >> 15);
         child.parentCanon = frame.canon;
-        if (walk.list) enterFrame(walk, frame, node, child);
+        if (walk.list) enterFrame(walk, frame, words, child);
         if (walk.frameCount < kMaxWalkFrames) {
             child.id = walk.frameCount++;
             child.canon = child.id;
@@ -1172,24 +1304,24 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
             child.canon = kNoFrameId;
             ++walk.skin.frameOverflow;
         }
-        if (walk.tape) shareFrame(*walk.tape, node, frame.id, child.id, pose);
+        if (walk.tape) shareFrame(*walk.tape, node, words, frame.id, child.id, pose);
         // gpl_matrixPush saves the memo pools' marks; 0x0D/0x13 (gpl_nodePoseRender 0x4CC650)
         // pop(1) back to them, 0x16 (0x4CC6A0) pops(0) and leaves what its child memoised.
-        size_t vertexMark = g_vertexMemo.pool.size();
-        size_t normalMark = g_normalMemo.pool.size();
+        size_t vertexMark = walk.vertexMemo->pool.size();
+        size_t normalMark = walk.normalMemo->pool.size();
         int wheel = -1;
         for (int w = 0; walk.program && w < 4; ++w)
             if (node == walk.wheels[w]) wheel = w;
         walk.wheelDepth += wheel >= 0 ? 1 : 0;
         if (wheel >= 0 && walk.tape)
-            visitWheel(walk, node, type, static_cast<unsigned>(wheel), child, depth, vertexMark,
-                       normalMark);
+            visitWheel(walk, node, type, static_cast<unsigned>(wheel), words[6], child, depth,
+                       vertexMark, normalMark);
         else
-            visitChild(walk, node, 8, child, depth);
+            visit(walk, words[6], child, depth + 1, 0);
         walk.wheelDepth -= wheel >= 0 ? 1 : 0;
         if (type != 0x16) {
-            memoUndo(g_vertexMemo, vertexMark);
-            memoUndo(g_normalMemo, normalMark);
+            memoUndo(*walk.vertexMemo, vertexMark);
+            memoUndo(*walk.normalMemo, normalMark);
         }
         return;
     }
@@ -1307,7 +1439,7 @@ void visit(Walk& walk, uintptr_t node, const Frame& frame, int depth, uintptr_t 
         // A kept list's walk draws the box's subtree for every eye the box does not cull, unless
         // the box is a configuration box (a register written inside it, report 105 section 4.24),
         // which it decides for this eye like a plain walk.
-        if (walk.program && walk.learn && carConfigDecides(node)) {
+        if (walk.program && walk.learn && configDecides(walk, node)) {
             walk.tape->boxes.back().config = true;
         } else if (walk.program) {
             uint16_t drawn = shareBoxCondition(*walk.tape, walk.tape->boxes.size() - 1,
@@ -1441,11 +1573,16 @@ void rootFrame(const Addresses& a, Frame& frame, float projection[16], float mod
 
 // A fresh walk from the root frame: GPL's memos as this walk will grow them start empty, with
 // the root as frame 0 (a memo GPL made before the walk is read from GPL's own pool).
+// A walk on the worker has the worker's memos set already (carWalkDetached).
 void beginWalk(Walk& walk, const Frame& root) {
+    if (!walk.detached) {
+        walk.vertexMemo = &g_vertexMemo;
+        walk.normalMemo = &g_normalMemo;
+    }
     const baked::CarScene& scene = carBakeScene();
     uint32_t               generation = carBakeGeneration();
-    memoBegin(g_vertexMemo, scene, generation, false);
-    memoBegin(g_normalMemo, scene, generation, true);
+    memoBegin(*walk.vertexMemo, scene, generation, false);
+    memoBegin(*walk.normalMemo, scene, generation, true);
     walk.frames[0] = root;
     walk.frameCount = 1;
     walk.skin = SkinCounts{};
@@ -1566,8 +1703,9 @@ void beginProgram(Walk& walk, float margin, uintptr_t instance) {
 
 // What a stage-2b walk is about to start from, for sharing it between the eyes (CarShare.h).
 ShareCall shareCall(const Walk& walk, const Frame& frame, uintptr_t record, uintptr_t root,
-                    uintptr_t handle, int driver) {
+                    uintptr_t handle, int driver, uintptr_t instance) {
     ShareCall call;
+    call.instance = instance;
     call.record = record;
     call.root = root;
     call.handle = handle;
@@ -1643,8 +1781,10 @@ ListOutcome listOurs(State& s, uintptr_t record, int driver, uintptr_t instance,
 
     // The car's kept list serves both eyes and later frames (report 105 section 4.23); without
     // one, in VR the second eye takes the first eye's list when this walk would build the same.
-    ShareCall      share = shareCall(walk, frame, record, root, handle, driver);
+    ShareCall      share = shareCall(walk, frame, record, root, handle, driver, instance);
     ProgramOutcome program = carProgramTake(share, list);
+    // A build handed to the worker (report 105 section 4.61): this call walks the car as before.
+    if (program == kProgramQueued) program = kProgramWalk;
     if (program == kProgramEmpty) return kListEmpty;
     if (program == kProgramReused || program == kProgramVerify)
         carShareTapeSkip(share, arena.count);
@@ -2018,6 +2158,132 @@ void carWalkPassBegin(bool mirror, int pane) {
 const baked::CarDrawList* carWalkPassLists(uint32_t& count) {
     count = g_car.arena.count;
     return count ? g_car.arena.lists.data() : nullptr;
+}
+
+// -- builds on the worker (CarBuildWorker.h, report 105 section 4.61) -----------------------------
+
+namespace {
+
+// The posed nodes' words 0-8 (an XFORM is 36 bytes; a BILLBOARD's colour is w2), and the wheels
+// and their models beginProgram would read; a fault refuses the snapshot.
+bool snapshotPoseGuarded(uintptr_t instance, CarBuildSnapshot& s) {
+    __try {
+        s.posedCount = 0;
+        for (unsigned offset : kPosedOffsets) {
+            uintptr_t node = at<uint32_t>(instance + offset);
+            bool      seen = !node;
+            for (uint32_t i = 0; i < s.posedCount && !seen; ++i) seen = s.posed[i].node == node;
+            if (seen) continue;
+            CarPosedNode& posed = s.posed[s.posedCount++];
+            posed.node = node;
+            std::memcpy(posed.words, reinterpret_cast<const void*>(node), sizeof(posed.words));
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            s.wheels[i] = at<uint32_t>(instance + kInstanceWheels + 8 * i);
+            for (unsigned m = 0; m < kWheelModels; ++m)
+                s.wheelModels[i][m] =
+                    at<uint32_t>(instance + kInstanceWheelModels + 4 * (kWheelModels * i + m));
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+}  // namespace
+
+bool carWalkSnapshotPose(uintptr_t instance, CarBuildSnapshot& snapshot) {
+    return instance && snapshotPoseGuarded(instance, snapshot);
+}
+
+// listOurs's build (setupWalk, rootFrame, beginList, beginProgram, the walk), every input from the
+// snapshot; on the worker only, which this Walk, these memos and this cache are.
+void carWalkDetached(const CarBuildSnapshot& s, ShareTape& tape, baked::CarDrawList& list,
+                     CarDetachedWalk& out) {
+    static Walk     walk;
+    static Memo     vertexMemo;
+    static Memo     normalMemo;
+    static Detached detached;
+    detached = Detached{};
+    detached.snapshot = &s;
+    detached.learned = out.learnedGates;
+    walk.detached = &detached;
+    walk.vertexMemo = &vertexMemo;
+    walk.normalMemo = &normalMemo;
+
+    walk.polygons = 0;
+    walk.planeMask = 0;
+    walk.classVisible = s.classVisible;
+    walk.lodScale = s.lodScale;
+    walk.dlong = s.dlong;
+    walk.dlat = s.dlat;
+    walk.cellPlanes = false;
+    walk.lightingOn = s.lightingOn;
+    std::memcpy(walk.registers, s.registers, sizeof(walk.registers));
+    walk.glassTexture = 0;
+    walk.glassOurs = false;
+
+    Frame frame;
+    std::memcpy(frame.clip, s.clip, sizeof(frame.clip));
+    std::memcpy(frame.eye, s.eye, sizeof(frame.eye));
+    std::memset(frame.planes, 0, sizeof(frame.planes));
+    float identity[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    std::memcpy(frame.root, identity, sizeof(identity));
+    frame.index = 0;
+    frame.halfFrom = 0;
+    frame.id = 0;
+    frame.node = 0;
+    frame.key = 0x9E3779B9u;
+    frame.canon = 0;
+    frame.parentCanon = 0;
+
+    list.clear();
+    std::memcpy(list.projection, s.projection, sizeof(list.projection));
+    std::memcpy(list.rootModelView, s.rootModelView, sizeof(list.rootModelView));
+    std::memcpy(list.light, s.light, sizeof(list.light));
+    baked::CarFrame root;
+    std::memcpy(root.rootFromLocal, frame.root, sizeof(root.rootFromLocal));
+    std::memcpy(root.eye, frame.eye, sizeof(root.eye));
+    root.halfFrom = 0;
+    list.frames.push_back(root);
+    baked::CarMaterial material;
+    material.surfaceClass = s.surfaceClass;
+    material.textured = s.textured;
+    material.specularExponent = s.specularExponent;
+    material.specular = s.specular;
+    list.materials.push_back(material);
+    list.driver = s.driver;
+    list.cockpit = false;
+    list.overlay = false;
+    list.mirror = s.mirror;
+    list.walkSlot = s.walkSlot;
+    list.flagman = false;
+    walk.list = &list;
+    walk.emit = EmitCounts{};
+    walk.material = 0;
+    walk.textureList = s.textureList;
+    walk.texturedMask = s.texturedMask;
+    walk.prim = 0;
+    walk.primSize = 0;
+    walk.object = -1;
+
+    walk.tape = &tape;
+    beginUnion(walk, s.margin > 0.0f ? s.margin : kMaxUnionMargin);
+    walk.program = true;
+    walk.everyGate = s.margin <= 0.0f;
+    walk.learn = true;
+    std::memcpy(walk.wheels, s.wheels, sizeof(walk.wheels));
+    std::memcpy(walk.wheelModels, s.wheelModels, sizeof(walk.wheelModels));
+    beginWalk(walk, frame);
+    out.walked = walkGuarded(walk, s.root, s.handle, frame);
+    out.hazard = out.walked ? firstHazard(walk) : -1;
+    out.refusal = shareRefusal(walk, list, out.walked);
+    out.learned = walk.learnedGates;
+    out.need = detached.need;
+    out.needAt = detached.needAt;
+    walk.tape = nullptr;
+    walk.list = nullptr;
+    walk.detached = nullptr;
 }
 
 }  // namespace gplvr

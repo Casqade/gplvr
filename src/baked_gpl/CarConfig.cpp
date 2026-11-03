@@ -1,6 +1,7 @@
 #include "baked_gpl/CarConfig.h"
 
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarBuildWorker.h"
 
 #include <windows.h>
 
@@ -55,10 +56,12 @@ uint32_t slotOf(uintptr_t node, unsigned bits) {
     return (static_cast<uint32_t>(node) * 2654435761u) >> (32 - bits);
 }
 
-// A new car set names other nodes: both tables start again.
+// A new car set names other nodes: both tables start again. Every write of the tables holds a
+// CarBuildPause: the build worker reads them (carConfigAnswered, carConfigKnownLearned).
 void follow() {
     uint32_t generation = carBakeGeneration();
     if (g_haveGeneration && generation == g_generation) return;
+    CarBuildPause pause;
     g_haveGeneration = true;
     g_generation = generation;
     g_scanBits = kScanMinBits;
@@ -221,15 +224,31 @@ bool learned(uintptr_t node) {
     }
 }
 
+// The memo's state of a control node, or null when it has none: stateOf without the insert.
+const uint8_t* findState(uintptr_t node) {
+    if (g_scanKeys.empty()) return nullptr;
+    uint32_t mask = static_cast<uint32_t>(g_scanKeys.size() - 1);
+    for (uint32_t i = slotOf(node, g_scanBits);; i = (i + 1) & mask) {
+        if (g_scanKeys[i] == node) return &g_scanStates[i];
+        if (!g_scanKeys[i]) return nullptr;
+    }
+}
+
+// The tables hold the car set the bake is on.
+bool current() { return g_haveGeneration && g_generation == carBakeGeneration(); }
+
 }  // namespace
 
 bool carConfigDecides(uintptr_t node) {
     follow();
     if (!node) return false;
     if (learned(node)) return true;
-    uint8_t* state = stateOf(node);
-    if (state && (*state == kYes || *state == kNo)) return *state == kYes;
+    const uint8_t* answer = findState(node);
+    if (answer && (*answer == kYes || *answer == kNo)) return *answer == kYes;
     // Unanswered (new, or an earlier scan could not finish): scan, with room for a whole model.
+    CarBuildPause pause;
+    uint8_t*      state = stateOf(node);
+    if (state && (*state == kYes || *state == kNo)) return *state == kYes;
     roomForScan();
     Scan scan;
     bool faulted = false;
@@ -251,10 +270,30 @@ int carConfigLearn(uintptr_t node) {
         if (g_learned[i] == node) return 0;
         if (g_learned[i]) continue;
         if (g_learnedCount >= kLearnSize / 2) return -1;
+        CarBuildPause pause;
         g_learned[i] = node;
         ++g_learnedCount;
         return 1;
     }
+}
+
+bool carConfigAnswered(uintptr_t node, bool& decides) {
+    decides = false;
+    if (!node || !current()) return false;
+    if (learned(node)) {
+        decides = true;
+        return true;
+    }
+    const uint8_t* state = findState(node);
+    if (!state || (*state != kYes && *state != kNo)) return false;
+    decides = *state == kYes;
+    return true;
+}
+
+int carConfigKnownLearned(uintptr_t node, uint32_t pending) {
+    if (!node || !current()) return -1;
+    if (learned(node)) return 1;
+    return g_learnedCount + pending >= kLearnSize / 2 ? -1 : 0;
 }
 
 }  // namespace gplvr

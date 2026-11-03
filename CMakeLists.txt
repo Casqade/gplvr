@@ -99,6 +99,7 @@ else()
         src/MirrorConfig.cpp
         src/MirrorDriverArms.cpp
         src/MirrorGeometry.cpp
+        src/MirrorShared.cpp
         src/MirrorTarget.cpp
         src/MirrorUv.cpp
         src/MouseLook.cpp
@@ -134,6 +135,7 @@ else()
         src/baked/Assets.cpp
         src/baked/BakedLog.cpp
         src/baked/CarRenderer.cpp
+        src/baked/CarRowStore.cpp
         src/baked/CarScene.cpp
         src/baked/Mip.cpp
         src/baked/Piff.cpp
@@ -147,6 +149,7 @@ else()
         src/baked_gpl/BakedMirror.cpp
         src/baked_gpl/BakedPass.cpp
         src/baked_gpl/CarBake.cpp
+        src/baked_gpl/CarBuildWorker.cpp
         src/baked_gpl/CarConfig.cpp
         src/baked_gpl/CarMemo.cpp
         src/baked_gpl/CarOrder.cpp
@@ -159,6 +162,7 @@ else()
         src/baked_gpl/CockpitDraw.cpp
         src/baked_gpl/CockpitGlass.cpp
         src/baked_gpl/Flagmen.cpp
+        src/baked_gpl/ProgramArena.cpp
         src/baked_gpl/ResidualDepth.cpp
         src/baked_gpl/TrackBake.cpp
     )

@@ -39,6 +39,30 @@
 // list holds the mirror glass (step 2, section 4.49): each assembly takes the glass's UVs from
 // GPL's PRIM again; one reuse in kCockpitVerifyEvery is walked anyway and compared run by run
 // (CarUnion.h), and a MISMATCH turns its programs off until the car set changes.
+//
+// Storage (section 4.59): a build is walked and compiled into one scratch program on the heap, and
+// a kept one is copied into a run of pages of the program region reserved at install
+// (ProgramArena.h); the region is the budget. Where it could not be reserved the programs are the
+// heap's, under a byte budget and the address-space floor (section 4.55.1).
+//
+// Builds on a worker (section 4.61, CarBuildWorker.h): a call that needs a build walks the car as
+// before and queues the build with a snapshot of the call (CarWalk.h); the worker walks and
+// compiles it into a job's heap scratch, and the render thread keeps it at a later pass begin
+// (copied into the region as above), after which the replay takes it or not as any program. The
+// cockpit, a car the worker could not build (an object not baked, a texture not resolved, a gate
+// not scanned yet), a full queue or a worker that did not start build on the render thread as
+// before; kCarBuildWorker false builds every program there.
+//
+// Stale draws (section 4.63, kCarStaleWhileBuilding): while a car's job is queued or in flight,
+// for at most kStaleMaxPasses main passes, its calls take its most recent program instead of the
+// walk where that program differs only in what the picture shows (a register, the helmet colour,
+// the LOD, a selector camera, a decided or configuration gate): its frames, child pointers, GPL's
+// vertex memo and live conditions are this call's, its selection the build's. A new car, a call
+// that dropped a program, a moved child pointer and the cockpit walk as before.
+//
+// The order a call tries a car's programs in, and the pose matrices of its replays (section 4.64,
+// kCarEyeFirst and kCarPoseCache below): each eye's last take first, and an XFORM's matrix made
+// once for each set of its pose words. Neither changes what a replay decides.
 
 #include "baked_gpl/CarShare.h"
 
@@ -55,23 +79,38 @@ namespace gplvr {
 // hazards on most of them, its list ~1.1-1.4x one eye's, kept ~10-80 frames in racing motion.
 constexpr float kProgramMargin = 0.3f;
 
+// Report 105 section 4.64 (a1). true: a car call tries first the program its eye took last (the
+// eyes of a main pass share a Car, as do the eyes of a mirror glass), then the others most
+// recently taken first; false: most recently taken first alone. The eyes of a pair that disagree
+// each move their own program to the front, so under the plain order each eye's first candidate
+// is often the other eye's. The replay decides either way: only the number of replays changes.
+constexpr bool kCarEyeFirst = true;
+
+// Report 105 section 4.64 (b1). true: a replay's XFORM pose matrices come from a cache keyed by the
+// node and the six words poseMatrix makes them from, so a node posed alike for several candidate
+// programs, both eyes and every glass is computed once; false: computed in every replay.
+constexpr bool kCarPoseCache = true;
+
 enum ProgramOutcome {
     kProgramWalk,    // walk the car as before (CarShare.h)
-    kProgramReused,  // `list` holds the program's list for this call's eye and pose
+    kProgramReused,  // `list` holds the program's list for this call's eye and pose (or stale)
     kProgramVerify,  // the cockpit: walk it without a tape and hand the list to carProgramVerify
     kProgramBuild,   // walk the car into carProgramTapeBegin's tape and hand it to ...TapeEnd
     kProgramEmpty,   // a mirror car whose root box the view culls: list nothing (CarPassView.h)
+    kProgramQueued,  // the build went to the worker (section 4.61): walk the car as before
 };
 
 // From carWalkInstall once the car hook is in: logs what the program does.
 void carProgramInstall();
 
 // From carWalkPassBegin. `enabled`: the car hook is installed. `pane`: a mirror pass's glass, -1
-// not known (report 105 section 4.54).
+// not known (report 105 section 4.54). Keeps the worker's finished builds, then opens its gate
+// (CarBuildWorker.h) for the pass.
 void carProgramPassBegin(bool mirror, bool enabled, int pane);
 
 // Every kept program and Car dropped, as if no car had been seen: from BakedPass when
-// bakedRenderer comes back on after passes GPL drew alone, whose frames no program followed.
+// rendererType() comes back on after passes GPL drew alone, whose frames no program followed. The
+// worker's jobs are cancelled (they come back unbuilt).
 void carProgramDropAll();
 
 // A car's first call in a baked main or mirror pass, `list` begun for it (header, root frame, root
@@ -95,5 +134,6 @@ bool carProgramTapeEnd(ShareTape& tape, int hazard, ShareRefusal refusal, baked:
 
 // After the walk kProgramVerify asked for.
 void carProgramVerify(const baked::CarDrawList& walked, bool walkedWhole);
+
 
 }  // namespace gplvr

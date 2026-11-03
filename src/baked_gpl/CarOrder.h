@@ -51,20 +51,22 @@ struct OrderMemo {
 // the draws whose condition it is and the order nodes whose `condition` or `onFront` it is, as
 // offsets [first[c], first[c + 1]) into one array; per draw, its innermost enclosing order node;
 // per order node, its enclosing one (kNoOrderNode: none). 16-bit throughout: a program with more
-// draws, order nodes or node entries than that keeps no index and emits its orders whole.
+// draws, order nodes or node entries than that keeps no index and emits its orders whole. A kept
+// program's copy lies in the program region with the rest of it (ProgramArena.h).
 constexpr uint16_t kNoOrderNode = 0xFFFF;
 struct OrderIndex {
-    std::vector<uint16_t> drawsFirst;
-    std::vector<uint16_t> draws;
-    std::vector<uint16_t> nodesFirst;
-    std::vector<uint16_t> nodes;
-    std::vector<uint16_t> drawNode;
-    std::vector<uint16_t> nodeParent;
+    ArenaVector<uint16_t> drawsFirst;
+    ArenaVector<uint16_t> draws;
+    ArenaVector<uint16_t> nodesFirst;
+    ArenaVector<uint16_t> nodes;
+    ArenaVector<uint16_t> drawNode;
+    ArenaVector<uint16_t> nodeParent;
     bool                  built = false;
 };
 
 // A kept program's order state: its memos, the patch's index, and whether a patch check found a
-// difference since it was kept (its orders are then emitted whole until it is rebuilt).
+// difference since it was kept (its orders are then emitted whole until it is rebuilt). The memos
+// are filled by its assemblies and stay on the heap.
 struct OrderState {
     OrderMemo  memos[kOrderMemos];
     OrderIndex index;
@@ -92,12 +94,11 @@ OrderMemo* orderTake(const OrderSource& s, OrderState& state, bool verify, uint3
                      std::vector<uint32_t>& drawOrder);
 
 // Whether the order nodes nest as emitRange walks them: each inside its parent's half, in order.
-bool ordersNest(const std::vector<ShareOrder>& orders, uint32_t begin, uint32_t end,
+bool ordersNest(const ArenaVector<ShareOrder>& orders, uint32_t begin, uint32_t end,
                 uint32_t orderBegin, uint32_t orderEnd, int depth);
 
 // The patch's index of a program being kept (section 4.53); false (and `index` empty) when the
 // program is past its 16-bit ids. The order nodes must nest (ordersNest).
 bool orderIndexBuild(OrderIndex& index, const OrderSource& s);
-size_t orderIndexBytes(const OrderIndex& index);
 
 }  // namespace gplvr

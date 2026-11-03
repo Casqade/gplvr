@@ -122,6 +122,20 @@ bool      g_vrMirrorModeKeyLast = false;
 bool      g_vrMouseLookKeyLast = false;
 bool      g_loggedMouseLook = false;
 
+const char* mirrorModeText(int mode) {
+    switch (mode) {
+        case kMirrorShared:
+            return "one pane every glass shares, rendered from each eye: depth, 2 mirror renders a "
+                   "frame";
+        case kMirrorSharedHeadCentre:
+            return "one pane every glass shares, rendered once from the head centre: no depth, 1 "
+                   "mirror render a frame";
+        default:
+            return "a pane per glass, rendered from each eye: depth, 2 mirror renders a frame per "
+                   "glass";
+    }
+}
+
 // Set by the scene hook when stereoRender actually split the frame into two eyes.
 // Read and cleared by the frame hook.
 //
@@ -807,19 +821,14 @@ void pollToggle() {
     // belong on the fg thread too.
     replayQuickMenuPoll();
 
-    // Per-eye mirrors on and off. The pass loop reads perEyeMirror every frame and the main
-    // world walk redirect is installed whichever way it started, so the two swap freely.
+    // The next mirror mode. The pass loop reads mirrorMode every frame and the main world walk
+    // redirect is installed whichever way it started, so the modes swap freely.
     if (g_options.vr && g_options.vrMirrorModeKey) {
         bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
         if (down && !g_vrMirrorModeKeyLast) {
-            g_options.perEyeMirror = !g_options.perEyeMirror;
-            logf("mirror: per-eye mirrors %s -- %s",
-                 g_options.perEyeMirror ? "ON" : "off",
-                 g_options.perEyeMirror
-                     ? "each eye renders both glasses from its own viewpoint (4 mirror "
-                       "renders a frame)"
-                     : "both glasses once from the head centre, shared by the eyes (2 mirror "
-                       "renders a frame)");
+            g_options.mirrorMode = (g_options.mirrorMode + 1) % 3;
+            logf("mirror: mode %d -- %s", g_options.mirrorMode,
+                 mirrorModeText(g_options.mirrorMode));
         }
         g_vrMirrorModeKeyLast = down;
     }
@@ -1181,9 +1190,6 @@ void renderExtraFrames() {
 int __cdecl screenDisplayHook(void* surface) {
     frameBudgetSwitch(kSpanHousekeeping);
 
-    // Every stampDraw of this frame has been issued by now, so its strings are complete.
-    if (g_options.vr) hudEndFrame();
-
     // We are on the game's render thread, between frames: sceneRender has already
     // returned and is not on any stack, so its call sites are safe to rewrite.
     applyPendingSceneRenderHook();
@@ -1256,7 +1262,7 @@ int __cdecl screenDisplayHook(void* surface) {
 
     // GPL'S OWN STAMPED TEXT HAS TO BE DRAWN WHILE THE OFF-SCREEN TARGET IS STILL BOUND.
     //
-    // With vrGplText = 1 the fast text path batches GPL's glyphs as quads and draws them in one
+    // In VR the fast text path batches GPL's glyphs as quads and draws them in one
     // go, and its own end-of-frame flush sits far below -- after the headset's copy and after
     // the window blit, which is where it belongs in flat mode and is a frame too late here.
     // Flushed from this side so the pixels are in the image the headset is handed; the call
@@ -1273,7 +1279,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // to both eyes.
     if (g_options.vrNoSignal && noSignalDrawnThisFrame()) rasterFlushPending();
 
-    // bakedRenderer = 2's mark, while the frame is still bound.
+    // rendererType() = 2's mark, while the frame is still bound.
     bakedMarkFrameEnd();
 
     // The off-screen frame has to stop being the draw target before the presenter
@@ -1730,7 +1736,7 @@ void __cdecl sceneRenderHook(void* params) {
     }
 
     // The engine creates the mirror camera lazily, and leaves p[43] null when mirrors are
-    // off. Say so the first time one appears, because otherwise perEyeMirror looks broken
+    // off. Say so the first time one appears, because otherwise mirrorMode looks broken
     // when in fact there is simply no mirror pass to place.
     if (scene->mirrorCamera && !g_loggedMirror) {
         g_loggedMirror = true;
@@ -2460,7 +2466,9 @@ void loadOptions(const char* fileName) {
     // the end -- the debug rotation ones sit with the keys they belong to.
     char text[64] = {};
 
-    g_options.perEyeMirror = GetPrivateProfileIntA("gplvr", "perEyeMirror", 1, path) != 0;
+    g_options.mirrorMode = GetPrivateProfileIntA("gplvr", "mirrorMode", kMirrorPerGlass, path);
+    if (g_options.mirrorMode < kMirrorSharedHeadCentre || g_options.mirrorMode > kMirrorPerGlass)
+        g_options.mirrorMode = kMirrorPerGlass;
     g_options.mirrorSkipOutOfView =
         GetPrivateProfileIntA("gplvr", "mirrorSkipOutOfView", 1, path) != 0 ? 1 : 0;
     g_options.mirrorCopyRebind =
@@ -2468,10 +2476,10 @@ void loadOptions(const char* fileName) {
     g_options.mirrorUpdateRate = GetPrivateProfileIntA("gplvr", "mirrorUpdateRate", 1, path);
     if (g_options.mirrorUpdateRate < 0) g_options.mirrorUpdateRate = 0;
     if (g_options.mirrorUpdateRate > 16) g_options.mirrorUpdateRate = 16;
-    if (g_options.mirrorUpdateRate > 1 && g_options.perEyeMirror) {
-        logf("options: mirrorUpdateRate = %d with perEyeMirror on needs a copy of mirror.mip "
-             "per eye, because the two eyes render their panes into the same texture and a "
-             "skipped frame would leave the left eye looking at the right eye's reflection. "
+    if (g_options.mirrorUpdateRate > 1 && mirrorFromEachEye()) {
+        logf("options: mirrorUpdateRate = %d with the mirror from each eye needs a copy of "
+             "mirror.mip per eye, because the two eyes render their panes into the same texture "
+             "and a skipped frame would leave the left eye looking at the right eye's reflection. "
              "The copies are built on the first frame that renders the mirror; watch for the "
              "`mirror: each eye keeps its own copy` line, and for a `no per-eye copy` line "
              "naming what refused. Until they exist every frame renders, as before.",
@@ -2559,22 +2567,13 @@ void loadOptions(const char* fileName) {
     g_options.vrHudDepth = static_cast<float>(atof(text));
     g_options.vrHudLayer = GetPrivateProfileIntA("gplvr", "vrHudLayer", 2, path);
     if (g_options.vrHudLayer < 0 || g_options.vrHudLayer > 2) g_options.vrHudLayer = 2;
-    GetPrivateProfileStringA("gplvr", "vrHudInset", "1.0", text, sizeof(text), path);
-    g_options.vrHudInset = static_cast<float>(atof(text));
-    // Zero collapses every item onto the eye's centre, which is what this setting did while
-    // it was a constant, and the whole layout arriving at one point reads as the HUD being
-    // absent rather than as a setting being wrong.
-    if (g_options.vrHudInset < 0.1f) g_options.vrHudInset = 0.1f;
-    if (g_options.vrHudInset > 1.0f) g_options.vrHudInset = 1.0f;
-    g_options.vrGplText = GetPrivateProfileIntA("gplvr", "vrGplText", 0, path);
-    if (g_options.vrGplText < 0 || g_options.vrGplText > 1) g_options.vrGplText = 0;
     g_options.vrGplTextScale = GetPrivateProfileIntA("gplvr", "vrGplTextScale", 1, path);
     if (g_options.vrGplTextScale < 1) g_options.vrGplTextScale = 1;
     if (g_options.vrGplTextScale > 4) g_options.vrGplTextScale = 4;
     GetPrivateProfileStringA("gplvr", "vrGplTextInset", "1.0", text, sizeof(text), path);
     g_options.vrGplTextInset = static_cast<float>(atof(text));
-    // The same floor vrHudInset has, for the same reason: 0 is every run on one point at the
-    // eye's centre, which reads as the text being gone rather than as a setting being wrong.
+    // 0 is every run on one point at the eye's centre, which reads as the text being gone
+    // rather than as a setting being wrong.
     if (g_options.vrGplTextInset < 0.1f) g_options.vrGplTextInset = 0.1f;
     if (g_options.vrGplTextInset > 1.0f) g_options.vrGplTextInset = 1.0f;
     // A key that is absent keeps the default the Options struct was built with.
@@ -2663,8 +2662,11 @@ void loadOptions(const char* fileName) {
     }
     g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
     if (g_options.simRing < 0 || g_options.simRing > 1) g_options.simRing = 0;
-    g_options.bakedRenderer = GetPrivateProfileIntA("gplvr", "bakedRenderer", 1, path);
-    if (g_options.bakedRenderer < 0 || g_options.bakedRenderer > 2) g_options.bakedRenderer = 1;
+    g_options.vrRendererType = GetPrivateProfileIntA("gplvr", "vrRendererType", 1, path);
+    if (g_options.vrRendererType < 0 || g_options.vrRendererType > 2) g_options.vrRendererType = 1;
+    g_options.flatRendererType = GetPrivateProfileIntA("gplvr", "flatRendererType", 1, path);
+    if (g_options.flatRendererType < 0 || g_options.flatRendererType > 2)
+        g_options.flatRendererType = 1;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2707,9 +2709,10 @@ void loadOptions(const char* fileName) {
              ? "a mirror pane whose glass no eye can see this frame is not rendered; watch "
                "`mirror panes N, out of view M` on the fps line"
              : "off: every pane is rendered on every mirror frame");
-    logf("options: perEyeMirror=%d mirrorCopyRebind=%d mirrorUpdateRate=%d (%s) -- the aim of the "
-         "glasses is per car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
-         g_options.perEyeMirror ? 1 : 0, g_options.mirrorCopyRebind ? 1 : 0,
+    logf("options: mirrorMode=%d (%s) mirrorCopyRebind=%d mirrorUpdateRate=%d (%s) -- the aim of "
+         "the glasses is per car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
+         g_options.mirrorMode, mirrorModeText(g_options.mirrorMode),
+         g_options.mirrorCopyRebind ? 1 : 0,
          g_options.mirrorUpdateRate,
          g_options.mirrorUpdateRate <= 0
              ? "the mirror is OFF and its texture is filled with black"
@@ -2722,9 +2725,9 @@ void loadOptions(const char* fileName) {
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
          g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
     mirrorConfigReset();
-    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", 1, path);
-    if (g_options.vrMonitorEye < 0 || g_options.vrMonitorEye > 3)
-        g_options.vrMonitorEye = 1;
+    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", kMonitorBoth, path);
+    if (g_options.vrMonitorEye < kMonitorOff || g_options.vrMonitorEye > kMonitorBoth)
+        g_options.vrMonitorEye = kMonitorBoth;
     g_options.vrTransferFinish =
         GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
     g_options.vrDirectToShared =
@@ -2758,19 +2761,12 @@ void loadOptions(const char* fileName) {
     logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d vrHeadAudioWidth=%.2f",
          g_options.vrHorizonLock, g_options.vrWorldScale, g_options.vrHeadAudio ? 1 : 0,
          g_options.vrHeadAudioWidth);
-    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f vrHudInset=%.2f (%s)",
-         g_options.vrHudLayer, g_options.vrHudBackdropOpacity, g_options.vrHudInset,
-         g_options.vrHudInset >= 0.999f
-             ? "GPL's own layout, every relative position exact"
-             : "pulled toward the eye centre -- dense groups compress");
-    logf("options: vrGplText=%d vrGplTextScale=%d vrGplTextInset=%.2f -- %s",
-         g_options.vrGplText, g_options.vrGplTextScale, g_options.vrGplTextInset,
-         g_options.vrGplText == 0
-             ? "GPL's stamped text stays roglv2's, drawn where GPL put it: in VR that is the "
-               "left eye's periphery at zero disparity, and nothing can move it"
-             : "gplvr draws GPL's stamped glyphs from its own atlas, once per eye, scaled and "
-               "pulled in -- watch the `fast text:` lines for how many glyphs it took and "
-               "which term refused the rest");
+    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f", g_options.vrHudLayer,
+         g_options.vrHudBackdropOpacity);
+    logf("options: vrGplTextScale=%d vrGplTextInset=%.2f -- in VR gplvr draws GPL's stamped "
+         "glyphs from its own atlas, once per eye, scaled and pulled in -- watch the `fast "
+         "text:` lines for how many glyphs it took and which term refused the rest",
+         g_options.vrGplTextScale, g_options.vrGplTextInset);
     logf("options: frameRate=%d (%s)", g_options.frameRate,
          g_options.frameRate == 0
              ? "THE SIM'S RATE: one frame per sim tick, unblended, as GPL ships"
@@ -2794,10 +2790,11 @@ void loadOptions(const char* fileName) {
              ? "the sim thread publishes each tick and the car render records are written from "
                "the ring"
              : "off: the sim and the render thread exchange state through GPL's latch alone");
-    logf("options: bakedRenderer=%d (%s)", g_options.bakedRenderer,
-         g_options.bakedRenderer == 0
-             ? "vanilla: GPL draws everything; the VR menu's Renderer row switches it live"
-         : g_options.bakedRenderer == 1
+    logf("options: vrRendererType=%d flatRendererType=%d, this mode's %d (%s)",
+         g_options.vrRendererType, g_options.flatRendererType, rendererType(),
+         rendererType() == 0
+             ? "vanilla: GPL draws everything; in VR the VR menu's Renderer row switches it live"
+         : rendererType() == 1
              ? "gplvr's renderer: the track baked on a worker thread and drawn with real depth, "
                "the other cars, the flagmen, the cockpit and the mirrors drawn by gplvr, GPL the "
                "rest, tested against that depth"
@@ -2946,7 +2943,7 @@ void requestSceneRenderHook(const Binding& binding) {
     // menu at any time, and the redirect is installed once at bind. The baked renderer needs it
     // in flat mode as well: the main walk is where it finds the track and, later, draws it.
     g_mainWalkPending =
-        (g_options.vr || g_options.bakedRenderer) && binding.sceneRender == 0x00487620;
+        (g_options.vr || rendererType() != 0) && binding.sceneRender == 0x00487620;
 
     g_sceneHookPending = true;
     logf("requestSceneRenderHook: queued %zu sceneRender and %zu cameraBind call site(s); "

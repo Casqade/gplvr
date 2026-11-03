@@ -33,6 +33,7 @@
 // Needs GL 4.3 (glMultiDrawElementsIndirect, an instanced draw index with a base instance) and
 // ARB_bindless_texture. Pure GL and CarScene: nothing here reads GPL.
 
+#include "baked/CarRowStore.h"
 #include "baked/CarScene.h"
 #include "baked/GlApi.h"
 #include "baked/Renderer.h"
@@ -43,6 +44,14 @@
 #include <vector>
 
 namespace baked {
+
+// Report 105 section 4.66: a kept list's rows and commands are drawn from the GPU store
+// (CarRowStore.h), uploaded once per program and order; a pass uploads the list's frames and
+// skinned corners only. false: every list's rows and commands are copied into the pass's tables and
+// uploaded with them each pass, as before.
+constexpr bool kCarRowsResident = true;
+// The store's self-check reads back one list drawn from it in this many.
+constexpr uint32_t kCarRowCheckEvery = 256;
 
 // GPL's lighting state of the pass (report 103 section 4; the globals are the host's).
 struct CarLighting {
@@ -125,6 +134,24 @@ public:
     // draws (CarDrawList::drawsElided, report 105 section 4.27).
     bool pinRows(uint32_t key, uint32_t frames, uint32_t& draws);
 
+    // Report 105 section 4.66. After init, before the first prepare, when kCarRowsResident: makes
+    // the GPU store and the skinned regions' room in the vertex and index buffers. False, with
+    // `why`, when it cannot; every list then takes the per-pass path.
+    bool createRowStore(std::string& why);
+    bool rowStoreReady() const { return store_.ready(); }
+    uint64_t rowStoreBytes() const { return store_.bytes(); }
+    uint64_t rowRegionBytes() const {
+        return static_cast<uint64_t>(regionVertices_) * sizeof(CarVertex) +
+               static_cast<uint64_t>(regionIndices_) * sizeof(uint32_t);
+    }
+    uint32_t rowStoreRows() const { return store_.rows(); }
+    bool     rowStoreImmutable() const { return store_.immutable(); }
+    // The store given up (its regions' room stays unused): the per-pass path from now on.
+    void dropRowStore();
+    // The program whose lists carry `key` (CarDrawList::contentKey) was dropped: its rows go,
+    // CPU and GPU, unless a list of the coming prepare pinned them.
+    void dropRows(uint32_t key);
+
 private:
     struct GpuTexture {
         GLuint   name = 0;
@@ -160,12 +187,16 @@ private:
 
     // The rows and commands of one drawOrder, in its order and with its ranks, relative as
     // CachedList's but with base instances from 0 (report 105 section 4.29.1).
+    static constexpr uint32_t kNotResident = 0xFFFFFFFFu;
     struct Emitted {
         uint32_t              orderKey = 0;  // CarDrawList::orderKey; 0: empty
         std::vector<uint32_t> words;
         std::vector<Command>  commands;
         std::vector<uint32_t> dynamic;  // the commands of skinned draws
         uint32_t              lastUsed = 0;  // prepares_
+        // Section 4.66: its first row in the GPU store and how many it took, or kNotResident.
+        uint32_t              rowStart = kNotResident;
+        uint32_t              rowCount = 0;
     };
     // As CarProgram's order memos (report 105 section 4.36).
     static constexpr int kEmittedOrders = 4;
@@ -184,6 +215,18 @@ private:
         // prepares_ it is in use and is not evicted.
         uint32_t lastUsed = 0;
         Emitted  emitted[kEmittedOrders];
+        // Section 4.66, the skinned region: `regionVertices` corners at `vertexStart` of the vertex
+        // buffer and `dynamicIndices` (the program's, every list of the key holds the same) at
+        // `indexStart` of the index buffer, uploaded in geometry epoch `indexEpoch`; the prepare
+        // that last wrote its corners. Its resident orders' skinned commands name it.
+        bool                  region = false;
+        uint32_t              vertexStart = 0;
+        uint32_t              regionVertices = 0;
+        uint32_t              indexStart = 0;
+        std::vector<uint32_t> dynamicIndices;
+        uint32_t              indexEpoch = 0;
+        uint32_t              regionPass = 0;
+        bool                  holdsStore = false;  // a region or a resident order
     };
     static constexpr uint8_t kCachedDynamic = 1;
     // One draw's row (`words`, the frame word relative to its list) and its command, relative as
@@ -211,6 +254,57 @@ private:
     bool        evictLeastRecent();
     void        evictIdle();
     void        clearCache();
+    // appendCached's two halves, shared with the store path: the list's entry, built or checked
+    // (null: the list is drawn from its own draws), and its drawOrder's emission in the entry, into
+    // `scratch` for a list without an orderKey (null with `own` when a check erased the entry; null
+    // alone without an orderKey or a scratch).
+    CachedList* cachedEntry(const CarScene& scene, const CarDrawList& list);
+    Emitted*    emittedFor(const CarScene& scene, const CarDrawList& list, CachedList& cached,
+                           Emitted* scratch, bool& own);
+
+    // -- section 4.66, the resident rows ------------------------------------------------------
+    // How a list's rows reach the GPU this pass.
+    enum RowsPath : uint8_t {
+        kRowsPass,   // copied into the pass's tables (appendCached, or its own draws)
+        kRowsOwn,    // from its own draws: appendCached would refuse it (a check failed)
+        kRowsStore,  // drawn from the store
+    };
+    struct StorePlan {
+        uint8_t  path = kRowsPass;
+        uint32_t rowStart = 0;
+        uint32_t rows = 0;
+        uint32_t vertexStart = 0;  // its skinned region, when it has corners
+    };
+    // Why a kept list took the per-pass path; each logged the first time.
+    enum StoreRefusal : int {
+        kStoreFull,        // the rows did not fit, after evicting what this pass does not draw
+        kStoreRegionFull,  // nor the skinned region
+        kStoreTwice,       // a second list of the program in one pass: its region holds the first's
+        kStoreDynamic,     // its skinned corners or indices are not its program's
+        kStoreNoOrder,     // no orderKey: its drawOrder is emitted for it alone
+        kStoreRefusals
+    };
+    bool      storeOn() const { return kCarRowsResident && store_.ready() && !storeOff_; }
+    StorePlan planStore(const CarScene& scene, const CarDrawList& list, uint32_t frameBase);
+    void      storeRefused(int why);
+    bool      makeRegion(CachedList& cached, const CarDrawList& list);
+    bool      makeResident(CachedList& cached, Emitted& emitted);
+    void      uploadRegionIndices(CachedList& cached);
+    // Gives back what the entry or the emission holds in the store: at once when no list of this
+    // prepare drew it, else at the next prepare's start.
+    void      releaseStore(CachedList& cached);
+    void      releaseEmitted(Emitted& emitted);
+    // Keeps `holdsStore` and programsResident_ to what the entry holds.
+    void      noteHolds(CachedList& cached);
+    void      giveRange(RangeAllocator& ranges, uint32_t first, uint32_t count, bool now);
+    bool      takeRange(RangeAllocator& ranges, bool rowsWanted, uint32_t count, uint32_t& first);
+    void      resetStore();
+    // The self-check (section 4.66): one store list in kCarRowCheckEvery read back from the GPU and
+    // compared with what the per-pass path builds for it.
+    void      beginRowCheck(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
+                            const StorePlan& plan);
+    void      pollRowCheck();
+    void      rowCheckFailed(const char* what, uint32_t draw, uint32_t ours, uint32_t theirs);
 
     GlApi gl_;
     bool  initialised_ = false;
@@ -240,6 +334,8 @@ private:
     GLint  uFog_ = -1;
     GLint  uFogColour_ = -1;
     GLint  uPaletteLinear_ = -1;
+    GLint  uRows_ = -1;
+    GLint  uRowSource_ = -1;
 
     GLuint vertexArray_ = 0;
     GLuint vertexBuffer_ = 0;
@@ -272,16 +368,25 @@ private:
     std::vector<uint32_t> paletteFixups_;  // draws_ words holding a row number to make a texel
     std::vector<Command>  commands_;
     std::vector<uint32_t> listOrder_;  // lists far to near
-    // Per car or flagman, far to near: its commands, consecutive in commands_.
+    // Per car or flagman, far to near: its commands, consecutive in commands_, or with `resident`
+    // in the store's command buffer, its rows from `first` there and its frames from `frameBase`.
     struct CarRange {
         uint32_t first;
         uint32_t count;
         uint32_t slot;  // CarDrawList::walkSlot
         bool     flagman;
+        bool     resident = false;
+        uint32_t frameBase = 0;
     };
     std::vector<CarRange> carRanges_;
     // carRanges_ by slot, far to near among equal slots: the walk-order runs.
     std::vector<CarRange> walkRuns_;
+    // Phase 0's multi-draws: carRanges_ in order, consecutive ranges of commands_ joined (one run
+    // when no list is resident).
+    std::vector<CarRange> solidRuns_;
+    // The u_rowSource the program holds; drawSolid sets it first.
+    void setRowSource(const CarRange* range);
+    int32_t rowSource_[3] = {-1, -1, -1};
     // drawSolid ran this pass, so the walk-order runs may be drawn.
     bool runsReady_ = false;
     // Report 105 section 4.49: the overlay lists' commands, after every other list's in commands_
@@ -313,6 +418,47 @@ private:
     // By contentKey (a kept program).
     std::unordered_map<uint32_t, CachedList> cache_;
     uint32_t prepares_ = 0;
+
+    // Section 4.66. The store, the room its skinned regions take at the start of the vertex and
+    // index buffers (objects start after it), and the buffers' epoch (re-specified: the regions'
+    // indices go up again).
+    CarRowStore store_;
+    uint32_t    regionVertices_ = 0;
+    uint32_t    regionIndices_ = 0;
+    uint32_t    geometryEpoch_ = 1;
+    bool        storeOff_ = false;  // the self-check found a difference: off until a new car set
+    std::vector<StorePlan> storePlans_;  // per pass list
+    uint32_t    storeRanges_ = 0;     // resident CarRanges this pass
+    uint32_t    programsResident_ = 0;
+    // Ranges given back while a list of this prepare may still draw them: freed at the next.
+    struct PendingRange {
+        RangeAllocator* ranges;
+        uint32_t        first;
+        uint32_t        count;
+    };
+    std::vector<PendingRange> pending_;
+    std::vector<Command>      commandScratch_;
+    bool     storeRefusalSaid_[kStoreRefusals] = {};
+    uint32_t storeLists_ = 0;  // lists drawn from the store, for kCarRowCheckEvery
+    // The self-check's sample in flight: what the per-pass path builds for the list, normalised
+    // (frame words absolute, skinned commands relative to their corners), and where it lies.
+    struct RowCheck {
+        uint32_t              key = 0;
+        uint32_t              orderKey = 0;
+        uint32_t              rows = 0;
+        uint32_t              frameBase = 0;
+        uint32_t              vertexStart = 0;
+        uint32_t              indexStart = 0;
+        uint32_t              issued = 0;  // prepares_
+        std::vector<uint32_t> words;
+        std::vector<Command>  commands;
+        std::vector<uint8_t>  dynamic;  // per command
+        std::vector<CarVertex> vertices;
+        std::vector<uint32_t>  indices;
+    };
+    RowCheck             rowCheck_;
+    std::vector<uint8_t> readback_;
+    bool                 rowCheckSaid_ = false;
 };
 
 }  // namespace baked

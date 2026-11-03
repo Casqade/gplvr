@@ -27,13 +27,13 @@ namespace gplvr {
 void bakedMirrorInstall();
 
 // Why a mirror walk was left to GPL. Each is logged the first time it happens, except the
-// ordinary ones (bakedRenderer 0, the upload still running).
+// ordinary ones (rendererType() 0, the upload still running).
 enum MirrorRefusal : int {
     kMirrorNotBound = 0,   // the baked pass not bound
     kMirrorNoParams,       // no scene parameter block yet
     kMirrorNoCamera,       // p[43] is null
     kMirrorNoFilter,       // the node filter could not be installed
-    kMirrorDrawingOff,     // bakedRenderer is 0
+    kMirrorDrawingOff,     // rendererType() is 0
     kMirrorNoScene,        // no baked scene for this track yet
     kMirrorUploadStopped,  // the upload stopped for this scene
     kMirrorRendererDown,   // the renderer is not up in this context

@@ -850,10 +850,12 @@ void noteMonitorHud(State& state, const char* reason, int monitorEye) {
         logf("vr: monitor HUD engaged -- the headset panel (%s) is drawn over %s of the "
              "monitor picture and pribluda's own monitor HUD is skipped",
              g_options.vrHudLayer == 1 ? "following the head" : "fixed to the seat",
-             monitorEye == 1 ? "each eye" : (monitorEye == 2 ? "the left eye" : "the right eye"));
+             monitorEye == kMonitorBoth
+                 ? "each eye"
+                 : (monitorEye == kMonitorLeft ? "the left eye" : "the right eye"));
     } else {
         logf("vr: monitor HUD not drawn -- %s; %s", reason,
-             monitorEye == 0 ? "pribluda's own monitor HUD is skipped too"
+             monitorEye == kMonitorOff ? "pribluda's own monitor HUD is skipped too"
                              : "pribluda draws its own monitor HUD");
     }
 }
@@ -884,7 +886,7 @@ void drawMonitorHud(State& state, int monitorEye) {
     // this must not draw unless that redirect is in place. None of that is true of the
     // menu, which replaces nothing and is drawn whenever it is up.
     const char* common = nullptr;
-    if (monitorEye == 0)
+    if (monitorEye == kMonitorOff)
         common = "vrMonitorEye = 0 clears the window to black";
     else if (!renderTargetWindowPicture(picture))
         common = "the window shows no off-screen picture this frame";
@@ -967,9 +969,9 @@ void drawMonitorHud(State& state, int monitorEye) {
     if (drawHudPanel) {
         gl.bindTexture(GL_TEXTURE_2D, state.hudTexture);
         bool seat = layer == 2;
-        if (monitorEye == 1 || monitorEye == 2)
+        if (monitorEye == kMonitorBoth || monitorEye == kMonitorLeft)
             drawPanelInEye(state, picture, 0, seat, corners);
-        if (monitorEye == 1 || monitorEye == 3)
+        if (monitorEye == kMonitorBoth || monitorEye == kMonitorRight)
             drawPanelInEye(state, picture, 1, seat, corners);
     }
 
@@ -987,9 +989,9 @@ void drawMonitorHud(State& state, int monitorEye) {
         // head-locked panel publishes in the view's space, and drawing that as if it were
         // seat-relative would put the menu somewhere the headset does not have it.
         const bool menuSeat = state.block->menuSpace == kMenuSpaceSeat;
-        if (monitorEye == 1 || monitorEye == 2)
+        if (monitorEye == kMonitorBoth || monitorEye == kMonitorLeft)
             drawPanelInEye(state, picture, 0, menuSeat, menuCorners);
-        if (monitorEye == 1 || monitorEye == 3)
+        if (monitorEye == kMonitorBoth || monitorEye == kMonitorRight)
             drawPanelInEye(state, picture, 1, menuSeat, menuCorners);
     }
 
@@ -1463,7 +1465,7 @@ void presenterBlitToWindow(int eye) {
     if (!alreadyBlitted) renderTargetBlitToWindow(state.gl, eye);
     // A black window stays black: pribluda's own monitor overlay is skipped as on a frame the
     // HUD panel was drawn over the picture.
-    if (eye == 0 && renderTargetActive()) state.monitorHudTaken = true;
+    if (eye == kMonitorOff && renderTargetActive()) state.monitorHudTaken = true;
     if (state.stage != Stage::Publishing || !state.block) return;
     frameBudgetSwitch(kSpanWindowHud);
     drawMonitorHud(state, eye);

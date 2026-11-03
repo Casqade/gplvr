@@ -298,6 +298,7 @@ struct Window {
     unsigned  clampedLow = 0;
     unsigned  clampedHigh = 0;
     unsigned  targetHeldBack = 0;    // frames whose target regressed and was held instead
+    unsigned  latencyRestarts = 0;   // samples more than three ticks off `latency` (blendFrame)
 
     // How far outside the pair the target was when it clamped, and how often the alpha reported
     // for the frame was the VIEW's rather than some other record's.
@@ -329,6 +330,13 @@ struct Window {
 };
 
 using CountFn = int(__cdecl*)();
+
+// How `latency` restarts after a sample lands more than three ticks off it (blendFrame). true: it
+// becomes the mean of the samples since the restart, over the newest kLatencyWindow of them, for
+// 2 * kLatencyWindow latches, and the slow average carries on from there. false: it becomes the
+// one sample that tripped the restart, as before (report 106 has the A/B).
+constexpr bool kLatencyReacquire = true;
+constexpr int  kLatencyWindow = 36;  // latches: one second at GPL's 36 Hz
 
 struct State {
     bool      installed = false;
@@ -394,6 +402,10 @@ struct State {
     // Display time less the time right after the latch, smoothed, in QPC ticks.
     double latency = 0.0;
     bool   haveLatency = false;
+    // The samples since `latency` last restarted, newest kLatencyWindow of them, while it
+    // reacquires (kLatencyReacquire).
+    double latencyRing[kLatencyWindow] = {};
+    int    latencySamples = 0;
 
 
     // When the ticks arrive, measured here rather than taken from RenderPacing, which is a VR
@@ -1214,18 +1226,43 @@ void blendFrame(State& s, long long now, bool frozen) {
     //
     // The target must advance as evenly as `display` does, so what is subtracted from it has to be
     // effectively constant frame to frame. kLatencyGain is the ripple budget: 0.004 puts it at
-    // 0.04 ms, well under a tenth of a millisecond, with a time constant of about 250 frames --
-    // under three seconds, which is fast enough for anything that is not a mode change. Mode
-    // changes are not left to it: the reset below takes them in one step.
+    // 0.04 ms, well under a tenth of a millisecond, with a time constant of about 250 updates.
+    // This runs once per LATCH, so that is 250 ticks -- about seven seconds at 36 Hz -- and an
+    // error handed to it takes twenty seconds to fall under the few milliseconds the clamps
+    // resolve. Mode changes are not left to it: a sample more than three ticks off restarts it.
+    //
+    // A RESTART MUST NOT TRUST ONE SAMPLE (report 106). The samples that trip it come from a hitch,
+    // where the samples are still settling for a few ticks after it (likeliest the render cost in
+    // the display-time model, inflated by the heavy frames). Taking one sample as the answer, the
+    // session-start hitch left `latency` at 53 ms against a steady 22-23 -- 30 ms high, inside the
+    // threshold and left to the slow average: alpha 0.00 with 85-90 of 90 frames clamped low for
+    // three seconds, and twenty-five before the baseline was back. After a restart the estimate is
+    // the mean of the samples since it, over a sliding window that drops the settling ones within
+    // a second; the slow average takes over from that mean.
     constexpr double kLatencyGain = 0.004;
     double tick = static_cast<double>(s.frequency) / simHz;
     double sample = static_cast<double>(display - now);
-    if (!s.haveLatency || std::fabs(sample - s.latency) > 3.0 * tick) {
-        s.latency = sample;
-        s.haveLatency = true;
+    bool   restart = !s.haveLatency || std::fabs(sample - s.latency) > 3.0 * tick;
+    if (restart) ++w.latencyRestarts;
+    if (!kLatencyReacquire) {
+        if (restart)
+            s.latency = sample;
+        else
+            s.latency += kLatencyGain * (sample - s.latency);
     } else {
-        s.latency += kLatencyGain * (sample - s.latency);
+        if (restart) s.latencySamples = 0;
+        if (s.latencySamples < 2 * kLatencyWindow) {
+            s.latencyRing[s.latencySamples % kLatencyWindow] = sample;
+            ++s.latencySamples;
+            int    count = s.latencySamples < kLatencyWindow ? s.latencySamples : kLatencyWindow;
+            double sum = 0.0;
+            for (int i = 0; i < count; ++i) sum += s.latencyRing[i];
+            s.latency = sum / count;
+        } else {
+            s.latency += kLatencyGain * (sample - s.latency);
+        }
     }
+    s.haveLatency = true;
     double target = holdTargetForward(s, static_cast<double>(display) - s.latency - tick);
 
     applyBlend(s, target, s.latched, s.latchedCount, s.mirrorLatched, s.pitBoardLatched, false);
@@ -1757,8 +1794,9 @@ bool interpolationFormat(char* out, size_t size) {
             "gaps 1:%u 2:%u 3:%u 4+:%u | cars blended %.1f a frame "
             "| view blended %u, mirror %u, pit board %u (snapped %u) | rotation: %u matrix "
             "fallbacks | blend left the pair %u times, worst %.2f m | display time from the "
-            "presenter %u, from the render cost %u | target = display - %.2f ms - one tick %.2f "
-            "ms | cost %.3f ms a frame | between ticks %u frames, %u re-blended, %.3f ms each",
+            "presenter %u, from the render cost %u | target = display - %.2f ms (restarted %u) - "
+            "one tick %.2f ms | cost %.3f ms a frame | between ticks %u frames, %u re-blended, "
+            "%.3f ms each",
             blendingEnabled() ? "on" : "off", w.frames, w.blended, w.frozen, w.untimed,
             w.alphas ? w.alphaSum / w.alphas : 0.0, w.alphas ? w.alphaMin : 0.0,
             w.alphas ? w.alphaMax : 0.0, w.clampedLow, w.clampedHigh, w.clampedWorstMs,
@@ -1771,7 +1809,7 @@ bool interpolationFormat(char* out, size_t size) {
             static_cast<double>(w.carsBlended) / w.frames, w.viewBlended, w.mirrorBlended,
             w.pitBoardBlended, w.pitBoardSnaps, g_rotationFallbacks, g_blendOutOfRange,
             static_cast<double>(g_blendWorstMetres), w.presenterTimed, w.costTimed,
-            s.haveLatency ? s.latency * toMs : 0.0,
+            s.haveLatency ? s.latency * toMs : 0.0, w.latencyRestarts,
             simHz > 0 ? 1000.0 / simHz : s.tickPeriod * toMs,
             static_cast<double>(w.costTicks) * toMs / w.frames,
             w.extraFrames, w.extraBlended,

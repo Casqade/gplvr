@@ -85,7 +85,7 @@ void bakedMirrorInstall() {
 
 void bakedMirrorRefused(MirrorRefusal why) {
     if (why < 0 || why >= kMirrorRefusalCount) return;
-    // bakedRenderer 0 and the upload still running are the ordinary states of a pass GPL draws.
+    // rendererType() 0 and the upload still running are the ordinary states of a pass GPL draws.
     if (why == kMirrorDrawingOff || why == kMirrorUploading) return;
     State& s = g_mirror;
     if (s.refusalSaid[why]) return;

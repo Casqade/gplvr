@@ -34,4 +34,12 @@ bool carConfigDecides(uintptr_t node);
 // the set, 0 when it was there already, -1 when the set is full or the node is 0.
 int carConfigLearn(uintptr_t node);
 
+// The car build worker's reads (CarBuildWorker.h, report 105 section 4.61), inside its gate; the
+// render thread writes the tables under a CarBuildPause. carConfigDecides's answer without a scan:
+// false when no scan of this car set has answered `node` (the build is left to the render thread).
+// And whether `node` is learned already (1), would be new (0), or the set is full once `pending`
+// gates the worker's walk has named are added (-1); those are learned at the build's keep.
+bool carConfigAnswered(uintptr_t node, bool& decides);
+int  carConfigKnownLearned(uintptr_t node, uint32_t pending);
+
 }  // namespace gplvr

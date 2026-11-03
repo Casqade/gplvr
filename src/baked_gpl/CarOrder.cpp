@@ -396,7 +396,9 @@ OrderMemo* orderTake(const OrderSource& s, OrderState& state, bool verify, uint3
     // are emitted whole.
     bool runs = !verify && state.index.built && !state.patchOff;
     // A program the patch serves keeps runs in every memo it fills, whole or patched.
-    if (runs && patchOrder(s, state, now, drawOrder, memo)) return memo;
+    if (runs && patchOrder(s, state, now, drawOrder, memo)) {
+        return memo;
+    }
     OrderMemo* fill = verify ? nullptr : leastRecent(state, nullptr);
     uint32_t*  first = g_orderScratch.data();
     uint32_t*  last;
@@ -411,7 +413,7 @@ OrderMemo* orderTake(const OrderSource& s, OrderState& state, bool verify, uint3
     return fill;
 }
 
-bool ordersNest(const std::vector<ShareOrder>& orders, uint32_t begin, uint32_t end,
+bool ordersNest(const ArenaVector<ShareOrder>& orders, uint32_t begin, uint32_t end,
                 uint32_t orderBegin, uint32_t orderEnd, int depth) {
     if (depth > 4096) return false;
     uint32_t from = begin;
@@ -474,12 +476,6 @@ bool orderIndexBuild(OrderIndex& index, const OrderSource& s) {
     indexRange(index, s.nodes, 0, s.draws, 0, s.nodeCount, kNoOrderNode);
     index.built = true;
     return true;
-}
-
-size_t orderIndexBytes(const OrderIndex& index) {
-    return (index.drawsFirst.capacity() + index.draws.capacity() + index.nodesFirst.capacity() +
-            index.nodes.capacity() + index.drawNode.capacity() + index.nodeParent.capacity()) *
-           sizeof(uint16_t);
 }
 
 }  // namespace gplvr

@@ -78,4 +78,19 @@ void mirrorUvRelease();
 int  mirrorUvCount();
 bool mirrorUvRect(int index, MirrorTextureRect& out);
 
+// Regions given from outside instead of the layout's: one per derived glass in the order the
+// geometry walk derived them, in the UVs this writes (v up), overlapping or not -- the shared view
+// (MirrorShared.h) gives every glass its part of one picture. Taking a set up puts the authored
+// UVs back and the next mirrorUvEnsure applies it; clearing goes back to the layout the same way.
+struct MirrorUvRegion {
+    float u0, u1, v0, v1;
+};
+void mirrorUvSetRegions(const MirrorUvRegion regions[], int count);
+void mirrorUvClearRegions();
+
+// Rewrites the glasses' UVs onto `regions` at once, from the authored values kept at apply: the
+// shared view moves them before each eye's pass, since each eye's picture is laid out from that
+// eye. False when a set of `count` is not applied.
+bool mirrorUvMoveRegions(const MirrorUvRegion regions[], int count);
+
 }  // namespace gplvr

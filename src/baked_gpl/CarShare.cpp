@@ -344,16 +344,15 @@ ShareOutcome take(const ShareCall& call, baked::CarDrawList& list) {
 
 // -- recording -----------------------------------------------------------------------------------
 
-void shareFrame(ShareTape& tape, uintptr_t node, uint16_t parent, uint16_t id,
-                const float pose[12]) {
+void shareFrame(ShareTape& tape, uintptr_t node, const uint32_t words[7], uint16_t parent,
+                uint16_t id, const float pose[12]) {
     if (id != tape.frames.size() + 1 || parent > tape.frames.size()) {
         if (tape.refusal == kShareOk) tape.refusal = kShareFrames;
         return;
     }
     ShareFrame frame;
     frame.node = node;
-    for (unsigned i = 0; i < 6; ++i) frame.words[i] = word(node, 1 + i);
-    frame.words[6] = word(node, 8);
+    std::memcpy(frame.words, words, sizeof(frame.words));
     std::memcpy(frame.pose, pose, sizeof(frame.pose));
     frame.parent = parent;
     tape.frames.push_back(frame);

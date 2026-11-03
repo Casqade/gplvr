@@ -20,6 +20,21 @@ struct HudPlacement {
     float width;
 };
 
+// Cheapest first, so a higher value is a better picture, as on every row of the VR menu.
+enum MirrorMode : int {
+    kMirrorSharedHeadCentre = 0,
+    kMirrorShared = 1,
+    kMirrorPerGlass = 2,
+};
+
+// vrMonitorEye's values: one eye before both, so the fullest picture is the highest value.
+enum MonitorView : int {
+    kMonitorOff = 0,
+    kMonitorLeft = 1,
+    kMonitorRight = 2,
+    kMonitorBoth = 3,
+};
+
 struct Options {
     // STEREO IS WHAT `vr` MEANS. Each eye is rendered into one half of the frame -- two
     // cameras aimed at bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the
@@ -27,21 +42,25 @@ struct Options {
     // only, and required for it", which is a setting whose only legal value was the one vr
     // already implied.
 
-    // The mirror pass, p[43]. The car's two mirror glasses sample opposite halves of
-    // mirror.mip, and each half is rendered by a camera aimed as that glass's reflection.
+    // How the mirror pass, p[43], is rendered (MirrorMode). Each glass samples a region of
+    // mirror.mip (MirrorUv.h).
     //
-    // ON: both panes are rendered on EACH eye's pass, from that eye, so the reflection has
-    // stereo depth like everything else in the frame -- 4 mirror renders a frame.
-    // OFF: both panes are rendered once, on the left eye's pass, from the head centre, and
-    // the right eye samples the same texture -- 2 renders, and a reflection that is subtly
-    // wrong for both eyes instead of right for each.
+    // kMirrorPerGlass: a pane per glass, each aimed as that glass reflects the eye, rendered on
+    //   EACH eye's pass from that eye -- the reflection has stereo depth like the rest of the
+    //   frame. 2 x glasses mirror renders a frame (6 on the 2020 demo's Ferrari 330 P4).
+    // kMirrorShared: one pane every glass reads its part of, as GPL renders its mirror
+    //   (MirrorShared.h), laid out and rendered on each eye's pass from that eye -- the same
+    //   depth, 2 renders a frame whatever the glass count; the glasses share mirror.mip's
+    //   texels, so each is a little softer.
+    // kMirrorSharedHeadCentre: that one pane rendered once, on the left eye's pass, from the head
+    //   centre, and sampled by both eyes -- 1 render, and a reflection with no depth that sits
+    //   on the glass.
     //
-    // Each pane after the first in a pass costs a sceneRender whose main pass is skipped.
-    //
-    // It was 0/1/2 with 0 meaning "no mirror" until 2026-09-27. Turning the mirror off now
-    // lives in `mirrorUpdateRate = 0`, where it belongs -- off is the far end of how often,
-    // not a third mode of how -- and this went down to the one question it is really about.
-    bool perEyeMirror = true;
+    // A pane per glass from the head centre (perEyeMirror = 0 until 2026-11-03) is not a mode: it
+    // costs more renders than kMirrorSharedHeadCentre for the same flat reflection. Turning the
+    // mirror off is `mirrorUpdateRate = 0`. Each pane after the first in a pass costs a
+    // sceneRender whose main pass is skipped. VR only.
+    int mirrorMode = kMirrorPerGlass;
 
     // Leave out a mirror pane whose glass no eye that samples it can see this frame (report 105
     // section 4.45, Stereo.cpp paneInView): the glass's bounding sphere against a cone holding
@@ -71,8 +90,8 @@ struct Options {
     // as a fault rather than an off switch. `mirror N/s +M restored` on the fps line says what
     // the setting actually produced.
     //
-    // With `perEyeMirror = 2` the frames that skip get their reflection from a copy of
-    // mirror.mip kept per eye (MirrorCache.h). There is one mirror texture for the whole
+    // With the mirror from each eye (mirrorMode) the frames that skip get their reflection from
+    // a copy of mirror.mip kept per eye (MirrorCache.h). There is one mirror texture for the whole
     // carset, so without the copies a skipped frame would leave the left eye sampling the
     // right eye's reflection and flickering between the two. The copies are built on the first
     // frame that renders the mirror; if anything refuses them the log says what, and every
@@ -109,9 +128,8 @@ struct Options {
     // doubles or halves it every two seconds, the same share of the field at any scale.
     float vrMirrorTweakFovSpeed = 0.5f;
 
-    // Toggle perEyeMirror while the game runs, for an A/B from the seat. 'N' by default;
-    // 0 disables. VR only. (It read 1/2 with a 0 that did nothing until perEyeMirror
-    // became a plain on/off on 2026-09-27.)
+    // Step mirrorMode to the next mode while the game runs, for an A/B from the seat (the VR
+    // menu's Mirrors row). 'N' by default; 0 disables. VR only.
     int vrMirrorModeKey = 'N';
 
     // KEEP DRAWING AND PRESENTING WHILE ANOTHER APPLICATION HAS THE FOREGROUND.
@@ -418,17 +436,9 @@ struct Options {
     // two copies stay identical.
     float vrHudDepth = 0.0f;
 
-    // HOW FAR IN FROM THE EYE'S EDGES GPL'S OWN 2D IS PULLED, as a fraction of the half
-    // extent, about the eye's centre. 1.0 keeps the layout GPL computed, which is the only
-    // value that preserves every relative position exactly; 0.6 brings a corner item to 20%
-    // in from the edge.
-    //
-    // Below 1.0 this scales POSITIONS and not the art drawn at them, so a dense group
-    // compresses while its pieces keep their authored size: the replay control band is ten
-    // buttons at a 37-pixel step, which at 0.6 becomes a 22-pixel step and collides. The
-    // tool for bringing a whole group into the comfortable cone is moving the group in its
-    // own layout (Letterbox.cpp), not this. Use this for the sparse in-race HUD.
-    float vrHudInset = 1.0f;
+    // `vrHudInset` was here until 2026-11-03: it pulled the per-eye re-issue's positions toward
+    // the eye's centre, and since GPL's text went to the fast text path that re-issue places
+    // nothing visible in the headset. vrGplTextInset below is the inset that reaches the text.
 
     // THE MIRROR GLASSES ARE NOT AN OPTION. They are read out of the car the game loaded
     // (MirrorGeometry.h), each is given a region of mirror.mip of its own by moving its UVs
@@ -492,31 +502,24 @@ struct Options {
     // was `vrHudEye`, which could put it in one eye only; that is not something to configure
     // once the depth is right, and the text is being rerouted onto a layer of its own anyway.
 
-    // WHO DRAWS GPL'S STAMPED TEXT IN VR, and the only switch that changes anything about it.
-    //
-    // 0 leaves it exactly where it is today: roglv2 blits each glyph with glDrawPixels into
-    // whatever framebuffer is bound, which in VR is the off-screen eye target, at the
-    // coordinates GPL computed for a 2560x1440 monitor. That puts the notices in the left eye's
-    // periphery at zero disparity, and nothing can move them: the destination handle decides
-    // WHERE IN A SURFACE a glyph lands, not which framebuffer receives it, so re-issuing a call
-    // against an eye surface moves the pixels nowhere at all (measured 2026-10-07; Hud.cpp's
+    // GPL'S STAMPED TEXT IN VR IS ALWAYS DRAWN BY THE FAST TEXT PATH. It was `vrGplText` until
+    // 2026-11-03, whose 0 left roglv2 blitting each glyph into the off-screen eye target at the
+    // coordinates GPL computed for a 2560x1440 monitor: the left eye's periphery at zero
+    // disparity, which nothing can move, because the destination handle decides WHERE IN A
+    // SURFACE a glyph lands, not which framebuffer receives it (measured 2026-10-07; Hud.cpp's
     // destinationCanSplit is why it declines).
     //
-    // GPL'S FPS COUNTER AND LAP TIMES ARE OUT OF REACH OF BOTH VALUES, and that is a fact about
-    // where GPL draws them rather than a gap here: both go through drawDebugText to
-    // screenGetBackBuffer(), the back buffer is not what the presenter hands the headset, and so
-    // the headset holds no copy of them to place or to enlarge. They are on the monitor only.
+    // In VR the fast text path takes the stampDraw global, reads each glyph out of roglv2's own
+    // font data and draws it from a GPU atlas as a quad of its own. A quad has a size and a
+    // position we choose, so vrGplTextScale and vrGplTextInset below are possible -- and a quad
+    // goes through the same transform the raster position did, so at scale 1 and inset 1 it
+    // lands on the pixels roglv2 would have written. In flat mode the same path installs because
+    // it is faster (103 us a glyph becomes one batched draw) and GPL's layout is left alone.
     //
-    // 1 hands the stampDraw global to the fast text path, which already reads the glyph out of
-    // roglv2's own font data and draws it from a GPU atlas as a quad of its own. A quad has a
-    // size and a position we choose, so vrGplTextScale and vrGplTextInset below become
-    // possible -- and a quad goes through the same transform the raster position did, so at
-    // scale 1 and inset 1 it lands on the pixels roglv2 would have written.
-    //
-    // FLAT MODE IS NOT THIS SETTING. There the fast text path installs because it is faster
-    // (103 us a glyph becomes one batched draw) and GPL's layout is left alone, which is what
-    // a monitor wants. This decides the VR case only, and the placement below is VR-only.
-    int vrGplText = 0;
+    // GPL'S FPS COUNTER AND LAP TIMES ARE OUT OF REACH, and that is a fact about where GPL draws
+    // them rather than a gap here: both go through drawDebugText to screenGetBackBuffer(), the
+    // back buffer is not what the presenter hands the headset, and so the headset holds no copy
+    // of them to place or to enlarge. They are on the monitor only.
 
     // HOW MUCH BIGGER GPL'S STAMPED GLYPHS ARE DRAWN, as a whole-number multiple.
     //
@@ -527,12 +530,11 @@ struct Options {
     // reproduces each source texel as an n-by-n block, which is what enlarging a bitmap font
     // means; a fractional multiple would drop and double rows unevenly along a line of text.
     //
-    // Needs vrGplText = 1. 1 is the size GPL authored.
+    // VR only. 1 is the size GPL authored.
     int vrGplTextScale = 1;
 
     // HOW FAR IN FROM THE EYE'S EDGES GPL'S STAMPED TEXT IS PULLED, about the eye's centre,
-    // as a fraction of the half extent. The same quantity vrHudInset names for the per-eye
-    // re-issue path, applied where it can actually take effect.
+    // as a fraction of the half extent.
     //
     // THE DELTA IS IN GPL'S OWN PIXELS, and this is how much of it survives. A run's anchor is
     // measured from the centre of GPL's layout, multiplied by this, and laid off from the
@@ -546,12 +548,12 @@ struct Options {
     // x by 1.24 and y by 2.20 while no glyph size followed.
     //
     // It moves a RUN's anchor and not the glyphs within it, so the spacing inside a line of
-    // text is exactly GPL's whatever this says -- which is the difference between this and
-    // vrHudInset, whose per-glyph scaling collapsed the replay band's 37-pixel button step.
-    // A run is recognised across frames by its stamp set and the baseline GPL asked for, so its
-    // extent is known from the frame before and a line is centred as a line.
+    // text is exactly GPL's whatever this says; scaling each glyph's position instead collapsed
+    // the replay band's 37-pixel button step. A run is recognised across frames by its stamp set
+    // and the baseline GPL asked for, so its extent is known from the frame before and a line is
+    // centred as a line.
     //
-    // Needs vrGplText = 1.
+    // VR only.
     float vrGplTextInset = 1.0f;
 
     // `vrPredictPosition` was here and is gone as of 2026-10-05: it moved each eye to where it
@@ -609,16 +611,20 @@ struct Options {
     // that is stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
     int simRing = 0;
 
-    // The baked renderer (src/baked, src/baked_gpl; docs/audit-2026-09-18/105-baked-renderer-
-    // rewrite.md), the VR menu's "Renderer". 0 vanilla: GPL draws everything and nothing of the
-    // renderer is installed. 1: gplvr bakes the track GPL loads on a worker thread and draws it,
-    // the other cars, the flagmen, the player's cockpit and the mirrors' track and cars itself,
-    // with real depth, every feature of report 105 on; GPL draws the rest -- the horizon,
-    // shadows, particles, lit polygons -- tested against that depth. Anything it cannot do falls
-    // back to GPL's own path. 2: as 1, and a red square in the top right corner of every
-    // rectangle it drew (BakedPass.h, bakedMarkFrameEnd). Read live: the menu switches it at
-    // any time; the first switch away from 0 installs it. Flat mode and VR.
-    int bakedRenderer = 1;
+    // Who draws the world, per mode (read through rendererType()): `vrRendererType` in the
+    // headset, the VR menu's "Renderer"; `flatRendererType` in flat mode, ini only, so a player
+    // can run gplvr's renderer in VR and the vanilla one in flat. The renderer is src/baked and
+    // src/baked_gpl (docs/audit-2026-09-18/105-baked-renderer-rewrite.md).
+    // 0 vanilla: GPL draws everything and nothing of the renderer is installed. 1: gplvr bakes
+    // the track GPL loads on a worker thread and draws it, the other cars, the flagmen, the
+    // player's cockpit and the mirrors' track and cars itself, with real depth, every feature of
+    // report 105 on; GPL draws the rest -- the horizon, shadows, particles, lit polygons --
+    // tested against that depth. Anything it cannot do falls back to GPL's own path. 2: as 1,
+    // and a red square in the top right corner of every rectangle it drew (BakedPass.h,
+    // bakedMarkFrameEnd). Read live: the menu switches it at any time; the first switch away
+    // from 0 installs it.
+    int vrRendererType = 1;
+    int flatRendererType = 1;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //
@@ -651,13 +657,13 @@ struct Options {
     //      it shows whatever its back buffer held -- black, or the last picture blitted
     //      there -- with pribluda's monitor overlay drawn over it every frame, which
     //      accumulates because nothing wipes it. Saves the blit's GPU time.
-    //   1  both eyes
-    //   2  the left eye
-    //   3  the right eye
+    //   1  the left eye
+    //   2  the right eye
+    //   3  both eyes
     //
     // Only meaningful with vrOffscreen on, because without an off-screen frame the window
     // IS the render and there is nothing to choose. Flat mode (vr = 0) never reads it.
-    int vrMonitorEye = 1;
+    int vrMonitorEye = kMonitorBoth;
 
     // Drain GL with glFinish after the frame transfer's wglDXUnlockObjectsNV, before the frame
     // is published. 1 (default) keeps it. 0 skips it and relies on the unlock, which hands the
@@ -705,6 +711,16 @@ struct Options {
 };
 
 extern Options g_options;
+
+// The two things Options::mirrorMode decides: whether each eye renders the mirror from its own
+// viewpoint, and whether the glasses share one pane.
+inline bool mirrorFromEachEye() { return g_options.mirrorMode != kMirrorSharedHeadCentre; }
+inline bool mirrorSharedPane() { return g_options.mirrorMode != kMirrorPerGlass; }
+
+// The renderer type of the mode running now (Options::vrRendererType, flatRendererType).
+inline int rendererType() {
+    return g_options.vr ? g_options.vrRendererType : g_options.flatRendererType;
+}
 
 void loadOptions(const char* fileName);
 

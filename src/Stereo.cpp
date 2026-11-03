@@ -13,6 +13,7 @@
 #include "MirrorCache.h"
 #include "MirrorConfig.h"
 #include "MirrorGeometry.h"
+#include "MirrorShared.h"
 #include "RenderProfile.h"
 #include "MirrorUv.h"
 #include "Pe.h"
@@ -49,35 +50,6 @@ typedef int(__cdecl* CameraBindFn)(void* camera);
 
 namespace {
 
-// -- THE TWO MIRROR GLASSES ---------------------------------------------------------------
-//
-// Every 1967 car has two round mirror glasses, and GPL already gives each its own half of
-// mirror.mip: the +Y (left) glass samples u 0.5-1, the -Y (right) glass u 0-0.5
-// (docs/audit-2026-09-13/41-mirror-panes.md 1.2). Where each glass sits, which way it faces
-// and how big it is are read out of the team's .3do, in car-local metres -- X forward, Y left,
-// Z up, origin at the physics body -- with the normal on the face toward the driver. The -Y
-// glass is the exact Y mirror of the +Y one on every car.
-struct PaneGeometry {
-    const char* team;
-    float       centre[3];   // +Y glass
-    float       normal[3];   // +Y glass
-    float       halfWidth;   // half the glass across the car
-    float       halfHeight;  // half the glass vertically
-};
-
-// Indexed by gpl_driverGetTeamIndex, whose order is the team-name table at 0x546178.
-constexpr PaneGeometry kPaneGeometry[] = {
-    {"brabham", {0.481f, 0.312f, 0.288f}, {-0.986f, 0.106f, 0.126f}, 0.057f, 0.057f},
-    {"brm", {0.510f, 0.302f, 0.213f}, {-0.986f, 0.106f, 0.126f}, 0.057f, 0.057f},
-    {"coventry", {0.481f, 0.312f, 0.288f}, {-0.986f, 0.106f, 0.126f}, 0.057f, 0.057f},
-    {"eagle", {0.566f, 0.345f, 0.188f}, {-0.992f, -0.059f, 0.107f}, 0.057f, 0.057f},
-    {"ferrari", {0.535f, 0.282f, 0.196f}, {-1.0f, 0.0f, 0.0f}, 0.0655f, 0.051f},
-    {"lotus", {0.582f, 0.322f, 0.278f}, {-0.986f, 0.106f, 0.126f}, 0.057f, 0.057f},
-    {"murasama", {0.566f, 0.345f, 0.188f}, {-0.992f, -0.059f, 0.107f}, 0.057f, 0.057f},
-};
-constexpr int kTeamCount = sizeof(kPaneGeometry) / sizeof(kPaneGeometry[0]);
-constexpr int kTeamLotus = 5;
-
 // gpl_mirrorViewCompute (0x454E30) puts the stock mirror eye at the body origin plus
 // R * gpl_mirrorMountOffset, and 0x539470 holds (0, 0, 0.35).
 constexpr float kMirrorMountHeight = 0.35f;
@@ -96,13 +68,6 @@ constexpr uintptr_t     kDriverGetTeamIndex = 0x00985AA6;
 constexpr unsigned char kDriverGetTeamIndexCode[18] = {0xFF, 0x74, 0x24, 0x04, 0xE8, 0x31,
                                                        0x95, 0xAE, 0xFF, 0x50, 0xE8, 0x0A,
                                                        0xFB, 0xFF, 0xFF, 0x59, 0x59, 0xC3};
-
-// Leaning past the glass would send the field through 180 degrees and the projection
-// through infinity. Neither limit is ever reached by a seated driver; they are here so
-// that a tracking glitch cannot produce a degenerate frustum.
-constexpr float kMirrorMinDistance = 0.15f;
-constexpr float kMirrorMinFov = 0.0175f;  // 1 degree
-constexpr float kMirrorMaxFov = 2.44f;    // 140 degrees
 
 struct Entries {
     // The rasterizer entries are held as their GLOBALS, not as resolved pointers. The
@@ -199,6 +164,10 @@ struct State {
     bool  panesGaveUp = false;
     int   paneBuildReports = 8;
     alignas(16) unsigned char paneStorage[kMaxMirrorSurfaces][512] = {};
+
+    // A shared-pane mirrorMode in force this frame: one pane over the whole of mirror.mip, laid
+    // out per eye by MirrorShared, every glass's UVs on its part of it.
+    bool sharedView = false;
 
     // Set around the mirror-only sceneRender.
     bool mirrorOnly = false;
@@ -504,6 +473,10 @@ void reportPanes(const char* reason) {
 // halves, which is the layout every stock glass was authored for.
 int planePanes(int mipWidth, int mipHeight, MirrorTextureRect rect[kMaxMirrorSurfaces]) {
     int regions = mirrorUvCount();
+    if (g_state.sharedView && regions > 0) {
+        rect[0] = MirrorTextureRect{0, 0, mipWidth, mipHeight};
+        return 1;
+    }
     if (regions > 0) {
         bool usable = true;
         for (int i = 0; i < regions && usable; ++i) usable = mirrorUvRect(i, rect[i]);
@@ -1184,8 +1157,10 @@ void publishPaneGlasses() {
     char         names[kMaxMirrorGlasses][kMirrorGlassNameBytes] = {};
     const char*  pointers[kMaxMirrorGlasses] = {};
     int          sides[kMaxMirrorGlasses] = {};
-    int          count = s.paneCount < kMaxMirrorGlasses ? s.paneCount : kMaxMirrorGlasses;
     bool         perSurface = mirrorUvCount() > 0;
+    // The shared view has one pane and still a glass, and an aim, per surface.
+    int          glasses = perSurface ? mirrorUvCount() : s.paneCount;
+    int          count = glasses < kMaxMirrorGlasses ? glasses : kMaxMirrorGlasses;
 
     for (int i = 0; i < count; ++i) {
         labels[i] = perSurface ? g_surfaceGlass[i].team : (i == 0 ? "left" : "right");
@@ -1600,86 +1575,31 @@ struct PaneAim {
     float pitch = 0.0f;
 };
 
-// Aims p[43..83] as the reflection in one glass of `eye` (world), and sets that pane camera's
-// aspect so the glass's vertical extent gets its own angle. `side` 0 is the +Y glass, 1 the
-// -Y glass. Starts from the stock view every time, so aims never compound.
-void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& frame,
-             const PaneGeometry& glass, int side, const float eye[3], void* camera,
-             PaneAim& aim) {
-    std::memcpy(params->mirrorEye, stock.eye, sizeof(stock.eye));
-    std::memcpy(params->mirrorOrientation, stock.basis, sizeof(stock.basis));
-    params->mirrorFov = stock.fov;
-    aim = PaneAim{};
-
-    // THE Y FLIP IS THE TABLE'S, NOT THE CAR'S. kPaneGeometry holds one glass and synthesises
-    // the other by negating Y, which is false for any car whose mirrors are not symmetric and
-    // cannot express one on the centreline at all. A derived glass already carries its own Y, so
-    // only the driver's yaw keeps a side.
-    float sign = side == 0 ? 1.0f : -1.0f;
-    float geomSign = g_derivedActive ? 1.0f : sign;
-    float c[3] = {glass.centre[0], geomSign * glass.centre[1], glass.centre[2]};
-    float n0[3] = {glass.normal[0], geomSign * glass.normal[1], glass.normal[2]};
-
-    // The driver's adjustment of THIS glass on its mount, from its own entry in
-    // gplvr_mirrors.ini. Yaw turns the normal about the car's up axis, positive anticlockwise
-    // seen from above, and a mirror turned by an angle turns its reflection by twice that the
-    // same way -- so a positive yaw swings the view, which looks astern, toward the car's right.
-    // Pitch then turns it about the car's sideways axis so a positive angle lifts the face.
-    MirrorAim tweak = mirrorAimFor(side);
-    float     yaw = tweak.yaw * 0.0174532925f;
-    float     pitch = tweak.pitch * 0.0174532925f;
-    float cy = std::cos(yaw), sy = std::sin(yaw);
-    float cp = std::cos(pitch), sp = std::sin(pitch);
-    float yx = n0[0] * cy - n0[1] * sy;
-    float yy = n0[0] * sy + n0[1] * cy;
-    float n[3] = {yx * cp - n0[2] * sp, yy, -yx * sp + n0[2] * cp};
-    float length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    for (int i = 0; i < 3; ++i) n[i] /= length;
-
-    float e[3];
-    worldToLocal(frame, eye, e);
-
-    float t[3] = {c[0] - e[0], c[1] - e[1], c[2] - e[2]};
-    float distance = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
-    if (distance < 1e-4f) return;
-
-    // The camera: the eye reflected through the glass plane.
-    float along = -(t[0] * n[0] + t[1] * n[1] + t[2] * n[2]);  // (E - C).n
+// Points p[43..83] and a pane camera from `position` along `direction` (both car axes) with
+// fields `fov` x `fovV`, and fills `aim` for the log.
+void aimCamera(SceneParams* params, const MirrorStock& stock, const PaneFrame& frame,
+               const float position[3], const float direction[3], float fov, float fovV,
+               float distance, void* camera, PaneAim& aim) {
     float wx = 0.0f, wy = 0.0f, wz = 0.0f;
-    localToWorld(frame.R, e[0] - 2.0f * along * n[0], e[1] - 2.0f * along * n[1],
-                 e[2] - 2.0f * along * n[2], wx, wy, wz);
+    localToWorld(frame.R, position[0], position[1], position[2], wx, wy, wz);
     params->mirrorEye[0] = frame.origin[0] + wx;
     params->mirrorEye[1] = frame.origin[1] + wy;
     params->mirrorEye[2] = frame.origin[2] + wz;
 
-    // The direction: the view of the glass reflected about its normal. Yaw and pitch come
-    // from it through gpl_viewRecordSetEuler's own convention; roll is the stock mirror's,
-    // which is the car's attitude and not ours to change.
-    float u[3] = {t[0] / distance, t[1] / distance, t[2] / distance};
-    float un = u[0] * n[0] + u[1] * n[1] + u[2] * n[2];
-    float r[3] = {u[0] - 2.0f * un * n[0], u[1] - 2.0f * un * n[1], u[2] - 2.0f * un * n[2]};
+    // Yaw and pitch come from the direction through gpl_viewRecordSetEuler's own convention;
+    // roll is the stock mirror's, which is the car's attitude and not ours to change.
     float rx = 0.0f, ry = 0.0f, rz = 0.0f;
-    localToWorld(frame.R, r[0], r[1], r[2], rx, ry, rz);
+    localToWorld(frame.R, direction[0], direction[1], direction[2], rx, ry, rz);
     if (rz > 1.0f) rz = 1.0f;
     if (rz < -1.0f) rz = -1.0f;
-
     float stockYaw = 0.0f, stockPitch = 0.0f, stockRoll = 0.0f;
     gplMatrixToEuler(stock.basis, stockYaw, stockPitch, stockRoll);
-    gplEulerToMatrix(std::atan2(ry, rx), -std::asin(rz), stockRoll,
-                     params->mirrorOrientation);
+    gplEulerToMatrix(std::atan2(ry, rx), -std::asin(rz), stockRoll, params->mirrorOrientation);
 
-    // The field: the glass's angular size from the eye. The pane camera's half extents are
-    // the texture half's, and the glass maps that half onto its whole face, so the aspect
-    // makes the vertical angle the glass's own: tan(v/2) = tan(h/2) * aspect * height / width.
-    float span = distance < kMirrorMinDistance ? kMirrorMinDistance : distance;
-    float fov = 2.0f * std::atan(glass.halfWidth / span) * tweak.fovScale;
-    float fovV = 2.0f * std::atan(glass.halfHeight / span) * tweak.fovScale;
-    if (fov < kMirrorMinFov) fov = kMirrorMinFov;
-    if (fov > kMirrorMaxFov) fov = kMirrorMaxFov;
-    if (fovV < kMirrorMinFov) fovV = kMirrorMinFov;
-    if (fovV > kMirrorMaxFov) fovV = kMirrorMaxFov;
+    // The pane camera's half extents are its region's, and the glass maps that region onto its
+    // whole face, so the aspect makes the vertical angle the glass's own:
+    // tan(v/2) = tan(h/2) * aspect * height / width.
     params->mirrorFov = fov;
-
     float halfW = cameraFloat(camera, kCameraHalfWExtent);
     float halfH = cameraFloat(camera, kCameraHalfHExtent);
     if (halfW > 0.0f && halfH > 0.0f) {
@@ -1689,11 +1609,80 @@ void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& fra
         bytes[kCameraDirty] = 1;
     }
 
-    float rzLocal = r[2] > 1.0f ? 1.0f : (r[2] < -1.0f ? -1.0f : r[2]);
+    float up = direction[2] > 1.0f ? 1.0f : (direction[2] < -1.0f ? -1.0f : direction[2]);
     aim.distance = distance;
     aim.fov = fov * 57.2957795f;
-    aim.yaw = std::atan2(r[1], r[0]) * 57.2957795f;
-    aim.pitch = std::asin(rzLocal) * 57.2957795f;
+    aim.yaw = std::atan2(direction[1], direction[0]) * 57.2957795f;
+    aim.pitch = std::asin(up) * 57.2957795f;
+}
+
+// One glass in car axes as the panes aim it. THE Y FLIP IS THE TABLE'S, NOT THE CAR'S:
+// kPaneGeometry holds one glass and synthesises the other by negating Y, which is false for any
+// car whose mirrors are not symmetric and cannot express one on the centreline at all. A derived
+// glass already carries its own Y, so only the driver's yaw keeps a side.
+MirrorGlass mirrorGlassOf(const PaneGeometry& glass, int side) {
+    float       geomSign = g_derivedActive || side == 0 ? 1.0f : -1.0f;
+    MirrorGlass out = {{glass.centre[0], geomSign * glass.centre[1], glass.centre[2]},
+                       {glass.normal[0], geomSign * glass.normal[1], glass.normal[2]},
+                       glass.halfWidth,
+                       glass.halfHeight};
+    return out;
+}
+
+// Aims p[43..83] as the reflection in one glass of `eye` (world), with the driver's aim of THIS
+// glass from gplvr_mirrors.ini. `side` 0 is the +Y glass, 1 the -Y glass. Starts from the stock
+// view every time, so aims never compound.
+void aimPane(SceneParams* params, const MirrorStock& stock, const PaneFrame& frame,
+             const PaneGeometry& glass, int side, const float eye[3], void* camera,
+             PaneAim& aim) {
+    std::memcpy(params->mirrorEye, stock.eye, sizeof(stock.eye));
+    std::memcpy(params->mirrorOrientation, stock.basis, sizeof(stock.basis));
+    params->mirrorFov = stock.fov;
+    aim = PaneAim{};
+
+    float e[3];
+    worldToLocal(frame, eye, e);
+    MirrorGlassView view;
+    if (!mirrorGlassView(mirrorGlassOf(glass, side), mirrorAimFor(side), e, view)) return;
+    aimCamera(params, stock, frame, view.camera, view.direction, view.fov, view.fovV,
+              view.distance, camera, aim);
+}
+
+// A shared-pane mirrorMode for this frame (MirrorShared.h): the derived glasses with their aims,
+// laid out from GPL's own eye `seat` (world) for MirrorUv's first apply. The per-glass mode, or a
+// car it cannot lay out, and the panes render one per glass.
+void planShared(const PaneFrame& frame, const float seat[3]) {
+    State& s = g_state;
+    s.sharedView = false;
+    if (!mirrorSharedPane()) {
+        mirrorSharedOff();
+        return;
+    }
+    int count = g_derivedActive ? g_derivedSet.count : 0;
+    if (count > kMaxMirrorSurfaces) count = kMaxMirrorSurfaces;
+    MirrorGlass glasses[kMaxMirrorSurfaces];
+    MirrorAim   aims[kMaxMirrorSurfaces];
+    for (int i = 0; i < count; ++i) {
+        glasses[i] = mirrorGlassOf(g_surfaceGlass[i], i);
+        aims[i] = mirrorAimFor(i);
+    }
+    float e[3];
+    worldToLocal(frame, seat, e);
+    s.sharedView = mirrorSharedPlan(glasses, aims, count, e);
+}
+
+// The shared view's camera for pass `pass`, whose viewpoint is `eye` (world), with the glasses'
+// UVs moved onto that eye's layout before the pass draws them.
+void aimShared(SceneParams* params, const MirrorStock& stock, const PaneFrame& frame,
+               const float eye[3], int pass, void* camera, PaneAim& aim) {
+    float e[3];
+    worldToLocal(frame, eye, e);
+    float                     position[3];
+    const MirrorSharedLayout& layout = mirrorSharedForEye(e, pass, position);
+    float d[3] = {position[0] - e[0], position[1] - e[1], position[2] - e[2]};
+    float distance = 0.5f * std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    aimCamera(params, stock, frame, position, layout.forward, layout.fov, layout.fovV, distance,
+              camera, aim);
 }
 
 // The cone a pane's glass is tested against (report 105 section 4.45): the eye's frustum held in a
@@ -1788,7 +1777,8 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
     for (int i = 0; i < count; ++i)
         logf("  %s glass: %.3f m away, fov %.1f deg, looking yaw %+.1f pitch %+.1f (car axes, "
              "yaw +/-180 = astern)",
-             mirrorConfigGlassName(i), aim[i].distance, aim[i].fov, aim[i].yaw, aim[i].pitch);
+             s.sharedView ? "shared" : mirrorConfigGlassName(i), aim[i].distance, aim[i].fov,
+             aim[i].yaw, aim[i].pitch);
 }
 
 // The panes are rendered by two different paths -- all but the last in a mirror-only
@@ -1807,12 +1797,12 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
 // simulation, which doubles the cost of every frame and so halves the rate. What a rear-view
 // mirror shows changes with the tick and with the head, and neither needs every frame.
 //
-// With perEyeMirror on, each eye's pass renders the panes from its own eye into the same
-// textures, so what is in them at the end of a frame is the right eye's, and a frame that
-// skipped the render left both eyes sampling that -- the left eye alternating between its own
-// reflection and the right's, which is a visible flicker and was reported as one. MirrorCache
-// gives each eye a copy and puts it back on the frames that do not render; until both copies
-// exist there is nothing to put back, so the frame renders.
+// With the mirror from each eye (mirrorMode), each eye's pass renders the panes from its own eye
+// into the same textures, so what is in them at the end of a frame is the right eye's, and a
+// frame that skipped the render left both eyes sampling that -- the left eye alternating between
+// its own reflection and the right's, which is a visible flicker and was reported as one.
+// MirrorCache gives each eye a copy and puts it back on the frames that do not render; until both
+// copies exist there is nothing to put back, so the frame renders.
 bool stereoMirrorOn() { return g_options.mirrorUpdateRate > 0; }
 
 void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView) {
@@ -1828,7 +1818,7 @@ void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView) {
 bool stereoMirrorDueThisFrame() {
     if (!stereoMirrorOn()) return false;
     if (g_options.mirrorUpdateRate <= 1) return true;
-    if (g_options.perEyeMirror && !mirrorCacheReady()) return true;
+    if (mirrorFromEachEye() && !mirrorCacheReady()) return true;
     return (flatFramesTickFrameIndex() % g_options.mirrorUpdateRate) == 0;
 }
 
@@ -1865,7 +1855,7 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     // camera is one that will not render the mirror and still draws a car that samples it --
     // an extra render through the present hook is exactly that -- so it wants the restore for
     // the same reason a skipped frame does. With nothing saved yet the restore costs a compare.
-    bool cacheEyes = g_options.perEyeMirror && g_options.mirrorUpdateRate > 1;
+    bool cacheEyes = mirrorFromEachEye() && g_options.mirrorUpdateRate > 1;
     // The params block is the GAME'S live memory, not a copy of it -- gpl_simFrameRender
     // reuses it and zeroes p[43] the moment sceneRender returns. So anything we adjust in
     // it has to be put back before we hand control away. The mirror aim is the frame
@@ -1950,19 +1940,25 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
             // mirror textures, and a pane built before that would be holding a bitmap handle
             // belonging to a mip that has just been freed -- which the copy-out would then
             // write through. ensurePanes rebuilds whenever the rects or the destinations move,
-            // so asking about the car first costs nothing and closes that window.
+            // so asking about the car first costs nothing and closes that window. The shared
+            // view's regions go to MirrorUv before ensurePanes applies them.
             bool teamChanged = false;
             glass = &viewedCarGlass(teamChanged);
+            paneFrameFromStock(mirrorStock, paneFrame);
+            float seat[3] = {savedX, savedY, savedZ};
+            planShared(paneFrame, seat);
             if (!ensurePanes(savedMirror)) {
                 reportPanes("the pane cameras are not built -- one stock image");
                 glass = nullptr;
             } else {
                 panes = true;
-                reportPanes("each glass renders its own reflection");
-                paneFrameFromStock(mirrorStock, paneFrame);
+                // MirrorUv refusing the regions leaves the two halves, which are aimed per glass.
+                if (mirrorUvCount() == 0 || g_state.paneCount != 1) g_state.sharedView = false;
+                reportPanes(g_state.sharedView
+                                ? "every glass reads its part of one shared view (mirrorMode)"
+                                : "each glass renders its own reflection");
                 if (teamChanged || !g_state.paneGeometryReported) {
                     g_state.paneGeometryReported = true;
-                    float seat[3] = {savedX, savedY, savedZ};
                     reportPaneGeometry(*glass, paneFrame, mirrorStock, carOrientation, seat);
                 }
             }
@@ -2120,6 +2116,15 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
             localToWorld(savedOrientation, vr[pass].offset[0], vr[pass].offset[1],
                          vr[pass].offset[2], dx, dy, dz);
             float eye[3] = {savedX + dx, savedY + dy, savedZ + dz};
+            // The shared view's one pane is wanted while any of the glasses reading it is.
+            if (g_state.sharedView) {
+                bool any = false;
+                for (int i = 0; i < mirrorUvCount() && !any; ++i)
+                    any = paneInView(paneFrame, g_surfaceGlass[i], i, eye, orientation,
+                                     vr[pass].fov);
+                paneSeen[pass][0] = any;
+                continue;
+            }
             for (int surface = 0; surface < g_state.paneCount && surface < kMaxMirrorSurfaces;
                  ++surface)
                 paneSeen[pass][surface] = paneInView(paneFrame, paneGlass(*glass, surface),
@@ -2205,37 +2210,42 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         // The mirrors. A pass that renders them renders every glass from its viewpoint: all but
         // the last in a mirror-only sceneRender of its own, copied into its region, and the last
         // riding the eye's own render so its copy lands just before that render draws the car
-        // whose glasses sample it. perEyeMirror 0 does this on the left eye's pass only, from
-        // the head centre, and the right eye samples what it left; 1 does it on both passes, each
-        // from its own eye. Without panes the same passes render GPL's single stock image.
+        // whose glasses sample it. kMirrorSharedHeadCentre does this on the left eye's pass only,
+        // from the head centre, and the right eye samples what it left; the other modes do it on
+        // both passes, each from its own eye. Without panes the same passes render GPL's single
+        // stock image.
         //
         // N glasses cost N-1 EXTRA gated sceneRenders per pass, at about 2.1 ms each: a car with
         // one mirror saves one of the two a pair costs, and a car with three pays one more.
-        bool mirrorThisPass = mirrorWanted && (g_options.perEyeMirror || pass == 0);
+        bool mirrorThisPass = mirrorWanted && (mirrorFromEachEye() || pass == 0);
         params->mirrorCamera = mirrorThisPass ? savedMirror : nullptr;
 
         int dueCount = mirrorThisPass && panes ? g_state.paneCount : 0;
 
-        if (dueCount > 0) {
-            float eye[3] = {params->eyeX, params->eyeY, params->eyeZ};
-            if (!g_options.perEyeMirror) {
-                // vr[i].offset is each eye's own displacement from the recentre pose, in GPL
-                // local axes, so their midpoint is the head's.
-                float hx = 0.0f, hy = 0.0f, hz = 0.0f;
-                localToWorld(savedOrientation, (vr[0].offset[0] + vr[1].offset[0]) * 0.5f,
-                             (vr[0].offset[1] + vr[1].offset[1]) * 0.5f,
-                             (vr[0].offset[2] + vr[1].offset[2]) * 0.5f, hx, hy, hz);
-                eye[0] = savedX + hx;
-                eye[1] = savedY + hy;
-                eye[2] = savedZ + hz;
-            }
+        // The viewpoint the mirror is rendered from: this eye, or the head centre when the eyes
+        // share one render.
+        float mirrorFrom[3] = {params->eyeX, params->eyeY, params->eyeZ};
+        if (!mirrorFromEachEye()) {
+            // vr[i].offset is each eye's own displacement from the recentre pose, in GPL local
+            // axes, so their midpoint is the head's.
+            float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+            localToWorld(savedOrientation, (vr[0].offset[0] + vr[1].offset[0]) * 0.5f,
+                         (vr[0].offset[1] + vr[1].offset[1]) * 0.5f,
+                         (vr[0].offset[2] + vr[1].offset[2]) * 0.5f, hx, hy, hz);
+            mirrorFrom[0] = savedX + hx;
+            mirrorFrom[1] = savedY + hy;
+            mirrorFrom[2] = savedZ + hz;
+        }
 
-            // The panes to render: those an eye sampling this pass's writes can see (perEyeMirror
-            // 0 renders here for both eyes). The last of them rides the eye's render.
+        bool sharedAimed = false;
+        if (dueCount > 0) {
+            // The panes to render: those an eye sampling this pass's writes can see
+            // (kMirrorSharedHeadCentre renders here for both eyes). The last of them rides the
+            // eye's render.
             int rendered[kMaxMirrorSurfaces];
             int renderCount = 0;
             for (int surface = 0; surface < dueCount; ++surface) {
-                bool seen = g_options.perEyeMirror
+                bool seen = mirrorFromEachEye()
                                 ? paneSeen[pass][surface]
                                 : paneSeen[0][surface] || paneSeen[1][surface];
                 if (seen)
@@ -2249,8 +2259,13 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
             PaneAim aim[kMaxMirrorSurfaces] = {};
             for (int k = 0; k < renderCount; ++k) {
                 int surface = rendered[k];
-                aimPane(params, mirrorStock, paneFrame, paneGlass(*glass, surface), surface, eye,
-                        g_state.pane[surface].camera, aim[surface]);
+                if (g_state.sharedView) {
+                    aimShared(params, mirrorStock, paneFrame, mirrorFrom, pass,
+                              g_state.pane[surface].camera, aim[surface]);
+                    sharedAimed = true;
+                } else
+                    aimPane(params, mirrorStock, paneFrame, paneGlass(*glass, surface), surface,
+                            mirrorFrom, g_state.pane[surface].camera, aim[surface]);
                 params->mirrorCamera = g_state.pane[surface].camera;
                 if (k + 1 >= renderCount) break;
 
@@ -2270,9 +2285,13 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
             mirrorMoved = true;
 
             if (pass == 0)
-                reportPaneAim(paneFrame, eye, aim, dueCount,
-                              !g_options.perEyeMirror ? "head centre" : "left eye");
+                reportPaneAim(paneFrame, mirrorFrom, aim, dueCount,
+                              !mirrorFromEachEye() ? "head centre" : "left eye");
         }
+        // A pass that samples the shared view without rendering it reads the picture its own eye
+        // left on an earlier frame, or at kMirrorSharedHeadCentre the left pass's.
+        if (panes && g_state.sharedView && !sharedAimed)
+            mirrorSharedRegionsFor(mirrorFromEachEye() ? pass : 0);
 
         // Does GPL's euler round trip preserve what we composed?
         //

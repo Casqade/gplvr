@@ -264,29 +264,6 @@ int remapAnchor(int x, int fullWidth) {
     return x;
 }
 
-// HOW FAR IN FROM THE EYE'S EDGES THE HUD IS PULLED, as a fraction of the half-extent.
-//
-// GPL lays its HUD out for a 4:3 monitor, where a corner is a glance away. An eye at 104
-// degrees is not a monitor: x = 5 of 1280 is not "the left edge", it is over your
-// shoulder, and the bottom-left corner of the frame is somewhere you cannot comfortably
-// look. The pixels were in the published frame all along -- measured, not assumed -- and
-// still read as missing.
-//
-// So the layout can be scaled about the eye's centre, keeping every relative position and
-// bringing the whole thing into the cone a seated driver actually uses. 1.0 is the raw
-// layout and the corners it implies; 0.6 puts a corner item at 20% in from the edge.
-//
-// THIS WAS A CONSTANT AT 0.0, which is x = eyeWidth/2 and y = eyeHeight/2 for every item --
-// the whole of GPL's 2D on one point at the centre of the eye. It went unnoticed because the
-// surface test below was declining before this line could be reached, so the only evidence
-// was one log line from the single frame where both agreed.
-//
-// It scales positions and not the art drawn at them, so anything below 1.0 compresses a dense
-// group while its pieces keep their size. The replay control band is ten buttons at a
-// 37-pixel step; at 0.6 the step is 22 and they overlap. Moving a whole group belongs in that
-// screen's own layout, which preserves the spacing exactly.
-float hudInset() { return g_options.vrHudInset; }
-
 // Horizontal disparity in pixels for `vrHudDepth` metres, or 0 for infinity.
 //
 // The left eye's copy goes RIGHT of centre and the right eye's LEFT of centre, which is
@@ -324,8 +301,8 @@ void emit(const Call& call) {
 
     // THE FRONT END HAS NO EYES, AND THE SOURCE HANDLE IT WOULD ASK ABOUT IS A CORPSE.
     //
-    // This is the guard `stampDrawThunk` and `bitmapDrawThunk` already carry and this caller
-    // did not -- the one of the three callers of destinationCanSplit that was unprotected, and
+    // This is the guard `bitmapDrawThunk` already carries and this caller did not -- the one of
+    // the callers of destinationCanSplit that was unprotected, and
     // the one that crashed on 2026-10-09. MenuScale's rasterFlushPending synthesises a
     // drawDebugText of "" against the back buffer once per front-end frame, so this path runs
     // continuously in the menus, with g_state.sourceSurface still holding the race's 0x6F.
@@ -372,17 +349,7 @@ void emit(const Call& call) {
     int x = remapAnchor(call.x, fullWidth);
     int y = call.y;
 
-    // The same inset the stamp path applies, so the two halves of GPL's 2D cannot be placed
-    // by different rules and drift apart.
-    int eyeWidth = rect[0][2];
-    int eyeHeight = rect[0][3];
-    scaleToEye(x, y, fullWidth, fullHeight, eyeWidth, eyeHeight);
-    if (eyeWidth > 0 && eyeHeight > 0) {
-        float halfX = static_cast<float>(eyeWidth) * 0.5f;
-        float halfY = static_cast<float>(eyeHeight) * 0.5f;
-        x = static_cast<int>(halfX + (static_cast<float>(x) - halfX) * hudInset());
-        y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * hudInset());
-    }
+    scaleToEye(x, y, fullWidth, fullHeight, rect[0][2], rect[0][3]);
 
     int disparity = disparityPixels(rect[0][2]);
     if (disparity != g_lastDisparity && g_reports > 0) {
@@ -444,13 +411,6 @@ int   g_bitmapSplitReports = 4;
 int   g_refusedDest[16] = {};
 int   g_refusedDestCount = 0;
 int   g_bitmapRefuseReports = 8;
-
-// ONE OWNER PER SLOT. With vrGplText = 1 the fast text path takes stampDraw, so this file does
-// not: both re-assert their thunk over whatever a mode change left in a slot and adopt what
-// they find as "the original", and two such modules on one slot make each the other's original
-// and the chain calls itself. Read from the option rather than from the other module's state,
-// because hudBind runs before fastTextBind and would see "not installed yet" either way.
-bool stampsBelongToFastText() { return g_options.vr && g_options.vrGplText != 0; }
 
 bool knownRefusal(int dest) {
     for (int i = 0; i < g_refusedDestCount; ++i)
@@ -561,399 +521,6 @@ void* censusThunkFor(int which) {
     }
 }
 
-// stampDraw(0x20004900) is five __cdecl arguments ending in rogl_fontBlitGlyph(a5, a2, ?,
-// ?, a3) -- a glyph blitter, which is what a gauge and a row of digits are made of. Only
-// a1 is looked up in the handle table, and there is no second handle argument, so unlike
-// bitmapDraw this one may have no explicit destination at all and simply draw wherever
-// polySetDest last pointed. That would put it on the game's main camera surface -- the
-// whole side-by-side buffer -- which is exactly the "layered on top of both eyes" the
-// user saw at vrOffscreen = 0, and exactly the "invisible" at 6344 wide.
-//
-// So the census logs ALL FIVE arguments and names none of them. One race says which is
-// which: the constant one is the stamp set, the pair that sweeps is the position.
-typedef void(__cdecl* StampDrawFn)(int a1, int a2, int a3, int a4, int a5);
-
-void**      g_stampDrawSlot = nullptr;
-StampDrawFn g_stampDrawOriginal = nullptr;
-int         g_stampReports = 12;
-int         g_stampPerEyeReports = 4;
-int         g_lastStampDisparity = -9999;
-int         g_stampCount = 0;
-int         g_stampHighWater = 0;
-
-// -- STAMPED TEXT: WHAT IT SAYS, AND WHAT CAN BE DROPPED -------------------------------
-//
-// The arguments, read from both sides on 2026-09-14:
-//
-//   roglv2 stampDraw (0x20004900): a1 is looked up in the handle table as the destination,
-//   a4 is resolved by sub_20018AC0 into a font object, and rogl_fontBlitGlyph draws glyph
-//   a5 of that font at a2, a3.
-//
-//   gplc67 reads the global at 0x00867628 in two places. sub_4EDE40 draws a string (the
-//   call at 0x004EDF5E) and the routine just before it draws one glyph (0x004EDE2A); both
-//   pass (surface, x, y, font->+33, glyph). The glyph comes from sub_4EDC80: the character
-//   looked up in the font's own map, falling back to the font's default glyph. For a font
-//   in mode 2 or 4 (font->+22) the string routine adds a quarter-pixel phase of 0..3 to the
-//   glyph and advances x in quarter pixels.
-//
-// The census values -- 48, 82, 69 -- are '0', 'R', 'E', so these fonts map characters to
-// their ASCII codes. Text is printed as characters, and any code outside printable ASCII
-// is escaped with its raw value.
-
-// The table of surfaces a bitmapDraw had touched went with `vrSkipStampText` on 2026-09-27.
-// It existed for one question -- can this stamp be dropped without anyone seeing it -- and
-// nothing drops a stamp any more. If a future change wants to know again, the rule was: a
-// destination no wider than the display and at least 7/8 as wide is a screen-space layer of
-// it, the off-screen frame is wider, and a surface a bitmapDraw has touched may have been
-// copied into the frame by another route.
-
-// One frame's stamps, grouped into strings in call order: a glyph joins the string before
-// it when it has the same destination, set and y, and sits a little to the right.
-constexpr int kMaxFrameStrings = 256;
-constexpr int kMaxStampChars = 80;
-constexpr int kMaxGlyphGap = 64;
-
-struct StampString {
-    int            dest;
-    int            width;
-    int            height;
-    int            set;
-    int            x;
-    int            y;
-    int            lastX;
-    int            length;
-    bool           truncated;
-    unsigned short codes[kMaxStampChars];
-};
-
-StampString g_frameStrings[kMaxFrameStrings];
-int         g_frameStringCount = 0;
-int         g_frameStampCalls = 0;
-int         g_frameUngrouped = 0;
-
-void recordStamp(int dest, int width, int height, int x, int y, int set, int glyph) {
-    unsigned short code =
-        (glyph >= 0 && glyph < 0xFFFF) ? static_cast<unsigned short>(glyph) : 0xFFFF;
-    if (g_frameStringCount > 0) {
-        StampString& s = g_frameStrings[g_frameStringCount - 1];
-        if (s.dest == dest && s.set == set && s.y == y && x > s.lastX &&
-            x - s.lastX <= kMaxGlyphGap) {
-            if (s.length < kMaxStampChars)
-                s.codes[s.length++] = code;
-            else
-                s.truncated = true;
-            s.lastX = x;
-            return;
-        }
-    }
-    if (g_frameStringCount >= kMaxFrameStrings) {
-        ++g_frameUngrouped;
-        return;
-    }
-    StampString& s = g_frameStrings[g_frameStringCount++];
-    s.dest = dest;
-    s.width = width;
-    s.height = height;
-    s.set = set;
-    s.x = x;
-    s.y = y;
-    s.lastX = x;
-    s.length = 1;
-    s.truncated = false;
-    s.codes[0] = code;
-}
-
-// Every string seen since the last mode change, by where it is drawn. A string is logged
-// when it first appears and when its text changes, at most once a second each, and no
-// more than kMaxTextLinesPerSecond lines a second across all of them.
-constexpr int kMaxKnownStrings = 512;
-constexpr int kMaxTextLinesPerSecond = 40;
-
-struct KnownString {
-    int      dest;
-    int      set;
-    int      x;
-    int      y;
-    unsigned loggedHash;
-    DWORD    loggedAt;
-    bool     logged;
-    bool     seen;     // during the current summary second
-    bool     waiting;  // its text changed and the rate limit has held the line back
-};
-
-KnownString g_known[kMaxKnownStrings];
-int         g_knownCount = 0;
-int         g_knownHint = 0;
-
-struct StampWindow {
-    DWORD     start = 0;
-    int       frames = 0;
-    long long calls = 0;
-    int       maxCalls = 0;
-    int       lines = 0;
-    int       untracked = 0;
-    int       ungrouped = 0;
-};
-
-StampWindow g_stampWindow;
-
-unsigned hashStampString(const StampString& s) {
-    unsigned hash = 2166136261u;
-    for (int i = 0; i < s.length; ++i) {
-        hash = (hash ^ (s.codes[i] & 0xFF)) * 16777619u;
-        hash = (hash ^ (s.codes[i] >> 8)) * 16777619u;
-    }
-    return (hash ^ static_cast<unsigned>(s.length) ^ (s.truncated ? 0x80000000u : 0u)) *
-           16777619u;
-}
-
-// Printable ASCII as itself; a quote or backslash escaped; anything else as \xNN or
-// \uNNNN carrying the raw code. True when any code fell outside printable ASCII.
-bool formatStampText(const StampString& s, char* out, size_t size) {
-    size_t used = 0;
-    bool   unusual = false;
-    for (int i = 0; i < s.length && used + 8 < size; ++i) {
-        unsigned code = s.codes[i];
-        if (code == '"' || code == '\\') {
-            out[used++] = '\\';
-            out[used++] = static_cast<char>(code);
-        } else if (code >= 32 && code < 127) {
-            out[used++] = static_cast<char>(code);
-        } else {
-            unusual = true;
-            int n = snprintf(out + used, size - used, code < 256 ? "\\x%02X" : "\\u%04X", code);
-            if (n > 0) used += static_cast<size_t>(n);
-        }
-    }
-    if (s.truncated && used + 4 < size) {
-        memcpy(out + used, "...", 3);
-        used += 3;
-    }
-    out[used] = 0;
-    return unusual;
-}
-
-KnownString* findKnown(const StampString& s) {
-    if (g_knownHint < g_knownCount) {
-        KnownString& k = g_known[g_knownHint];
-        if (k.dest == s.dest && k.set == s.set && k.x == s.x && k.y == s.y) {
-            ++g_knownHint;
-            return &k;
-        }
-    }
-    for (int i = 0; i < g_knownCount; ++i) {
-        KnownString& k = g_known[i];
-        if (k.dest == s.dest && k.set == s.set && k.x == s.x && k.y == s.y) {
-            g_knownHint = i + 1;
-            return &k;
-        }
-    }
-    return nullptr;
-}
-
-void flushStampStrings(DWORD now) {
-    g_knownHint = 0;
-    for (int i = 0; i < g_frameStringCount; ++i) {
-        const StampString& s = g_frameStrings[i];
-        unsigned hash = hashStampString(s);
-
-        KnownString* k = findKnown(s);
-        if (!k) {
-            if (g_knownCount >= kMaxKnownStrings) {
-                ++g_stampWindow.untracked;
-                continue;
-            }
-            k = &g_known[g_knownCount++];
-            *k = KnownString{};
-            k->dest = s.dest;
-            k->set = s.set;
-            k->x = s.x;
-            k->y = s.y;
-            g_knownHint = g_knownCount;
-        }
-        k->seen = true;
-        if (k->logged && k->loggedHash == hash) {
-            k->waiting = false;
-            continue;
-        }
-        if ((k->logged && now - k->loggedAt < 1000) ||
-            g_stampWindow.lines >= kMaxTextLinesPerSecond) {
-            k->waiting = true;
-            continue;
-        }
-
-        char text[512];
-        bool unusual = formatStampText(s, text, sizeof(text));
-        char codes[256];
-        codes[0] = 0;
-        if (unusual) {
-            size_t used = 0;
-            for (int c = 0; c < s.length && used + 8 < sizeof(codes); ++c) {
-                int n = snprintf(codes + used, sizeof(codes) - used, " %u", s.codes[c]);
-                if (n > 0) used += static_cast<size_t>(n);
-            }
-        }
-        logf("hud: stamp text %s on surface %d (%dx%d), set %d, at %d,%d: \"%s\"%s%s",
-             k->logged ? "CHANGED" : "new", s.dest, s.width, s.height, s.set, s.x, s.y,
-             text, unusual ? " -- raw codes:" : "", codes);
-        k->logged = true;
-        k->loggedHash = hash;
-        k->loggedAt = now;
-        k->waiting = false;
-        ++g_stampWindow.lines;
-    }
-}
-
-void resetStampTracking() {
-    g_knownCount = 0;
-    g_knownHint = 0;
-}
-
-// THE IN-RACE HUD, ONCE PER EYE.
-//
-// Established 2026-09-12 after four wrong answers: `stampDraw(109, 2, 1309, 11, 94)` with
-// destination 109 measuring 2560x1440 -- the WHOLE render surface -- at 56 calls a frame
-// through a race. Under stereo that surface is two 1280x1440 eyes, so a single pass at
-// x = 2 puts the entire HUD in the left eye's bottom-left corner and nothing in the right.
-// At 104 degrees per eye that corner is far enough into the periphery to read as missing,
-// which is exactly what it looked like.
-//
-// Same treatment as the text path and the same two reasons it works: the destination is
-// an argument, so re-issuing costs nothing but the call; and the anchor class is
-// recoverable from x against the full width, so an item pinned to an edge stays pinned to
-// that edge in an eye half as wide. y needs no remap -- each eye is the full height of the
-// buffer, and a sub-rect instance already offsets into the root by its own origin.
-void __cdecl stampDrawThunk(int a1, int a2, int a3, int a4, int a5) {
-    ++g_stampCount;
-
-    // NOTHING IS MEASURED BEFORE IT IS DECIDED WHETHER THE MEASUREMENT IS MEANINGFUL.
-    //
-    // This crashed the game three times, and the dumps are unambiguous: a read of
-    // 0x0000000C inside roglv2!bitmapWidth, called from here. `stereoSourceSurface()`
-    // caches the world surface handle 0x6F, `stereoRelease()` is only reachable from a
-    // world render, so LEAVING A RACE NEVER CLEARS IT -- and the front end goes on
-    // drawing stamps against a handle whose table slot has been freed. `bitmapWidth`
-    // takes a HANDLE and does `table[handle]` then `[+0x0C]`, so a freed slot is a null
-    // dereference. The `if (!bitmap)` guard added earlier catches handle 0; it cannot
-    // catch a freed non-zero handle.
-    //
-    // The front-end test was already in the condition below and would have short-circuited
-    // every one of those crashes. It was simply read four lines too late, because the
-    // measurement was hoisted above the decision.
-    if (windowInFrontEnd() || !g_stampDrawOriginal) {
-        if (g_stampDrawOriginal) g_stampDrawOriginal(a1, a2, a3, a4, a5);
-        return;
-    }
-
-    if (g_stampReports > 0 && g_stampCount <= 3) {
-        --g_stampReports;
-        // a1 holds through a whole race while a4 takes small changing values, so a1 is
-        // the destination surface and a4 the stamp set. Its SIZE is the thing that
-        // settles what it is: the back buffer, the driving view carved out of it, or
-        // something else again -- and that decides whether the HUD can be re-issued per
-        // eye the way the text path is.
-        void* dest = reinterpret_cast<void*>(static_cast<intptr_t>(a1));
-        logf("hud: stampDraw(%d, %d, %d, %d, %d) -- call %d this frame. Destination %d is "
-             "%dx%d; the stereo source %p is %dx%d and the eyes are %p/%p.",
-             a1, a2, a3, a4, a5, g_stampCount, a1, bitmapWidth(dest), bitmapHeight(dest),
-             stereoSourceSurface(), bitmapWidth(stereoSourceSurface()),
-             bitmapHeight(stereoSourceSurface()), stereoEyeSurface(0),
-             stereoEyeSurface(1));
-    }
-
-    int rect[2][4];
-    void* dest = reinterpret_cast<void*>(static_cast<intptr_t>(a1));
-    void* left = stereoEyeSurface(0);
-    void* right = stereoEyeSurface(1);
-
-    // THE HUD'S DESTINATION IS NOT THE SURFACE STEREO SPLIT, AND IT NEVER WAS.
-    //
-    // It is 109 where the stereo source is 111 -- both 2560x1440, different objects, both
-    // views onto one framebuffer. An identity test written against the source ignored that,
-    // so the first version of this branch declined on every call.
-    //
-    // The size test against stereoSourceSurface() that replaced it then declined on every call
-    // once the world moved off-screen, and that too was correct: the eyes were no longer
-    // sub-rects of GPL's destination, so a re-issue had nowhere to put anything. See
-    // destinationCanSplit.
-    int fullWidth = 0;
-    int fullHeight = 0;
-    bool canSplit = destinationCanSplit(dest, fullWidth, fullHeight);
-
-    // One record per call GPL makes, before any re-issue; flushed by hudEndFrame.
-    ++g_frameStampCalls;
-    recordStamp(a1, fullWidth, fullHeight, a2, a3, a4, a5);
-
-    if (!left || !right || !canSplit || !stereoEyeRect(0, rect[0]) ||
-        !stereoEyeRect(1, rect[1])) {
-        // Once per distinct destination, so a pass-through that should have been a split
-        // says so instead of being silent. Five rounds of this were lost to a branch that
-        // declined without comment.
-        if (firstSightOf(dest)) {
-            void* source = stereoSourceSurface();
-            logf("hud: stampDraw to surface %d (%dx%d) passed through UNCHANGED -- the stereo "
-                 "source is %p (%dx%d), eyes %p/%p. Only a destination the eyes were carved "
-                 "out of can be split; while the world renders off-screen none is, and GPL's "
-                 "2D stays where GPL put it.",
-                 a1, fullWidth, fullHeight, source, bitmapWidth(source), bitmapHeight(source),
-                 left, right);
-        }
-        g_stampDrawOriginal(a1, a2, a3, a4, a5);
-        return;
-    }
-
-    int eyeWidth = rect[0][2];
-    int eyeHeight = rect[0][3];
-
-    int x = remapAnchor(a2, fullWidth);
-    int y = a3;
-
-    scaleToEye(x, y, fullWidth, fullHeight, eyeWidth, eyeHeight);
-
-    // Toward the middle of the eye, both axes, about its centre.
-    if (eyeWidth > 0 && eyeHeight > 0) {
-        float halfX = static_cast<float>(eyeWidth) * 0.5f;
-        float halfY = static_cast<float>(eyeHeight) * 0.5f;
-        x = static_cast<int>(halfX + (static_cast<float>(x) - halfX) * hudInset());
-        y = static_cast<int>(halfY + (static_cast<float>(y) - halfY) * hudInset());
-    }
-
-    int disparity = disparityPixels(eyeWidth);
-
-    // A LEFT-ANCHORED ITEM MINUS HALF THE DISPARITY IS OFF THE EDGE.
-    //
-    // x = 5 with 16 px of disparity sent the right eye's copy to -3, which roglv2 clipped
-    // away -- so the split ran, reported itself as working, and put exactly one copy on
-    // screen. The monitor showed "the HUD as always" and the headset showed it in one eye
-    // at the far corner, which is indistinguishable from no HUD at all. The inset above
-    // makes this nearly impossible, but nearly is not a guarantee when the anchor classes
-    // and the depth are both tunable.
-    int half = disparity / 2;
-    if (eyeWidth > 0) {
-        if (x - half < 0) half = x;
-        if (x + half > eyeWidth - 1) half = eyeWidth - 1 - x;
-        if (half < 0) half = 0;
-    }
-    if (disparity != g_lastStampDisparity && g_stampPerEyeReports > 0) {
-        --g_stampPerEyeReports;
-        g_lastStampDisparity = disparity;
-        logf("hud: the in-race HUD is drawn once per eye -- (%d,%d) on a %d-wide surface "
-             "becomes (%d,%d) in a %dx%d eye after the anchor remap and a %.2f inset, "
-             "separated by %d px (clamped from %d) for vrHudDepth = %.2f. The headset's "
-             "copy of this frame was %s.",
-             a2, a3, fullWidth, x, y, eyeWidth, eyeHeight, hudInset(), half * 2, disparity,
-             g_options.vrHudDepth,
-             frameAlreadyPublished()
-                 ? "ALREADY TAKEN -- these pixels reach the monitor and never the eyes"
-                 : "not yet taken, so these pixels are in it");
-    }
-
-    g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)), x + half, y, a4,
-                        a5);
-    g_stampDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(right)), x - half, y, a4,
-                        a5);
-}
-
 int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     ++g_bitmapDrawCount;
     // Anything the fast text path still has batched goes down first -- see censusEnter.
@@ -1026,17 +593,18 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
         }
     }
 
-    // GPL'S 2D ART, ONCE PER EYE -- the same treatment the stamp path gives its text.
+    // GPL'S 2D ART, ONCE PER EYE.
     //
     // This path had no per-eye branch at all, which is why GPL's bitmap 2D stayed in window
     // coordinates even when the text was relocated: the replay control band is drawn here,
     // and its labels are drawn by stampDraw, so the two halves of one widget band went to
-    // different places. The destination is an ARGUMENT, so the re-issue needs nothing the
-    // stamp path does not already do.
+    // different places. The destination is an ARGUMENT, so the re-issue costs nothing but the
+    // call.
     //
-    // The front-end test comes first for the reason recorded in stampDrawThunk: leaving a
-    // race never clears a cached surface handle, and bitmapWidth on a freed one is a null
-    // dereference rather than a zero.
+    // THE FRONT-END TEST COMES FIRST. The removed stampDraw thunk crashed the game three times
+    // by measuring before deciding: stereoSourceSurface() caches the world surface handle,
+    // leaving a race never clears it, and bitmapWidth on a freed handle is a null dereference
+    // rather than a zero.
     // THE FIRST ARGUMENT IS THE DESTINATION, not the fourth.
     //
     // roglv2 binds a1's texture and reads a4's pixels, so a1 is where the pixels land -- which
@@ -1089,12 +657,6 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     int outX = remapAnchor(x, fullWidth);
     int outY = y;
     scaleToEye(outX, outY, fullWidth, fullHeight, eyeWidth, eyeHeight);
-    if (eyeWidth > 0 && eyeHeight > 0) {
-        float halfX = static_cast<float>(eyeWidth) * 0.5f;
-        float halfY = static_cast<float>(eyeHeight) * 0.5f;
-        outX = static_cast<int>(halfX + (static_cast<float>(outX) - halfX) * hudInset());
-        outY = static_cast<int>(halfY + (static_cast<float>(outY) - halfY) * hudInset());
-    }
 
     int disparity = disparityPixels(eyeWidth);
     int half = disparity / 2;
@@ -1230,26 +792,11 @@ void hudBind(const Binding& binding) {
          "drawDebugText, bitmapDraw and stampDraw are silent for a whole race, so it is "
          "one of these or it is 3D geometry.");
 
-    if (stampsBelongToFastText()) {
-        logf("hud: stampDraw is NOT thunked here -- vrGplText = 1, so the fast text path owns "
-             "that global and draws GPL's glyphs from its own atlas, once per eye, where "
-             "vrGplTextScale and vrGplTextInset put them. This file's own stamp census and its "
-             "string reconstruction go with it; the `fast text:` lines carry both. The other "
-             "thunks here flush that path's pending batch before they draw, which is the "
-             "ordering the six globals it gives up were holding.");
-    } else if ((g_stampDrawSlot = rasterGlobal(binding.image, "stampDraw")) != nullptr &&
-               *g_stampDrawSlot) {
-        g_stampDrawOriginal = reinterpret_cast<StampDrawFn>(*g_stampDrawSlot);
-        void* census = reinterpret_cast<void*>(&stampDrawThunk);
-        if (patchBytes(g_stampDrawSlot, &census, sizeof(census))) {
-            logf("hud: stampDraw census installed at global %p -- all five arguments are "
-                 "logged for the first calls of a phase, unnamed, so one race says which "
-                 "is the stamp set and which is the position.",
-                 reinterpret_cast<void*>(g_stampDrawSlot));
-        } else {
-            g_stampDrawOriginal = nullptr;
-        }
-    }
+    logf("hud: stampDraw is NOT thunked here -- the fast text path owns that global and draws "
+         "GPL's glyphs from its own atlas, once per eye, where vrGplTextScale and "
+         "vrGplTextInset put them; the `fast text:` lines carry its census. The other thunks "
+         "here flush that path's pending batch before they draw, which is the ordering the six "
+         "globals it gives up were holding.");
 
     // The expected slot goes through rebase, because the slot itself was resolved by entry-point
     // name and will legitimately differ from the reference link's address on an image whose data
@@ -1307,17 +854,12 @@ void reassert(const char* name, void** slot, void* thunk, void** originalStorage
 // rather than the game.
 void hudEnsureThunk() {
     static int textReports = 4;
-    static int stampReports = 4;
     static int bitmapReports = 4;
     static int censusReports = 6;
 
     if (g_slot && g_original) {
         reassert("drawDebugText", g_slot, reinterpret_cast<void*>(&drawDebugTextThunk),
                  reinterpret_cast<void**>(&g_original), textReports);
-    }
-    if (g_stampDrawSlot && g_stampDrawOriginal) {
-        reassert("stampDraw", g_stampDrawSlot, reinterpret_cast<void*>(&stampDrawThunk),
-                 reinterpret_cast<void**>(&g_stampDrawOriginal), stampReports);
     }
     if (g_bitmapDrawSlot && g_bitmapDrawOriginal) {
         reassert("bitmapDraw", g_bitmapDrawSlot, reinterpret_cast<void*>(&bitmapDrawThunk),
@@ -1341,8 +883,6 @@ void hudBeginFrame() {
         g_bitmapSplitReports = 4;
         g_refusedDestCount = 0;
         g_bitmapRefuseReports = 8;
-        g_stampReports = 12;
-        g_stampHighWater = 0;
         for (int i = 0; i < kCensusCount; ++i) {
             g_census[i].reports = 6;
             g_census[i].high = 0;
@@ -1350,9 +890,6 @@ void hudBeginFrame() {
         g_lastReportedCount = 0;
         g_countReports = 8;
         g_seenCount = 0;
-        // Handles are recycled across a mode change, so what was composited or logged
-        // before it says nothing about the surfaces after it.
-        resetStampTracking();
         logf("hud: census reset -- the engine has entered %s, and the counts below are "
              "that phase's own.",
              inFrontEnd ? "the front end" : "a world mode");
@@ -1366,12 +903,6 @@ void hudBeginFrame() {
         }
         c.count = 0;
     }
-
-    if (g_stampCount > g_stampHighWater && g_stampReports > 0) {
-        g_stampHighWater = g_stampCount;
-        logf("hud: up to %d stampDraw call(s) in one frame now.", g_stampHighWater);
-    }
-    g_stampCount = 0;
 
     if (g_bitmapDrawCount > g_bitmapDrawHighWater && g_bitmapDrawReports > 0) {
         g_bitmapDrawHighWater = g_bitmapDrawCount;
@@ -1395,60 +926,6 @@ void hudBeginFrame() {
              g_callCount);
     }
     g_callCount = 0;
-}
-
-void hudEndFrame() {
-    DWORD now = GetTickCount();
-    if (g_stampWindow.start == 0) g_stampWindow.start = now;
-
-    ++g_stampWindow.frames;
-    g_stampWindow.calls += g_frameStampCalls;
-    if (g_frameStampCalls > g_stampWindow.maxCalls) g_stampWindow.maxCalls = g_frameStampCalls;
-    g_stampWindow.ungrouped += g_frameUngrouped;
-
-    flushStampStrings(now);
-
-    g_frameStringCount = 0;
-    g_frameStampCalls = 0;
-    g_frameUngrouped = 0;
-
-    DWORD elapsed = now - g_stampWindow.start;
-    if (elapsed < 1000) return;
-
-    // Silent through a second with no stamps at all, which is every second of the front
-    // end: the thunk counts only world-mode calls.
-    if (g_stampWindow.calls > 0) {
-        double perFrame = static_cast<double>(g_stampWindow.calls) / g_stampWindow.frames;
-        {
-            int distinct = 0;
-            int waiting = 0;
-            int surfaces[16];
-            int surfaceCount = 0;
-            for (int i = 0; i < g_knownCount; ++i) {
-                KnownString& k = g_known[i];
-                if (k.waiting) ++waiting;
-                if (!k.seen) continue;
-                k.seen = false;
-                ++distinct;
-                bool listed = false;
-                for (int j = 0; j < surfaceCount; ++j)
-                    if (surfaces[j] == k.dest) listed = true;
-                if (!listed && surfaceCount < 16) surfaces[surfaceCount++] = k.dest;
-            }
-            logf("hud: stamps, last %lu ms: %lld calls over %d frames (%.0f a frame, max %d), "
-                 "%d distinct strings on %d surface(s); %d text lines logged%s, %d changed "
-                 "strings held back by the rate limit, %d string sightings past the %d-entry "
-                 "table, %d calls past the %d-string frame table",
-                 static_cast<unsigned long>(elapsed), g_stampWindow.calls,
-                 g_stampWindow.frames, perFrame, g_stampWindow.maxCalls, distinct,
-                 surfaceCount, g_stampWindow.lines,
-                 g_stampWindow.lines >= kMaxTextLinesPerSecond ? " (CAPPED)" : "", waiting,
-                 g_stampWindow.untracked, kMaxKnownStrings, g_stampWindow.ungrouped,
-                 kMaxFrameStrings);
-        }
-    }
-    g_stampWindow = StampWindow{};
-    g_stampWindow.start = now;
 }
 
 void hudReplay() {

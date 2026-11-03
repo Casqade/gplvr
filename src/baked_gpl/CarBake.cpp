@@ -1,5 +1,6 @@
 #include "baked_gpl/CarBake.h"
 
+#include "baked_gpl/CarBuildWorker.h"
 #include "baked_gpl/TrackBake.h"
 
 #include "DataRebase.h"
@@ -314,7 +315,9 @@ void openFolders(State& s, const std::string& carset) {
 // Drops everything baked: the scene, what it was made from, and the objects known by address.
 // The car set's folders stay. The new generation tells the car renderer, the walk's texture
 // cache and its vertex memo to start again too.
+// Every write of what the build worker reads (the scene, `known`) holds a CarBuildPause.
 void resetBake(State& s) {
+    CarBuildPause pause;
     s.scene = baked::CarScene{};
     ++s.generation;
     s.known.clear();
@@ -353,6 +356,7 @@ void addDependency(State& s, uintptr_t entry, uint32_t type, uint32_t value,
 // Re-reads GPL's resource cache and the Obj3d words of every loaded .3do. A known object whose
 // entry, name and words are unchanged keeps its bake.
 void scanCache(State& s) {
+    CarBuildPause pause;
     s.raw.resize(kMaxCacheEntries);
     uint32_t head = 0;
     int      count = readCacheList(s.cacheHead, s.raw.data(), kMaxCacheEntries, &head);
@@ -480,6 +484,7 @@ int32_t resolveResource(State& s, uint32_t type, uint32_t handle) {
     auto known = byHandle.find(handle);
     if (known != byHandle.end()) return known->second;
 
+    CarBuildPause pause;
     const char* kind = sprite ? "sprite" : "texture";
     int32_t     result = -1;
     auto        entry = s.cacheByValue.find(cacheKey(type, handle));
@@ -606,6 +611,7 @@ void logObject(const baked::CarObject& object, uint32_t vertexCount, uint32_t no
 // Resolving a sprite or texture can re-read the cache, which rebuilds `known`; so the object is
 // baked from a copy of its entry and the result is written to whatever entry holds it after.
 void bakeKnown(State& s, Known source) {
+    CarBuildPause pause;
     LARGE_INTEGER frequency, start, end;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&start);
@@ -891,6 +897,33 @@ void carBakePassBegin() {
         logf("baked cars: the reload check threw an unknown exception; the car bake is dropped");
         resetBake(s);
     }
+}
+
+int32_t carBakeObjectBaked(uintptr_t node, uintptr_t& primAddress, uint32_t& primSize,
+                           bool& unbaked) {
+    State& s = g_bake;
+    unbaked = false;
+    const Known* known = s.scanned ? findKnown(s, node) : nullptr;
+    if (!known || (known->object < 0 && !known->failed)) {
+        unbaked = true;
+        return -1;
+    }
+    if (known->object < 0) return -1;
+    primAddress = known->prim;
+    primSize = known->primSize;
+    return known->object;
+}
+
+int32_t carBakeTextureResolved(uint32_t handle, bool& known) {
+    known = true;
+    if (!handle) return -1;
+    const auto& byHandle = g_bake.scene.textureByHandle;
+    auto        found = byHandle.find(handle);
+    if (found == byHandle.end()) {
+        known = false;
+        return -1;
+    }
+    return found->second;
 }
 
 const baked::CarScene& carBakeScene() { return g_bake.scene; }

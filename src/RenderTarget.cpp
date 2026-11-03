@@ -1,6 +1,7 @@
 #include "RenderTarget.h"
 
 #include "FrameBudget.h"
+#include "Hooks.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -1148,10 +1149,10 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
 
     // vrMonitorEye = 0: a black window. pribluda's monitor overlay is skipped on these frames
     // (presenterBlitToWindow), so nothing draws over the black.
-    if (monitorEye == 0) {
+    if (monitorEye == kMonitorOff) {
         clearWindow(gl);
-        if (g_target.loggedMonitorEye != 0) {
-            g_target.loggedMonitorEye = 0;
+        if (g_target.loggedMonitorEye != kMonitorOff) {
+            g_target.loggedMonitorEye = kMonitorOff;
             logf("target: vrMonitorEye = 0 -- the game window is cleared to black every frame");
         }
         return;
@@ -1169,10 +1170,10 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
     const int halfW = g_target.width / 2;
     int       srcX = 0;
     int       srcW = g_target.width;
-    if (monitorEye == 2) {
+    if (monitorEye == kMonitorLeft) {
         srcX = 0;
         srcW = halfW;
-    } else if (monitorEye == 3) {
+    } else if (monitorEye == kMonitorRight) {
         srcX = halfW;
         srcW = g_target.width - halfW;
     }
@@ -1299,8 +1300,9 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
         g_target.loggedMonitorEye = monitorEye;
         logf("target: the game window is showing %s of the %dx%d off-screen frame, "
              "aspect-fitted into %dx%d",
-             monitorEye == 2 ? "the LEFT eye"
-                             : (monitorEye == 3 ? "the RIGHT eye" : "both eyes"),
+             monitorEye == kMonitorLeft
+                 ? "the LEFT eye"
+                 : (monitorEye == kMonitorRight ? "the RIGHT eye" : "both eyes"),
              g_target.width, g_target.height, windowW, windowH);
     }
 }

@@ -4,8 +4,8 @@
 // mirror is not rendered at all (`mirrorUpdateRate`).
 //
 // THERE IS EXACTLY ONE mirror.mip -- one texture for the whole carset (report 37 section 1.4)
-// -- and both glasses live in it as its two halves. With `perEyeMirror` on, each eye's pass
-// renders both glasses from its own viewpoint into that one texture and then draws the car
+// -- and both glasses live in it as its two halves. With the mirror from each eye (mirrorMode),
+// each eye's pass renders both glasses from its own viewpoint into that one texture and then draws the car
 // that samples it, so the image the car gets is always the pass's own. What survives to the
 // end of the frame is whichever pass ran last, which is the right eye's.
 //

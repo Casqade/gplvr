@@ -121,9 +121,10 @@ bool stereoAvailable();
 // should render normally -- a failed stereo setup must never cost you the game.
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*));
 
-// Whether this frame renders the mirror (`mirrorUpdateRate`). Always true unless that is above
-// 1 AND `perEyeMirror` is off -- with it on the two eyes share one mirror texture, so a skipped frame
-// leaves one eye looking at the other's reflection.
+// Whether this frame renders the mirror (`mirrorUpdateRate`). Always true while the mirror is
+// rendered from each eye (mirrorMode) and MirrorCache's per-eye copies are not ready: the two
+// eyes share one mirror texture, so a skipped frame would leave one eye looking at the other's
+// reflection.
 bool stereoMirrorDueThisFrame();
 
 // Mirror panes rendered, and panes left out because no eye that samples them could see their glass

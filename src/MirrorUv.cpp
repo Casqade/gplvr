@@ -49,6 +49,12 @@ struct State {
 
     const char* refusal = nullptr;
     int         refusalReports = 6;
+
+    // mirrorUvSetRegions's set, applied instead of the layout while `external`.
+    bool           external = false;
+    bool           externalSaid = false;
+    int            externalCount = 0;
+    MirrorUvRegion externalRegion[kMaxMirrorSurfaces] = {};
 };
 
 State g_state;
@@ -308,8 +314,13 @@ bool apply(int baseWidth, int baseHeight) {
 
     // Laid out before anything is written, so a layout that cannot be made has nothing to undo.
     Region region[kMaxMirrorSurfaces];
-    int    shelves = layoutRegions(s.set, wanted, baseWidth, baseHeight, region);
-    if (!shelves) {
+    bool   external = s.external && s.externalCount == wanted;
+    if (external) {
+        for (int i = 0; i < wanted; ++i) {
+            const MirrorUvRegion& given = s.externalRegion[i];
+            region[i] = Region{given.u0, given.u1, given.v0, given.v1};
+        }
+    } else if (!layoutRegions(s.set, wanted, baseWidth, baseHeight, region)) {
         refuse("mirror.mip is too small to give every glass a region of at least one texel");
         return false;
     }
@@ -401,6 +412,10 @@ bool apply(int baseWidth, int baseHeight) {
     s.baseHeight = baseHeight;
     s.refusal = nullptr;
 
+    // A given set is re-applied whenever the driver re-aims a glass, so it is said once.
+    if (external && s.externalSaid) return true;
+    s.externalSaid = external;
+
     char glasses[160] = {};
     size_t used = 0;
     for (int i = 0; i < s.count && used < sizeof(glasses); ++i) {
@@ -410,9 +425,10 @@ bool apply(int baseWidth, int baseHeight) {
         if (wrote < 0) break;
         used += static_cast<size_t>(wrote);
     }
-    logf("mirror uv: team %d has %d glass%s, each in a region of mirror.mip (%dx%d) of its own: "
-         "%s",
-         s.team, s.count, s.count == 1 ? "" : "es", baseWidth, baseHeight, glasses);
+    logf("mirror uv: team %d has %d glass%s, %s of mirror.mip (%dx%d): %s", s.team, s.count,
+         s.count == 1 ? "" : "es",
+         external ? "each reading its part of one shared view" : "each in a region of its own",
+         baseWidth, baseHeight, glasses);
     return true;
 }
 
@@ -426,6 +442,7 @@ void mirrorUvSetSurfaces(int team, const MirrorSurfaceSet* set) {
     s.refusalReports = 6;
     s.baseWidth = 0;
     s.baseHeight = 0;
+    s.externalSaid = false;
     if (!set) {
         s.haveSet = false;
         s.team = -1;
@@ -508,6 +525,73 @@ bool mirrorUvRect(int index, MirrorTextureRect& out) {
     if (index < 0 || index >= mirrorUvCount()) return false;
     out = g_state.glass[index].rect;
     return out.w > 0 && out.h > 0;
+}
+
+void mirrorUvSetRegions(const MirrorUvRegion regions[], int count) {
+    State& s = g_state;
+    if (count < 1 || count > kMaxMirrorSurfaces) {
+        mirrorUvClearRegions();
+        return;
+    }
+    // Once in force, a set is moved by mirrorUvMoveRegions; this only takes it up, or holds the
+    // regions the next apply starts from.
+    if (s.external && s.externalCount == count) {
+        if (!s.applied)
+            for (int i = 0; i < count; ++i) s.externalRegion[i] = regions[i];
+        return;
+    }
+    s.external = true;
+    s.externalCount = count;
+    for (int i = 0; i < count; ++i) s.externalRegion[i] = regions[i];
+    s.gaveUp = false;
+    restore();
+}
+
+bool mirrorUvMoveRegions(const MirrorUvRegion regions[], int count) {
+    State& s = g_state;
+    if (!s.applied || !s.external || s.count != count) return false;
+    for (int g = 0; g < count; ++g) {
+        const MirrorUvRegion& to = regions[g];
+        Glass&                glass = s.glass[g];
+        if (glass.u0 == to.u0 && glass.u1 == to.u1 && glass.v0 == to.v0 && glass.v1 == to.v1)
+            continue;
+        // apply's mapping: the authored span onto the region, linearly.
+        const MirrorSurface& surface = s.set.surface[g];
+        float                du = std::fabs(surface.u1 - surface.u0);
+        float                dv = std::fabs(surface.v1 - surface.v0);
+        if (du < 1e-4f || dv < 1e-4f) return false;
+        float uLow = surface.u0 < surface.u1 ? surface.u0 : surface.u1;
+        float vLow = surface.v0 < surface.v1 ? surface.v0 : surface.v1;
+        float uScale = (to.u1 - to.u0) / du;
+        float vScale = (to.v1 - to.v0) / dv;
+        for (int p = 0; p < glass.polys; ++p) {
+            const SavedPoly& saved = glass.saved[p];
+            if (!saved.node || saved.verts < 1) continue;
+            float moved[kMaxUvFloats];
+            for (int k = 0; k < 2 * saved.verts; k += 2) {
+                moved[k] = to.u0 + (saved.uv[k] - uLow) * uScale;
+                moved[k + 1] = to.v0 + (saved.uv[k + 1] - vLow) * vScale;
+            }
+            writeUv(saved.node, saved.verts, moved);
+        }
+        glass.u0 = to.u0;
+        glass.u1 = to.u1;
+        glass.v0 = to.v0;
+        glass.v1 = to.v1;
+        glass.rect = rectForRange(to.u0, to.u1, to.v0, to.v1, s.baseWidth, s.baseHeight);
+        s.externalRegion[g] = to;
+    }
+    return true;
+}
+
+void mirrorUvClearRegions() {
+    State& s = g_state;
+    if (!s.external) return;
+    s.external = false;
+    s.externalCount = 0;
+    s.externalSaid = false;
+    s.gaveUp = false;
+    restore();
 }
 
 }  // namespace gplvr

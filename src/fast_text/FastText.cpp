@@ -119,7 +119,7 @@ constexpr uint32_t kAlphaScaleBits = 0x3B888889u;
 constexpr size_t kMaxCachedGlyphs = 4096;
 constexpr size_t kMaxBatchQuads = 2048;
 
-// -- GPL'S TEXT, PLACED IN THE EYES (VR only, vrGplText = 1) --------------------------------
+// -- GPL'S TEXT, PLACED IN THE EYES (VR only) ------------------------------------------------
 //
 // A RUN IS THE UNIT THAT MOVES, not a glyph and not the surface.
 //
@@ -216,8 +216,8 @@ struct StampSource {
 // in-race notices come through as 0, 14, 17, 48 for ' ', '.', '1', 'P'. A code outside printable
 // ASCII is therefore escaped with its raw value rather than collapsed to one character, which is
 // what lets this line serve as the inventory of what GPL stamps: a set nobody has decoded yet
-// still arrives as readable numbers. With `vrGplText = 1` it is the ONLY such inventory, because
-// Hud.cpp's own census is not installed then.
+// still arrives as readable numbers. In VR it is the ONLY such inventory, because Hud.cpp's own
+// census is not installed there.
 constexpr int kMaxSampleRuns = 4;
 constexpr int kMaxSampleChars = 40;
 // Room for every sampled code to arrive as "<255>".
@@ -387,7 +387,7 @@ struct State {
     // and the two cannot both re-assert over one slot -- each would adopt the other's thunk as
     // "the original" and the chain would call itself.
     bool  owns[kRasterKinds] = {};
-    bool  vrPlacement = false;  // vr and vrGplText, decided once at bind
+    bool  vrPlacement = false;  // vr, decided once at bind
     int   placeReports = 4;
 
     PlacedRun runs[kMaxPlacedRuns];
@@ -973,7 +973,7 @@ void noteProbeQuad(int set, int outcome, float v0, float v1) {
 // One stampDraw call. True when we drew it (or when roglv2 would have drawn nothing).
 // -- THE VR PLACEMENT ------------------------------------------------------------------------
 //
-// Everything below is reached only with `vr` and `vrGplText = 1`. Flat mode runs the original
+// Everything below is reached only with `vr`. Flat mode runs the original
 // path untouched, and so does the front end, every menu and every frame with no stereo pair --
 // which is what keeps the shared code above exercised in the mode this project has four times
 // found a VR-only gate hiding a bug in.
@@ -1761,13 +1761,6 @@ void fastTextBind(const Binding& binding) {
     State& s = g_state;
     if (s.bound) return;
     s.bound = true;
-    if (g_options.vr && !g_options.vrGplText) {
-        logf("fast text: not installed -- vrGplText = 0, so in VR the 2D globals belong to "
-             "Hud.cpp and GPL's stamped text stays where GPL put it: the left eye's periphery "
-             "at zero disparity. vrGplText = 1 hands stampDraw over so it can be placed.");
-        return;
-    }
-
     // WHICH GLOBALS THIS PATH TAKES, and why VR is not all of them.
     //
     // The other six exist here to FLUSH the pending quad batch before anything else draws, so
@@ -1778,7 +1771,7 @@ void fastTextBind(const Binding& binding) {
     // makes each one the other's original, and the chain calls itself for ever. Hud.cpp calls
     // fastTextFlushNow() from its own thunks instead, which honours the same contract with one
     // owner per slot.
-    s.vrPlacement = g_options.vr && g_options.vrGplText != 0;
+    s.vrPlacement = g_options.vr;
     for (int kind = 0; kind < kRasterKinds; ++kind)
         s.owns[kind] = !s.vrPlacement || kind == kRasterStampDraw;
 

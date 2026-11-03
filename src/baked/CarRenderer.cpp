@@ -16,6 +16,8 @@ namespace {
 constexpr GLenum kFrameUnit = gl::kTexture0 + 6;
 constexpr GLenum kDrawUnit = gl::kTexture0 + 7;
 constexpr GLenum kUploadUnit = gl::kTexture0 + 6;
+// The resident rows' table (report 105 section 4.66); unit 9 is ResidualDepth's.
+constexpr GLenum kRowUnit = gl::kTexture0 + 8;
 
 constexpr unsigned kFrameFloats = 16;  // four RGBA32F texels
 constexpr unsigned kDrawWords = 8;     // two RGBA32UI texels
@@ -52,6 +54,18 @@ constexpr uint32_t kPaletteTexels = 4;  // 16 ARGB words a palette
 constexpr size_t   kCacheLists = 256;
 constexpr uint32_t kCacheIdlePrepares = 360;
 
+// Report 105 section 4.66, sized from the MirrorProbe run of 2026-11-03 (race start, 220-227 s):
+// a mirror pass drew 10-20 lists from the row cache at 850-1,000 commands each, and each list
+// skinned ~10-15 KB (~300 corners, ~450 indices). The row cache holds at most kCacheLists programs
+// of kEmittedOrders orders each, ~1M rows at 1,000; the store holds twice that (64 MiB of rows and
+// 40 MiB of commands), the regions ~1.8x their ~73k corners and ~2.4x their ~110k indices. A full
+// store or region evicts what this pass does not draw, then refuses (the per-pass path).
+constexpr uint32_t kStoreRows = 1u << 21;
+constexpr uint32_t kRegionVertices = 131072;  // 4.5 MiB at the start of the vertex buffer
+constexpr uint32_t kRegionIndices = 262144;   // 1 MiB at the start of the index buffer
+// A self-check readback (kCarRowCheckEvery) not done after this many prepares is given up.
+constexpr uint32_t kRowCheckGiveUp = 512;
+
 const char* const kCarVertexHead = R"(#version 400
 #extension GL_ARB_bindless_texture : require
 layout(location = 0) in vec3 a_position;
@@ -65,6 +79,10 @@ layout(location = 9) in uint a_draw;     // the draw's row, one per instance
 uniform mat4 u_clipFromView;
 uniform samplerBuffer u_frames;          // per frame: eye-relative world from local, 3 rows; half
 uniform usamplerBuffer u_draws;
+// Report 105 section 4.66: a list drawn from the GPU store reads its rows from u_rows at x, its
+// frames from y (z 1); the pass's own tables hold absolute rows and frames (0, 0, 0).
+uniform usamplerBuffer u_rows;
+uniform ivec3 u_rowSource;
 uniform vec3 u_light;                    // world, unit
 uniform vec4 u_lighting;                 // x lighting on, y specular on, z ka, w kd
 uniform int u_gouraud;
@@ -99,10 +117,11 @@ vec4 argb(uint word) {
                 float(word >> 24)) / 255.0;
 }
 void main() {
-    int draw = int(a_draw) * 2;
-    uvec4 d0 = texelFetch(u_draws, draw);
-    uvec4 d1 = texelFetch(u_draws, draw + 1);
-    int frame = int(d0.z) * 4;
+    int draw = (int(a_draw) + u_rowSource.x) * 2;
+    bool resident = u_rowSource.z != 0;
+    uvec4 d0 = resident ? texelFetch(u_rows, draw) : texelFetch(u_draws, draw);
+    uvec4 d1 = resident ? texelFetch(u_rows, draw + 1) : texelFetch(u_draws, draw + 1);
+    int frame = (int(d0.z) + u_rowSource.y) * 4;
     vec4 r0 = texelFetch(u_frames, frame);
     vec4 r1 = texelFetch(u_frames, frame + 1);
     vec4 r2 = texelFetch(u_frames, frame + 2);
@@ -346,6 +365,7 @@ struct SavedBindings {
     GLint frameUnitBuffer = 0;
     GLint drawUnitBuffer = 0;
     GLint uploadUnit2D = 0;
+    GLint rowUnitBuffer = 0;
 };
 
 void saveBindings(const GlApi& gl, SavedBindings& s) {
@@ -359,9 +379,13 @@ void saveBindings(const GlApi& gl, SavedBindings& s) {
     gl.getIntegerv(gl::kTextureBinding2D, &s.uploadUnit2D);
     gl.activeTexture(kDrawUnit);
     gl.getIntegerv(gl::kTextureBindingBuffer, &s.drawUnitBuffer);
+    gl.activeTexture(kRowUnit);
+    gl.getIntegerv(gl::kTextureBindingBuffer, &s.rowUnitBuffer);
 }
 
 void restoreBindings(const GlApi& gl, const SavedBindings& s) {
+    gl.activeTexture(kRowUnit);
+    gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.rowUnitBuffer));
     gl.activeTexture(kDrawUnit);
     gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.drawUnitBuffer));
     gl.activeTexture(kFrameUnit);
@@ -456,6 +480,8 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     uFog_ = gl_.getUniformLocation(program_, "u_fog");
     uFogColour_ = gl_.getUniformLocation(program_, "u_fogColour");
     uPaletteLinear_ = gl_.getUniformLocation(program_, "u_paletteLinear");
+    uRows_ = gl_.getUniformLocation(program_, "u_rows");
+    uRowSource_ = gl_.getUniformLocation(program_, "u_rowSource");
 
     SavedBindings saved;
     saveBindings(gl_, saved);
@@ -536,6 +562,10 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
 }
 
 void CarRenderer::release(bool contextAlive) {
+    store_.release(gl_, contextAlive && initialised_);
+    regionVertices_ = regionIndices_ = 0;
+    storeOff_ = false;
+    rowCheck_ = RowCheck{};
     if (contextAlive && initialised_) {
         for (GpuTexture& texture : textures_) {
             if (texture.handle) gl_.makeTextureHandleNonResident(texture.handle);
@@ -583,7 +613,10 @@ void CarRenderer::resetScene() {
     textures_.clear();
     objects_.clear();
     clearCache();
-    verticesUsed_ = indicesUsed_ = 0;
+    // The skinned regions' room stays first; a self-check that turned the store off is undone.
+    verticesUsed_ = regionVertices_;
+    indicesUsed_ = regionIndices_;
+    storeOff_ = false;
 }
 
 void CarRenderer::ensureDrawIndices(uint32_t count) {
@@ -621,11 +654,14 @@ bool CarRenderer::uploadObjects(const CarScene& scene, size_t extraVertices, siz
         gl_.bindBuffer(gl::kArrayBuffer, indexBuffer_);
         gl_.bufferData(gl::kArrayBuffer, static_cast<GLsizeiptr>(indexCapacity_ * sizeof(uint32_t)),
                        nullptr, gl::kStaticDraw);
-        // The objects go up again in the same order from 0, at the same bases, so the cached rows'
-        // commands stay valid.
+        // The objects go up again in the same order after the skinned regions' room, at the same
+        // bases, so the cached rows' commands stay valid; the regions' indices go up again at
+        // their next draw (geometryEpoch_).
         first = 0;
         objects_.clear();
-        verticesUsed_ = indicesUsed_ = 0;
+        verticesUsed_ = regionVertices_;
+        indicesUsed_ = regionIndices_;
+        ++geometryEpoch_;
     }
     for (size_t i = first; i < scene.objects.size(); ++i) {
         const CarObject& object = scene.objects[i];
@@ -859,16 +895,12 @@ bool sameDraws(const std::vector<CarDraw>& a, const std::vector<CarDraw>& b) {
 
 }  // namespace
 
-bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
-                               uint32_t vertexBase, uint32_t indexBase) {
-    // An overlay list (the cockpit's kept list, report 105 section 4.50) is drawn from its own
-    // draws, which count its leaves and glass for drawOverlay.
-    if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return false;
+CarRenderer::CachedList* CarRenderer::cachedEntry(const CarScene& scene, const CarDrawList& list) {
     auto        frames = static_cast<uint32_t>(list.frames.size());
     CachedList* entry = findCached(list.contentKey, frames);
     if (list.drawsElided) {
         // Its draws are not here to build from: the pinned rows are the only way to draw it.
-        if (!entry || entry->commands.size() != list.elidedDraws) return false;
+        if (!entry || entry->commands.size() != list.elidedDraws) return nullptr;
     } else if (entry && list.contentCheck) {
         // The check of a cached program against a fresh build: on a difference the entry goes and
         // the list is drawn from its own draws.
@@ -881,38 +913,35 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
                                  fresh.commands.size() * sizeof(Command)) == 0);
         if (!same) {
             eraseCached(list.contentKey);
-            return false;
+            return nullptr;
         }
     } else if (!entry) {
         CachedList fresh;
-        if (!buildCached(scene, list, fresh)) return false;
+        if (!buildCached(scene, list, fresh)) return nullptr;
         entry = storeCached(list.contentKey, std::move(fresh));
-        if (!entry) return false;
     }
-    auto maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
-    auto maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
-    auto palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
-    if ((commands_.size() + list.drawOrder.size()) * 2 + (palettes + 1) * kPaletteTexels >
-            maxTexels ||
-        frameBase + entry->frames > maxFrames)
-        return false;
-    CachedList& cached = *entry;
-    cached.lastUsed = prepares_;
+    return entry;
+}
 
+CarRenderer::Emitted* CarRenderer::emittedFor(const CarScene& scene, const CarDrawList& list,
+                                              CachedList& cached, Emitted* scratch, bool& own) {
+    own = false;
     // This drawOrder's rows as emitted for an earlier list, else emitted now into the least
-    // recently used slot.
+    // recently used slot (into `scratch` for a list without an orderKey).
     Emitted* emitted = nullptr;
     if (list.orderKey)
         for (Emitted& e : cached.emitted)
             if (e.orderKey == list.orderKey) emitted = &e;
-    Emitted scratch;
     if (!emitted) {
-        emitted = &scratch;
+        emitted = scratch;
         if (list.orderKey) {
             emitted = &cached.emitted[0];
             for (Emitted& e : cached.emitted)
                 if (e.lastUsed < emitted->lastUsed) emitted = &e;
+            releaseEmitted(*emitted);
+            noteHolds(cached);
         }
+        if (!emitted) return nullptr;
         emitOrder(cached, list, *emitted);
     }
     emitted->lastUsed = prepares_;
@@ -927,9 +956,33 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
              std::memcmp(reference.commands.data(), emitted->commands.data(),
                          reference.commands.size() * sizeof(Command)) != 0)) {
             eraseCached(list.contentKey);
-            return false;
+            own = true;
+            return nullptr;
         }
     }
+    return emitted;
+}
+
+bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
+                               uint32_t vertexBase, uint32_t indexBase) {
+    // An overlay list (the cockpit's kept list, report 105 section 4.50) is drawn from its own
+    // draws, which count its leaves and glass for drawOverlay.
+    if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return false;
+    CachedList* entry = cachedEntry(scene, list);
+    if (!entry) return false;
+    auto maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
+    auto maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
+    auto palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
+    if ((commands_.size() + list.drawOrder.size()) * 2 + (palettes + 1) * kPaletteTexels >
+            maxTexels ||
+        frameBase + entry->frames > maxFrames)
+        return false;
+    CachedList& cached = *entry;
+    cached.lastUsed = prepares_;
+    Emitted  scratch;
+    bool     own = false;
+    Emitted* emitted = emittedFor(scene, list, cached, &scratch, own);
+    if (!emitted) return false;
 
     auto   row = static_cast<uint32_t>(commands_.size());
     size_t wordAt = draws_.size();
@@ -1015,6 +1068,7 @@ CarRenderer::CachedList* CarRenderer::storeCached(uint32_t key, CachedList&& ent
     auto found = cache_.find(key);
     if (found != cache_.end()) {
         if (found->second.lastUsed >= prepares_) return nullptr;
+        releaseStore(found->second);
         found->second = std::move(entry);
         return &found->second;
     }
@@ -1027,7 +1081,12 @@ CarRenderer::CachedList* CarRenderer::storeCached(uint32_t key, CachedList&& ent
     return &stored;
 }
 
-void CarRenderer::eraseCached(uint32_t key) { cache_.erase(key); }
+void CarRenderer::eraseCached(uint32_t key) {
+    auto found = cache_.find(key);
+    if (found == cache_.end()) return;
+    releaseStore(found->second);
+    cache_.erase(found);
+}
 
 // The least recently used entry that no list of this pass uses or pinned.
 bool CarRenderer::evictLeastRecent() {
@@ -1037,6 +1096,7 @@ bool CarRenderer::evictLeastRecent() {
             (oldest == cache_.end() || it->second.lastUsed < oldest->second.lastUsed))
             oldest = it;
     if (oldest == cache_.end()) return false;
+    releaseStore(oldest->second);
     cache_.erase(oldest);
     return true;
 }
@@ -1045,14 +1105,408 @@ bool CarRenderer::evictLeastRecent() {
 void CarRenderer::evictIdle() {
     for (auto it = cache_.begin(); it != cache_.end();) {
         uint32_t used = it->second.lastUsed;
-        if (used < prepares_ && prepares_ - used > kCacheIdlePrepares)
+        if (used < prepares_ && prepares_ - used > kCacheIdlePrepares) {
+            releaseStore(it->second);
             it = cache_.erase(it);
-        else
+        } else {
             ++it;
+        }
     }
 }
 
-void CarRenderer::clearCache() { cache_.clear(); }
+void CarRenderer::clearCache() {
+    cache_.clear();
+    resetStore();
+}
+
+// -- report 105 section 4.66: the resident rows ----------------------------------------------------
+
+bool CarRenderer::createRowStore(std::string& why) {
+    if (!kCarRowsResident) {
+        why = "kCarRowsResident is false";
+        return false;
+    }
+    if (!initialised_) {
+        why = "the car renderer is not ready";
+        return false;
+    }
+    if (!objects_.empty() || verticesUsed_ || indicesUsed_) {
+        why = "car objects are on the GPU already";
+        return false;
+    }
+    // Two RGBA32UI texels a row.
+    uint32_t rows = std::min(kStoreRows, static_cast<uint32_t>(maxTextureBufferSize_) / 2);
+    SavedBindings saved;
+    saveBindings(gl_, saved);
+    gl_.activeTexture(kRowUnit);
+    bool made = store_.create(gl_, rows, why);
+    restoreBindings(gl_, saved);
+    if (!made) return false;
+    regionVertices_ = kRegionVertices;
+    regionIndices_ = kRegionIndices;
+    verticesUsed_ = regionVertices_;
+    indicesUsed_ = regionIndices_;
+    storeOff_ = false;
+    resetStore();
+    return true;
+}
+
+void CarRenderer::dropRowStore() {
+    store_.release(gl_, initialised_);
+    for (auto& entry : cache_) {
+        CachedList& cached = entry.second;
+        for (Emitted& emitted : cached.emitted) emitted.rowStart = kNotResident;
+        cached.region = false;
+        cached.dynamicIndices.clear();
+        cached.holdsStore = false;
+    }
+    resetStore();
+}
+
+void CarRenderer::dropRows(uint32_t key) {
+    if (!kCarRowsResident) return;
+    auto found = cache_.find(key);
+    // Pinned (above prepares_): a list of the coming prepare left its draws out for these rows.
+    if (found == cache_.end() || found->second.lastUsed > prepares_) return;
+    releaseStore(found->second);
+    cache_.erase(found);
+}
+
+void CarRenderer::resetStore() {
+    pending_.clear();
+    programsResident_ = 0;
+    store_.rowRanges.reset(store_.rows());
+    store_.vertexRanges.reset(store_.ready() ? regionVertices_ : 0);
+    store_.indexRanges.reset(store_.ready() ? regionIndices_ : 0);
+}
+
+void CarRenderer::giveRange(RangeAllocator& ranges, uint32_t first, uint32_t count, bool now) {
+    if (!count) return;
+    if (now)
+        ranges.give(first, count);
+    else
+        pending_.push_back(PendingRange{&ranges, first, count});
+}
+
+void CarRenderer::releaseEmitted(Emitted& emitted) {
+    if (emitted.rowStart == kNotResident) return;
+    giveRange(store_.rowRanges, emitted.rowStart, emitted.rowCount, emitted.lastUsed < prepares_);
+    emitted.rowStart = kNotResident;
+    emitted.rowCount = 0;
+}
+
+void CarRenderer::releaseStore(CachedList& cached) {
+    for (Emitted& emitted : cached.emitted) releaseEmitted(emitted);
+    if (cached.region) {
+        bool now = cached.lastUsed < prepares_;
+        giveRange(store_.vertexRanges, cached.vertexStart, cached.regionVertices, now);
+        giveRange(store_.indexRanges, cached.indexStart,
+                  static_cast<uint32_t>(cached.dynamicIndices.size()), now);
+        cached.region = false;
+        cached.regionVertices = 0;
+        cached.dynamicIndices.clear();
+    }
+    noteHolds(cached);
+}
+
+void CarRenderer::noteHolds(CachedList& cached) {
+    bool holds = cached.region;
+    for (const Emitted& emitted : cached.emitted) holds = holds || emitted.rowStart != kNotResident;
+    if (holds == cached.holdsStore) return;
+    cached.holdsStore = holds;
+    if (holds)
+        ++programsResident_;
+    else if (programsResident_)
+        --programsResident_;
+}
+
+// `count` units of `ranges`; when they do not fit, what no list of this prepare draws goes, the
+// least recently drawn first: an order's rows (`rowsWanted`), else a whole program's store.
+bool CarRenderer::takeRange(RangeAllocator& ranges, bool rowsWanted, uint32_t count,
+                            uint32_t& first) {
+    while (!ranges.take(count, first)) {
+        Emitted*    oldestOrder = nullptr;
+        CachedList* oldestEntry = nullptr;
+        for (auto& entry : cache_) {
+            CachedList& cached = entry.second;
+            if (rowsWanted) {
+                for (Emitted& emitted : cached.emitted)
+                    if (emitted.rowStart != kNotResident && emitted.lastUsed < prepares_ &&
+                        (!oldestOrder || emitted.lastUsed < oldestOrder->lastUsed)) {
+                        oldestOrder = &emitted;
+                        oldestEntry = &cached;
+                    }
+            } else if (cached.region && cached.lastUsed < prepares_ &&
+                       (!oldestEntry || cached.lastUsed < oldestEntry->lastUsed)) {
+                oldestEntry = &cached;
+            }
+        }
+        if (oldestOrder) {
+            releaseEmitted(*oldestOrder);
+            noteHolds(*oldestEntry);
+        } else if (oldestEntry) {
+            releaseStore(*oldestEntry);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+void CarRenderer::storeRefused(int why) {
+    static const char* const kWhy[kStoreRefusals] = {
+        "the store was full after evicting every order this pass does not draw",
+        "the skinned regions were full after evicting every program this pass does not draw",
+        "a second list of its program in one pass (its skinned region holds the first's corners)",
+        "its skinned corners or indices differ from its program's first list's",
+        "its drawOrder has no orderKey, so it is emitted for that list alone"};
+    if (why < 0 || why >= kStoreRefusals || storeRefusalSaid_[why]) return;
+    storeRefusalSaid_[why] = true;
+    logf("baked cars: a kept list was drawn through the per-pass path instead of the GPU store -- "
+         "%s (logged once per reason; report 105 section 4.66)",
+         kWhy[why]);
+}
+
+void CarRenderer::uploadRegionIndices(CachedList& cached) {
+    if (!cached.dynamicIndices.empty()) {
+        gl_.bindBuffer(gl::kArrayBuffer, indexBuffer_);
+        gl_.bufferSubData(gl::kArrayBuffer,
+                          static_cast<GLintptr>(cached.indexStart * sizeof(uint32_t)),
+                          static_cast<GLsizeiptr>(cached.dynamicIndices.size() * sizeof(uint32_t)),
+                          cached.dynamicIndices.data());
+    }
+    cached.indexEpoch = geometryEpoch_;
+}
+
+bool CarRenderer::makeRegion(CachedList& cached, const CarDrawList& list) {
+    auto     vertices = static_cast<uint32_t>(list.dynamicVertices.size());
+    auto     indices = static_cast<uint32_t>(list.dynamicIndices.size());
+    uint32_t vertexStart = 0;
+    uint32_t indexStart = 0;
+    if (vertices && !takeRange(store_.vertexRanges, false, vertices, vertexStart)) {
+        storeRefused(kStoreRegionFull);
+        return false;
+    }
+    if (indices && !takeRange(store_.indexRanges, false, indices, indexStart)) {
+        if (vertices) store_.vertexRanges.give(vertexStart, vertices);
+        storeRefused(kStoreRegionFull);
+        return false;
+    }
+    cached.region = true;
+    cached.vertexStart = vertexStart;
+    cached.regionVertices = vertices;
+    cached.indexStart = indexStart;
+    cached.dynamicIndices.assign(list.dynamicIndices.begin(), list.dynamicIndices.end());
+    uploadRegionIndices(cached);
+    noteHolds(cached);
+    return true;
+}
+
+// The order's rows and commands into the store, its skinned commands naming the program's region.
+bool CarRenderer::makeResident(CachedList& cached, Emitted& emitted) {
+    auto     rows = static_cast<uint32_t>(emitted.commands.size());
+    uint32_t first = 0;
+    if (!takeRange(store_.rowRanges, true, rows, first)) {
+        storeRefused(kStoreFull);
+        return false;
+    }
+    commandScratch_.assign(emitted.commands.begin(), emitted.commands.end());
+    for (uint32_t c : emitted.dynamic) {
+        Command& command = commandScratch_[c];
+        command.firstIndex += cached.indexStart;
+        command.baseVertex = static_cast<int32_t>(cached.vertexStart);
+    }
+    store_.upload(gl_, first, rows, emitted.words.data(), commandScratch_.data());
+    emitted.rowStart = first;
+    emitted.rowCount = rows;
+    noteHolds(cached);
+    return true;
+}
+
+// The list's rows from the store: its entry and emission as appendCached finds or makes them, its
+// skinned region, and the emission uploaded when the store does not hold it yet.
+CarRenderer::StorePlan CarRenderer::planStore(const CarScene& scene, const CarDrawList& list,
+                                              uint32_t frameBase) {
+    StorePlan plan;
+    if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return plan;
+    CachedList* entry = cachedEntry(scene, list);
+    // appendCached refuses what cachedEntry refuses, and a list past the frame table.
+    if (!entry || frameBase + entry->frames > static_cast<uint32_t>(maxTextureBufferSize_) / 4) {
+        plan.path = kRowsOwn;
+        return plan;
+    }
+    CachedList& cached = *entry;
+    cached.lastUsed = prepares_;
+    if (!list.orderKey) {
+        storeRefused(kStoreNoOrder);
+        return plan;
+    }
+    bool     own = false;
+    Emitted* emitted = emittedFor(scene, list, cached, nullptr, own);
+    if (!emitted) {
+        plan.path = kRowsOwn;
+        return plan;
+    }
+    auto vertices = static_cast<uint32_t>(list.dynamicVertices.size());
+    if (vertices || !list.dynamicIndices.empty() || cached.region || !emitted->dynamic.empty()) {
+        if (!cached.region) {
+            if (!makeRegion(cached, list)) return plan;
+        } else if (cached.regionVertices != vertices || cached.dynamicIndices != list.dynamicIndices) {
+            storeRefused(kStoreDynamic);
+            return plan;
+        } else if (cached.regionPass == prepares_) {
+            storeRefused(kStoreTwice);
+            return plan;
+        } else if (cached.indexEpoch != geometryEpoch_) {
+            uploadRegionIndices(cached);
+        }
+        cached.regionPass = prepares_;
+        plan.vertexStart = cached.vertexStart;
+    }
+    auto rows = static_cast<uint32_t>(emitted->commands.size());
+    if (rows && emitted->rowStart == kNotResident && !makeResident(cached, *emitted)) return plan;
+    ensureDrawIndices(rows);
+    plan.path = kRowsStore;
+    plan.rowStart = rows ? emitted->rowStart : 0;
+    plan.rows = rows;
+    return plan;
+}
+
+void CarRenderer::setRowSource(const CarRange* range) {
+    bool    resident = range && range->resident;
+    int32_t source[3] = {resident ? static_cast<int32_t>(range->first) : 0,
+                         resident ? static_cast<int32_t>(range->frameBase) : 0, resident ? 1 : 0};
+    if (gl_.uniform3i && std::memcmp(source, rowSource_, sizeof(source)) != 0) {
+        gl_.uniform3i(uRowSource_, source[0], source[1], source[2]);
+        std::memcpy(rowSource_, source, sizeof(source));
+    }
+    gl_.bindBuffer(gl::kDrawIndirectBuffer, resident ? store_.commandBuffer() : commandBuffer_);
+}
+
+// What the per-pass path builds for the list -- its rows from its own draws, or for a list without
+// them from the program's rows emitted afresh, so the check does not read the emission the store
+// was filled from -- normalised as the GPU reads both (frame words absolute, skinned commands
+// relative to their corners), kept to compare with the store's bytes, which the GPU copies once
+// this pass's writes are done.
+void CarRenderer::beginRowCheck(const CarScene& scene, const CarDrawList& list, uint32_t frameBase,
+                                const StorePlan& plan) {
+    CachedList* cached = findCached(list.contentKey, static_cast<uint32_t>(list.frames.size()));
+    if (!cached || store_.readbackPending()) return;
+    Emitted reference;
+    bool    built = true;
+    if (list.drawsElided)
+        emitOrder(*cached, list, reference);
+    else
+        built = emitFromDraws(scene, list, reference);
+    RowCheck& check = rowCheck_;
+    check.key = list.contentKey;
+    check.orderKey = list.orderKey;
+    if (!built) {
+        rowCheckFailed("the per-pass path refused a draw of the list", 0, 0, 0);
+        return;
+    }
+    auto rows = static_cast<uint32_t>(reference.commands.size());
+    if (rows != plan.rows) {
+        rowCheckFailed("the number of draws", 0, plan.rows, rows);
+        return;
+    }
+    check.rows = rows;
+    check.frameBase = frameBase;
+    check.vertexStart = cached->vertexStart;
+    check.indexStart = cached->indexStart;
+    check.issued = prepares_;
+    check.words = reference.words;
+    for (size_t w = 2; w < check.words.size(); w += kDrawWords) check.words[w] += frameBase;
+    check.commands = reference.commands;
+    check.dynamic.assign(rows, 0);
+    for (uint32_t c : reference.dynamic)
+        if (c < rows) check.dynamic[c] = 1;
+    check.vertices = list.dynamicVertices;
+    check.indices = list.dynamicIndices;
+    CarRowStore::Copy copies[4] = {
+        {store_.rowBuffer(), static_cast<size_t>(plan.rowStart) * kDrawWords * sizeof(uint32_t),
+         static_cast<size_t>(rows) * kDrawWords * sizeof(uint32_t)},
+        {store_.commandBuffer(), static_cast<size_t>(plan.rowStart) * sizeof(Command),
+         static_cast<size_t>(rows) * sizeof(Command)},
+        {vertexBuffer_, static_cast<size_t>(check.vertexStart) * sizeof(CarVertex),
+         check.vertices.size() * sizeof(CarVertex)},
+        {indexBuffer_, static_cast<size_t>(check.indexStart) * sizeof(uint32_t),
+         check.indices.size() * sizeof(uint32_t)}};
+    store_.readbackBegin(gl_, copies, 4);
+}
+
+void CarRenderer::pollRowCheck() {
+    if (!store_.readbackPending()) return;
+    RowCheck& check = rowCheck_;
+    int       got = store_.readbackPoll(gl_, readback_);
+    if (got == 0 && prepares_ - check.issued > kRowCheckGiveUp) store_.readbackDrop(gl_, true);
+    if (got <= 0) return;
+    size_t rows = check.rows;
+    size_t wordBytes = rows * kDrawWords * sizeof(uint32_t);
+    size_t commandBytes = rows * sizeof(Command);
+    size_t vertexBytes = check.vertices.size() * sizeof(CarVertex);
+    size_t indexBytes = check.indices.size() * sizeof(uint32_t);
+    if (readback_.size() != wordBytes + commandBytes + vertexBytes + indexBytes) {
+        rowCheckFailed("the bytes read back", 0, static_cast<uint32_t>(readback_.size()),
+                       static_cast<uint32_t>(wordBytes + commandBytes + vertexBytes + indexBytes));
+        return;
+    }
+    const uint8_t* at = readback_.data();
+    for (size_t i = 0; i < rows * kDrawWords; ++i) {
+        uint32_t word;
+        std::memcpy(&word, at + i * sizeof(uint32_t), sizeof(word));
+        if (i % kDrawWords == 2) word += check.frameBase;
+        if (word != check.words[i]) {
+            rowCheckFailed(i % kDrawWords == 2 ? "a row's frame (with the list's frame base)"
+                                               : "a row word",
+                           static_cast<uint32_t>(i / kDrawWords), word, check.words[i]);
+            return;
+        }
+    }
+    at += wordBytes;
+    for (size_t c = 0; c < rows; ++c) {
+        Command ours;
+        std::memcpy(&ours, at + c * sizeof(Command), sizeof(ours));
+        const Command& theirs = check.commands[c];
+        auto           draw = static_cast<uint32_t>(c);
+        uint32_t       firstIndex = ours.firstIndex - (check.dynamic[c] ? check.indexStart : 0u);
+        int32_t        baseVertex = ours.baseVertex -
+                             (check.dynamic[c] ? static_cast<int32_t>(check.vertexStart) : 0);
+        if (ours.count != theirs.count)
+            rowCheckFailed("a command's count", draw, ours.count, theirs.count);
+        else if (ours.instanceCount != theirs.instanceCount)
+            rowCheckFailed("a command's instance count", draw, ours.instanceCount,
+                           theirs.instanceCount);
+        else if (firstIndex != theirs.firstIndex)
+            rowCheckFailed("a command's first index", draw, firstIndex, theirs.firstIndex);
+        else if (baseVertex != theirs.baseVertex)
+            rowCheckFailed("a command's base vertex", draw, static_cast<uint32_t>(baseVertex),
+                           static_cast<uint32_t>(theirs.baseVertex));
+        else if (ours.baseInstance != theirs.baseInstance)
+            rowCheckFailed("a command's row", draw, ours.baseInstance, theirs.baseInstance);
+        else
+            continue;
+        return;
+    }
+    at += commandBytes;
+    if (vertexBytes && std::memcmp(at, check.vertices.data(), vertexBytes) != 0) {
+        rowCheckFailed("the skinned corners", 0, 0, 0);
+        return;
+    }
+    at += vertexBytes;
+    if (indexBytes && std::memcmp(at, check.indices.data(), indexBytes) != 0)
+        rowCheckFailed("the skinned indices", 0, 0, 0);
+}
+
+void CarRenderer::rowCheckFailed(const char* what, uint32_t draw, uint32_t ours, uint32_t theirs) {
+    storeOff_ = true;
+    if (rowCheckSaid_) return;
+    rowCheckSaid_ = true;
+    logf("baked cars: MISMATCH -- the GPU store's rows of a kept list (key %u, order %u) differ from "
+         "what the per-pass path builds for it: %s, draw %u: store %08X, per-pass %08X; lists take "
+         "the per-pass path until the car set changes (report 105 section 4.66)",
+         rowCheck_.key, rowCheck_.orderKey, what, draw, ours, theirs);
+}
 
 void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarDrawList* lists,
                           uint32_t listCount, const CarDrawList* more, uint32_t moreCount,
@@ -1063,6 +1517,9 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     discardOverlay();
     if (!initialised_) return;
     if (++prepares_ % 256 == 0) evictIdle();
+    // What the last prepare drew and gave back since is free now: its draws were issued.
+    for (const PendingRange& range : pending_) range.ranges->give(range.first, range.count);
+    pending_.clear();
     passLists_.clear();
     for (uint32_t l = 0; l < listCount; ++l) passLists_.push_back(lists + l);
     for (uint32_t l = 0; l < moreCount; ++l) passLists_.push_back(more + l);
@@ -1081,6 +1538,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     gl_.pixelStorei(gl::kUnpackRowLength, 0);
     gl_.pixelStorei(gl::kUnpackSkipRows, 0);
     gl_.pixelStorei(gl::kUnpackSkipPixels, 0);
+    pollRowCheck();
 
     if (!haveGeneration_ || generation != generation_ || scene.objects.size() < objects_.size() ||
         scene.textures.size() < textures_.size()) {
@@ -1100,27 +1558,6 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         dynamicIndices += passLists_[l]->dynamicIndices.size();
     }
     uploadObjects(scene, dynamicVertices, dynamicIndices);
-    if (dynamicVertices) {
-        for (uint32_t l = 0; l < count; ++l) {
-            const CarDrawList& list = *passLists_[l];
-            if (!list.dynamicVertices.empty()) {
-                gl_.bindBuffer(gl::kArrayBuffer, vertexBuffer_);
-                gl_.bufferSubData(
-                    gl::kArrayBuffer,
-                    static_cast<GLintptr>((verticesUsed_ + dynamicVertexBase[l]) * sizeof(CarVertex)),
-                    static_cast<GLsizeiptr>(list.dynamicVertices.size() * sizeof(CarVertex)),
-                    list.dynamicVertices.data());
-            }
-            if (!list.dynamicIndices.empty()) {
-                gl_.bindBuffer(gl::kArrayBuffer, indexBuffer_);
-                gl_.bufferSubData(
-                    gl::kArrayBuffer,
-                    static_cast<GLintptr>((indicesUsed_ + dynamicIndexBase[l]) * sizeof(uint32_t)),
-                    static_cast<GLsizeiptr>(list.dynamicIndices.size() * sizeof(uint32_t)),
-                    list.dynamicIndices.data());
-            }
-        }
-    }
 
     // Per list: eye-relative world from its dispatch frame, the frames under it, and how far
     // away the car is.
@@ -1198,6 +1635,51 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         light_[2] = 1.0f;
     }
 
+    // Report 105 section 4.66: the kept lists the GPU store draws, their orders and skinned regions
+    // uploaded where it does not hold them yet; one of them in kCarRowCheckEvery checked.
+    storePlans_.assign(count, StorePlan{});
+    storeRanges_ = 0;
+    int checkList = -1;
+    if (storeOn()) {
+        for (uint32_t l = 0; l < count; ++l) {
+            storePlans_[l] = planStore(scene, *passLists_[l], frameBase[l]);
+            if (storePlans_[l].path == kRowsStore && storePlans_[l].rows &&
+                ++storeLists_ % kCarRowCheckEvery == 0 && !store_.readbackPending())
+                checkList = static_cast<int>(l);
+        }
+    }
+
+    // The skinned leaves: a store list's corners into its region, every other list's corners and
+    // indices after the objects, re-specified each pass.
+    if (dynamicVertices) {
+        for (uint32_t l = 0; l < count; ++l) {
+            const CarDrawList& list = *passLists_[l];
+            bool               stored = storePlans_[l].path == kRowsStore;
+            if (!list.dynamicVertices.empty()) {
+                size_t first = stored ? storePlans_[l].vertexStart
+                                      : verticesUsed_ + dynamicVertexBase[l];
+                gl_.bindBuffer(gl::kArrayBuffer, vertexBuffer_);
+                gl_.bufferSubData(
+                    gl::kArrayBuffer, static_cast<GLintptr>(first * sizeof(CarVertex)),
+                    static_cast<GLsizeiptr>(list.dynamicVertices.size() * sizeof(CarVertex)),
+                    list.dynamicVertices.data());
+            }
+            if (!list.dynamicIndices.empty() && !stored) {
+                gl_.bindBuffer(gl::kArrayBuffer, indexBuffer_);
+                gl_.bufferSubData(
+                    gl::kArrayBuffer,
+                    static_cast<GLintptr>((indicesUsed_ + dynamicIndexBase[l]) * sizeof(uint32_t)),
+                    static_cast<GLsizeiptr>(list.dynamicIndices.size() * sizeof(uint32_t)),
+                    list.dynamicIndices.data());
+            }
+        }
+    }
+    // After its corners went up, so the GPU copies what this pass's draws read.
+    if (checkList >= 0)
+        beginRowCheck(scene, *passLists_[static_cast<uint32_t>(checkList)],
+                      frameBase[static_cast<uint32_t>(checkList)],
+                      storePlans_[static_cast<uint32_t>(checkList)]);
+
     // Draws, far cars first: the order of the blended phase.
     listOrder_.resize(count);
     for (uint32_t l = 0; l < count; ++l) listOrder_[l] = l;
@@ -1214,7 +1696,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         auto carFirst = static_cast<uint32_t>(commands_.size());
         // The list's palette row, appended the first time one of its draws needs it.
         int32_t listPalette = -1;
-        bool cached = appendCached(scene, list, frameBase[l], dynamicVertexBase[l],
+        bool cached = storePlans_[l].path != kRowsOwn &&
+                      appendCached(scene, list, frameBase[l], dynamicVertexBase[l],
                                    dynamicIndexBase[l]);
         // A draw's rank is the place of its run among the draws this eye draws, as its own list
         // would have merged them (carDrawContinues): the draw's index in a list without
@@ -1266,6 +1749,15 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     for (uint32_t l : listOrder_) {
         const CarDrawList& list = *passLists_[l];
         if (list.overlay) continue;
+        const StorePlan& plan = storePlans_[l];
+        if (plan.path == kRowsStore) {
+            if (plan.rows) {
+                carRanges_.push_back(CarRange{plan.rowStart, plan.rows, list.walkSlot, false, true,
+                                              frameBase[l]});
+                ++storeRanges_;
+            }
+            continue;
+        }
         auto carFirst = static_cast<uint32_t>(commands_.size());
         uint32_t carCount = appendList(l);
         if (carCount)
@@ -1287,12 +1779,23 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     walkRuns_ = carRanges_;
     std::stable_sort(walkRuns_.begin(), walkRuns_.end(),
                      [](const CarRange& a, const CarRange& b) { return a.slot < b.slot; });
+    // Phase 0 in carRanges_' order, so the store's lists keep their places among the pass's.
+    solidRuns_.clear();
+    for (const CarRange& range : carRanges_) {
+        CarRange* last = solidRuns_.empty() ? nullptr : &solidRuns_.back();
+        if (last && !last->resident && !range.resident && last->first + last->count == range.first)
+            last->count += range.count;
+        else
+            solidRuns_.push_back(range);
+    }
 
-    if (!commands_.empty()) {
-        ensureDrawIndices(static_cast<uint32_t>(commands_.size()));
+    if (!commands_.empty() || storeRanges_) {
         gl_.bindBuffer(gl::kArrayBuffer, frameBuffer_);
         gl_.bufferData(gl::kArrayBuffer, static_cast<GLsizeiptr>(frames_.size() * sizeof(float)),
                        frames_.data(), gl::kStreamDraw);
+    }
+    if (!commands_.empty()) {
+        ensureDrawIndices(static_cast<uint32_t>(commands_.size()));
         gl_.bindBuffer(gl::kArrayBuffer, drawBuffer_);
         gl_.bufferData(gl::kArrayBuffer, static_cast<GLsizeiptr>(draws_.size() * sizeof(uint32_t)),
                        draws_.data(), gl::kStreamDraw);
@@ -1310,7 +1813,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
 }
 
 void CarRenderer::drawSolid(const SolidHookContext& context) {
-    if (!prepared_ || commands_.empty()) return;
+    if (!prepared_ || (commands_.empty() && !storeRanges_)) return;
     const ViewInputs&  view = *context.view;
     const FrameInputs& frame = *context.frame;
 
@@ -1344,24 +1847,33 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.uniform1i(uSolidOrder_, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
     gl_.uniform1i(uSolidDepth_, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
     gl_.uniform1i(uOrderTest_, 1);
+    gl_.uniform1i(uRows_, static_cast<GLint>(kRowUnit - gl::kTexture0));
     gl_.activeTexture(kFrameUnit);
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
+    gl_.activeTexture(kRowUnit);
+    gl_.bindTexture(gl::kTextureBuffer, store_.rowTexture());
+    rowSource_[0] = rowSource_[1] = rowSource_[2] = -1;
+    setRowSource(nullptr);
 
     // The overlay lists' commands follow every other list's and take neither phase.
-    auto drawCount = static_cast<GLsizei>(overlayFirst_);
     overlayReady_ = true;
-    // Phase 0: the cores, with depth and the car mark in the order attachment. The flagmen's
-    // draws discard everything here (kWalkOnlyBit).
-    if (drawCount > 0) {
+    // Phase 0: the cores, with depth and the car mark in the order attachment, a multi-draw per
+    // run of solidRuns_ (one without the store). The flagmen's draws discard everything here
+    // (kWalkOnlyBit).
+    if (!solidRuns_.empty()) {
         GLenum solid[2] = {gl::kColorAttachment0, gl::kColorAttachment1};
         gl_.drawBuffers(2, solid);
         gl_.depthMask(1);
         gl_.uniform1i(uPhase_, 0);
-        gl_.multiDrawElementsIndirect(gl::kTriangles, gl::kUnsignedInt, nullptr, drawCount,
-                                      sizeof(Command));
+        for (const CarRange& run : solidRuns_) {
+            setRowSource(&run);
+            gl_.multiDrawElementsIndirect(
+                gl::kTriangles, gl::kUnsignedInt,
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(run.first) * sizeof(Command)),
+                static_cast<GLsizei>(run.count), sizeof(Command));
+        }
     }
     gl_.uniform1i(uPhase_, 1);
     restoreBindings(gl_, saved);
@@ -1388,7 +1900,9 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
+    gl_.activeTexture(kRowUnit);
+    gl_.bindTexture(gl::kTextureBuffer, store_.rowTexture());
+    setRowSource(&car);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
         reinterpret_cast<const void*>(static_cast<uintptr_t>(car.first) * sizeof(Command)),
@@ -1557,7 +2071,7 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.bindBuffer(gl::kDrawIndirectBuffer, commandBuffer_);
+    setRowSource(nullptr);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
         reinterpret_cast<const void*>(static_cast<uintptr_t>(overlayFirst_) * sizeof(Command)),

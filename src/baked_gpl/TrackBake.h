@@ -17,7 +17,7 @@ namespace gplvr {
 
 // Once per main walk, before it, with the scene parameters of the pass (p[0] is the track
 // object). Starts a bake when the object is new, and logs the bake's counts when it lands.
-// Does nothing unless bakedRenderer is on.
+// Does nothing unless rendererType() is on.
 void trackBakeMainWalk(void* sceneParams);
 
 // The scene for the track GPL is drawing, or null while it is baking or when it failed.
@@ -30,6 +30,19 @@ uint32_t trackBakeSceneGeneration();
 // The track's PRIM payload as GPL holds it, which the scene's item keys are offsets into. False
 // when there is no scene.
 bool trackBakePrim(const unsigned char*& prim, unsigned& size);
+
+// The scene's vertices and indices are read only by the renderer's geometry upload. Once that
+// has run they are freed: the largest thing the scene holds, kept for nothing but a new GL
+// context. Does nothing when there is no scene or they are already gone.
+void trackBakeDropGeometry();
+
+// Whether the scene still holds its vertices and indices.
+bool trackBakeHoldsGeometry();
+
+// For a new GL context after trackBakeDropGeometry: the scene is dropped and the same track is
+// baked again on the worker at the next main walk, as after a track load. The game draws the
+// track meanwhile.
+void trackBakeRebake();
 
 // The process's free address space now (GlobalMemoryStatusEx's ullAvailVirtual); 0 when the call
 // fails.

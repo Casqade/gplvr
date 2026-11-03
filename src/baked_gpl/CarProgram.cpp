@@ -5,17 +5,22 @@
 #include "baked/CarScene.h"
 #include "baked_gpl/BakedPass.h"
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarBuildWorker.h"
 #include "baked_gpl/CarConfig.h"
 #include "baked_gpl/CarOrder.h"
 #include "baked_gpl/CarPassView.h"
 #include "baked_gpl/CarUnion.h"
+#include "baked_gpl/CarWalk.h"
+#include "baked_gpl/ProgramArena.h"
 
 #include <windows.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,27 +31,29 @@ namespace {
 // CarWalk's arena holds 64 a pass; a car has a Car for the main passes and one per mirror glass
 // (report 105 sections 4.42, 4.54): a field of 26 with the cockpit and three glasses needs 27 + 78.
 constexpr size_t   kMaxCars = 256;
-// Every car's configurations together (report 105 section 4.24). The vectors they hold stay under
-// kBudgetBytes: past it the program taken least recently is dropped. The pool is above what the
-// budget holds of the 2020 grid's programs (~380 KiB each, section 4.55), so the budget is the
-// limit (section 4.54).
+// Every car's configurations together (report 105 section 4.24). Their vectors lie in the program
+// region (ProgramArena.h, section 4.59): a kept build takes a run of its pages, and while none is
+// free the program taken least recently is dropped. The pool is above what the region holds of the
+// 2020 grid's programs (~380 KiB each, section 4.55), so the region is the limit (section 4.54).
 constexpr size_t   kMaxPrograms = 1024;
 constexpr uint32_t kConfigsPerCar = 8;
-// About 700 programs of the 2020 grid's (~380 KiB each, section 4.55): the mirror passes' lists by
-// glass at a full-field start. While less than kFreeFloorBytes of address space is free, a kept
-// build only replaces what it displaces (budgetFor).
+// Where no region could be reserved, the vectors are the heap's and stay under kBudgetBytes, about
+// 700 programs of the 2020 grid's: the mirror passes' lists by glass at a full-field start. While
+// less than kFreeFloorBytes of address space is free, a kept build there only replaces what it
+// displaces (budgetFor). The region is not reserved where it would leave less than the floor free.
 constexpr size_t   kBudgetBytes = size_t{256} << 20;
 constexpr uint64_t kFreeFloorBytes = uint64_t{384} << 20;
 constexpr size_t   kMaxFrames = 257;       // the root and CarWalk's kMaxWalkFrames
 constexpr int32_t  kMaxSelectorCases = 4096;
 constexpr int32_t  kMaxPoolScan = 2048;    // as CarShare's
-// Main passes: a program not taken for this many is dropped; after a build that could not be kept,
-// the every-gate walk is tried again after kEveryGateRetry, the margin's after kMarginRetry, and a
-// build refused for another reason (a fault, a refused leaf) after kRefusedRetry. A build whose
-// hazards taught CarConfig new gates is tried again on the next pass, at most kLearnRetries times
-// running. A car rebuilt within kChurnPasses of its last build kChurnLimit times running is walked
-// as before for kChurnBackoff.
-constexpr uint32_t kEvictPasses = 600;
+// Main passes. Programs are dropped only for the budget and the pool, least recently taken first:
+// a car out of view keeps its programs for when it comes back. A Car holding no program is freed
+// after kCarIdlePasses unused. After a build that could not be kept, the every-gate walk is tried
+// again after kEveryGateRetry, the margin's after kMarginRetry, and a build refused for another
+// reason (a fault, a refused leaf) after kRefusedRetry. A build whose hazards taught CarConfig new
+// gates is tried again on the next pass, at most kLearnRetries times running. A car rebuilt within
+// kChurnPasses of its last build kChurnLimit times running is walked as before for kChurnBackoff.
+constexpr uint32_t kCarIdlePasses = 600;
 constexpr uint32_t kEveryGateRetry = 1024;
 constexpr uint32_t kMarginRetry = 64;
 constexpr uint32_t kRefusedRetry = 8;
@@ -94,6 +101,86 @@ void poseMatrix(uintptr_t node, float m[12]) {
                      sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx, ty,
                      -sy,     cy * sx,                cy * cx,                tz};
     std::memcpy(m, out, sizeof(out));
+}
+
+// -- the pose cache (report 105 section 4.64 (b1), kCarPoseCache) --------------------------------
+
+// poseMatrix reads the XFORM's words 1-6 and nothing else, and computes from them alone, so the
+// matrix it made from six words is the matrix of every later call that finds the same six words,
+// bit for bit. A replay re-makes every frame of its program (remakeFrames), and a call tries
+// several programs of one car whose XFORMs GPL's pose has just written; the frame's other passes
+// (the other eye, each glass) find the same words again while the car stands where the tick put
+// it. The team's model is shared, so one node holds each team-mate's pose in turn: the key is the
+// node and its six words. kPoseWays entries a set, the set by a hash of the key, the entry filled
+// least recently replaced. One hit in kPoseCheckEvery is made again by poseMatrix and compared bit
+// for bit; a difference turns the cache off until the car set changes. Emptied at a change of the
+// car set (carBakeGeneration) and with every program, though no entry can go stale: its words are
+// its key.
+constexpr uint32_t kPoseSets = 1024;  // a power of two: the hash's top 10 bits
+constexpr uint32_t kPoseWays = 4;
+constexpr uint32_t kPoseCheckEvery = 64;
+
+struct PoseEntry {
+    uintptr_t node = 0;  // 0: empty
+    uint32_t  words[6] = {};
+    uint32_t  filled = 0;
+    float     m[12] = {};
+};
+
+PoseEntry g_poses[kPoseSets * kPoseWays];  // 4,096 x 80 bytes
+uint32_t  g_poseClock = 0;
+uint32_t  g_poseGeneration = 0;
+bool      g_poseOff = false;
+uint32_t  g_poseLookups = 0;
+uint32_t  g_poseHits = 0;
+uint32_t  g_poseChecks = 0;
+uint32_t  g_poseMismatches = 0;
+
+void posesClear() {
+    for (PoseEntry& e : g_poses) e.node = 0;
+}
+
+// poseMatrix's matrix of `node`, from the cache where its six words are an entry's.
+void posedMatrix(uintptr_t node, float m[12]) {
+    if constexpr (kCarPoseCache) {
+        if (!g_poseOff) {
+            uint32_t words[6];
+            std::memcpy(words, reinterpret_cast<const void*>(node + 4), sizeof(words));
+            uint32_t hash = static_cast<uint32_t>(node) * 0x9E3779B1u;
+            for (uint32_t w : words) hash = (hash ^ w) * 0x9E3779B1u;
+            PoseEntry* set = &g_poses[(hash >> 22) * kPoseWays];
+            PoseEntry* victim = nullptr;
+            ++g_poseLookups;
+            for (uint32_t way = 0; way < kPoseWays; ++way) {
+                PoseEntry& e = set[way];
+                if (e.node == node && std::memcmp(e.words, words, sizeof(words)) == 0) {
+                    if (++g_poseHits % kPoseCheckEvery != 0) {
+                        std::memcpy(m, e.m, sizeof(e.m));
+                        return;
+                    }
+                    ++g_poseChecks;
+                    poseMatrix(node, m);
+                    if (std::memcmp(m, e.m, sizeof(e.m)) == 0) return;
+                    if (g_poseMismatches++ == 0)
+                        logf("baked cars: the pose cache's matrix of XFORM %08X differs from "
+                             "poseMatrix's (report 105 section 4.64) -- the cache is off until "
+                             "the car set changes",
+                             static_cast<unsigned>(node));
+                    g_poseOff = true;
+                    return;
+                }
+                if (!victim || (victim->node && (!e.node || e.filled < victim->filled)))
+                    victim = &e;
+            }
+            poseMatrix(node, m);
+            victim->node = node;
+            std::memcpy(victim->words, words, sizeof(words));
+            victim->filled = ++g_poseClock;
+            std::memcpy(victim->m, m, sizeof(victim->m));
+            return;
+        }
+    }
+    poseMatrix(node, m);
 }
 
 // enterPose's clip and eye (no user planes: a kept list's walk has none).
@@ -253,35 +340,53 @@ struct PlaneTest {
 };
 constexpr uint32_t kNoTest = 0xFFFFFFFFu;  // Program::conditionTest of a box condition
 
+// What a program keeps of its walk's list (baked::CarDrawList): its kinds, its frame count, and
+// what an assembly copies.
+struct KeptList {
+    int    driver = 0;
+    bool   cockpit = false;
+    bool   overlay = false;
+    bool   mirror = false;
+    bool   flagman = false;
+    size_t frames = 0;
+    ArenaVector<baked::CarMaterial> materials;
+    ArenaVector<baked::CarDraw>     draws;
+    ArenaVector<baked::CarVertex>   dynamicVertices;
+    ArenaVector<uint32_t>           dynamicIndices;
+};
+
 // One car's list for one configuration: the sides of the configuration gates its walk met, and
-// one LOD (its kind-0 selections).
+// one LOD (its kind-0 selections). Built in g_build, then copied into its slot: into one run of the
+// program region (ProgramArena.h, report 105 section 4.59), or onto the heap where there is none.
 struct Program {
     int32_t   car = -1;  // its g_cars index; -1: a free slot
     bool      valid = false;
     ShareTape tape;
     // The walk's list: every condition's draws, the order nodes' halves sealed.
-    baked::CarDrawList list;
+    KeptList  list;
     float     margin = 0.0f;  // of the kept list; 0: every gate both ways
     uint32_t  lastTaken = 0;  // main passes
     uint32_t  built = 0;
-    size_t    bytes = 0;         // its vectors, counted against kBudgetBytes
+    size_t    bytes = 0;         // its vectors, counted against kBudgetBytes on the heap
     uint32_t  serial = 0;        // this kept build's own: its assemblies' contentKey
     // The tape's side conditions as plane tests (report 105 section 4.28): each distinct
     // (plane, frame) once, and per condition its test (kNoTest for a box).
-    std::vector<PlaneTest> tests;
-    std::vector<uint32_t>  conditionTest;
-    // Its assemblies' last drawOrders, by condition bits (not counted in `bytes`), and the order
-    // patch's index (counted; CarOrder.h, report 105 section 4.53).
+    ArenaVector<PlaneTest> tests;
+    ArenaVector<uint32_t>  conditionTest;
+    // Its assemblies' last drawOrders, by condition bits (on the heap, not counted in `bytes`), and
+    // the order patch's index (counted; CarOrder.h, report 105 section 4.53).
     OrderState order;
     // list.draws[i].condition, packed for emitRange (report 105 section 4.30).
-    std::vector<uint16_t> drawConditions;
+    ArenaVector<uint16_t> drawConditions;
     // list.draws[i].polygons, with kDynamicDraw where its object is kDynamicCarObject, packed for
     // an order memo's counts (report 105 section 4.38).
-    std::vector<uint32_t> drawPolygons;
+    ArenaVector<uint32_t> drawPolygons;
     // Report 105 section 4.37, per condition index: the condition whose descendants are the
     // conditions [index, skipEnd[index]) (0: none), which the replay passes over while it is off.
-    std::vector<uint16_t> skipOwner;
-    std::vector<uint32_t> skipEnd;
+    ArenaVector<uint16_t> skipOwner;
+    ArenaVector<uint32_t> skipEnd;
+    // Its pages in the program region; none on the heap.
+    ArenaRun  run;
 };
 
 // A car's programs, most recently taken first, and when it may be built again.
@@ -308,10 +413,27 @@ struct Car {
     uint32_t  everyGateAfter = 0;
     uint32_t  marginAfter = 0;
     uint32_t  buildAfter = 0;
+    // Report 105 section 4.61: this Car's own number (a job names its Car by index and serial),
+    // its job in flight on the worker (-1 none), and what the worker last could not do for it (a
+    // CarDetachedNeed; its next build is the render thread's).
+    uint32_t  serial = 0;
+    int16_t   job = -1;
+    int8_t    buildHere = kDetachedOk;
+    // Section 4.63: the main pass its job was queued in, and while it is drawn from its previous
+    // program, the main pass of the first such draw.
+    uint32_t  jobPass = 0;
+    bool      staleRun = false;
+    uint32_t  staleFrom = 0;
+    // Section 4.64 (a1): the program each stereo eye last took or built (-1 none); one no longer
+    // among `programs` is passed over.
+    int16_t   eyeLast[2] = {-1, -1};
 };
 
 std::vector<Program> g_programs;  // reserved to kMaxPrograms once: never reallocated
 std::vector<Car>     g_cars;      // reserved to kMaxCars once
+// The build under way: the walk records into its tape, and the keep compiles into it; all on the
+// heap, its capacity kept from build to build.
+Program              g_build;
 size_t               g_bytes = 0;  // of the valid programs
 bool                 g_installed = false;
 bool                 g_active = false;  // this pass is a main or mirror pass with the program on
@@ -346,6 +468,7 @@ std::vector<uint8_t> g_side;
 // g_on and g_side as the skip check evaluates them, every condition visited (section 4.37).
 std::vector<uint8_t> g_onCheck;
 std::vector<uint8_t> g_sideCheck;
+uint32_t             g_carSerial = 0;  // the last Car::serial handed out
 
 bool on(uint16_t condition) { return condition < g_on.size() && g_on[condition] != 0; }
 
@@ -370,6 +493,8 @@ Car* allocateCar(uintptr_t record, uintptr_t handle, bool mirror, bool cockpit, 
         car = &g_cars.back();
     }
     *car = Car{};
+    if (++g_carSerial == 0) g_carSerial = 1;
+    car->serial = g_carSerial;
     car->record = record;
     car->mirror = mirror;
     car->cockpit = cockpit;
@@ -504,6 +629,55 @@ Verdict evaluateConditions(const Program& p, size_t frames, std::vector<uint8_t>
     return kAgrees;
 }
 
+// Whether every XFORM's child is the one the build walked. A wheel XFORM the build took every
+// model of may point at any of them (report 105 section 4.30); any other child is a new one.
+bool childrenHold(const ShareTape& tape) {
+    for (const ShareFrame& f : tape.frames) {
+        uint32_t child = word(f.node, 8);
+        if (child == f.words[6]) continue;
+        bool known = false;
+        for (uint32_t k = f.switchFirst; k < f.switchFirst + f.switchCount; ++k)
+            known = known || (k >= 1 && k <= tape.conditions.size() &&
+                              tape.conditions[k - 1].plane == child);
+        if (!known) return false;
+    }
+    return true;
+}
+
+// The frames re-made from the XFORM words GPL's pose wrote for this car call, into g_clips,
+// g_eyes, g_roots and g_half; then the sizes of the per-condition arrays checked.
+Verdict remakeFrames(const Program& p, const ShareCall& call, int& reason) {
+    const ShareTape& tape = p.tape;
+    static const float kIdentity[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                        0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+    std::memcpy(g_clips[0], call.clip, sizeof(g_clips[0]));
+    std::memcpy(g_eyes[0], call.eye, sizeof(g_eyes[0]));
+    std::memcpy(g_roots[0], kIdentity, sizeof(g_roots[0]));
+    g_half[0] = 0;
+    for (size_t k = 0; k < tape.frames.size(); ++k) {
+        const ShareFrame& f = tape.frames[k];
+        if (f.parent > k) {
+            reason = kFrames;
+            return kRebuildIt;
+        }
+        float pose[12];
+        posedMatrix(f.node, pose);
+        enterPose(g_clips[f.parent], g_eyes[f.parent], pose, g_clips[k + 1], g_eyes[k + 1]);
+        enterRoot(g_roots[f.parent], pose, g_roots[k + 1]);
+        // GPL rebuilds the half vector only where a rotation ran (enterFrame).
+        bool rotates = wordFloat(f.node, 4) != 0.0f || wordFloat(f.node, 5) != 0.0f ||
+                       wordFloat(f.node, 6) != 0.0f;
+        g_half[k + 1] = rotates ? static_cast<uint16_t>(k + 1) : g_half[f.parent];
+    }
+    if (p.conditionTest.size() != tape.conditions.size() ||
+        p.skipOwner.size() != tape.conditions.size() ||
+        p.skipEnd.size() != tape.conditions.size()) {
+        reason = kFrames;
+        return kRebuildIt;
+    }
+    return kAgrees;
+}
+
 // The replay of a program for this call: what GPL may have moved, then the frames re-made from
 // the XFORM words GPL's pose wrote for this car call, then every condition and decision from this
 // eye.
@@ -516,23 +690,13 @@ Verdict replay(const Program& p, const ShareCall& call, int& reason) {
             return kRebuildIt;
         }
     size_t frames = tape.frames.size() + 1;
-    if (frames > kMaxFrames || p.list.frames.size() != frames) {
+    if (frames > kMaxFrames || p.list.frames != frames) {
         reason = kFrames;
         return kRebuildIt;
     }
-    // A wheel XFORM the build took every model of may point at any of them (report 105 section
-    // 4.30); any other child is a new one.
-    for (const ShareFrame& f : tape.frames) {
-        uint32_t child = word(f.node, 8);
-        if (child == f.words[6]) continue;
-        bool known = false;
-        for (uint32_t k = f.switchFirst; k < f.switchFirst + f.switchCount; ++k)
-            known = known || (k >= 1 && k <= tape.conditions.size() &&
-                              tape.conditions[k - 1].plane == child);
-        if (!known) {
-            reason = kChild;
-            return kRebuildIt;
-        }
+    if (!childrenHold(tape)) {
+        reason = kChild;
+        return kRebuildIt;
     }
     for (const ShareSprite& s : tape.sprites)
         if (spriteColour(s.node) != s.colour) {
@@ -547,36 +711,10 @@ Verdict replay(const Program& p, const ShareCall& call, int& reason) {
         }
     Verdict pool = scanPool(tape, call, reason);
     if (pool != kAgrees) return pool;
-
-    static const float kIdentity[12] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-    std::memcpy(g_clips[0], call.clip, sizeof(g_clips[0]));
-    std::memcpy(g_eyes[0], call.eye, sizeof(g_eyes[0]));
-    std::memcpy(g_roots[0], kIdentity, sizeof(g_roots[0]));
-    g_half[0] = 0;
-    for (size_t k = 0; k < tape.frames.size(); ++k) {
-        const ShareFrame& f = tape.frames[k];
-        if (f.parent > k) {
-            reason = kFrames;
-            return kRebuildIt;
-        }
-        float pose[12];
-        poseMatrix(f.node, pose);
-        enterPose(g_clips[f.parent], g_eyes[f.parent], pose, g_clips[k + 1], g_eyes[k + 1]);
-        enterRoot(g_roots[f.parent], pose, g_roots[k + 1]);
-        // GPL rebuilds the half vector only where a rotation ran (enterFrame).
-        bool rotates = wordFloat(f.node, 4) != 0.0f || wordFloat(f.node, 5) != 0.0f ||
-                       wordFloat(f.node, 6) != 0.0f;
-        g_half[k + 1] = rotates ? static_cast<uint16_t>(k + 1) : g_half[f.parent];
-    }
+    Verdict remade = remakeFrames(p, call, reason);
+    if (remade != kAgrees) return remade;
     // The plane tests hold the planes as the build read them; now and then they are compared
     // with the model, and a plane that moved drops the program.
-    if (p.conditionTest.size() != tape.conditions.size() ||
-        p.skipOwner.size() != tape.conditions.size() ||
-        p.skipEnd.size() != tape.conditions.size()) {
-        reason = kFrames;
-        return kRebuildIt;
-    }
     bool check = g_replays % kPlaneCheckEvery == 0;
     if (check) {
         for (const PlaneTest& test : p.tests)
@@ -657,6 +795,36 @@ Verdict replayGuarded(const Program& p, const ShareCall& call, int& reason) {
     }
 }
 
+// A stale take's replay (report 105 section 4.63): the frames and conditions of `p` for this call,
+// made as a reuse makes them, with its child pointers and GPL's vertex memo checked as a reuse
+// checks them. The registers, sprite colours and decisions keep the build's values: the program's
+// draws are those of its build's selection.
+Verdict staleReplay(const Program& p, const ShareCall& call, int& reason) {
+    size_t frames = p.tape.frames.size() + 1;
+    if (frames > kMaxFrames || p.list.frames != frames) {
+        reason = kFrames;
+        return kRebuildIt;
+    }
+    if (!childrenHold(p.tape)) {
+        reason = kChild;
+        return kRebuildIt;
+    }
+    Verdict pool = scanPool(p.tape, call, reason);
+    if (pool != kAgrees) return pool;
+    Verdict remade = remakeFrames(p, call, reason);
+    if (remade != kAgrees) return remade;
+    return evaluateConditions<true>(p, frames, g_on, g_side, reason);
+}
+
+Verdict staleReplayGuarded(const Program& p, const ShareCall& call, int& reason) {
+    __try {
+        return staleReplay(p, call, reason);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        reason = kFault;
+        return kRebuildIt;
+    }
+}
+
 // -- assembly ------------------------------------------------------------------------------------
 
 // This eye's list from the program, with the header `fresh` was begun with. A list to draw holds
@@ -711,13 +879,13 @@ void assemble(Program& p, const baked::CarDrawList& fresh, baked::CarDrawList& o
             out.draws.push_back(p.list.draws[index]);
             out.draws.back().condition = 0;
         }
-        out.materials = p.list.materials;
+        out.materials.assign(p.list.materials.begin(), p.list.materials.end());
     } else {
-        out.draws = p.list.draws;
-        out.materials = p.list.materials;
+        out.draws.assign(p.list.draws.begin(), p.list.draws.end());
+        out.materials.assign(p.list.materials.begin(), p.list.materials.end());
     }
-    out.dynamicIndices = p.list.dynamicIndices;
-    out.dynamicVertices = p.list.dynamicVertices;
+    out.dynamicIndices.assign(p.list.dynamicIndices.begin(), p.list.dynamicIndices.end());
+    out.dynamicVertices.assign(p.list.dynamicVertices.begin(), p.list.dynamicVertices.end());
     // emitSkinned's corners, carried through the re-made frames.
     const baked::CarScene& scene = carBakeScene();
     for (const ShareSkin& skin : p.tape.skins) {
@@ -811,7 +979,7 @@ bool readPlane(uintptr_t address, float out[4]) {
 // tape has just read it; a box or a wheel model has none (kNoTest). False when a plane cannot be
 // read.
 bool compileTests(Program& p) {
-    const std::vector<ShareCondition>& conditions = p.tape.conditions;
+    const ArenaVector<ShareCondition>& conditions = p.tape.conditions;
     p.tests.clear();
     p.conditionTest.assign(conditions.size(), kNoTest);
     std::unordered_map<uint64_t, uint32_t> byPlane;
@@ -845,7 +1013,7 @@ bool compileTests(Program& p) {
 // other as a descendant at a lower index. A tape with a parent at or after its child gets no runs;
 // the replay refuses it.
 void compileSkips(Program& p) {
-    const std::vector<ShareCondition>& conditions = p.tape.conditions;
+    const ArenaVector<ShareCondition>& conditions = p.tape.conditions;
     size_t n = conditions.size();
     p.skipOwner.assign(n, 0);
     p.skipEnd.assign(n, 0);
@@ -877,11 +1045,74 @@ void compileSkips(Program& p) {
     }
 }
 
-size_t vectorBytes(const Program& p);
-
 // -- the program pool ----------------------------------------------------------------------------
 
-// Takes program `index` out of its car's list and frees its vectors.
+// Every vector a kept program copies from g_build (the list's come from the walk's list).
+template <typename F>
+void forEachKept(const Program& p, F&& f) {
+    const ShareTape& t = p.tape;
+    f(t.vertices);
+    f(t.frames);
+    f(t.gates);
+    f(t.boxes);
+    f(t.selectors);
+    f(t.registers);
+    f(t.sprites);
+    f(t.conditions);
+    f(t.orders);
+    f(t.skins);
+    f(t.skinFrames);
+    f(t.glass);
+    f(p.tests);
+    f(p.conditionTest);
+    f(p.drawConditions);
+    f(p.drawPolygons);
+    f(p.skipOwner);
+    f(p.skipEnd);
+    const OrderIndex& index = p.order.index;
+    f(index.drawsFirst);
+    f(index.draws);
+    f(index.nodesFirst);
+    f(index.nodes);
+    f(index.drawNode);
+    f(index.nodeParent);
+}
+
+// The vectors a program keeps of a list: a KeptList's, or the walk's baked::CarDrawList's.
+template <typename List, typename F>
+void forEachKeptOfList(const List& l, F&& f) {
+    f(l.materials);
+    f(l.draws);
+    f(l.dynamicVertices);
+    f(l.dynamicIndices);
+}
+
+// What a kept program's vectors hold, counted against kBudgetBytes on the heap.
+size_t vectorBytes(const Program& p) {
+    size_t bytes = 0;
+    auto   add = [&bytes](const auto& v) {
+        using Vector = std::decay_t<decltype(v)>;
+        bytes += v.capacity() * sizeof(typename Vector::value_type);
+    };
+    forEachKept(p, add);
+    forEachKeptOfList(p.list, add);
+    return bytes;
+}
+
+// The bytes the copy of `build` and the walk's `list` takes in a run of the program region, block
+// by block as ArenaAllocator packs them.
+size_t keptBytes(const Program& build, const baked::CarDrawList& list) {
+    size_t bytes = 0;
+    auto   add = [&bytes](const auto& v) {
+        using Vector = std::decay_t<decltype(v)>;
+        bytes += programArenaBlockBytes(v.size() * sizeof(typename Vector::value_type));
+    };
+    forEachKept(build, add);
+    forEachKeptOfList(list, add);
+    return bytes;
+}
+
+// Takes program `index` out of its car's list and frees its vectors, then its run.
 void dropProgram(int index) {
     Program& p = g_programs[static_cast<size_t>(index)];
     if (p.car >= 0 && static_cast<size_t>(p.car) < g_cars.size()) {
@@ -892,7 +1123,11 @@ void dropProgram(int index) {
         car.count = kept;
     }
     if (p.valid) g_bytes -= std::min(g_bytes, p.bytes);
+    // Its rows in the car renderer, CPU and GPU, go with it (report 105 section 4.66).
+    if (p.serial) bakedCarRowsDropped(p.serial);
+    ArenaRun run = p.run;
     p = Program{};
+    programArenaGive(run);
 }
 
 // The valid program taken least recently, other than `except`; -1 when there is none.
@@ -908,11 +1143,12 @@ int leastRecent(int except) {
     return best;
 }
 
-// The bytes the programs may hold once a kept build of `added` bytes is counted: kBudgetBytes, or
-// from the first kept build that finds less than kFreeFloorBytes of address space free (or
-// GlobalMemoryStatusEx failing) on, what they held before that build, at least kFloorCapMin: the
-// heap keeps what dropped programs free, so new programs reuse it instead of taking address
-// space, and free address space does not come back to lift the cap (report 105 section 4.55.1).
+// On the heap (no program region): the bytes the programs may hold once a kept build of `added`
+// bytes is counted: kBudgetBytes, or from the first kept build that finds less than
+// kFreeFloorBytes of address space free (or GlobalMemoryStatusEx failing) on, what they held
+// before that build, at least kFloorCapMin: the heap keeps what dropped programs free, so new
+// programs reuse it instead of taking address space, and free address space does not come back to
+// lift the cap (report 105 section 4.55.1).
 constexpr size_t kFloorCapMin = size_t{32} << 20;
 size_t           g_floorCap = 0;  // 0 until the floor is met
 
@@ -952,9 +1188,182 @@ int programSlot(Car& car) {
     return index;
 }
 
-// Which build to ask for, or why not.
-ProgramOutcome askBuild(Car& car, int why) {
+// A build's tape begun from its call, under the car bake it is asked under.
+void tapeBegin(ShareTape& tape, const ShareCall& call, float margin, uint32_t generation,
+               uint32_t rebaked) {
+    tape.record = call.record;
+    tape.root = call.root;
+    tape.handle = call.handle;
+    tape.driver = call.driver;
+    tape.classVisible = call.classVisible;
+    tape.textureList = call.textureList;
+    tape.texturedMask = call.texturedMask;
+    tape.lightingOn = call.lightingOn;
+    tape.generation = generation;
+    tape.rebaked = rebaked;
+    tape.low = ~static_cast<uintptr_t>(0);
+    tape.high = 0;
+    tape.vertices.clear();
+    tape.refusal = call.planeMask || call.cellPlanes ? kSharePlanes : kShareOk;
+    std::memset(tape.written, 0, sizeof(tape.written));
+    tape.frames.clear();
+    tape.gates.clear();
+    tape.boxes.clear();
+    tape.selectors.clear();
+    tape.registers.clear();
+    tape.sprites.clear();
+    tape.margin = margin;
+    tape.conditions.clear();
+    tape.orders.clear();
+    tape.skins.clear();
+    tape.skinFrames.clear();
+    tape.glass.clear();
+    std::memcpy(tape.rootEye, call.eye, sizeof(tape.rootEye));
+}
+
+// -- builds on the worker (CarBuildWorker.h, report 105 section 4.61) ----------------------------
+
+// Why a build stays on the render thread. kHereObject..kHereScan follow CarDetachedNeed's order.
+enum BuiltHere : int {
+    kHereOff,        // kCarBuildWorker is false
+    kHereNoWorker,   // the worker did not start
+    kHereCockpit,    // the cockpit's glass reads GPL's live UVs and the glass set (CockpitGlass.h)
+    kHereObject,     // the worker met an object not baked yet; the render thread bakes it
+    kHereTexture,    // a texture handle not resolved yet
+    kHereScan,       // a gate or box CarConfig's scan had not answered
+    kHereQueueFull,  // kCarBuildQueue jobs in flight
+    kHereSnapshot,   // the posed nodes could not be read
+    kHereReasons
+};
+static_assert(kHereTexture - kHereObject == kDetachedTexture - kDetachedObject &&
+                  kHereScan - kHereObject == kDetachedScan - kDetachedObject,
+              "a worker's need names its render-thread build");
+
+// What the worker made of a job; at its keep the render thread adds kLandStale and kLandNoRoom.
+// kJobObject..kJobScan follow CarDetachedNeed's order.
+enum JobStatus : int {
+    kJobBuilt,      // walked and compiled (kLandKept once kept)
+    kJobHazard,     // a hazard, or a frame the tape could not place: retried as a build here is
+    kJobRefused,    // the walk faulted, or its list, orders, skins or planes refused it
+    kJobObject,
+    kJobTexture,
+    kJobScan,
+    kJobCancelled,  // the epoch moved or the car bake was dropped, before or while it ran
+    kJobAged,       // queued more than kJobMaxAge main passes ago: not built
+    kJobThrew,      // an exception (an allocation) ended it
+    kLandStale,     // landed, its Car gone or the car bake moved since it was asked
+    kLandNoRoom,    // built, but no slot or run of the region took it
+    kLandOutcomes
+};
+constexpr int kLandKept = kJobBuilt;
+static_assert(kJobTexture - kJobObject == kDetachedTexture - kDetachedObject &&
+                  kJobScan - kJobObject == kDetachedScan - kDetachedObject,
+              "a worker's need names its job status");
+// A job queued this many main passes before the worker reaches it is not built: the car has moved
+// on (builds are predictable a few frames ahead, section 4.60).
+constexpr uint32_t kJobMaxAge = 16;
+
+// One build on the worker: the request, then the result in heap scratch of its own, its capacity
+// kept from job to job. The render thread fills it and hands it over; the worker owns it from
+// carBuildWorkerSubmit to carBuildWorkerTakeDone.
+struct BuildJob {
+    CarBuildSnapshot snapshot;
+    int32_t   car = -1;
+    uint32_t  carSerial = 0;
+    uintptr_t record = 0;
+    int       why = kNoProgram;
+    int8_t    eye = -1;  // the stereo eye of the call that queued it
+    uint32_t  pass = 0;  // g_pass when queued
+    int       status = kJobThrew;
+    bool      frames = false;  // of a kJobHazard
+    uint32_t  learned = 0;     // configuration gates the walk's hazards named that were new
+    std::vector<uintptr_t> learnedGates;  // learned at the keep (CarConfig is the render thread's)
+    Program   build;
+    baked::CarDrawList list;
+};
+
+std::vector<BuildJob> g_jobs;      // kCarBuildQueue, made at install: never reallocated
+std::vector<uint16_t> g_freeJobs;  // render thread
+bool                  g_worker = false;
+std::atomic<uint32_t> g_passClock{0};  // g_pass, for the worker's kJobMaxAge
+uint32_t              g_here[kHereReasons] = {};
+uint32_t              g_landed[kLandOutcomes] = {};
+
+// Queues a build of `car` for this call: -1, or the BuiltHere reason it is the render thread's.
+int queueBuild(Car& car, int why, const ShareCall& call, const baked::CarDrawList& list) {
+    if (g_freeJobs.empty()) return kHereQueueFull;
+    uint16_t          slot = g_freeJobs.back();
+    BuildJob&         job = g_jobs[slot];
+    CarBuildSnapshot& s = job.snapshot;
+    if (!call.registers || list.materials.empty()) return kHereSnapshot;
+    if (!carWalkSnapshotPose(call.instance, s)) return kHereSnapshot;
+    s.record = call.record;
+    s.root = call.root;
+    s.handle = call.handle;
+    s.instance = call.instance;
+    s.driver = call.driver;
+    std::memcpy(s.clip, call.clip, sizeof(s.clip));
+    std::memcpy(s.eye, call.eye, sizeof(s.eye));
+    s.lodScale = call.lodScale;
+    s.dlong = call.dlong;
+    s.dlat = call.dlat;
+    s.classVisible = call.classVisible;
+    s.lightingOn = call.lightingOn;
+    s.textureList = call.textureList;
+    s.texturedMask = call.texturedMask;
+    std::memcpy(s.registers, call.registers, sizeof(s.registers));
+    std::memcpy(s.rootModelView, list.rootModelView, sizeof(s.rootModelView));
+    std::memcpy(s.projection, list.projection, sizeof(s.projection));
+    std::memcpy(s.light, list.light, sizeof(s.light));
+    s.mirror = list.mirror;
+    s.walkSlot = list.walkSlot;
+    const baked::CarMaterial& material = list.materials[0];
+    s.surfaceClass = material.surfaceClass;
+    s.textured = material.textured;
+    s.specularExponent = material.specularExponent;
+    s.specular = material.specular;
+    s.margin = car.nextMargin;
+    s.generation = carBakeGeneration();
+    s.rebaked = carBakeTotals().objectsRebaked;
+    s.epoch = carBuildWorkerEpoch();
+    job.car = carIndex(car);
+    job.carSerial = car.serial;
+    job.record = car.record;
+    job.why = why;
+    job.eye = static_cast<int8_t>(carPassView().eye);
+    job.pass = g_pass;
+    job.status = kJobThrew;
+    if (!carBuildWorkerSubmit(slot)) return kHereQueueFull;
+    g_freeJobs.pop_back();
+    car.job = static_cast<int16_t>(slot);
+    car.jobPass = g_pass;
+    return -1;
+}
+
+// A build the render thread makes: counted, and each reason but the switch logged the first time.
+void builtHere(int reason) {
+    if (g_here[reason]++ || reason == kHereOff) return;
+    static const char* const kWhy[kHereReasons] = {
+        "",
+        "the build worker did not start",
+        "a cockpit's build reads GPL's live glass",
+        "the worker met an object not baked yet (the render thread bakes it)",
+        "the worker met a texture handle not resolved yet",
+        "the worker met a gate or box CarConfig had not scanned",
+        "the worker's queue was full",
+        "the car's posed nodes could not be read for the worker"};
+    logf("baked cars: a car program was built on the render thread -- %s (report 105 section "
+         "4.61; logged once a reason)",
+         kWhy[reason]);
+}
+
+// Which build to ask for, or why not. `call` and `list` (begun for it) are what a build on the
+// worker is asked with.
+ProgramOutcome askBuild(Car& car, int why, const ShareCall& call,
+                        const baked::CarDrawList& list) {
     if (g_pass < car.buildAfter) return kProgramWalk;
+    // The worker builds this car already; this call walks as before until the build lands.
+    if (car.job >= 0) return kProgramWalk;
     if (g_pass >= car.everyGateAfter)
         car.nextMargin = 0.0f;
     else if (g_pass >= car.marginAfter)
@@ -972,6 +1381,15 @@ ProgramOutcome askBuild(Car& car, int why) {
     } else if (why != kNoProgram) {
         car.churn = 0;
     }
+    // On the worker where it can be (report 105 section 4.61), else here as before.
+    int here = !kCarBuildWorker ? kHereOff
+               : !g_worker      ? kHereNoWorker
+               : car.cockpit    ? kHereCockpit
+               : car.buildHere  ? kHereObject + (car.buildHere - kDetachedObject)
+                                : queueBuild(car, why, call, list);
+    if (here < 0) return kProgramQueued;
+    car.buildHere = kDetachedOk;
+    builtHere(here);
     int slot = programSlot(car);
     if (slot < 0) return kProgramWalk;
     Program& p = g_programs[static_cast<size_t>(slot)];
@@ -981,29 +1399,466 @@ ProgramOutcome askBuild(Car& car, int why) {
     return kProgramBuild;
 }
 
-size_t vectorBytes(const Program& p) {
-    const baked::CarDrawList& l = p.list;
-    const ShareTape&          t = p.tape;
-    return l.frames.capacity() * sizeof(baked::CarFrame) +
-           l.materials.capacity() * sizeof(baked::CarMaterial) +
-           l.draws.capacity() * sizeof(baked::CarDraw) +
-           l.dynamicVertices.capacity() * sizeof(baked::CarVertex) +
-           l.dynamicIndices.capacity() * sizeof(uint32_t) + l.conditionOn.capacity() +
-           t.frames.capacity() * sizeof(ShareFrame) + t.gates.capacity() * sizeof(ShareGate) +
-           t.boxes.capacity() * sizeof(ShareBox) +
-           t.selectors.capacity() * sizeof(ShareSelector) +
-           t.registers.capacity() * sizeof(ShareRegister) +
-           t.sprites.capacity() * sizeof(ShareSprite) +
-           t.conditions.capacity() * sizeof(ShareCondition) +
-           t.orders.capacity() * sizeof(ShareOrder) + t.skins.capacity() * sizeof(ShareSkin) +
-           t.skinFrames.capacity() * sizeof(uint16_t) + t.vertices.capacity() * sizeof(uint32_t) +
-           t.glass.capacity() * sizeof(ShareGlass) +
-           p.tests.capacity() * sizeof(PlaneTest) +
-           p.conditionTest.capacity() * sizeof(uint32_t) +
-           p.drawConditions.capacity() * sizeof(uint16_t) +
-           p.drawPolygons.capacity() * sizeof(uint32_t) +
-           p.skipOwner.capacity() * sizeof(uint16_t) + p.skipEnd.capacity() * sizeof(uint32_t) +
-           orderIndexBytes(p.order.index);
+// -- the program region (ProgramArena.h, report 105 section 4.59) -------------------------------
+
+// Why a kept build got no run: it was not kept, and its car is walked as before.
+enum RegionRefusal : int {
+    kRegionTooBig,      // its run is longer than the region
+    kRegionCommit,      // VirtualAlloc could not commit its run
+    kRegionNoRun,       // no run free with every other program dropped
+    kRegionRefusalCount
+};
+
+uint32_t g_regionRefused[kRegionRefusalCount] = {};
+uint32_t g_regionDrops = 0;       // programs dropped for a run
+uint32_t g_regionScattered = 0;   // of them, while the pages were free but not in one run
+uint32_t g_regionSpilled = 0;     // kept builds that outgrew the run keptBytes asked for
+bool     g_saidRegionFull = false;
+bool     g_saidRegionScattered = false;
+bool     g_saidRegionSpill = false;
+
+void logRegionUse(const char* what) {
+    ArenaUse use = programArenaUse();
+    uint32_t held = 0;
+    for (const Program& p : g_programs) held += p.valid ? 1u : 0u;
+    logf("baked cars: %s -- %u programs hold %u of %u pages (%zu KiB each), %u committed, the "
+         "largest free run %u pages; dropped for a run %u (pages free but scattered %u), refused "
+         "too big %u / commit %u / no run %u, spilled to the heap %u (logged once)",
+         what, held, use.used, use.pages, kArenaPageBytes >> 10, use.committed, use.largestFree,
+         g_regionDrops, g_regionScattered, g_regionRefused[kRegionTooBig],
+         g_regionRefused[kRegionCommit], g_regionRefused[kRegionNoRun], g_regionSpilled);
+}
+
+// A run of the program region for program `index` (not valid yet) to hold `bytes`: the programs
+// taken least recently are dropped until one is free. False when none can be had.
+bool regionRun(int index, size_t bytes, ArenaRun& run) {
+    for (;;) {
+        int taken = programArenaTake(bytes, run);
+        if (taken == kArenaTaken) return true;
+        int refusal = taken == kArenaTooBig        ? kRegionTooBig
+                      : taken == kArenaCommitFailed ? kRegionCommit
+                                                    : kRegionNoRun;
+        int oldest = refusal == kRegionNoRun ? leastRecent(index) : -1;
+        if (oldest < 0) {
+            if (g_regionRefused[refusal]++ == 0) {
+                static const char* const kWhy[kRegionRefusalCount] = {
+                    "a kept list is longer than the program region",
+                    "the program region could not commit a run",
+                    "no run of the program region is free with every other program dropped"};
+                logf("baked cars: %s (%zu KiB; the last commit error %lu) -- it is not kept and the "
+                     "car is walked as before (logged once)",
+                     kWhy[refusal], bytes >> 10, programArenaCommitError());
+            }
+            return false;
+        }
+        if (!g_saidRegionFull) {
+            g_saidRegionFull = true;
+            logRegionUse("the program region is full, the programs taken least recently are "
+                         "dropped from now on");
+        }
+        ++g_regionDrops;
+        if (taken == kArenaNoRun) {
+            ++g_regionScattered;
+            if (!g_saidRegionScattered) {
+                g_saidRegionScattered = true;
+                logRegionUse("a kept build found the region's free pages scattered and dropped a "
+                             "program for a run");
+            }
+        }
+        dropProgram(oldest);
+    }
+}
+
+// Copies the build into program `p`: the build's vectors (g_build's, or a worker job's) and the
+// walk's list, into `run` (none: the heap). The order memos start empty.
+void keepBuild(Program& p, const Program& build, const baked::CarDrawList& list,
+               const ArenaRun& run) {
+    p.order = OrderState{};
+    p.run = run;
+    uint32_t spills = programArenaSpills();
+    {
+        ProgramArenaFill fill(run);
+        p.tape = build.tape;
+        p.list.materials.assign(list.materials.begin(), list.materials.end());
+        p.list.draws.assign(list.draws.begin(), list.draws.end());
+        p.list.dynamicVertices.assign(list.dynamicVertices.begin(), list.dynamicVertices.end());
+        p.list.dynamicIndices.assign(list.dynamicIndices.begin(), list.dynamicIndices.end());
+        p.tests = build.tests;
+        p.conditionTest = build.conditionTest;
+        p.drawConditions = build.drawConditions;
+        p.drawPolygons = build.drawPolygons;
+        p.skipOwner = build.skipOwner;
+        p.skipEnd = build.skipEnd;
+        p.order.index = build.order.index;
+    }
+    p.list.driver = list.driver;
+    p.list.cockpit = list.cockpit;
+    p.list.overlay = list.overlay;
+    p.list.mirror = list.mirror;
+    p.list.flagman = list.flagman;
+    p.list.frames = list.frames.size();
+    if (programArenaSpills() != spills) {
+        ++g_regionSpilled;
+        if (!g_saidRegionSpill) {
+            g_saidRegionSpill = true;
+            logRegionUse("a kept list outgrew the run its sizes asked for, the rest came from the "
+                         "heap");
+        }
+    }
+}
+
+// -- a walked build: checked and compiled on either thread, kept on the render thread ------------
+
+enum BuildVerdict { kBuildKeep, kBuildHazard, kBuildRefused };
+
+// Whether `build`'s walk (its tape, `list`) can be kept: kBuildHazard for a hazard (`hazard`, the
+// first UnionRedone, -1 none) or a frame the tape could not place (`frames`), kBuildRefused for
+// what CarWalk's shareRefusal (`refusal`), the order nodes, the skins or the plane reads refuse.
+// Reads the car bake and GPL's planes: on the worker, inside its gate.
+BuildVerdict checkBuild(Program& build, int hazard, ShareRefusal refusal,
+                        const baked::CarDrawList& list, bool& frames) {
+    ShareTape& tape = build.tape;
+    if (tape.refusal == kShareOk) tape.refusal = refusal;
+    frames = tape.refusal == kShareFrames || list.frames.size() != tape.frames.size() + 1;
+    if (hazard >= 0 || frames) return kBuildHazard;
+    if (tape.refusal != kShareOk ||
+        !ordersNest(tape.orders, 0, static_cast<uint32_t>(list.draws.size()), 0,
+                    static_cast<uint32_t>(tape.orders.size()), 0) ||
+        !skinsValid(tape, list) || !compileTests(build))
+        return kBuildRefused;
+    return kBuildKeep;
+}
+
+// What a kept build adds to its tape: its vertices sealed, the packed draw arrays, the skip runs
+// and the order patch's index. Its own data only.
+void compileBuild(Program& build, const baked::CarDrawList& list) {
+    ShareTape& tape = build.tape;
+    shareSealVertices(tape);
+    build.drawConditions.resize(list.draws.size());
+    build.drawPolygons.resize(list.draws.size());
+    for (size_t i = 0; i < list.draws.size(); ++i) {
+        const baked::CarDraw& draw = list.draws[i];
+        build.drawConditions[i] = draw.condition;
+        build.drawPolygons[i] = (draw.polygons & ~kDynamicDraw) |
+                                (draw.object == baked::kDynamicCarObject ? kDynamicDraw : 0u);
+    }
+    compileSkips(build);
+    // The order patch's index (report 105 section 4.53) over the draws and order nodes as kept;
+    // ordersNest held in checkBuild. A refused index leaves the program's misses to whole
+    // emissions.
+    OrderSource source{tape.orders.data(),
+                       static_cast<uint32_t>(tape.orders.size()),
+                       build.drawConditions.data(),
+                       static_cast<uint32_t>(build.drawConditions.size()),
+                       build.drawPolygons.data(),
+                       nullptr,
+                       static_cast<uint32_t>(tape.conditions.size() + 1)};
+    orderIndexBuild(build.order.index, source);
+}
+
+// After a build with a hazard: gates the hazards named (`learned` new ones) are decided from the
+// next build on (CarConfig.h), so it is tried again then, at the same margin. Otherwise what the
+// union cannot follow is a fact of the model at this selection: step down.
+void afterHazard(Car& car, uint32_t learned, bool frames) {
+    if (learned && !frames && ++car.learning <= kLearnRetries) {
+        car.buildAfter = g_pass + 1;
+        return;
+    }
+    car.learning = 0;
+    if (car.nextMargin <= 0.0f)
+        car.everyGateAfter = g_pass + kEveryGateRetry;
+    else
+        car.marginAfter = g_pass + kMarginRetry;
+}
+
+// Keeps a checked and compiled build in program slot `index` (its car set, not valid yet), first
+// of `car`'s programs: a run of the program region, made free by dropping the programs taken least
+// recently, or the heap under the byte budget where no region was reserved. False when no run
+// could be had: the slot is dropped and the car retried later.
+bool keepInto(int index, Car& car, const Program& build, const baked::CarDrawList& list,
+              float margin) {
+    Program& p = g_programs[static_cast<size_t>(index)];
+    ArenaRun run;
+    if (programArenaActive() && !regionRun(index, keptBytes(build, list), run)) {
+        car.buildAfter = g_pass + kRefusedRetry;
+        dropProgram(index);
+        return false;
+    }
+    keepBuild(p, build, list, run);
+    p.margin = margin;
+    p.valid = true;
+    if (++g_serial == 0) g_serial = 1;
+    p.serial = g_serial;
+    p.built = g_pass;
+    p.lastTaken = g_pass;
+    p.bytes = vectorBytes(p);
+    g_bytes += p.bytes;
+    car.built = g_pass;
+    car.learning = 0;
+    uint32_t count = std::min(car.count, kConfigsPerCar - 1);
+    for (uint32_t i = count; i > 0; --i) car.programs[i] = car.programs[i - 1];
+    car.programs[0] = static_cast<int16_t>(index);
+    car.count = count + 1;
+    if (!programArenaActive()) {
+        size_t budget = budgetFor(p.bytes);
+        while (g_bytes > budget) {
+            int oldest = leastRecent(index);
+            if (oldest < 0) break;
+            dropProgram(oldest);
+        }
+    }
+    return true;
+}
+
+// The worker's job (CarBuildWorker.h): listOurs's build of the snapshot, checked and compiled.
+// Inside the gate while it reads GPL or the car bake; the pure compile after it.
+int buildJob(BuildJob& job) {
+    const CarBuildSnapshot& s = job.snapshot;
+    if (g_passClock.load(std::memory_order_relaxed) - job.pass > kJobMaxAge) return kJobAged;
+    if (!carBuildEnter(s.epoch)) return kJobCancelled;
+    if (carBakeGeneration() != s.generation) return kJobCancelled;
+    ShareCall call;
+    call.record = s.record;
+    call.root = s.root;
+    call.handle = s.handle;
+    call.driver = s.driver;
+    call.clip = s.clip;
+    call.eye = s.eye;
+    call.classVisible = s.classVisible;
+    call.lightingOn = s.lightingOn;
+    call.textureList = s.textureList;
+    call.texturedMask = s.texturedMask;
+    call.registers = s.registers;
+    Program& build = job.build;
+    tapeBegin(build.tape, call, s.margin, s.generation, s.rebaked);
+    CarDetachedWalk walked;
+    walked.learnedGates = &job.learnedGates;
+    carWalkDetached(s, build.tape, job.list, walked);
+    job.learned = walked.learned;
+    if (walked.need == kDetachedCancelled) return kJobCancelled;
+    if (walked.need != kDetachedOk) return kJobObject + (walked.need - kDetachedObject);
+    BuildVerdict verdict =
+        checkBuild(build, walked.walked ? walked.hazard : -1, walked.refusal, job.list, job.frames);
+    carBuildLeave();
+    if (verdict == kBuildHazard) return kJobHazard;
+    if (verdict == kBuildRefused) return kJobRefused;
+    compileBuild(build, job.list);
+    return kJobBuilt;
+}
+
+void runJob(uint32_t slot) {
+    BuildJob& job = g_jobs[slot];
+    job.status = kJobThrew;
+    job.frames = false;
+    job.learned = 0;
+    job.learnedGates.clear();
+    try {
+        job.status = buildJob(job);
+    } catch (...) {
+        job.status = kJobThrew;
+    }
+    carBuildLeave();
+}
+
+// -- drawn from the previous program while the build is on the worker (report 105 section 4.63) -
+
+// Main passes after its job was queued from which a car walks as before until the job lands (the
+// worker drops a job it reaches after kJobMaxAge anyway).
+constexpr uint32_t kStaleMaxPasses = 16;
+
+// Why a call whose build is on the worker walks as before after all.
+enum StaleRefusal : int {
+    kStaleNoProgram,  // no program of the car is left
+    kStaleDropped,    // this call dropped a program of the car (inputs, bake, frames, a fault)
+    kStaleNever,      // its most recent program differs where a stale draw is not safe (a child)
+    kStalePast,       // its job was queued more than kStaleMaxPasses main passes ago
+    kStaleRemake,     // that program's frames or conditions could not be made (GPL's memo, a fault)
+    kStaleRefusals
+};
+
+// Main passes from a car's first stale draw to its job's landing: 0, 1, 2-3, 4-7, 8-16, more.
+constexpr int kStaleSpans = 6;
+
+uint32_t g_stale[kRebuildCount] = {};
+uint32_t g_staleRefused[kStaleRefusals] = {};
+uint32_t g_staleSpans[kStaleSpans] = {};
+uint32_t g_staleTotal = 0;
+uint32_t g_staleLogged = 0;         // g_staleTotal at the last totals line
+uint32_t g_staleNextLog = 1000;     // the next tenfold of g_staleTotal that logs the totals
+uint32_t g_staleGeneration = 0;     // the car set the totals were last looked at in
+
+const char* const kRebuildName[kRebuildCount] = {
+    "no program", "inputs", "a register", "a child pointer", "the helmet colour", "the LOD",
+    "the selector camera", "a decided gate", "frames", "a fault", "a configuration gate or box",
+    "the cockpit glass"};
+static_assert(kRebuildCount == 12, "kRebuildName names every Rebuild reason");
+
+// The reasons whose difference only the picture shows: the program's draws are its build's
+// selection, its frames and live conditions this call's (staleReplay).
+bool staleSafe(int reason) {
+    return reason == kRegisters || reason == kSprite || reason == kLod || reason == kCamera ||
+           reason == kGate || reason == kConfig;
+}
+
+void logStaleTotals(const char* when) {
+    g_staleLogged = g_staleTotal;
+    logf("baked cars: stale draws %s -- %u: register %u, helmet colour %u, LOD %u, selector camera "
+         "%u, decided gate %u, configuration %u; walked instead: no program %u, a program dropped "
+         "%u, a child pointer %u, past %u main passes %u, frames not made %u; jobs landed 0 / 1 / "
+         "2-3 / 4-7 / 8-16 / more main passes after the first stale draw: %u / %u / %u / %u / %u / "
+         "%u (report 105 section 4.63)",
+         when, g_staleTotal, g_stale[kRegisters], g_stale[kSprite], g_stale[kLod],
+         g_stale[kCamera], g_stale[kGate], g_stale[kConfig], g_staleRefused[kStaleNoProgram],
+         g_staleRefused[kStaleDropped], g_staleRefused[kStaleNever], kStaleMaxPasses,
+         g_staleRefused[kStalePast], g_staleRefused[kStaleRemake], g_staleSpans[0],
+         g_staleSpans[1], g_staleSpans[2], g_staleSpans[3], g_staleSpans[4], g_staleSpans[5]);
+}
+
+void staleRefused(int why) {
+    if (g_staleRefused[why]++) return;
+    static const char* const kWhy[kStaleRefusals] = {
+        "no program of the car is left (a new car, or every program dropped)",
+        "this call dropped a program of the car (its inputs or the bake moved, frames, a fault)",
+        "its most recent program's child pointer moved (a tyre swap, a lost wheel)",
+        "its build was queued too many main passes ago",
+        "its most recent program's frames or conditions could not be made for this call (GPL's "
+        "vertex memo, a fault)"};
+    logf("baked cars: a car whose build is on the worker was walked as before -- %s (report 105 "
+         "section 4.63; logged once a reason)",
+         kWhy[why]);
+}
+
+// A car's job landed: the main passes since its first stale draw, if it had one.
+void staleEnded(Car& car) {
+    if (!car.staleRun) return;
+    car.staleRun = false;
+    uint32_t passes = g_pass - car.staleFrom;
+    int      span = 5;
+    if (passes <= 1)
+        span = static_cast<int>(passes);
+    else if (passes <= 3)
+        span = 2;
+    else if (passes <= 7)
+        span = 3;
+    else if (passes <= kStaleMaxPasses)
+        span = 4;
+    ++g_staleSpans[span];
+}
+
+// While `car`'s build is queued or on the worker, this call takes its most recent program
+// (car.programs[0]) instead of the walk: its frames and conditions made for this call as a reuse
+// makes them, its decisions as its build took them (staleReplay), assembled as a reuse is.
+// `reason`: why that program's replay disagreed this call; `dropped`: this call dropped a program
+// of the car. False: the call walks as before.
+bool staleTake(Car& car, int reason, bool dropped, const ShareCall& call,
+               baked::CarDrawList& list) {
+    if (car.job < 0 || car.cockpit || list.cockpit) return false;
+    int refusal = -1;
+    if (!car.count)
+        refusal = kStaleNoProgram;
+    else if (dropped)
+        refusal = kStaleDropped;
+    else if (!staleSafe(reason))
+        refusal = kStaleNever;
+    else if (g_pass - car.jobPass > kStaleMaxPasses)
+        refusal = kStalePast;
+    if (refusal >= 0) {
+        staleRefused(refusal);
+        return false;
+    }
+    Program& p = g_programs[static_cast<size_t>(car.programs[0])];
+    int      why = 0;
+    bool     remade = p.valid && staleReplayGuarded(p, call, why) == kAgrees;
+    if (!remade) {
+        staleRefused(kStaleRemake);
+        return false;
+    }
+    p.lastTaken = g_pass;
+    assemble(p, list, list, ++g_reuses % kWholeEvery == 0, false);
+    if (!car.staleRun) {
+        car.staleRun = true;
+        car.staleFrom = g_pass;
+    }
+    ++g_staleTotal;
+    if (g_stale[reason]++ == 0)
+        logf("baked cars: a car was drawn from its previous program while its build was on the "
+             "worker -- %s differed (report 105 section 4.63; logged once a reason)",
+             kRebuildName[reason]);
+    if (g_staleTotal == g_staleNextLog) {
+        logStaleTotals("so far");
+        g_staleNextLog = g_staleNextLog <= 100000000u ? g_staleNextLog * 10 : 0;
+    }
+    return true;
+}
+
+// A call no kept program agrees with: the build askBuild asks for, and while the car's build is
+// on the worker its most recent program instead of the walk.
+ProgramOutcome noAgreement(Car& car, int why, int staleReason, bool dropped,
+                           const ShareCall& call, baked::CarDrawList& list) {
+    ProgramOutcome asked = askBuild(car, why, call, list);
+    if constexpr (kCarStaleWhileBuilding) {
+        if ((asked == kProgramWalk || asked == kProgramQueued) &&
+            staleTake(car, staleReason, dropped, call, list))
+            return kProgramReused;
+    }
+    return asked;
+}
+
+// A job the worker handed back (report 105 section 4.61), on the render thread at a pass begin:
+// kept when it was built for the Car, car bake and epoch that still hold, else what it found is
+// what a build here would have left on its Car (carProgramTapeEnd). The slot is free again.
+void landJob(uint32_t slot) {
+    BuildJob& job = g_jobs[slot];
+    Car*      car = nullptr;
+    if (job.car >= 0 && static_cast<size_t>(job.car) < g_cars.size()) {
+        Car& c = g_cars[static_cast<size_t>(job.car)];
+        if (c.record == job.record && c.serial == job.carSerial) car = &c;
+    }
+    if (car && car->job == static_cast<int16_t>(slot)) {
+        car->job = -1;
+        staleEnded(*car);
+    }
+    bool holds = car && job.snapshot.epoch == carBuildWorkerEpoch() &&
+                 job.snapshot.generation == carBakeGeneration() &&
+                 job.snapshot.rebaked == carBakeTotals().objectsRebaked;
+    int outcome = job.status;
+    if (holds) {
+        // The gates its hazards named, as a walk here learns them.
+        for (uintptr_t node : job.learnedGates) carConfigLearn(node);
+        if (outcome == kJobBuilt) {
+            int index = programSlot(*car);
+            outcome = kLandNoRoom;
+            if (index >= 0) {
+                Program& p = g_programs[static_cast<size_t>(index)];
+                p.car = carIndex(*car);
+                p.valid = false;
+                if (keepInto(index, *car, job.build, job.list, job.snapshot.margin)) {
+                    outcome = kLandKept;
+                    if (job.eye == 0 || job.eye == 1)
+                        car->eyeLast[job.eye] = static_cast<int16_t>(index);
+                }
+            }
+        } else if (outcome == kJobHazard) {
+            afterHazard(*car, job.learned, job.frames);
+        } else if (outcome == kJobRefused || outcome == kJobThrew) {
+            car->buildAfter = g_pass + kRefusedRetry;
+        } else if (outcome >= kJobObject && outcome <= kJobScan) {
+            car->buildHere = static_cast<int8_t>(kDetachedObject + (outcome - kJobObject));
+        }
+    } else if (outcome != kJobCancelled && outcome != kJobAged) {
+        outcome = kLandStale;
+    }
+    if (g_landed[outcome]++ == 0 && (outcome == kJobThrew || outcome == kLandNoRoom))
+        logf("baked cars: a build from the worker %s (report 105 section 4.61; logged once)",
+             outcome == kJobThrew ? "threw (an allocation?); the car is built again later"
+                                  : "found no program slot or region run; it is not kept");
+    g_freeJobs.push_back(static_cast<uint16_t>(slot));
+}
+
+void landJobs() {
+    uint32_t slot = 0;
+    while (carBuildWorkerTakeDone(slot))
+        if (slot < g_jobs.size()) landJob(slot);
 }
 
 }  // namespace
@@ -1011,14 +1866,59 @@ size_t vectorBytes(const Program& p) {
 void carProgramInstall() {
     if (g_installed) return;
     g_installed = true;
+    bool   region = programArenaInstall(kFreeFloorBytes);
+    size_t budget = region ? programArenaUse().bytes : kBudgetBytes;
     logf("baked cars: lists kept across frames (report 105 sections 4.23, 4.24) -- in every baked "
          "pass a car's list is walked once with every gate both ways (or, where its memo cannot be "
          "followed so, every gate within %.2f m of the eye and every gate in the wheels), deciding "
          "for its eye every configuration gate, then re-posed and assembled for each eye and frame "
          "until its LOD, a register, a child pointer, the helmet colour, the pass's inputs or a "
-         "decided gate changes; up to %u lists a car, %zu lists and %zu KiB for all cars, up to "
-         "%zu Cars, dropped after %u main passes unused",
-         kProgramMargin, kConfigsPerCar, kMaxPrograms, kBudgetBytes >> 10, kMaxCars, kEvictPasses);
+         "decided gate changes; up to %u lists a car, %zu lists and %zu KiB for all cars (%s), up "
+         "to %zu Cars; past the budget or the pool the list taken least recently is dropped",
+         kProgramMargin, kConfigsPerCar, kMaxPrograms, budget >> 10,
+         region ? "the program region" : "the heap", kMaxCars);
+    // Report 105 section 4.61: after the region is placed, which the worker's frees compare with.
+    const char* why = "kCarBuildWorker is false";
+    if (kCarBuildWorker) {
+        g_jobs.resize(kCarBuildQueue);
+        g_freeJobs.clear();
+        for (uint32_t i = kCarBuildQueue; i > 0; --i)
+            g_freeJobs.push_back(static_cast<uint16_t>(i - 1));
+        g_worker = carBuildWorkerStart(&runJob, why);
+    }
+    if (g_worker)
+        logf("baked cars: program builds on a worker thread (report 105 section 4.61) -- a car "
+             "call that needs a build walks as before and queues it with a snapshot of the call "
+             "(%u jobs at most, one a Car; one queued over %u main passes before it starts is "
+             "dropped); the worker reads GPL's graph only inside a baked pass and lets the render "
+             "thread in at every node; a finished build is kept at the next pass begin and taken "
+             "by the replay as any program. Cockpit builds, and what the worker cannot do (bake an "
+             "object, resolve a texture, scan a gate), stay on the render thread",
+             kCarBuildQueue, kJobMaxAge);
+    else
+        logf("baked cars: program builds on the render thread (report 105 section 4.61) -- the "
+             "build worker is NOT used: %s",
+             why);
+    if (g_worker && kCarStaleWhileBuilding)
+        logf("baked cars: while a car's build is on the worker it is drawn from its most recent "
+             "program instead of walked (report 105 section 4.63) -- where that program differs "
+             "only in its LOD, a selector camera, a decided or configuration gate, a register or "
+             "the helmet colour, for at most %u main passes after the build was queued; a new "
+             "car, a dropped program, a moved child pointer and the cockpit walk as before",
+             kStaleMaxPasses);
+    else if (g_worker)
+        logf("baked cars: a car whose build is on the worker is walked as before (report 105 "
+             "section 4.63) -- kCarStaleWhileBuilding is false");
+    logf("baked cars: a call tries %s (kCarEyeFirst %d); a replay's pose matrices %s "
+         "(kCarPoseCache %d, %u entries, 1 hit in %u checked against poseMatrix) (report 105 "
+         "section 4.64)",
+         kCarEyeFirst ? "first the program its eye took last, then the rest most recently taken "
+                        "first"
+                      : "a car's programs most recently taken first",
+         kCarEyeFirst ? 1 : 0,
+         kCarPoseCache ? "come from a cache keyed by the XFORM and its six pose words"
+                       : "are computed in every replay",
+         kCarPoseCache ? 1 : 0, kPoseSets * kPoseWays, kPoseCheckEvery);
 }
 
 void carProgramPassBegin(bool mirror, bool enabled, int pane) {
@@ -1028,24 +1928,45 @@ void carProgramPassBegin(bool mirror, bool enabled, int pane) {
     g_active = enabled;
     g_mirror = mirror;
     if (!enabled) return;
+    // Section 4.64's pose cache starts again with each car set.
+    if (carBakeGeneration() != g_poseGeneration) {
+        posesClear();
+        g_poseGeneration = carBakeGeneration();
+        g_poseOff = false;
+    }
     // The passes a program's age and a car's retries count are the main passes; a mirror pass
     // takes and builds programs only (report 105 section 4.42).
-    if (mirror) return;
-    ++g_pass;
-    for (size_t i = 0; i < g_programs.size(); ++i) {
-        Program& p = g_programs[i];
-        if (p.car < 0 || g_pass - p.lastTaken <= kEvictPasses) continue;
-        dropProgram(static_cast<int>(i));
+    if (!mirror) {
+        ++g_pass;
+        for (Car& car : g_cars)
+            if (car.record && !car.count && car.job < 0 && g_pass - car.lastTaken > kCarIdlePasses)
+                car = Car{};
+        // Section 4.63's totals, when the car set changes after stale draws.
+        uint32_t generation = carBakeGeneration();
+        if (generation != g_staleGeneration) {
+            if (g_staleTotal != g_staleLogged) logStaleTotals("up to a change of the car set");
+            g_staleGeneration = generation;
+        }
     }
-    for (Car& car : g_cars)
-        if (car.record && !car.count && g_pass - car.lastTaken > kEvictPasses) car = Car{};
+    // The worker's finished builds are kept before this pass takes programs, then the worker may
+    // read until the pass ends (CarBuildWorker.h).
+    if (!g_worker) return;
+    g_passClock.store(g_pass, std::memory_order_relaxed);
+    landJobs();
+    carBuildGateOpen();
 }
 
 void carProgramDropAll() {
+    // Every job in flight comes back cancelled and finds no Car.
+    carBuildWorkerCancel();
+    if (g_staleTotal != g_staleLogged) logStaleTotals("up to a drop of every program");
     for (size_t i = 0; i < g_programs.size(); ++i)
         if (g_programs[i].car >= 0) dropProgram(static_cast<int>(i));
     for (Car& car : g_cars) car = Car{};
+    programArenaTrim();
+    posesClear();
 }
+
 
 namespace {
 
@@ -1077,37 +1998,84 @@ ProgramOutcome takeProgram(const ShareCall& call, baked::CarDrawList& list) {
     }
     car->lastTaken = g_pass;
     car->handle = call.handle;
-    if (!car->count) return askBuild(*car, kNoProgram);
+    if (!car->count) return noAgreement(*car, kNoProgram, kNoProgram, false, call, list);
     // The car's programs, most recently taken first: the first whose inputs, reads and decisions
     // all hold for this call is taken. One that cannot hold again (the pass's inputs or the bake
-    // moved, its tape names frames it does not hold, its replay faulted) is dropped.
+    // moved, its tape names frames it does not hold, its replay faulted) is dropped. `first`: the
+    // reason of the one left most recent, for a stale take (section 4.63).
     int      why = -1;
+    int      first = kNoProgram;
+    bool     dropped = false;
     Program* p = nullptr;
     uint32_t position = 0;
-    while (position < car->count) {
-        int      index = car->programs[position];
+    int      eye = carPassView().eye == 0 || carPassView().eye == 1 ? carPassView().eye : -1;
+    // A candidate's inputs, then its replay.
+    auto test = [&](int index, int& reason) {
         Program& candidate = g_programs[static_cast<size_t>(index)];
-        int      reason = kInputs;
-        Verdict  verdict = kRebuildIt;
-        if (sameInputs(candidate, call, list)) verdict = replayGuarded(candidate, call, reason);
+        reason = kInputs;
+        Verdict verdict = kRebuildIt;
+        if (sameInputs(candidate, call, list)) {
+            verdict = replayGuarded(candidate, call, reason);
+        }
+        return verdict;
+    };
+    // Section 4.64 (a1): the program this eye took last goes first where another is more recent;
+    // the loop below passes over it (`skip`) when it was refused.
+    uint32_t ownAt = 0;
+    int      ownWhy = -1;
+    int      skip = -1;
+    if constexpr (kCarEyeFirst) {
+        for (uint32_t i = 1; eye >= 0 && i < car->count && !ownAt; ++i)
+            if (car->programs[i] == car->eyeLast[eye]) ownAt = i;
+    }
+    if (ownAt) {
+        int     index = car->programs[ownAt];
+        int     reason = kInputs;
+        Verdict verdict = test(index, reason);
         if (verdict == kWalkIt) return kProgramWalk;
         if (verdict == kAgrees) {
-            p = &candidate;
+            p = &g_programs[static_cast<size_t>(index)];
+            position = ownAt;
+        } else if (reason == kInputs || reason == kFrames || reason == kFault) {
+            ownWhy = reason;
+            dropProgram(index);
+            dropped = true;
+        } else {
+            ownWhy = reason;
+            skip = index;
+        }
+    }
+    while (!p && position < car->count) {
+        int index = car->programs[position];
+        if (index == skip) {
+            if (position == 0) first = ownWhy;
+            ++position;
+            continue;
+        }
+        int     reason = kInputs;
+        Verdict verdict = test(index, reason);
+        if (verdict == kWalkIt) return kProgramWalk;
+        if (verdict == kAgrees) {
+            p = &g_programs[static_cast<size_t>(index)];
             break;
         }
         if (why < 0) why = reason;
         if (reason == kInputs || reason == kFrames || reason == kFault) {
             dropProgram(index);
+            dropped = true;
             continue;
         }
+        if (position == 0) first = reason;
         ++position;
     }
-    if (!p) return askBuild(*car, why < 0 ? kNoProgram : why);
+    if (why < 0) why = ownWhy;
+    if (!p) return noAgreement(*car, why < 0 ? kNoProgram : why, first, dropped, call, list);
     if (position > 0) {
         int index = car->programs[position];
         for (uint32_t i = position; i > 0; --i) car->programs[i] = car->programs[i - 1];
         car->programs[0] = static_cast<int16_t>(index);
     }
+    if (eye >= 0) car->eyeLast[eye] = car->programs[0];
     p->lastTaken = g_pass;
     // A mirror car serves up to six cameras a frame (three glasses, two eyes) and builds a program
     // for each on consecutive passes; a reuse shows its builds are being taken (section 4.51).
@@ -1154,36 +2122,9 @@ ShareTape* carProgramTapeBegin(const ShareCall& call, float& margin) {
         return nullptr;
     }
     Program&   p = g_programs[static_cast<size_t>(g_building)];
-    ShareTape& tape = p.tape;
+    ShareTape& tape = g_build.tape;
     margin = g_cars[static_cast<size_t>(p.car)].nextMargin;
-    tape.record = call.record;
-    tape.root = call.root;
-    tape.handle = call.handle;
-    tape.driver = call.driver;
-    tape.classVisible = call.classVisible;
-    tape.textureList = call.textureList;
-    tape.texturedMask = call.texturedMask;
-    tape.lightingOn = call.lightingOn;
-    tape.generation = carBakeGeneration();
-    tape.rebaked = carBakeTotals().objectsRebaked;
-    tape.low = ~static_cast<uintptr_t>(0);
-    tape.high = 0;
-    tape.vertices.clear();
-    tape.refusal = call.planeMask || call.cellPlanes ? kSharePlanes : kShareOk;
-    std::memset(tape.written, 0, sizeof(tape.written));
-    tape.frames.clear();
-    tape.gates.clear();
-    tape.boxes.clear();
-    tape.selectors.clear();
-    tape.registers.clear();
-    tape.sprites.clear();
-    tape.margin = margin;
-    tape.conditions.clear();
-    tape.orders.clear();
-    tape.skins.clear();
-    tape.skinFrames.clear();
-    tape.glass.clear();
-    std::memcpy(tape.rootEye, call.eye, sizeof(tape.rootEye));
+    tapeBegin(tape, call, margin, carBakeGeneration(), carBakeTotals().objectsRebaked);
     p.valid = false;
     return &tape;
 }
@@ -1191,8 +2132,7 @@ ShareTape* carProgramTapeBegin(const ShareCall& call, float& margin) {
 bool carProgramTapeEnd(ShareTape& tape, int hazard, ShareRefusal refusal, baked::CarDrawList& list,
                        uint32_t learned) {
     if (g_building < 0 || static_cast<size_t>(g_building) >= g_programs.size() ||
-        &g_programs[static_cast<size_t>(g_building)].tape != &tape ||
-        g_programs[static_cast<size_t>(g_building)].car < 0 ||
+        &g_build.tape != &tape || g_programs[static_cast<size_t>(g_building)].car < 0 ||
         static_cast<size_t>(g_programs[static_cast<size_t>(g_building)].car) >= g_cars.size()) {
         g_building = -1;
         return false;
@@ -1201,71 +2141,18 @@ bool carProgramTapeEnd(ShareTape& tape, int hazard, ShareRefusal refusal, baked:
     Program& p = g_programs[static_cast<size_t>(index)];
     Car&     car = g_cars[static_cast<size_t>(p.car)];
     g_building = -1;
-    if (tape.refusal == kShareOk) tape.refusal = refusal;
-    bool frames = tape.refusal == kShareFrames || list.frames.size() != tape.frames.size() + 1;
-    if (hazard >= 0 || frames) {
-        // Gates the hazards named are decided from the next build on (CarConfig.h): try again
-        // then, at the same margin. Otherwise what the union cannot follow is a fact of the model
-        // at this selection: step down.
-        if (learned && !frames && ++car.learning <= kLearnRetries) {
-            car.buildAfter = g_pass + 1;
-        } else {
-            car.learning = 0;
-            if (car.nextMargin <= 0.0f)
-                car.everyGateAfter = g_pass + kEveryGateRetry;
-            else
-                car.marginAfter = g_pass + kMarginRetry;
-        }
+    bool         frames = false;
+    BuildVerdict verdict = checkBuild(g_build, hazard, refusal, list, frames);
+    if (verdict == kBuildHazard) afterHazard(car, learned, frames);
+    if (verdict == kBuildRefused) car.buildAfter = g_pass + kRefusedRetry;
+    if (verdict != kBuildKeep) {
         dropProgram(index);
         return false;
     }
-    if (tape.refusal != kShareOk ||
-        !ordersNest(tape.orders, 0, static_cast<uint32_t>(list.draws.size()), 0,
-                    static_cast<uint32_t>(tape.orders.size()), 0) ||
-        !skinsValid(tape, list) || !compileTests(p)) {
-        car.buildAfter = g_pass + kRefusedRetry;
-        dropProgram(index);
-        return false;
-    }
-    shareSealVertices(tape);
-    p.list = list;
-    p.drawConditions.resize(list.draws.size());
-    p.drawPolygons.resize(list.draws.size());
-    for (size_t i = 0; i < list.draws.size(); ++i) {
-        const baked::CarDraw& draw = list.draws[i];
-        p.drawConditions[i] = draw.condition;
-        p.drawPolygons[i] = (draw.polygons & ~kDynamicDraw) |
-                            (draw.object == baked::kDynamicCarObject ? kDynamicDraw : 0u);
-    }
-    compileSkips(p);
-    p.margin = car.nextMargin;
-    p.valid = true;
-    if (++g_serial == 0) g_serial = 1;
-    p.serial = g_serial;
-    // The order patch's index (report 105 section 4.53) over the draws and order nodes as kept;
-    // ordersNest held above. A refused index leaves the program's misses to whole emissions.
-    p.order = OrderState{};
-    OrderSource source{tape.orders.data(),      static_cast<uint32_t>(tape.orders.size()),
-                       p.drawConditions.data(), static_cast<uint32_t>(p.drawConditions.size()),
-                       p.drawPolygons.data(),   nullptr,
-                       static_cast<uint32_t>(tape.conditions.size() + 1)};
-    orderIndexBuild(p.order.index, source);
-    p.built = g_pass;
-    p.lastTaken = g_pass;
-    p.bytes = vectorBytes(p);
-    g_bytes += p.bytes;
-    car.built = g_pass;
-    car.learning = 0;
-    uint32_t count = std::min(car.count, kConfigsPerCar - 1);
-    for (uint32_t i = count; i > 0; --i) car.programs[i] = car.programs[i - 1];
-    car.programs[0] = static_cast<int16_t>(index);
-    car.count = count + 1;
-    size_t budget = budgetFor(p.bytes);
-    while (g_bytes > budget) {
-        int oldest = leastRecent(index);
-        if (oldest < 0) break;
-        dropProgram(oldest);
-    }
+    compileBuild(g_build, list);
+    if (!keepInto(index, car, g_build, list, car.nextMargin)) return false;
+    int eye = carPassView().eye;
+    if (eye == 0 || eye == 1) car.eyeLast[eye] = static_cast<int16_t>(index);
     // The walking eye draws the sides it is on and its own order.
     list.conditionOn.assign(tape.conditions.size() + 1, 0);
     list.conditionOn[0] = 1;

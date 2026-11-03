@@ -372,7 +372,7 @@ void logAddressSpace(const Job& job, const baked::Scene* scene) {
 }  // namespace
 
 void trackBakeMainWalk(void* sceneParams) {
-    if (g_options.bakedRenderer == 0 || !sceneParams) return;
+    if (rendererType() == 0 || !sceneParams) return;
     State& s = g_state;
     bind(s);
 
@@ -453,6 +453,31 @@ bool trackBakePrim(const unsigned char*& prim, unsigned& size) {
     prim = g_state.prim;
     size = g_state.primSize;
     return true;
+}
+
+void trackBakeDropGeometry() {
+    State& s = g_state;
+    if (!s.scene || (s.scene->vertices.empty() && s.scene->indices.empty())) return;
+    size_t bytes = sceneBytes(*s.scene);
+    std::vector<baked::Vertex>().swap(s.scene->vertices);
+    std::vector<uint32_t>().swap(s.scene->indices);
+    logf("baked: the scene's vertices and indices (%.1f MiB) freed -- they are on the GPU; a new GL "
+         "context bakes the track again",
+         bytes / 1048576.0);
+}
+
+bool trackBakeHoldsGeometry() {
+    const State& s = g_state;
+    return s.scene && !s.scene->vertices.empty();
+}
+
+void trackBakeRebake() {
+    State& s = g_state;
+    resetScene(s);
+    // The next main walk takes the same object as a new one and starts the job.
+    s.trackObject = nullptr;
+    s.prim = nullptr;
+    s.primSize = 0;
 }
 
 uint64_t trackBakeFreeAddressSpace() {

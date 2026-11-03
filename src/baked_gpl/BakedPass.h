@@ -8,7 +8,7 @@
 // the horizon underneath, cars, cockpit, flagmen, particles, refused items -- is tested against
 // that depth (ResidualDepth.h).
 //
-// `bakedRenderer` is read live: 0 refuses every pass, so GPL draws everything as it ships; 1 and
+// `rendererType()` is read live: 0 refuses every pass, so GPL draws everything as it ships; 1 and
 // 2 bake them (2 also marks the rectangles it drew, bakedMarkFrameEnd). The VR menu changes it at
 // any time. Nothing is installed until the first pass that wants the renderer, so a session that
 // stays at 0 never patches GPL.
@@ -24,7 +24,7 @@ struct Binding;
 void bakedPassBind(const Binding& binding);
 
 // Around gpl_worldRenderSegmentRange in the main walk thunk. Begin returns whether this pass is
-// baked; End draws it. Both are no-ops while bakedRenderer is 0 or no scene is ready.
+// baked; End draws it. Both are no-ops while rendererType() is 0 or no scene is ready.
 bool bakedPassBegin(void* sceneParams);
 void bakedPassEnd(void* sceneParams);
 
@@ -34,7 +34,7 @@ void bakedPassEnd(void* sceneParams);
 bool bakedPassBeginMirror(void* sceneParams);
 void bakedPassEndMirror(void* sceneParams);
 
-// At the end of a frame, with bakedRenderer = 2: a red square (a cell is 1/300 of the
+// At the end of a frame, with rendererType() = 2: a red square (a cell is 1/300 of the
 // rectangle's height) in the top right corner of every rectangle the baked renderer drew this
 // frame, so its passes can be told from GPL's own.
 void bakedMarkFrameEnd();
@@ -92,5 +92,8 @@ unsigned bakedPassWalkPosition();
 // prepare and `draws` is their count, so the assembly may leave its draws out (report 105
 // sections 4.27, 4.29).
 bool bakedCarRowsPinned(uint32_t key, uint32_t frames, uint32_t& draws);
+// The kept program whose lists carry `key` was dropped: the car renderer gives back its rows, on
+// the CPU and in the GPU store (report 105 section 4.66). Render thread.
+void bakedCarRowsDropped(uint32_t key);
 
 }  // namespace gplvr

@@ -33,6 +33,8 @@ using GLchar = char;
 using GLubyte = unsigned char;
 using GLsizeiptr = std::ptrdiff_t;
 using GLintptr = std::ptrdiff_t;
+struct GLsyncObject;  // GL's opaque __GLsync
+using GLsync = GLsyncObject*;
 
 struct GlApi {
     // GL 1.1
@@ -144,6 +146,15 @@ struct GlApi {
                                                  GLsizei) = nullptr;
     void(BAKED_GLAPI* bindBufferBase)(GLenum, GLuint, GLuint) = nullptr;
     void(BAKED_GLAPI* multiDrawArraysIndirect)(GLenum, const void*, GLsizei, GLsizei) = nullptr;
+
+    // GL 2.0 - 4.4, used only by the car renderer's resident rows (CarRowStore.h, report 105
+    // section 4.66), which checks them itself; glApiMissing does not require them.
+    void(BAKED_GLAPI* uniform3i)(GLint, GLint, GLint, GLint) = nullptr;
+    void(BAKED_GLAPI* copyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr) = nullptr;
+    GLsync(BAKED_GLAPI* fenceSync)(GLenum, GLbitfield) = nullptr;
+    GLenum(BAKED_GLAPI* clientWaitSync)(GLsync, GLbitfield, uint64_t) = nullptr;
+    void(BAKED_GLAPI* deleteSync)(GLsync) = nullptr;
+    void(BAKED_GLAPI* bufferStorage)(GLenum, GLsizeiptr, const void*, GLbitfield) = nullptr;
 
     // GL 1.1 queries (glGetTexEnv* are compatibility-profile only, from the SDK's gl/GL.h), used
     // only by the ordered renderer's state diagnostics; nothing requires them.
@@ -262,7 +273,15 @@ constexpr GLenum kElementArrayBuffer = 0x8893;
 constexpr GLenum kArrayBufferBinding = 0x8894;
 constexpr GLenum kStaticDraw = 0x88E4;
 constexpr GLenum kStreamDraw = 0x88E0;
+constexpr GLenum kStreamRead = 0x88E1;
 constexpr GLenum kDynamicDraw = 0x88E8;
+constexpr GLbitfield kDynamicStorageBit = 0x0100;  // glBufferStorage
+constexpr GLenum kCopyReadBuffer = 0x8F36;  // also its binding's query
+constexpr GLenum kCopyWriteBuffer = 0x8F37;
+constexpr GLenum kSyncGpuCommandsComplete = 0x9117;
+constexpr GLenum kAlreadySignaled = 0x911A;
+constexpr GLenum kTimeoutExpired = 0x911B;
+constexpr GLenum kConditionSatisfied = 0x911C;
 constexpr GLenum kVertexArrayBinding = 0x85B5;
 constexpr GLenum kDrawIndirectBuffer = 0x8F3F;
 constexpr GLenum kDrawIndirectBufferBinding = 0x8F43;

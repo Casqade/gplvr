@@ -2,6 +2,7 @@
 
 #include "baked_gpl/BakedMirror.h"
 #include "baked_gpl/CarBake.h"
+#include "baked_gpl/CarBuildWorker.h"
 #include "baked_gpl/CarProgram.h"
 #include "baked_gpl/CarWalk.h"
 #include "baked_gpl/Flagmen.h"
@@ -199,7 +200,7 @@ struct State {
     bool overlayRefusalSaid[kOverlayRefusals] = {};
     bool overlayLostSaid[kLostKinds] = {};
     bool listsLostSaid = false;
-    // The live bakedRenderer the last pass saw, so a switch is logged once.
+    // The live rendererType() the last pass saw, so a switch is logged once.
     int  modeSeen = -1;
     // The scene generation (trackBakeSceneGeneration) whose upload was stopped, 0 for none: its
     // GPU copy is released and GPL draws that track until another scene lands.
@@ -442,6 +443,13 @@ bool fillGlApi(baked::GlApi& g) {
     BAKED_EXT(getInteger64v, "glGetInteger64v");
     BAKED_EXT(vertexAttribDivisor, "glVertexAttribDivisor");
     BAKED_EXT(multiDrawElementsIndirect, "glMultiDrawElementsIndirect");
+    BAKED_EXT(getBufferSubData, "glGetBufferSubData");
+    BAKED_EXT(uniform3i, "glUniform3i");
+    BAKED_EXT(copyBufferSubData, "glCopyBufferSubData");
+    BAKED_EXT(fenceSync, "glFenceSync");
+    BAKED_EXT(clientWaitSync, "glClientWaitSync");
+    BAKED_EXT(deleteSync, "glDeleteSync");
+    BAKED_EXT(bufferStorage, "glBufferStorage");
 #undef BAKED_CORE
 #undef BAKED_EXT
     return true;
@@ -456,6 +464,45 @@ bool fillGl(State& s) {
     if (!s.wglGetCurrentContext || !fillGlApi(s.gl)) return false;
     s.glFilled = true;
     return true;
+}
+
+// Report 105 section 4.66: the car renderer's GPU store of kept lists' rows, made right after it
+// starts. The store is meant to be device memory only; a driver that shadows it in the process's
+// address space (the 32-bit process's scarce resource) gives itself away by the free address space
+// falling by half the store's size or more, and the store is then given up.
+uint64_t freeAddressSpace() {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullAvailVirtual : 0;
+}
+
+void startRowStore(State& s) {
+    std::string why;
+    uint64_t    before = freeAddressSpace();
+    if (!s.cars.createRowStore(why)) {
+        logf("baked cars: kept lists' rows are NOT resident on the GPU (%s) -- every list's rows "
+             "are uploaded with its pass (report 105 section 4.66)",
+             why.c_str());
+        return;
+    }
+    uint64_t after = freeAddressSpace();
+    uint64_t taken = before > after ? before - after : 0;
+    uint64_t bytes = s.cars.rowStoreBytes();
+    logf("baked cars: kept lists' rows resident on the GPU (kCarRowsResident 1, report 105 section "
+         "4.66) -- a store of %u rows (%.1f MiB of rows and commands, %s) and skinned regions of "
+         "%.1f MiB at the start of the vertex and index buffers; a pass uploads only the frames and "
+         "skinned corners of a list drawn from it; 1 store list in %u read back and compared with "
+         "the per-pass path; free address space %.1f MiB before the store, %.1f MiB after",
+         s.cars.rowStoreRows(), bytes / 1048576.0,
+         s.cars.rowStoreImmutable() ? "glBufferStorage, never mapped" : "glBufferData STATIC_DRAW",
+         s.cars.rowRegionBytes() / 1048576.0, baked::kCarRowCheckEvery, before / 1048576.0,
+         after / 1048576.0);
+    if (before && after && taken >= bytes / 2) {
+        s.cars.dropRowStore();
+        logf("baked cars: the driver took %.1f MiB of address space for the GPU store -- it is "
+             "given up, every list's rows are uploaded with its pass",
+             taken / 1048576.0);
+    }
 }
 
 // The renderer for the context current now: re-created when the context changes (a display mode
@@ -487,6 +534,8 @@ bool ensureRenderer(State& s) {
                 logf("baked cars: the car renderer could not start (%s) -- GPL draws the cars",
                      error.c_str());
                 s.carsFailed = true;
+            } else if (baked::kCarRowsResident) {
+                startRowStore(s);
             }
         }
     }
@@ -749,22 +798,24 @@ void bakedPassBind(const Binding& binding) {
     s.bitmapWidthSlot = binding.raster.bitmapWidth;
     s.bitmapHeightSlot = binding.raster.bitmapHeight;
     s.backBufferSlot = binding.raster.screenGetBackBuffer;
-    if (g_options.bakedRenderer != 0) bindNow(s);
+    if (rendererType() != 0) bindNow(s);
 }
 
 namespace {
 
-// The live bakedRenderer (the VR menu switches it between frames), and a switch logged. Back on
+// The live rendererType() (the VR menu switches it between frames), and a switch logged. Back on
 // after passes GPL drew alone, the kept car programs are dropped: no pass followed the cars
 // meanwhile, so each is built again from its first call rather than trusted to a replay.
 int liveMode(State& s) {
-    int mode = g_options.bakedRenderer;
+    int mode = rendererType();
     if (mode != s.modeSeen) {
         if (s.modeSeen >= 0)
             logf("baked: renderer now %s", mode == 0   ? "GPL's own (vanilla)"
                                            : mode == 1 ? "gplvr's"
                                                        : "gplvr's, its rectangles marked red");
         if (s.modeSeen == 0 && mode != 0) carProgramDropAll();
+        // Off: the car build worker's jobs come back cancelled (report 105 section 4.61).
+        if (s.modeSeen > 0 && mode == 0) carBuildWorkerCancel();
         s.modeSeen = mode;
     }
     return mode;
@@ -776,6 +827,9 @@ int liveMode(State& s) {
 // camera -- are GPL's globals as gpl_sceneRender set them for the mirror before its walk, read here
 // as the main pass reads its own.
 bool beginPass(State& s, SceneParams* params, bool mirror) {
+    // The car build worker stays out until carProgramPassBegin opens its gate, after the car bake
+    // below has followed GPL's reloads (report 105 section 4.61).
+    carBuildGateClose();
     // A main pass refused here is logged by its own reason (or not at all, as before); a mirror
     // pass by the mirror's.
     auto refuse = [&s, mirror](int mainReason, MirrorRefusal why) {
@@ -797,6 +851,23 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
     // Before any walk of this pass: the car bake drops itself when GPL has released or reused
     // anything it was made from (report 105 section 4.20).
     carBakePassBegin();
+    // A new GL context (a display mode change) has lost the GPU copy, and the scene freed its
+    // geometry after the upload, so there is nothing to upload again from: the track is baked
+    // again on the worker, as after a track load, and the game draws it meanwhile. The old
+    // context's objects died with it, so nothing is deleted.
+    if (s.scene && s.context && !trackBakeHoldsGeometry() && fillGl(s)) {
+        HGLRC current = s.wglGetCurrentContext();
+        if (current && current != s.context) {
+            s.renderer.release(false);
+            s.cars.release(false);
+            s.scene = nullptr;
+            s.ready = false;
+            s.context = nullptr;
+            trackBakeRebake();
+            logf("baked: the GL context changed -- the scene's geometry was freed after its "
+                 "upload, so the track is baked again; the game draws it meanwhile");
+        }
+    }
     // A track reload drops the scene before the next one is baked: its GPU copy goes now, so the
     // driver's share of the address space is free while that bake runs.
     // ensureRenderer starts it again for the next scene: it takes a forgotten context as a new one.
@@ -808,7 +879,7 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         logf("baked: the track's scene was dropped (GPL loaded a track again) -- its GPU copy is "
              "released");
     }
-    // bakedRenderer 0, from the ini or the VR menu: GPL draws this pass, and everything above
+    // rendererType() 0, from the ini or the VR menu: GPL draws this pass, and everything above
     // keeps the bake's own state in step with GPL's for when it comes back on.
     if (liveMode(s) == 0) return refuse(-1, kMirrorDrawingOff);
 
@@ -858,7 +929,10 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
             stopUpload(s, why);
             return false;
         }
-        if (!s.renderer.upload(*scene, kUploadBytesPerPass)) {
+        bool uploaded = s.renderer.upload(*scene, kUploadBytesPerPass);
+        // The geometry goes up in the first call and is never read on the CPU again.
+        if (s.renderer.uploadedGeometryBytes()) trackBakeDropGeometry();
+        if (!uploaded) {
             if (s.renderer.uploadFailed())
                 stopUpload(s, "a texture could not be read again (the line above)");
             return false;
@@ -987,9 +1061,9 @@ void endPass(State& s, SceneParams* params, bool mirror) {
         pass.nearPlane = view.nearPlane;
         pass.reversedZ = s.renderer.reversedZ();
         residualArm(pass);
-        // bakedRenderer = 2: the mark goes on the frame; a mirror's rectangle is copied out of it
+        // rendererType() = 2: the mark goes on the frame; a mirror's rectangle is copied out of it
         // before then.
-        if (!mirror && g_options.bakedRenderer == 2 && s.markCount < 2)
+        if (!mirror && rendererType() == 2 && s.markCount < 2)
             std::memcpy(s.markRects[s.markCount++], s.rect, sizeof(s.rect));
     }
     if (listCount) s.cars.finishPass();
@@ -1009,15 +1083,18 @@ bool bakedPassBegin(void* sceneParams) {
     State& s = g_state;
     if (!sceneParams) return false;
     if (!s.bound) {
-        if (g_options.bakedRenderer == 0) return false;
+        if (rendererType() == 0) return false;
         bindNow(s);
         if (!s.bound) return false;
     }
     return beginPass(s, static_cast<SceneParams*>(sceneParams), false);
 }
 
+// The car build worker reads GPL's graph only inside a pass: GPL releases the cars between passes
+// (report 105 section 4.61, CarBuildWorker.h).
 void bakedPassEnd(void* sceneParams) {
     endPass(g_state, static_cast<SceneParams*>(sceneParams), false);
+    carBuildGateClose();
 }
 
 bool bakedPassBeginMirror(void* sceneParams) {
@@ -1035,6 +1112,7 @@ bool bakedPassBeginMirror(void* sceneParams) {
 
 void bakedPassEndMirror(void* sceneParams) {
     endPass(g_state, static_cast<SceneParams*>(sceneParams), true);
+    carBuildGateClose();
 }
 
 void bakedMarkFrameEnd() {
@@ -1155,6 +1233,10 @@ void bakedPassMainWalkDone() {
 bool bakedCarRowsPinned(uint32_t key, uint32_t frames, uint32_t& draws) {
     if (!g_collecting || !bakedPassDrawsCars()) return false;
     return g_state.cars.pinRows(key, frames, draws);
+}
+
+void bakedCarRowsDropped(uint32_t key) {
+    if (g_state.cars.initialised()) g_state.cars.dropRows(key);
 }
 
 namespace {
