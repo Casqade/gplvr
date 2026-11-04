@@ -117,7 +117,7 @@ else()
         src/RenderTarget.cpp
         src/ReplayPanel.cpp
         src/ReplayQuickMenu.cpp
-        src/SimRing.cpp
+        src/SegmentSearch.cpp
         src/SkidFlood.cpp
         src/Stereo.cpp
         src/StereoEuler.cpp

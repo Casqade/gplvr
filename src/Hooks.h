@@ -604,12 +604,10 @@ struct Options {
     // ticks a frame can be drawn between. 0 does not pay it.
     int frameRate = 1;
 
-    // The sim/render state ring (SimRing.h, docs/audit-2026-09-18/72-work-vs-wait.md section 6).
-    // The sim thread publishes each finished tick's car sources into one of four slots.
-    // 0 off. 1 writes each car's render record from the ring instead of reading live sim state.
-    // GPL's tick wait and its lock bracket are still GPL's, so it does not reclaim the wait yet --
-    // that is stage 3, which needs the rest of the latch in the ring. Flat mode and VR.
-    int simRing = 0;
+    // `simRing`, the sim/render state ring (report 75), was here until 2026-11-04. It wrote the
+    // cars' render records from a ring the sim thread published into, verified exact; the stage
+    // that would have reclaimed the render thread's wait was never built, because in VR the
+    // render thread measured 0.02 ms of wait a frame. Removed as dead weight.
 
     // Who draws the world, per mode (read through rendererType()): `vrRendererType` in the
     // headset, the VR menu's "Renderer"; `flatRendererType` in flat mode, ini only, so a player
@@ -671,23 +669,10 @@ struct Options {
     // torn, half-drawn or stale frames in the headset, the unlock does not synchronise here.
     bool vrTransferFinish = true;
 
-    // Render the frame straight into the shared texture the presenter reads, instead of
-    // rendering into our own and copying it across at publish. Report 80.
-    //
-    // The copy is a glBlitFramebuffer of the whole frame -- 80.5 MB read and written at
-    // 6344x3172, measured at 1.0 to 1.9 ms of an 11.11 ms budget. Nothing needs it: the
-    // shared texture is already a complete GL render target, so the off-screen framebuffer
-    // can take it as colour attachment 0 and the game draws into it directly.
-    //
-    // What changes for the presenter is how long a slot is held: the interop lock now spans
-    // the whole frame rather than the moment of the copy, and there are two slots. What
-    // changes for the game is that a frame no longer starts from the previous one's pixels
-    // -- the texture is registered WRITE_DISCARD and the two slots alternate -- so anything
-    // GPL draws once and expects to survive would show every other frame.
-    //
-    // Requires vrOffscreen. A lock or an attachment that fails drops back to the copy for
-    // the rest of the session and says so.
-    bool vrDirectToShared = false;
+    // `vrDirectToShared` (report 80) was here until 2026-11-04. It rendered the frame straight
+    // into the presenter's shared texture, holding the interop lock for the whole frame, so
+    // the copy at publish never ran. It worked and bought nothing: the GPU copy halved, but
+    // the CPU cost of the transfer is the WGL_NV_DX_interop lock, not the bytes. Removed.
 
     // GPL'S STAMPED TEXT IS NEVER DROPPED. `vrSkipStampText` threw away stamps that could
     // not reach the headset -- a few thousand glyphs a frame into a surface the eyes never

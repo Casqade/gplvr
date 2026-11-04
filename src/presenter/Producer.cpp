@@ -106,8 +106,16 @@ struct State {
     int         monitorHudReports = 32;
     bool        monitorHudGlError = false;
 
+    // The shared frame textures' size, which only grows (see presenterFrame), and the frame's
+    // own size is whatever the game rendered; a smaller frame sits in the texture's top-left
+    // corner as the image is read.
     int  width = 0;
     int  height = 0;
+    // Creation attempts that failed since the last success, and when the last one failed. A
+    // failure is retried once a second rather than ending the channel: the game may be holding
+    // the address space for a moment (a track bake on a 2 GB process) and give it back.
+    int      textureFailures = 0;
+    LONGLONG textureFailedQpc = 0;
     int  frameSequence = 0;
     // Side-by-side frames held because they were rendered at a size other than the one the
     // presenter asked for: in the current run, and reports left.
@@ -116,19 +124,8 @@ struct State {
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
 
-    // vrDirectToShared, report 80. The slot the frame is being drawn straight into --
-    // locked from before its first draw call until it is published -- or -1 when the frame
-    // goes into our own target and is copied across at publish. `directGaveUp` is one-way:
-    // a lock or an attachment that fails takes the session back to the copy for good,
-    // because a path that alternates between the two would be neither measurable nor
-    // debuggable.
-    int  directSlot = -1;
-    bool directGaveUp = false;
-    bool directReported = false;
-    bool directNotYetReported = false;
-    // The window's picture has to be taken while the shared texture is still locked, which
-    // is before the publish rather than after it. Set there, cleared by the blit that would
-    // otherwise repeat it.
+    // The window's picture, taken early by presenterDrawVrRay so the ray stays out of it. Set
+    // there, cleared by presenterBlitToWindow, which would otherwise take it again.
     bool windowBlitDone = false;
 
     // Pose diagnostics, logged every two seconds. viewLag counts, per published frame, how
@@ -147,6 +144,14 @@ void fail(const char* why) {
     logf("vr: %s -- the presenter channel is off; the game continues as a flat stereo "
          "mod", why);
     g_state.stage = Stage::Failed;
+}
+
+// The process's free address space, for the lines that report a failed allocation.
+double freeAddressSpaceMiB() {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) return 0.0;
+    return static_cast<double>(status.ullAvailVirtual) / 1048576.0;
 }
 
 // -- setup -----------------------------------------------------------------------
@@ -340,20 +345,7 @@ void releaseMenuTextures(State& state) {
         reinterpret_cast<volatile LONG*>(&state.block->menuVisible), 0);
 }
 
-// Hand back a slot that is being rendered into without publishing it. The frame in it is
-// lost, which is the right outcome everywhere this is called from: the textures are about
-// to be unregistered, and unregistering one that GL still holds is the same fault as
-// unlocking one that is still attached.
-void dropDirect(State& state) {
-    if (state.directSlot < 0) return;
-    renderTargetAttachColour(state.gl, 0);
-    glInteropPublishDirect(state.gl, state.interopDevice,
-                           state.shared[state.directSlot], false, nullptr);
-    state.directSlot = -1;
-}
-
 void releaseTextures(State& state) {
-    dropDirect(state);
     for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
         glInteropUnregister(state.gl, state.interopDevice, state.shared[slot]);
         if (state.textures[slot]) state.textures[slot]->Release();
@@ -387,11 +379,15 @@ bool createTextures(State& state, int width, int height) {
                                                  &state.textures[slot]))) {
             logf("vr: CreateTexture2D %dx%d failed for slot %u", width, height, slot);
             releaseTextures(state);
+            state.width = 0;
+            state.height = 0;
             return false;
         }
         if (!glInteropRegister(state.gl, state.interopDevice, state.textures[slot],
                                state.shared[slot])) {
             releaseTextures(state);
+            state.width = 0;
+            state.height = 0;
             return false;
         }
         storeSharedHandle(state.block->textures[slot], state.shared[slot].shareHandle);
@@ -412,86 +408,6 @@ bool createTextures(State& state, int width, int height) {
     logf("vr: published %u shared textures at %dx%d, generation %d", kFrameSlots, width,
          height, state.block->textureGeneration);
     return true;
-}
-
-void directGiveUp(State& state, const char* why) {
-    if (state.directGaveUp) return;
-    state.directGaveUp = true;
-    renderTargetAttachColour(state.gl, 0);
-    logf("vr: rendering straight into the shared texture is off for this session -- %s. The "
-         "frame is copied into it at publish instead, as it was before vrDirectToShared.",
-         why);
-}
-
-// Take the slot the next frame will be drawn into, lock it, and make it the off-screen
-// target's colour attachment.
-//
-// Called after every publish rather than once a frame, because an extra render is a whole
-// frame of its own and publishes on its own: between two of them there is no other moment
-// at which a new slot could be taken.
-//
-// Everything that is not ready yet is a silent no-op, not a failure -- the textures are
-// created at publish time and the framebuffer at bind time, so the first frames of a
-// session, of a mode change and of a resolution change legitimately have neither. Those
-// frames take the copy path, which is also the fallback if this is ever refused.
-// Say once that the option is on and has not taken. Every reason below is a silent `return`,
-// and a silently inert option reads exactly like one that is working.
-void directNotYet(State& state, const char* why) {
-    if (state.directReported || state.directNotYetReported) return;
-    state.directNotYetReported = true;
-    logf("vr: vrDirectToShared = 1 but the frame is still being copied -- %s. If this is the "
-         "last word on it, the option did nothing this session.",
-         why);
-}
-
-void acquireDirect(State& state) {
-    if (!g_options.vrDirectToShared || state.directGaveUp) return;
-    if (state.stage != Stage::Publishing || state.directSlot >= 0) return;
-    if (!state.gl.dxLockObjects || !state.gl.dxUnlockObjects || !state.interopDevice) {
-        directNotYet(state, "WGL_NV_DX_interop's lock entry points or the interop device are "
-                            "not there");
-        return;
-    }
-
-    int width = 0;
-    int height = 0;
-    if (!renderTargetSize(width, height)) {
-        directNotYet(state,
-                     "there is no off-screen render target to attach it to -- it did not "
-                     "build, and the target: lines say why");
-        return;
-    }
-    if (width != state.width || height != state.height) return;
-
-    // The same arithmetic the publish uses: the presenter reads slot
-    // (frameSequence % kFrameSlots), so the frame about to be drawn is numbered
-    // frameSequence + 1 and belongs in the other one.
-    uint32_t               slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
-    const GlSharedTexture& shared = state.shared[slot];
-    if (!shared.interopObject || !shared.name) {
-        directNotYet(state, "the shared textures are not registered with GL");
-        return;
-    }
-
-    if (!glInteropLockDirect(state.gl, state.interopDevice, shared)) {
-        directGiveUp(state, "wglDXLockObjectsNV would not give GL the slot");
-        return;
-    }
-    if (!renderTargetAttachColour(state.gl, shared.name)) {
-        glInteropPublishDirect(state.gl, state.interopDevice, shared, false, nullptr);
-        directGiveUp(state, "the shared texture would not serve as the off-screen "
-                            "framebuffer's colour attachment");
-        return;
-    }
-
-    state.directSlot = static_cast<int>(slot);
-    if (!state.directReported) {
-        state.directReported = true;
-        logf("vr: the frame is rendered straight into the shared texture -- slot %u, GL "
-             "texture %u, %dx%d. No copy at publish; the interop lock is held for the whole "
-             "frame.",
-             slot, shared.name, width, height);
-    }
 }
 
 // Pribluda's panel is 2048 texels wide whatever the monitor is: at the default 0.6 m that
@@ -1167,27 +1083,60 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     if (!renderTargetSize(width, height) && !glDrawableSize(state.gl, width, height))
         return;
 
-    if (width != state.width || height != state.height) {
+    // THE SHARED TEXTURES ARE SIZED FOR THE HEADSET AS SOON AS IT IS KNOWN, AND NEVER SHRINK.
+    // They were sized to each frame, so a return to the front end shrank them to the window's
+    // size and entering the car grew them again -- and on a 2 GB process, with a big track's
+    // bake holding the address space at that moment, the re-registration failed with
+    // GL_OUT_OF_MEMORY and the headset stopped for the session (the beta on Isle of Man). Held
+    // at the headset's size from the first frame, they are allocated before any track is baked,
+    // which waits for them (presenterHeadsetMemoryHeld). A smaller frame -- the front end's --
+    // is copied into the top-left of the image and its rect published, which is all the
+    // presenter reads.
+    int needWidth = width;
+    int needHeight = height;
+    if (g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
+        int headsetWidth = static_cast<int>(block->targetEyeWidth) * 2;
+        int headsetHeight = static_cast<int>(block->targetEyeHeight);
+        if (headsetWidth > needWidth) needWidth = headsetWidth;
+        if (headsetHeight > needHeight) needHeight = headsetHeight;
+    }
+    if (needWidth > state.width || needHeight > state.height) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (!state.qpcFrequency) {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            state.qpcFrequency = frequency.QuadPart;
+        }
+        if (state.textureFailures &&
+            now.QuadPart - state.textureFailedQpc < state.qpcFrequency)
+            return;
+
+        int textureWidth = needWidth > state.width ? needWidth : state.width;
+        int textureHeight = needHeight > state.height ? needHeight : state.height;
         if (state.width) {
-            logf("vr: render size changed %dx%d -> %dx%d, recreating shared textures",
-                 state.width, state.height, width, height);
+            logf("vr: the frame needs %dx%d, growing the shared textures %dx%d -> %dx%d", width,
+                 height, state.width, state.height, textureWidth, textureHeight);
             char why[96];
-            sprintf_s(why, "the render size changed %dx%d -> %dx%d", state.width, state.height,
-                      width, height);
+            sprintf_s(why, "the shared textures grew %dx%d -> %dx%d", state.width, state.height,
+                      textureWidth, textureHeight);
             frameTraceArm(12, why);
         }
-        bool wasDirect = state.directSlot >= 0;
-        if (!createTextures(state, width, height)) {
-            fail("the shared textures could not be created");
+        if (!createTextures(state, textureWidth, textureHeight)) {
+            ++state.textureFailures;
+            state.textureFailedQpc = now.QuadPart;
+            if (state.textureFailures <= 3 || state.textureFailures % 30 == 0)
+                logf("vr: the shared textures could not be created at %dx%d (attempt %d, %.0f "
+                     "MiB of address space free) -- the headset holds its last image, and this "
+                     "is retried once a second",
+                     textureWidth, textureHeight, state.textureFailures,
+                     freeAddressSpaceMiB());
             return;
         }
-        // On the direct path this frame was drawn into a texture that has just been thrown
-        // away with the rest, so there is nothing to publish: take a slot of the new size
-        // and let the next frame be the first one at it. The copy path has the frame in its
-        // own target and carries on.
-        if (wasDirect) {
-            acquireDirect(state);
-            return;
+        if (state.textureFailures) {
+            logf("vr: the shared textures were created at %dx%d after %d failed attempt(s)",
+                 textureWidth, textureHeight, state.textureFailures);
+            state.textureFailures = 0;
         }
     }
 
@@ -1245,28 +1194,37 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     // the 3D view, the window's size at the top left of a frame sized for the headset, and the
     // rest keeps the previous picture. A rect outside the frame is dropped and the whole frame
     // shown.
+    //
+    // A frame smaller than the textures is copied to GL's origin, which the bottom-up texture
+    // shows at the bottom-left of the image, so its rects move down by the difference in height
+    // -- and when it names none, its whole extent is the rect, or the presenter would sample
+    // the unused rest of the texture.
     bool haveMonoRect = !sideBySide && monoRect && monoRect[0] >= 0 && monoRect[1] >= 0 &&
                         monoRect[2] > 0 && monoRect[3] > 0 &&
                         monoRect[0] + monoRect[2] <= width &&
                         monoRect[1] + monoRect[3] <= height;
+    bool smallerFrame = width < state.width || height < state.height;
+    int  frameTop = state.height - height;
     for (int eye = 0; eye < 2; ++eye) {
         int rect[4] = {};
         bool have = sideBySide ? stereoEyeRect(eye, rect) : haveMonoRect;
         if (!sideBySide && have)
             for (int i = 0; i < 4; ++i) rect[i] = monoRect[i];
+        if (have) {
+            rect[1] += frameTop;
+        } else if (smallerFrame) {
+            int eyeWidth = sideBySide ? width / 2 : width;
+            rect[0] = sideBySide ? eye * eyeWidth : 0;
+            rect[1] = frameTop;
+            rect[2] = eyeWidth;
+            rect[3] = height;
+            have = true;
+        }
         for (int i = 0; i < 4; ++i)
             block->eyeRect[eye][i] = have ? static_cast<uint32_t>(rect[i]) : 0u;
     }
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->stretchToFill),
                         stretchToFill ? 1 : 0);
-
-    // The off-screen target rebuilds itself on a mode change as well as a resolution
-    // change, and a rebuilt framebuffer has the target's OWN texture attached again. When
-    // that has happened the frame did not land in the slot being held, so the slot is given
-    // back unpublished and this frame takes the copy path.
-    if (state.directSlot >= 0 &&
-        renderTargetAttachedColour() != state.shared[state.directSlot].name)
-        dropDirect(state);
 
     // The poses this frame was drawn from, echoed back untouched. Written before the
     // frame sequence that advertises the pixels, so the presenter never pairs a new
@@ -1274,13 +1232,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     // The slot must be the one the published sequence names, not the one before it:
     // the presenter reads slot (frameSequence % kFrameSlots), so the frame we are about
     // to write is numbered frameSequence + 1 and belongs in that slot.
-    //
-    // On the direct path the frame is already IN a slot -- chosen by this same arithmetic
-    // when it was locked, before the frame's first draw call -- and that one is what gets
-    // published, whatever the arithmetic says now.
-    const uint32_t slot = state.directSlot >= 0
-                              ? static_cast<uint32_t>(state.directSlot)
-                              : static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
+    uint32_t slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
 
     // The poses go in the SAME slot as the pixels they belong to. Version 1 kept one
     // shared copy, written before frameSequence moved, so a consumer could latch
@@ -1330,28 +1282,11 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     int           transferring = frameBudgetEnter(kSpanTransfer);
     LARGE_INTEGER transferBegin, transferEnd;
     QueryPerformanceCounter(&transferBegin);
-    bool transferred;
-    if (state.directSlot >= 0) {
-        // The pixels are already where the presenter will read them. What is left is
-        // everything that still has to happen while GL holds the texture: the pointer's
-        // saved pixels go back into the frame, the texture comes off the framebuffer -- the
-        // unlock fails if it does not -- and the panel rides out under the same unlock.
-        //
-        // The window's picture was taken in presenterEndFrame, for the same reason the
-        // restore is here: after the unlock this texture belongs to Direct3D.
-        cursorOverlayRestore(state.gl);
-        renderTargetAttachColour(state.gl, 0);
-        transferred = glInteropPublishDirect(state.gl, state.interopDevice,
-                                             state.shared[slot], g_options.vrTransferFinish,
-                                             copyPanel ? &panelCopy : nullptr);
-        state.directSlot = -1;
-    } else {
-        transferred = glInteropCopyBackBuffer(state.gl, state.interopDevice,
-                                              state.shared[slot], width, height,
-                                              renderTargetFramebuffer(),
-                                              g_options.vrTransferFinish,
-                                              copyPanel ? &panelCopy : nullptr);
-    }
+    bool transferred = glInteropCopyBackBuffer(state.gl, state.interopDevice,
+                                               state.shared[slot], width, height,
+                                               renderTargetFramebuffer(),
+                                               g_options.vrTransferFinish,
+                                               copyPanel ? &panelCopy : nullptr);
     QueryPerformanceCounter(&transferEnd);
     frameBudgetLeave(transferring);
     presenterNoteTransfer(transferEnd.QuadPart - transferBegin.QuadPart);
@@ -1366,12 +1301,6 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
     renderPacingNotePublished();
-
-    // The next frame's slot is taken here rather than at the top of the next frame: an
-    // extra render draws and publishes a whole frame of its own between the two, and the
-    // game's own next frame starts drawing without passing through presenterBeginFrame
-    // again when it does.
-    acquireDirect(state);
 
     // The HUD panel copied under the same lock goes out now, after the same synchronisation,
     // so the presenter can never copy one that is still being written.
@@ -1439,19 +1368,6 @@ void presenterEndFrame() {
     State& state = g_state;
     if (state.stage == Stage::Off) return;
     renderTargetEndFrame(state.gl);
-
-    // On the direct path the window's picture is read out of the shared texture, so it has
-    // to be taken here -- the frame is finished and the texture is still locked to GL. The
-    // publish that follows hands it to Direct3D, after which GL may not read it at all.
-    //
-    // Only the blit moves. The panel that goes over the picture is drawn into the window's
-    // own buffer and stays where it was, after the publish, so it still uses the views this
-    // frame was rendered from.
-    if (state.directSlot >= 0) {
-        frameBudgetSwitch(kSpanWindowBlit);
-        renderTargetBlitToWindow(state.gl, g_options.vrMonitorEye);
-        state.windowBlitDone = true;
-    }
 }
 
 void presenterBlitToWindow(int eye) {
@@ -1595,18 +1511,11 @@ void presenterBeginFrame() {
     if (!g_options.vr) {
         // Not merely "do not bind": the engine's back buffer size has to go back to what
         // roglv2 believes, or the next frame is laid out for a surface that is no longer
-        // the render target. A slot still held goes back first -- the framebuffer it is
-        // attached to is about to be deleted.
-        dropDirect(state);
+        // the render target.
         renderTargetRelease(state.gl);
         return;
     }
     renderTargetBeginFrame(state.gl);
-
-    // After the bind, not before it: the framebuffer the slot is attached to is built in
-    // there. Inert whenever a slot is already held, which is the usual case -- the publish
-    // takes the next one as soon as it lets the last one go.
-    acquireDirect(state);
 }
 
 namespace {
@@ -1635,6 +1544,15 @@ bool presenterFovMutable() {
     State& state = g_state;
     if (state.stage != Stage::Publishing || !state.block) return true;
     return state.block->fovMutable != 0;
+}
+
+bool presenterHeadsetMemoryHeld() {
+    State& state = g_state;
+    if (!g_options.vr || state.stage == Stage::Off || state.stage == Stage::Failed) return true;
+    if (state.stage != Stage::Publishing || !state.block) return false;
+    if (!state.block->targetEyeWidth || !state.block->targetEyeHeight) return false;
+    return state.width >= static_cast<int>(state.block->targetEyeWidth) * 2 &&
+           state.height >= static_cast<int>(state.block->targetEyeHeight);
 }
 
 int32_t presenterViewSequence() {

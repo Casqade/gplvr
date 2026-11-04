@@ -32,6 +32,10 @@ namespace gplvr {
 // and screenGetBackBuffer. Without them the off-screen path stays off.
 void renderTargetBind(const Binding& binding);
 
+// roglv2's mipSetCurrent global, which mirror.mip's GL texture is found through. Both modes: the
+// baked cockpit overlay needs it in flat mode as well.
+void renderTargetBindMips(const Binding& binding);
+
 // roglv2's screenDisplay, captured BEFORE the frame counter replaces the global with our
 // own hook. The display object -- whose size decides the ortho every destination change
 // rebuilds -- is decoded out of its code, and our hook contains no such reference.
@@ -68,19 +72,6 @@ bool renderTargetActive();
 // and the size of what is in it.
 GLuint renderTargetFramebuffer();
 bool   renderTargetSize(int& width, int& height);
-
-// Draw into a texture we do not own, as colour attachment 0 in place of the target's own.
-//
-// This is what lets the frame be rendered straight into the presenter's shared texture
-// (vrDirectToShared, report 80). `name` 0 puts the target's own texture back, which is also
-// what a rebuild does -- so the caller has to ask again after a resolution change rather
-// than assume the attachment survived. False means the attachment was refused or the
-// framebuffer is incomplete with it, and the target's own texture is attached instead.
-//
-// The texture must be lockable by whoever owns it for as long as it is attached, and it
-// must be detached before it is handed back.
-bool   renderTargetAttachColour(const GlFunctions& gl, GLuint name);
-GLuint renderTargetAttachedColour();
 
 // The GL texture a rasterizer bitmap handle draws from, or 0 if the handle does not reach one.
 //

@@ -205,6 +205,8 @@ struct State {
     // The scene generation (trackBakeSceneGeneration) whose upload was stopped, 0 for none: its
     // GPU copy is released and GPL draws that track until another scene lands.
     uint32_t stoppedGeneration = 0;
+    // Why, in a few words, for the VR menu.
+    const char* stoppedBrief = nullptr;
 };
 
 State g_state;
@@ -730,12 +732,14 @@ void sayOverlayLost(State& s, OverlayLost why) {
 }
 
 // Ends the scene's upload for good: its GPU copy goes, and the context is forgotten so the next
-// scene restarts the renderer (as when a scene drops). GPL draws this track.
-void stopUpload(State& s, const char* why) {
+// scene restarts the renderer (as when a scene drops). GPL draws this track. `brief` is the
+// reason in a few words, for the VR menu.
+void stopUpload(State& s, const char* why, const char* brief) {
     s.renderer.release(s.context && s.wglGetCurrentContext() == s.context);
     s.ready = false;
     s.context = nullptr;
     s.stoppedGeneration = trackBakeSceneGeneration();
+    s.stoppedBrief = brief;
     logf("baked: the GPU upload STOPPED -- %s; its GPU copy is released and the game draws this "
          "track (%.0f MiB of address space free now)",
          why, trackBakeFreeAddressSpace() / 1048576.0);
@@ -926,7 +930,7 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
                           "(%.1f MiB of textures were up)",
                           freeBytes / 1048576.0, kUploadAddressFloor / 1048576.0,
                           s.renderer.uploadedTextureBytes() / 1048576.0);
-            stopUpload(s, why);
+            stopUpload(s, why, "not enough memory left for the track's textures");
             return false;
         }
         bool uploaded = s.renderer.upload(*scene, kUploadBytesPerPass);
@@ -934,7 +938,8 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         if (s.renderer.uploadedGeometryBytes()) trackBakeDropGeometry();
         if (!uploaded) {
             if (s.renderer.uploadFailed())
-                stopUpload(s, "a texture could not be read again (the line above)");
+                stopUpload(s, "a texture could not be read again (the line above)",
+                           "a track texture could not be read");
             return false;
         }
         logf("baked: GPU upload done -- %.0f MiB of address space free",
@@ -1155,6 +1160,12 @@ void bakedMarkFrameEnd() {
 }
 
 bool bakedPassCollecting() { return g_collecting != 0; }
+
+const char* bakedPassUploadStopped() {
+    State& s = g_state;
+    if (!s.stoppedGeneration || s.stoppedGeneration != trackBakeSceneGeneration()) return nullptr;
+    return s.stoppedBrief;
+}
 
 bool bakedPassDrawsCars() { return g_collecting && g_carsReady; }
 

@@ -5,7 +5,6 @@
 #include "Log.h"
 #include "Pe.h"
 #include "RenderPacing.h"
-#include "SimRing.h"
 #include "TaskRate.h"
 
 #include <windows.h>
@@ -1571,16 +1570,10 @@ void interpolationInstall() {
         return;
     }
 
-    // The three car latch sites may already hold the sim ring's hook (SimRing.h), which
-    // installs first and calls the stock latch itself; the blend then runs outside it.
-    uintptr_t ring = simRingCarLatchHookAddress();
-
     const StockCall* calls[6] = {&kCarLatchCalls[0], &kCarLatchCalls[1], &kCarLatchCalls[2],
                                  &kViewLatchCall,    &kMirrorLatchCall,  &kPitBoardLatchCall};
     for (const StockCall* call : calls) {
         auto bytes = reinterpret_cast<const uint8_t*>(call->site);
-        bool isCarLatch = call == calls[0] || call == calls[1] || call == calls[2];
-        if (isCarLatch && ring && bytes[0] == 0xE8 && callTarget(call->site) == ring) continue;
         if (std::memcmp(bytes, call->bytes, sizeof(call->bytes)) != 0) {
             logf("interp: %08X does not hold its stock call (%02X %02X %02X %02X %02X) -- no "
                  "interpolation",

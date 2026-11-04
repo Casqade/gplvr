@@ -20,10 +20,16 @@ struct Entries {
     void** bitmapWidthSlot = nullptr;
     void** bitmapHeightSlot = nullptr;
     void** backBufferSlot = nullptr;
-    void** mipSetCurrentSlot = nullptr;
 };
 
 Entries g_entries;
+
+// roglv2's mipSetCurrent global, which the MIP handle table below is decoded from. Bound in BOTH
+// modes by renderTargetBindMips, and so not in Entries, which renderTargetBind resets and binds
+// only in VR: the baked cockpit overlay finds mirror.mip's GL texture through this table, and
+// with it bound in VR alone every flat frame fell back to drawing the cockpit by depth, which
+// cut the Eagle's wheel rim, gear gate and tachometer needles.
+void** g_mipSetCurrentSlot = nullptr;
 
 // roglv2's MIP handle table, decoded out of mipSetCurrent (0x20003980): `mov ecx, [table]`,
 // `mov edx, [ecx+8]`, `mov esi, [edx+eax*8]`. Mips have a table of their own; the bitmap table
@@ -96,9 +102,6 @@ struct Target {
     GLuint framebuffer = 0;
     GLuint colour = 0;
     GLuint depth = 0;
-    // A texture belonging to somebody else, attached in place of `colour` for a frame that
-    // renders straight into it. 0 means the target's own.
-    GLuint borrowed = 0;
     int    width = 0;
     int    height = 0;
 
@@ -256,8 +259,8 @@ bool resolveSurface() {
 // The MIP handle table's pointer (MipTable), or null when mipSetCurrent's code does not hold
 // exactly one `8B 0D imm32 8B 51 08 8B 34 C2` in its first 96 bytes. Each new verdict is logged.
 void* const* mipHandleTable() {
-    if (!g_entries.mipSetCurrentSlot || !*g_entries.mipSetCurrentSlot) return nullptr;
-    const void* code = *g_entries.mipSetCurrentSlot;
+    if (!g_mipSetCurrentSlot || !*g_mipSetCurrentSlot) return nullptr;
+    const void* code = *g_mipSetCurrentSlot;
     if (code == g_mipTable.code) return g_mipTable.table;
     g_mipTable.code = code;
     g_mipTable.table = nullptr;
@@ -580,7 +583,6 @@ void destroyFramebuffer(const GlFunctions& gl) {
     g_target.framebuffer = 0;
     g_target.depth = 0;
     g_target.colour = 0;
-    g_target.borrowed = 0;
     g_target.width = 0;
     g_target.height = 0;
     g_target.bound = false;
@@ -746,7 +748,10 @@ void renderTargetBind(const Binding& binding) {
     g_entries.bitmapWidthSlot = binding.raster.bitmapWidth;
     g_entries.bitmapHeightSlot = binding.raster.bitmapHeight;
     g_entries.backBufferSlot = binding.raster.screenGetBackBuffer;
-    g_entries.mipSetCurrentSlot = rasterGlobal(binding.image, "mipSetCurrent");
+}
+
+void renderTargetBindMips(const Binding& binding) {
+    g_mipSetCurrentSlot = rasterGlobal(binding.image, "mipSetCurrent");
 }
 
 void renderTargetSetScreenDisplay(const void* original) {
@@ -946,43 +951,6 @@ bool renderTargetSize(int& width, int& height) {
     height = g_target.height;
     return true;
 }
-
-bool renderTargetAttachColour(const GlFunctions& gl, GLuint name) {
-    if (!g_target.framebuffer || !gl.bindFramebuffer || !gl.framebufferTexture2D)
-        return false;
-
-    GLuint wanted = name ? name : g_target.colour;
-    if (!wanted) return false;
-
-    // The binding is saved and put back rather than left at the target's own: this runs
-    // both between frames, where nothing is bound, and in the middle of the extra-render
-    // tail, where the target is bound and the frame after this one keeps drawing into it.
-    GLint previous = 0;
-    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previous);
-    gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
-    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, wanted, 0);
-
-    GLenum status = gl.checkFramebufferStatus ? gl.checkFramebufferStatus(kGlFramebuffer)
-                                              : kGlFramebufferComplete;
-    if (status != kGlFramebufferComplete) {
-        // Put our own back before returning, so a refusal leaves a target that still
-        // renders rather than one that is incomplete for the rest of the session.
-        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
-                                g_target.colour, 0);
-        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
-        g_target.borrowed = 0;
-        logf("target: texture %u will not serve as colour attachment 0 of the %dx%d "
-             "off-screen framebuffer (0x%04X) -- the target's own is attached again",
-             name, g_target.width, g_target.height, status);
-        return false;
-    }
-
-    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
-    g_target.borrowed = name;
-    return true;
-}
-
-GLuint renderTargetAttachedColour() { return g_target.borrowed; }
 
 GLuint rasterBitmapGlTexture(int handle) {
     if (handle <= 0 || !resolveSurface()) return 0;

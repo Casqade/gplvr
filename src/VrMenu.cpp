@@ -19,6 +19,8 @@
 #include "VrInput.h"
 #include "VrText.h"
 #include "Window.h"
+#include "baked_gpl/BakedPass.h"
+#include "baked_gpl/TrackBake.h"
 #include "presenter/Producer.h"
 
 #include <cmath>
@@ -626,6 +628,37 @@ void notice(const char* text) {
     _snprintf_s(g_notice, sizeof(g_notice), _TRUNCATE, "%s", text);
     g_noticeUntil = menuNow() + kNoticeSeconds;
     logf("vr menu: %s", text);
+}
+
+// THE RENDERER THE DRIVER CHOSE IS NOT DRAWING THIS TRACK. Said in the warning colour above the
+// hovered row's help for as long as it lasts: without a baked scene every pass is the game's own
+// -- the track, the cars, the cockpit and the mirrors alike -- and that is a frame rate a driver
+// would otherwise put down to something else. The footer grows by kRendererWarningLines while it
+// shows, so the help under it keeps its room.
+constexpr int kRendererWarningLines = 2;
+
+bool rendererWarning(char* out, size_t size) {
+    if (rendererType() == 0) return false;
+    const char* brief = bakedPassUploadStopped();
+    if (const char* why = trackBakeFailure()) {
+        if (std::strstr(why, "out of memory"))
+            brief = "not enough memory for this track";
+        else if (std::strncmp(why, "no tracks", 9) == 0)
+            brief = "its track file was not found";
+        else
+            brief = "the track could not be prepared";
+    }
+    if (!brief) return false;
+    _snprintf_s(out, size, _TRUNCATE,
+                "GPL VR renderer is off on this track: %s. The game's own renderer draws it, so "
+                "performance may be lower.",
+                brief);
+    return true;
+}
+
+int footerLines() {
+    char warning[200];
+    return kHelpLines + (rendererWarning(warning, sizeof(warning)) ? kRendererWarningLines : 0);
 }
 
 // What a row's new value implies elsewhere. There is nothing here today: the one rule that
@@ -1249,7 +1282,7 @@ float helpFooterHeight(int slot, int lines);
 // from the same two numbers the draw does, so a row is where it looks.
 float rowBand() {
     const float footer =
-        helpFooterHeight(kVrTextSmall, kHelpLines) / static_cast<float>(kMenuCanvasHeight);
+        helpFooterHeight(kVrTextSmall, footerLines()) / static_cast<float>(kMenuCanvasHeight);
     return (1.0f - footer) / static_cast<float>(lineCount());
 }
 
@@ -2843,6 +2876,7 @@ struct HelpBlock {
     char lines[kHintLines][kHelpLineChars];
     int  count = 0;
     bool warning = false;  // a refusal rather than a hint, and drawn in the warning colour
+    int  warningLines = 0;  // the first lines alone are a warning (rendererWarning)
 };
 
 // Greedy word wrap, in the slot's own metrics rather than a character count: the font is
@@ -2905,6 +2939,7 @@ const char* bindingText(const char* description) {
 void buildHelpBlock(HelpBlock& block, int slot, float width) {
     block.count = 0;
     block.warning = false;
+    block.warningLines = 0;
 
     if (g_notice[0] && menuNow() < g_noticeUntil) {
         block.warning = true;
@@ -2913,6 +2948,11 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
     }
 
     if (g_state.mode == Mode::Menu) {
+        char warning[200];
+        if (rendererWarning(warning, sizeof(warning))) {
+            wrapInto(block, slot, width, warning);
+            block.warningLines = block.count;
+        }
         if (g_state.hovered < 0 || g_state.hovered >= kRowCount) return;
 
         // WHAT THE ROW IS, then HOW TO WORK IT, as two lines rather than one sentence with
@@ -3006,7 +3046,7 @@ unsigned helpBlockHash(const HelpBlock& block) {
     for (int line = 0; line < block.count; ++line)
         for (const char* c = block.lines[line]; *c; ++c)
             hash = (hash ^ static_cast<unsigned char>(*c)) * 16777619u;
-    return hash ^ (block.warning ? 0x9E3779B9u : 0u);
+    return (hash ^ (block.warning ? 0x9E3779B9u : 0u)) + static_cast<unsigned>(block.warningLines);
 }
 
 // The reserved height, which does not depend on what the block says.
@@ -3019,13 +3059,14 @@ float helpFooterHeight(int slot, int lines) {
 void drawHelpBlock(const GlFunctions& gl, const HelpBlock& block, int slot, float x,
                    float top) {
     float step = static_cast<float>(vrTextHeight(slot)) * kHelpLineSpacing;
-    if (block.warning)
-        gl.color4f(1.0f, 0.78f, 0.30f, 1.0f);
-    else
-        gl.color4f(0.62f, 0.70f, 0.82f, 1.0f);
-    for (int line = 0; line < block.count; ++line)
+    for (int line = 0; line < block.count; ++line) {
+        if (block.warning || line < block.warningLines)
+            gl.color4f(1.0f, 0.78f, 0.30f, 1.0f);
+        else
+            gl.color4f(0.62f, 0.70f, 0.82f, 1.0f);
         canvasText(gl, slot, x, top + step * (static_cast<float>(line) + 0.5f),
                    block.lines[line]);
+    }
 }
 
 // The cursor, in the canvas because the canvas IS the panel now: there is no other
@@ -3201,7 +3242,7 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     // nothing: the reservation is the same whether it holds one line or none.
     HelpBlock block;
     buildHelpBlock(block, kVrTextSmall, w - kHelpMargin * 2.0f);
-    float footer = helpFooterHeight(kVrTextSmall, kHelpLines);
+    float footer = helpFooterHeight(kVrTextSmall, footerLines());
     int   lines = lineCount();
     float band = (h - footer) / static_cast<float>(lines);
 

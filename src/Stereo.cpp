@@ -18,6 +18,7 @@
 #include "MirrorUv.h"
 #include "Pe.h"
 #include "RenderTarget.h"
+#include "SegmentSearch.h"
 #include "StereoEuler.h"
 #include "VrCamera.h"
 
@@ -610,8 +611,8 @@ __declspec(naked) void paneDropThunk() {
 // sub_460B40(hint, &out, x, y, z): the search gpl_sceneRender makes at 0x487D73 over the global
 // segment array, seeded by (u16)p[23] and driven by the eye position in dlong units (metres x
 // 19685, dbl_53A020). It reads globals only, so it can be called with the values the pass is
-// about to use. Returns the segment index the walk is centred on.
-using WalkSegmentFn = int(__cdecl*)(int hint, int* out, int x, int y, int z);
+// about to use. Returns the segment index the walk is centred on. SegmentSearch.h holds its type
+// and the checks on its answers.
 constexpr uintptr_t kWalkSegmentOf = 0x00460B40;
 
 // THE FALLBACK. gpl_sceneRender asks this function where the camera is on the track, and uses
@@ -647,65 +648,20 @@ void* g_walkLookupOriginal = nullptr;
 // of the walk, so that frame draws a different stretch of track: terrain over everything, no
 // road, the bare ground showing through.
 //
-// THE SEED IS NOT THE VARIABLE, and this is measured, not assumed. An earlier instrument reseated
-// the seed from the blended position and reported `hint reseated 0, corrected 0` -- it never fired
-// -- and the decisive case had the SAME seed (12) with two positions 0.46 m apart answering 12 and
-// 17. A search that steps one segment an iteration cannot legitimately move five segments for
-// 0.46 m of input. What decides where it stops is the ORDER of the probes, not the seed, so any
-// fix that supplies a better seed is a no-op wearing a new hat.
+// THE SEED IS NOT THE VARIABLE for this defect, measured: an earlier instrument reseated the seed
+// from the blended position and reported `hint reseated 0, corrected 0` -- it never fired -- and
+// the decisive case had the SAME seed (12) with two positions 0.46 m apart answering 12 and 17.
+// What decides where it stops is the ORDER of the probes. (A search that runs AWAY from its seed
+// past a curve's start is a different defect, and a reseat does fix that one: SegmentSearch.cpp
+// askNearHint.)
 //
 // So the seed is left exactly as gpl_sceneRender passes it, and the ANSWER is checked instead: a
 // dlong cannot advance further than the car did. When it has, the car's own dlong replaces it --
 // record byte 12, the value the sim maintains, which the mark ring shows moving smoothly to a
 // tenth of a metre through the very frames where this search spiked 32 m. Live authoritative
-// data, not a stale value and not a guess about the search.
+// data, not a stale value and not a guess about the search. The containment test on GPL's answer
+// is SegmentSearch.cpp's placementOf.
 constexpr uintptr_t kTrackLengthDlong = 0x006B3884;
-constexpr uintptr_t kSegmentCount = 0x006AFB08;
-constexpr uintptr_t kSegmentTable = 0x006AEA1C;  // float rows: +4 start m, +12 scale, +16 length
-constexpr int       kSegmentRowWords = 360;      // 1440 bytes a row
-
-// GPL'S OWN CONTAINMENT ANSWER, which its search asks for and then throws away.
-//
-// gpl_segmentPlacePoint 0x4608D0 projects the point onto one segment and returns:
-//     0  the point is INSIDE this segment -- the dlong it wrote is real
-//     1  the point is past its end
-//     2  the point is before its start
-// On 1 and 2 it still writes a dlong: `segment.baseDlong + projection`, the point EXTRAPOLATED
-// along that segment's axis. That number is only meaningful if the track continues the way this
-// segment does.
-//
-// gpl_cameraTrackPositionFromWorld loops it, stepping one segment towards the point, and exits on
-// `while (v8 & v9)` -- as soon as two consecutive probes stop sharing a bit. A 1 followed by a 2
-// (stepped forward and overshot) shares nothing, so the loop stops there and PUBLISHES THE
-// EXTRAPOLATION from a segment the point is not in. There is no step-back-and-accept.
-//
-// So the failure has a name and a test: the point fell in a seam between two segments'
-// longitudinal spans, and the answer is an extrapolation. Asking this function directly about the
-// segment the search settled on is exactly the check the engine omits -- no threshold in it.
-constexpr uintptr_t kSegmentArray = 0x006B7FD8;   // dword_6B7FD8, the array 0x460B40 indexes
-constexpr uintptr_t kSegmentArrayCount = 0x006AFB08;
-constexpr uintptr_t kSegmentPlacePoint = 0x004608D0;
-using PlacePointFn = int(__cdecl*)(const void* segment, int x, int y, int* dlong, int* dlat);
-
-// 0 inside, 1 past the end, 2 before the start, -1 when it could not be asked.
-//
-// Both globals go through rebase because this reads a pointer out of one, indexes it, and hands
-// the element to the engine as an object pointer. The non-null and range tests below cannot tell
-// a wrong global from a right one -- a plausible pointer and a count of a few hundred are common
-// shapes -- and the install gate is two code sites that are identical in every link of 1.2.0.2.
-int placementOf(int segment, int x, int y) {
-    uintptr_t arrayAt = rebase(kSegmentArray);
-    uintptr_t countAt = rebase(kSegmentArrayCount);
-    if (!arrayAt || !countAt) return -1;
-    auto base = *reinterpret_cast<const void* const* const*>(arrayAt);
-    int  count = *reinterpret_cast<const int*>(countAt);
-    if (!base || count <= 0 || count > 8192 || segment < 0 || segment >= count) return -1;
-    const void* node = base[segment];
-    if (!node) return -1;
-    int dlong = 0;
-    int dlat = 0;
-    return reinterpret_cast<PlacePointFn>(kSegmentPlacePoint)(node, x, y, &dlong, &dlat);
-}
 
 int      g_walkLastDlong = 0;
 float    g_walkLastPosition[3] = {};
@@ -771,56 +727,6 @@ void walkSetCentre(float x, float y, float z) {
     g_walkHaveCentre = true;
 }
 
-// Signed difference the short way round the lap, in dlong units.
-// THE SEGMENT FOR A DLONG, by table lookup instead of by search.
-//
-// gpl_cameraTrackPositionFromWorld answers the same question by walking from a hint segment, and
-// that walk is not a continuous function of its input: it can settle on a segment the point is not
-// inside (report 84) and which one it settles on moves with the hint and with sub-centimetre
-// changes in the position. The segment sets the origin of the drawn range, so a multi-segment
-// change shifts the whole world for a frame.
-//
-// The table at 0x006AEA1C is an ordered array of 1440-byte rows whose start dlong is at +4 and
-// whose length is +16 / +12, so this is monotone: the answer moves by one segment when the dlong
-// crosses a boundary and cannot move by four unless the DLONG moved by four segments' worth. It
-// therefore still follows a camera cut, a car reset or a lap crossing exactly, because those move
-// the dlong; what it cannot do is invent a jump the dlong did not make.
-//
-// Returns -1 when the table cannot be placed or read, or the dlong is outside it.
-int segmentForDlong(float metres) {
-    // Through rebase: the table pointer is dereferenced and then indexed by up to 4096 rows of
-    // 1440 bytes, so a global belonging to another link reads megabytes away from anything.
-    uintptr_t countAt = rebase(kSegmentCount);
-    uintptr_t tableAt = rebase(kSegmentTable);
-    if (!countAt || !tableAt) return -1;
-    int          count = *reinterpret_cast<const int*>(countAt);
-    const float* table = *reinterpret_cast<const float* const*>(tableAt);
-    if (count <= 0 || count > 4096 || !table) return -1;
-
-    int low = 0;
-    int high = count - 1;
-    while (low <= high) {
-        int          mid = low + (high - low) / 2;
-        const float* row = table + kSegmentRowWords * mid;
-        float        start = row[1];
-        if (!(row[3] > 0.0f)) return -1;
-        float end = start + row[4] / row[3];
-        if (metres < start) {
-            high = mid - 1;
-        } else if (metres >= end) {
-            low = mid + 1;
-        } else {
-            return mid;
-        }
-    }
-    return -1;
-}
-
-// ANYTHING COMPARING TWO SEGMENT INDICES needs the shortest way round the ring, the way
-// stereoDlongDelta does for the dlong: the count is at kSegmentCount, and without the wrap a lap
-// crossing reads as a jump of the whole track. A helper for that lived here and went with the
-// jump counter.
-
 int walkLookupCompute(int hint, int* out, int x, int y, int z) {
     auto original = reinterpret_cast<WalkSegmentFn>(g_walkLookupOriginal);
 
@@ -836,8 +742,11 @@ int walkLookupCompute(int hint, int* out, int x, int y, int z) {
     // The containment test decides. Report 84 measured 308 corrections in 66,160 passes, so
     // the eye's answer is sound on better than 99% of them and the car is a fallback, not a
     // replacement.
-    int  segment = original(hint, out, x, y, z);
-    bool sound = placementOf(segment, x, y) == 0;
+    //
+    // A runaway from the hint (askNearHint) is never sound, however its own tests come out.
+    bool runaway = false;
+    int  segment = askNearHint(original, hint, out, x, y, z, runaway);
+    bool sound = !runaway && placementOf(segment, x, y) == 0;
 
     // THE SECOND TEST: is GPL's own (segment, dlong) pair consistent with itself? A dlong
     // really inside `segment` must look up to `segment`. When the table answers a different
@@ -874,7 +783,10 @@ int walkLookupCompute(int hint, int* out, int x, int y, int z) {
     int uy = toUnits(blended[1]);
     int uz = toUnits(blended[2]);
 
-    segment = original(hint, out, ux, uy, uz);
+    // The car is drawn a tick behind the hint as the eye is, so its search can run away the same
+    // way and is asked again the same way.
+    bool carRunaway = false;
+    segment = askNearHint(original, hint, out, ux, uy, uz, carRunaway);
 
     // How far the car moved since the last accepted answer. All four calls in a frame -- two eyes,
     // and the mirror pass with them -- use the same substituted point, so within a frame this is
@@ -884,8 +796,9 @@ int walkLookupCompute(int hint, int* out, int x, int y, int z) {
     float dz = blended[2] - g_walkLastPosition[2];
     float moved = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-    // THE PRIMARY TEST: did the search settle on a segment the point is actually in?
-    bool extrapolated = placementOf(segment, ux, uy) > 0;
+    // THE PRIMARY TEST: did the search settle on a segment the point is actually in? A runaway
+    // that no reseat placed counts as not.
+    bool extrapolated = carRunaway || placementOf(segment, ux, uy) > 0;
 
     // The secondary net, for the one failure the containment test cannot see. A segment whose
     // type is neither 1 nor 2 makes gpl_segmentPlacePoint return 0 -- "inside" -- WITHOUT writing
@@ -912,9 +825,12 @@ int walkLookupCompute(int hint, int* out, int x, int y, int z) {
 
     if (extrapolated || impossible) {
         // Only out[0] is replaced. out[1], the dlat, feeds gpl_selectorCameraDlat, a
-        // level-of-detail input, and out[2] is the z we passed in, echoed back.
+        // level-of-detail input, and out[2] is the z we passed in, echoed back. A runaway's dlat
+        // is measured from a far part of the track (-634 m on monza10k), so it goes to the
+        // centreline instead.
         float carDlong = 0.0f;
         if (interpolationViewedCarDlong(carDlong)) out[0] = toUnits(carDlong);
+        if (carRunaway) out[1] = 0;
     }
 
     g_walkLastDlong = out[0];

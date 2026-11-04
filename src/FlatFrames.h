@@ -32,9 +32,8 @@
 //
 // WHAT THIS IS NOT. It does not touch fgDisableBG/fgEnableBG, so the sim/render lock protocol is
 // exactly GPL's; an extra frame simply never enters it. It reads no simulation state -- it
-// redraws records latched normally under the stock lock -- so it does not need the sim/render
-// ring (SimRing.h) and is unaffected by it. Stage 3 of report 72 section 6.5, which drops the
-// brackets, remains unbuilt and is not a prerequisite.
+// redraws records latched normally under the stock lock -- so it needs no sim/render ring (report
+// 72 section 6.5, never built past stage 2 and since removed).
 //
 // BOTH MODES. `frameRate` decides whether the wait is skipped and what, if anything, gates a
 // frame afterwards: 1 draws one frame per display frame (per published view set in VR, per

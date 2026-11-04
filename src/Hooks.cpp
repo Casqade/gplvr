@@ -27,7 +27,6 @@
 #include "RenderPacing.h"
 #include "RenderProfile.h"
 #include "ReplayPanel.h"
-#include "SimRing.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
 #include "SwapControl.h"
@@ -556,9 +555,6 @@ void reportOncePerSecond() {
     // frame, so the clears read against the eye and mirror-only renders on the fps line.
     char marks[200] = {};
     if (drawnMarksFormat(marks, sizeof(marks), g_frames)) logf("%s", marks);
-
-    char ring[512] = {};
-    if (simRingFormat(ring, sizeof(ring), g_frames)) logf("%s", ring);
 
     // The controllers and the menu. Both print only when something happened, so a session
     // with no headset adds nothing to the log -- and both print their REFUSALS, because a
@@ -1289,10 +1285,9 @@ int __cdecl screenDisplayHook(void* surface) {
     presenterEndFrame();
 
     // The aiming ray goes in HERE, between the window's picture and the transfer: it
-    // belongs in the headset's image and not in the monitor's. presenterEndFrame has
-    // taken the picture on the direct path; presenterDrawVrRay takes it on the other one
-    // before it draws, and does nothing at all while the menu is closed -- except over the
-    // replay panel, while a hand is pointing.
+    // belongs in the headset's image and not in the monitor's. presenterDrawVrRay takes
+    // the picture before it draws, and does nothing at all while the menu is closed --
+    // except over the replay panel, while a hand is pointing.
     presenterDrawVrRay(true);
 
     frameBudgetSwitch(kSpanPublish);
@@ -2660,8 +2655,6 @@ void loadOptions(const char* fileName) {
                      wanted, derived, g_options.frameRate);
         }
     }
-    g_options.simRing = GetPrivateProfileIntA("gplvr", "simRing", 0, path);
-    if (g_options.simRing < 0 || g_options.simRing > 1) g_options.simRing = 0;
     g_options.vrRendererType = GetPrivateProfileIntA("gplvr", "vrRendererType", 1, path);
     if (g_options.vrRendererType < 0 || g_options.vrRendererType > 2) g_options.vrRendererType = 1;
     g_options.flatRendererType = GetPrivateProfileIntA("gplvr", "flatRendererType", 1, path);
@@ -2730,13 +2723,6 @@ void loadOptions(const char* fileName) {
         g_options.vrMonitorEye = kMonitorBoth;
     g_options.vrTransferFinish =
         GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
-    g_options.vrDirectToShared =
-        GetPrivateProfileIntA("gplvr", "vrDirectToShared", 0, path) != 0;
-    logf("options: vrDirectToShared=%d (%s)", g_options.vrDirectToShared ? 1 : 0,
-         g_options.vrDirectToShared
-             ? "the frame is rendered straight into the shared texture, with no copy at "
-               "publish"
-             : "the frame is rendered into our own target and copied across at publish");
     g_options.pribludaUpdateRate =
         GetPrivateProfileIntA("gplvr", "pribludaUpdateRate", 2, path);
     if (g_options.pribludaUpdateRate < 1) g_options.pribludaUpdateRate = 1;
@@ -2785,11 +2771,6 @@ void loadOptions(const char* fileName) {
              "is what makes a frame between two ticks a new picture rather than a copy. It "
              "costs one sim tick of latency (6.94 ms at 144 Hz); frameRate = 0 does not pay "
              "it and does not get the rate.");
-    logf("options: simRing=%d (%s)", g_options.simRing,
-         g_options.simRing > 0
-             ? "the sim thread publishes each tick and the car render records are written from "
-               "the ring"
-             : "off: the sim and the render thread exchange state through GPL's latch alone");
     logf("options: vrRendererType=%d flatRendererType=%d, this mode's %d (%s)",
          g_options.vrRendererType, g_options.flatRendererType, rendererType(),
          rendererType() == 0
@@ -2912,6 +2893,8 @@ void requestSceneRenderHook(const Binding& binding) {
         stereoBind(binding);
         renderTargetBind(binding);
     }
+    // Both modes: the baked cockpit overlay reaches mirror.mip's GL texture through it.
+    renderTargetBindMips(binding);
 
     // BOTH MODES. It resolves four exported scheduler functions and patches nothing, and what it
     // answers -- the simulation's tick rate -- is read by the blend and by three report lines.

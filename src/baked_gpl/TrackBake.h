@@ -23,6 +23,11 @@ void trackBakeMainWalk(void* sceneParams);
 // The scene for the track GPL is drawing, or null while it is baking or when it failed.
 const baked::Scene* trackBakeScene();
 
+// Why the track GPL is drawing has no scene -- the bake's own words, e.g. "out of memory -- too
+// large for this process" -- or null while it is baking or baked. Without a scene every pass is
+// GPL's: the track, the cars, the cockpit, the flagmen and the mirrors alike.
+const char* trackBakeFailure();
+
 // Bumped each time a scene lands. A new scene can be allocated where the freed one was, so a
 // holder tells them apart by this, never by the pointer.
 uint32_t trackBakeSceneGeneration();

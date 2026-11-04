@@ -33,7 +33,6 @@
 #include "ReplayQuickMenu.h"
 #include "RenderPacing.h"
 #include "RenderProfile.h"
-#include "SimRing.h"
 #include "SkidFlood.h"
 #include "Stereo.h"
 #include "Log.h"
@@ -162,9 +161,6 @@ DWORD WINAPI installThread(LPVOID) {
     // Flat mode too: a stock overflow in the render walk (report 53). The patch stays on the
     // stock list until the next clear, so it may go in with a pass under way.
     drawnMarksInstall();
-    // Flat mode too, and before interpolationInstall: it chains onto the same three car latch
-    // call sites and expects to find either their stock bytes or this hook.
-    simRingInstall();
 
     logf("installing frame counter...");
 
@@ -287,7 +283,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         crashGuardLogSummary();
         flagmanReplayLogSummary();
         drawnMarksLogSummary();
-        simRingLogSummary();
         logf("detaching");
         logClose();
     }

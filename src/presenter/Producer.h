@@ -189,4 +189,9 @@ int32_t presenterConsumedSequence();
 // to true until the presenter has reported, so nothing is disabled on a guess.
 bool presenterFovMutable();
 
+// Whether the headset's frame textures exist at its full size, so that work which takes a lot
+// of address space -- a track bake -- can no longer starve them. True when there is nothing to
+// wait for: flat mode, or a presenter that is off or failed.
+bool presenterHeadsetMemoryHeld();
+
 }  // namespace gplvr

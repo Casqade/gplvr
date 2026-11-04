@@ -3,6 +3,7 @@
 #include "DataRebase.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "presenter/Producer.h"
 
 #include "baked/Assets.h"
 #include "baked/BakedLog.h"
@@ -209,6 +210,11 @@ void runJob(std::shared_ptr<Job> job) {
 
 // -- state ---------------------------------------------------------------------------------------
 
+// The longest a bake waits for the headset's frame textures. They are made at the presenter's
+// first frame, seconds before any track loads; a presenter that never gets there should not
+// keep the renderer off for the session.
+constexpr DWORD kHeadsetWaitMs = 20000;
+
 struct State {
     bool        bound = false;
     std::string gameDirectory;
@@ -219,6 +225,14 @@ struct State {
     uint8_t* prim = nullptr;
     uint32_t primSize = 0;
     bool     trackFailed = false;
+    // Why this track has no scene, for the VR menu; empty while it is baking or baked.
+    std::string failure;
+
+    // A bake waits to start until the headset's frame textures hold their full size
+    // (presenterHeadsetMemoryHeld), so it cannot take the address space they need: the job is
+    // made, and started by a later main walk. Not past kHeadsetWaitMs.
+    bool  jobWaiting = false;
+    DWORD waitingSince = 0;
 
     std::shared_ptr<Job>          job;
     std::unique_ptr<baked::Scene> scene;
@@ -260,6 +274,8 @@ size_t sceneBytes(const baked::Scene& scene) {
 size_t resetScene(State& s) {
     if (s.job) s.job->cancel.store(true);
     s.job.reset();
+    s.jobWaiting = false;
+    s.failure.clear();
     size_t freed = s.scene ? sceneBytes(*s.scene) : 0;
     s.scene.reset();
     return freed;
@@ -400,6 +416,7 @@ void trackBakeMainWalk(void* sceneParams) {
             !readable(reinterpret_cast<const void*>(base), 16) ||
             !readable(reinterpret_cast<const void*>(xyzsEnd - 16), 16)) {
             s.trackFailed = true;
+            s.failure = "the game's track object could not be read";
             logf("baked: the track object %p is not readable as an Obj3d -- nothing baked",
                  object);
             return;
@@ -425,7 +442,29 @@ void trackBakeMainWalk(void* sceneParams) {
              "%.0f MiB freed and added to the budget)",
              object, primSize, vertexCount, freed / 1048576.0);
         s.job = job;
-        std::thread(runJob, job).detach();
+        if (presenterHeadsetMemoryHeld()) {
+            std::thread(runJob, job).detach();
+            return;
+        }
+        s.jobWaiting = true;
+        s.waitingSince = GetTickCount();
+        logf("baked: the bake waits until the headset's frame textures hold their full size, so "
+             "it cannot take the address space they need (at most %lu s)",
+             static_cast<unsigned long>(kHeadsetWaitMs / 1000));
+        return;
+    }
+
+    if (s.jobWaiting) {
+        bool  held = presenterHeadsetMemoryHeld();
+        DWORD waited = GetTickCount() - s.waitingSince;
+        if (!held && waited < kHeadsetWaitMs) return;
+        s.jobWaiting = false;
+        logf(held ? "baked: the headset's frame textures are in place after %lu ms -- the bake "
+                    "starts"
+                  : "baked: the headset's frame textures are still not in place after %lu ms -- "
+                    "the bake starts anyway",
+             static_cast<unsigned long>(waited));
+        std::thread(runJob, s.job).detach();
         return;
     }
 
@@ -433,6 +472,7 @@ void trackBakeMainWalk(void* sceneParams) {
     std::shared_ptr<Job> job = std::move(s.job);
     if (!job->scene) {
         s.trackFailed = true;
+        s.failure = job->result;
         logf("baked: nothing baked after %.0f ms -- %s; left to the game's own renderer",
              job->milliseconds, job->result.c_str());
         logAddressSpace(*job, nullptr);
@@ -445,6 +485,10 @@ void trackBakeMainWalk(void* sceneParams) {
 }
 
 const baked::Scene* trackBakeScene() { return g_state.scene.get(); }
+
+const char* trackBakeFailure() {
+    return g_state.failure.empty() ? nullptr : g_state.failure.c_str();
+}
 
 uint32_t trackBakeSceneGeneration() { return g_state.generation; }
 

@@ -79,6 +79,10 @@ void bakedPassMainWalkDone();
 // counterparts (the node filter is collecting). bakedPassDrawsCars: and the car renderer is up,
 // so the car hook may leave a car's body to CarRenderer for this pass.
 bool bakedPassCollecting();
+
+// Why the GPU upload of the current track's scene was stopped, in a few words, or null when it
+// was not: the track is then GPL's, as when its bake failed (trackBakeFailure).
+const char* bakedPassUploadStopped();
 bool bakedPassDrawsCars();
 // While collecting: whether the pass is a mirror pass.
 bool bakedPassMirror();

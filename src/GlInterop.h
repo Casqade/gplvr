@@ -275,38 +275,18 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
                              const GlSharedTexture& shared, int width, int height,
                              GLuint sourceFramebuffer, bool finish, GlPanelCopy* panel);
 
-// The direct path: the frame is drawn INTO the shared texture and the copy above never
-// runs. See report 80 and vrDirectToShared.
-//
-// The lock is taken before the frame's first draw call and held until it is published, so
-// a slot is unavailable to Direct3D for the whole frame rather than for the moment of a
-// copy. The texture is registered WRITE_DISCARD, which is what rendering into it wants and
-// also means a frame never starts from the previous one's pixels.
-bool glInteropLockDirect(const GlFunctions& gl, HANDLE interopDevice,
-                         const GlSharedTexture& shared);
-
-// Finish a frame rendered straight into `shared`: copy the HUD panel if there is one, then
-// unlock, and glFinish when `finish`. The unlock is the synchronisation, exactly as it is
-// for the copy.
-//
-// THE CALLER MUST HAVE DETACHED the texture from every framebuffer first. GL may not still
-// be holding a shared object at the unlock -- the bug that made the race black, recorded at
-// the detach inside the copy.
-bool glInteropPublishDirect(const GlFunctions& gl, HANDLE interopDevice,
-                            const GlSharedTexture& shared, bool finish, GlPanelCopy* panel);
-
 // Copy ONE panel into its shared texture under a lock of its own, outside the frame
 // transfer entirely.
 //
 // The frame transfer batches the frame and exactly one panel into a single
-// wglDXLockObjectsNV/wglDXUnlockObjectsNV pair (`HANDLE objects[2]` in both copy paths),
+// wglDXLockObjectsNV/wglDXUnlockObjectsNV pair (`HANDLE objects[2]` in the copy),
 // and that batch is the most delicate code in this project -- the detach-before-unlock bug
 // recorded inside it made every race black while reporting success. A SECOND panel, the VR
 // menu's, takes its own pair rather than widening that one: it costs one extra interop
 // synchronisation on the frames the menu is open, which is a menu and not a race, and the
 // frame path keeps the single synchronisation it has always had.
 //
-// The blit itself is the same debugged routine both frame paths use, detach and all.
+// The blit itself is the same debugged routine the frame transfer uses, detach and all.
 // `panel.copied` says whether the image reached the shared texture.
 bool glInteropPublishPanel(const GlFunctions& gl, HANDLE interopDevice, GlPanelCopy& panel);
 

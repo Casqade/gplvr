@@ -17,7 +17,7 @@ namespace {
 // -- game addresses (gplc67.exe, report 95) --------------------------------------------------
 
 // gpl_bgTask's call of gpl_soundSchedulerUpdate_perTick 0x477280: once per sim tick, on the sim
-// thread, after gpl_simStep has updated the view and before bgSleep (SimRing's site, 0x452B74).
+// thread, after gpl_simStep has updated the view and before bgSleep (0x452B74).
 // Its only caller.
 constexpr uintptr_t     kSchedulerCallSite = 0x00452B6F;
 constexpr unsigned char kSchedulerCallStock[5] = {0xE8, 0x0C, 0x47, 0x02, 0x00};
@@ -439,8 +439,8 @@ uintptr_t callTarget(uintptr_t site) {
     return site + 5 + rel;
 }
 
-// One 32-bit store of the displacement, as SimRing.cpp's redirect: the sim thread may be running
-// the call while it is written.
+// One 32-bit store of the displacement: the sim thread may be running the call while it is
+// written.
 bool redirect(uintptr_t site, uintptr_t to) {
     auto    displacement = reinterpret_cast<volatile int32_t*>(site + 1);
     int32_t rel = static_cast<int32_t>(to - (site + 5));
