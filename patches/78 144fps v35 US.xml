@@ -8,8 +8,9 @@
         sim rate      144 Hz  (stock 36)
         timer rate    288 Hz  (2x sim)
         physics       288 Hz = 144 x 2 substeps per tick, exact
-        The AI's OTHER half is in gpla67.ini, in ticks, and no exe
-        patch touches it. See STATUS.md. -->
+        The AI's OTHER half is in gpla67.ini, in ticks. This patch scales
+        it as GPL parses it (tools/gplaihook.py), so install the 36 Hz
+        gpla67.ini unchanged: a rescaled one would be scaled twice. -->
 
    <ExeSection>
       <Name>modtext</Name>
@@ -1395,6 +1396,18 @@
       <!-- v24 jump into the cave at 00988B18: rec+72 ground-clearance filter, two-constant form so the DC gain stays 1 -->
       <VirtualAddress>0x004999E0</VirtualAddress>
       <Data>E933F14E00909090909090909090909090909090</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- AI ini hook: the float setter plus (rate/36)^k for 38 key names (38 key pointers) of tables 0x42/0x44/0x46 - alt_accel_k1 rate^-2, alt_accel_k2 rate^-1, base_gearshift_hiatus rate^+1, base_race_start_hiatus rate^+1, check_driver_mistake_interval rate^+1, cornering_dlat_accel_k1 rate^-2, cornering_dlat_accel_k2 rate^-1, cornering_dlat_trans_time rate^+1, cornering_long_term_lookahead rate^+1, cornering_short_term_lookahead rate^+1, crashing_recovery_yaw_velocity rate^-1, dlat_accel_k1 rate^-2, dlat_accel_k2 rate^-1, dlat_lookahead rate^+1, dlat_trans_time rate^+1, gear_shift_rpm_decrement rate^-1, goal_dlat_accel_averaging rate^+1, in_session_driver_mod_interval rate^+1, inverse_slipcurve_k rate^-2, long_term_check_min_speed rate^-1, long_term_lookahead rate^+1, low_speed_override_threshold rate^-1, max_lat_acc_from_speed rate^-1, max_ws_interval rate^+1, mechanical_failure_interval rate^+1, min_ws_interval rate^+1, nominal_max_accel rate^-2, nominal_traction_circle rate^-2, pitch_accel_coeff rate^+2, roll_accel_coeff rate^+2, short_term_lookahead rate^+1, stay_on_track_trans_time rate^+1, straightaway_pass_closing_velocity rate^-1, suspension_mechanical_drag_coeff rate^-2, switch_to_cornering_dlat_velocity rate^-1, tire_failure_mechanical_drag_coeff rate^-2, yaw_accel_k1 rate^-2, yaw_accel_k2 rate^-1 -->
+      <VirtualAddress>0x00981780</VirtualAddress>
+      <Data>568BF1578B7E22576874615400FF742414E82AD9B9FF83C40C83F80175328B460483F842740A83F844740583F84675258B460CB9E81798008B1185D2741739C2740583C108EBF1D907D84904D91FEB058B4E26890F807C24100074058B1789562A5F5EC208000000D05955000000803DE85955000000803EFC635500000080402064550000008040246E5500000080405C7E55000000803D747E55000000803EA87D550000008040207E550000008040007E550000008040706755000000803E005A55000000803D185A55000000803E48625500000080406462550000008040D05A55000000803E1C67550000008040D06D5500000080404C5B55000000803DA46255000000803E0462550000008040946955000000803E485A55000000803EAC5B550000008040185F550000008040C45B550000008040D85B55000000803D105C55000000803D685A550000008041845A550000008041246255000000804044645500000080408C6855000000803E185E55000000803D106955000000803E485E55000000803D605955000000803D785955000000803E00000000</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <!-- AI ini hook: the float binding vtable's set-from-text slot -> the cave at 00981780 -->
+      <VirtualAddress>0x00536B20</VirtualAddress>
+      <Data>80179800</Data>
    </BinaryPatch>
 
 </GPLPatch>

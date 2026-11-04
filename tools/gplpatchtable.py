@@ -4,7 +4,8 @@
 WHY THIS EXISTS
 
 The build is GEM+'s gpl67 XML set, gpl67-carset-names.xml and ONE frame-rate XML from
-gplrategen.py (plus the two optional gplffb.py preferences), with a rescaled ini alongside.
+gplrategen.py (plus the two optional gplffb.py preferences). The AI ini is installed at
+36 Hz; the frame-rate XML scales it as GPL parses it (family S, gplaihook.py).
 The reasoning behind each site lives in three places: the note strings in gplrategen.py,
 the module docstrings in gplffb.py and gplaiscale.py, and the reports in
 docs/audit-2026-09-*/. That is fine for working on a site and useless for auditing the
@@ -35,9 +36,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gplrategen as G  # noqa: E402
 import gplaiscale as A  # noqa: E402
-
-DEFAULT_INI_144 = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "patches", "gpla67-144.ini")
+import gplaihook as H  # noqa: E402
 
 # IDB symbol snapshot, gpl_/mod_ only. Taken 2026-09-13 from the primary instance.
 # The last block is the exception: unnamed functions that contain sites or neighbour the
@@ -708,6 +707,24 @@ exponential.
 144 Hz build gives. A sharper wheel is a legitimate preference, but it is now a matter of
 editing this table rather than of omitting a switch: the default has to be the rate-correct
 one."""),
+    ("S", "The AI ini hook: gpla67.ini scaled as it is parsed", """
+GPL turns every ini value into a float in one place: slot +8 of the float binding vtable,
+`0x405250`, whose only reference is the dword at `0x536B20`. That dword now points at a copy
+in a modtext cave which parses the same way and then, for a binding of the three AI tables
+gpla67.ini fills (0x42 descriptors, 0x44 line states, 0x46 car classes) whose key pointer is
+in its table, multiplies by `(rate/36)^k`. The table is `gplaiscale.py`'s exponents reduced
+to one per key name -- 36 names -- plus the two names whose default only family K scales
+(`stay_on_track_trans_time`, `goal_dlat_accel_averaging`), so a player who adds either to
+the ini gets it scaled too. `gplaihook.py --check` proves the table reproduces gplaiscale's
+rescale of the 36 Hz ini bit for bit at 144.
+
+So the 36 Hz `gpla67.ini` is installed unchanged, and a player's own edits are scaled too.
+Nothing is scaled twice: only text passes through the setter, every load resets its table to
+the defaults first, and nothing writes these tables back to a file. A gpla67.ini already
+rescaled by gplaiscale WOULD be scaled twice -- install the 36 Hz file. track.ini (0x45) is
+left alone: its rate-dependent values are converted where they are read (B, D). Report 108.
+The cave's table holds key POINTERS, which sit in the +8 window, so this is one of the
+payloads that makes the XML link-specific."""),
     ("Z", "Parsed but NOT emitted", """
 These are in the 60 fps reference and deliberately excluded. The rate carriers are
 replaced wholesale instead: `0x0040BCA9`, `0x004E71B7` and `0x004E842D` are one-byte
@@ -741,6 +758,8 @@ def family(site, note):
     if site.out is None or site.kind in ("code", "unclassified", "overflow") \
             or va in G.RATE_CARRYING_SITES:
         return "Z"
+    if va == H.VTABLE_SLOT_VA or H.CAVE_VA <= va < H.CAVE_END:
+        return "S"
     if site.kind == "substep" or 0x988B70 <= va < 0x988BA0 \
             or va in (0x40BCA8, 0x4E71B1, 0x4E8426):
         return "O"
@@ -800,6 +819,9 @@ def show(blob):
         return "%d" % int.from_bytes(blob, "little", signed=True)
     if len(blob) in (2, 4):
         return "%d" % int.from_bytes(blob, "little")
+    if len(blob) > 128:
+        return ("%d zero bytes" % len(blob) if not any(blob)
+                else "%d bytes (`%s`...)" % (len(blob), blob[:16].hex().upper()))
     return "`%s`" % blob.hex().upper()
 
 
@@ -807,34 +829,16 @@ def cell(text):
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def ini_rows(src, dst):
-    def load(path):
-        d, sec = {}, ""
-        for line in io.open(path, encoding="latin-1"):
-            m = A.SECTION_LINE.match(line)
-            if m:
-                sec = m.group("name")
-                continue
-            m = A.VALUE_LINE.match(line)
-            if m:
-                d.setdefault((sec, m.group("key")), []).append(
-                    (float(m.group("value")), (m.group("rest") or "").strip()))
-        return d
-
-    a, b = load(src), load(dst)
-    ratio = 4.0
+def ini_rows(src, rate, table):
+    """Every value of the 36 Hz ini that family S changes, as the exe will hold it."""
+    values, comments, _ = A.read_ini(src)
     out = []
-    for key in a:
-        if key not in b:
+    for key, x in values.items():
+        exponent = table.get(key[1], 0)
+        if not exponent or not x:
             continue
-        for (x, comment), (y, _) in zip(a[key], b[key]):
-            if x == y:
-                continue
-            exp = "?"
-            for e in (-2, -1, 1, 2):
-                if x and abs(y - x * ratio ** e) <= max(1e-9, abs(x * ratio ** e) * 2e-3):
-                    exp = "%+d" % e
-            out.append((key[0], key[1], x, y, exp, comment))
+        y = struct.unpack("<f", struct.pack("<f", x * H.factor(rate, exponent)))[0]
+        out.append((key[0], key[1], x, y, "%+d" % exponent, comments.get(key, "")))
     out.sort()
     return out
 
@@ -846,7 +850,9 @@ def main():
     ap.add_argument("--reference",
                     help="default: <game-dir>/tools/60FPS/60fpsv2/60FPSv2.xml")
     ap.add_argument("--ini-36", help="default: <game-dir>/gpla67.ini.36")
-    ap.add_argument("--ini-144", default=DEFAULT_INI_144)
+    ap.add_argument("--oracle-stock", help="default: <game-dir>/gpl_ai.ini.98")
+    ap.add_argument("--oracle-reference",
+                    help="default: <game-dir>/tools/60FPS/60fpsv2/gpl_ai_60fps.ini")
     ap.add_argument("--rate", type=float, default=144.0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -859,6 +865,9 @@ def main():
                                   "tools", "60FPS", "60fpsv2", "60FPSv2.xml")
     args.ini_36 = gp.game_file(args, "ini36", "--ini-36",
                                "the unpatched 36 Hz AI ini", "gpla67.ini.36")
+    args.ai_ini = args.ini_36
+    _, _, oracle_stock, oracle_reference = H.inputs(args)
+    ai_inputs = (args.ini_36, oracle_stock, oracle_reference)
 
     syms = load_symbols()
     starts = [s[0] for s in syms]
@@ -866,7 +875,7 @@ def main():
     def owner(va):
         if 0x536000 <= va < 0x600000:
             return "*.rdata/.data constant*"
-        if 0x988900 <= va < 0x989000:
+        if 0x988900 <= va < 0x989000 or H.CAVE_VA <= va < H.CAVE_END:
             return "*code cave*"
         if not (0x401000 <= va < 0x536000 or 0x980000 <= va < 0x988900):
             return "-"
@@ -901,7 +910,7 @@ def main():
         # Add it in the same pass that applies it.
         return "%s +0x%X%s" % (name, gap, " ?" if gap >= 0x1000 else "")
 
-    _, sites, substeps, physics_hz = G.build(args.exe, args.reference, args.rate)
+    _, sites, substeps, physics_hz = G.build(args.exe, args.reference, args.rate, ai_inputs)
     buckets = {}
     for s in sites:
         buckets.setdefault(family(s, s.note), []).append(s)
@@ -933,7 +942,7 @@ def main():
     for va, why in sorted(G.REFERENCE_MISTAKES.items()):
         o.write("| `%08X` | %s | %s |\n" % (va, owner(va), cell(why)))
 
-    rows = ini_rows(args.ini_36, args.ini_144)
+    rows = ini_rows(args.ini_36, args.rate, H.name_exponents(*ai_inputs))
     o.write(INI_SECTION % len(rows))
     for sec, key, x, y, exp, comment in rows:
         o.write("| `[%s]` | `%s` | %g | %g | %s | %s |\n"
@@ -1032,10 +1041,11 @@ Both are dropped entirely, leaving stock bytes.
 """
 
 INI_SECTION = """
-## gpla67.ini -- %d rescaled keys
+## gpla67.ini -- %d values the exe scales as it reads them
 
-`tools/gplaiscale.py` rescales the AI ini from `gpla67.ini.36`. It derives each key's
-exponent from an ORACLE -- the diff between the stock 36 Hz ini and the reference's 60 Hz
+The ini is installed at 36 Hz and family S scales these values while GPL parses it; the
+column is what GPL then holds. The exponents are `tools/gplaiscale.py`'s, which derives each
+key's exponent from an ORACLE -- the diff between the stock 36 Hz ini and the reference's 60 Hz
 ini -- then applies a table of overrides where the reference is dimensionally wrong. The
 two override tables and the reasoning behind each entry are in the module's docstring; the
 most consequential are the `dlat_accel_k1/k2` spring-damper pairs, which the reference
@@ -1095,7 +1105,7 @@ preferences that are equally valid on a stock 36 Hz build. The one rate coupling
 path, the smoothing filter, is in every build as family R above; it used to be a third
 optional XML here.
 
-#### `81 ffb no spring damper v1.xml` -- `-FfbNoSpringDamper` -- NOT APPLIED
+#### `81 ffb no spring damper v2.xml` -- `-FfbNoSpringDamper` -- NOT APPLIED
 Zeroes two coefficients at `0x004A1116` and `0x004A113F`: the centring spring and the
 damper GPL installs in the wheel itself at FFB init. They are DirectInput CONDITION
 effects, computed by the wheel's own firmware from wheel position and velocity, so they
@@ -1103,9 +1113,19 @@ never pass through the tick loop and never see the car -- a fixed feel laid over
 signal, which travels separately as a constant-force effect. A preference, not a fix, and
 equally valid at 36 Hz.
 
-#### `82 ffb deeper notch v1.xml` -- `-FfbDeeperNotch` -- NOT APPLIED
+#### `82 ffb deeper notch v2.xml` -- `-FfbDeeperNotch` -- NOT APPLIED
 Rescales the negative half of the force curve by `depth/1.20` (25 sites), deepening the
 centre notch. A preference, tunable with `-FfbNotchDepth`.
+
+#### The six listening variants in `out\\`, 2026-10-24
+Built so the two preferences can be judged separately, at both rates, since neither
+depends on the rate: `gplc67-144-prib-uk-{nosd,notch,nosd-notch}.exe` and
+`gplc67-prib-uk-{nosd,notch,nosd-notch}.exe`. Each is its own base rebuilt with the
+switches added and nothing else changed, and in both families the no-FFB control came out
+byte-identical to the shipped `gplc67-144-prib-uk.exe` / `gplc67-prib-uk.exe`, so the
+diff against the control is the FFB patch alone: 6 bytes for `-FfbNoSpringDamper`,
+79 bytes in 21 runs for `-FfbDeeperNotch`. They are listening tests, not build outputs --
+delete them once the preference is settled and record the answer here.
 
 ## What the build depends on that is NOT ours
 
@@ -1146,7 +1166,7 @@ our adj-coeff cave lives.
 | `gplc67_36.exe` | every generator | the unpatched reference every stock value is checked against, and the CD-key donor for the two `-CarryBytes` regions |
 | `60FPSv2.xml` | gplrategen | the known-good 60 fps patch every rate^k exponent is read off |
 | `gpl_ai.ini.98` + `gpl_ai_60fps.ini` | gplaiscale | the 36/60 pair that acts as the exponent oracle for the ini |
-| `gpla67.ini.36` | gplaiscale | the 36 Hz AI ini that is rescaled |
+| `gpla67.ini.36` | gplrategen, gplaihook | the 36 Hz AI ini whose key names family S's table is resolved over, and the file installed as `gpla67.ini` |
 
 ### Nothing protects our bytes from a later XML
 
@@ -1161,42 +1181,13 @@ intended sites. The donor half of that rule was added after 77G's destruction of
 `gpl_tickPeriodSeconds` stayed invisible for the whole campaign, because 77G was in every
 build being compared.
 
-## DEFERRED: folding the ini rescale into the exe patch
+## DONE (v35): the ini rescale folded into the exe patch
 
-**Written off as future work, 2026-09-09.** Today the build ships two artefacts: this XML,
-and a rescaled `gpla67.ini` produced by `tools/gplaiscale.py`. The ini half is the awkward
-one to distribute — it overwrites a file players edit themselves, it cannot be layered with
-anyone else's AI tuning, and "install this exe AND replace your ini" is two steps where one
-would do.
-
-The question is whether the ini could be eliminated by patching its CONSUMERS instead:
-convert each value at the point it is read, the way families B, D and E already do for the
-`.lp` world, so a stock 36 Hz `gpla67.ini` keeps working unchanged at any rate.
-
-**It is possible, and it is a large piece of work.** What makes it possible is that the ini
-is not read directly by scattered code: it is parsed once into the PARAMETER-DESCRIPTOR
-TABLE at `0x554658..0x55595F`, and family K already patches defaults in that table. So
-there is a single funnel. What makes it large:
-
-* **96 keys, each needing its consumer traced.** The exponent alone is not enough — the
-  campaign's sharpest rule is that two constants multiplying the same tick delta can need
-  opposite treatment, so every one needs the "does the consumer already divide by the rate?"
-  question answered individually. That is the same work the ini oracle does today for free,
-  by diffing a hand-made 60 Hz ini against the stock one.
-* **The oracle disappears.** `gpl_ai.ini.98` vs `gpl_ai_60fps.ini` is what makes the current
-  rescaler trustworthy: the exponents are READ OFF a known-good pair rather than reasoned
-  out. Patching consumers throws that away and replaces measurement with argument.
-* **Values arrive as text.** The descriptor table holds defaults, but a key present in the
-  user's ini overrides its default at parse time, so the conversion has to happen after
-  parsing — at the reader, or in a post-parse pass over the table.
-* **Nine of fifteen line states are unnamed in the ini** and seeded from descriptor defaults
-  only, so the two paths already differ and both would need covering.
-
-The honest trade: it removes a distribution wart and gains compatibility with other people's
-AI tuning, at the cost of replacing a measured, oracle-checked rescale with 96 hand-derived
-exponents. Not worth doing until someone actually wants to ship this to players, and if it
-is done it should keep `gplaiscale.py` alive as the CROSS-CHECK — generate both and assert
-they agree.
+Deferred on 2026-09-09 as "96 keys, each needing its consumer traced". Report 108 found the
+cheaper design: every ini value passes through ONE function, the float setter at `0x405250`,
+so scaling happens there, by key name, with gplaiscale's own exponents -- no consumer had to
+be traced, and the oracle stays the source of the table and its test. That is family S. The
+build no longer ships a rescaled `gpla67.ini`.
 
 ## DEFERRED: wiring the player's slipstream into physics
 

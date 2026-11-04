@@ -55,8 +55,10 @@ region and GPLPatchDLL has no collision detection whatsoever.
 write the same bytes with different values. Nothing needs it for the normal build; it is
 there for checking a patch someone else wants to stack.
 
-WHAT THIS STILL DOES NOT FIX: the AI's other half lives in gpla67.ini, in TICKS, and no
-exe patch of any kind touches it. That is tools/gplaiscale.py. See STATUS.md.
+THE AI'S OTHER HALF lives in gpla67.ini, in TICKS. The patch scales it too: tools/gplaihook.py
+hooks the float setter GPL parses every ini value with and multiplies the rate-dependent AI
+keys as they are read, using the exponents tools/gplaiscale.py derives. So the 36 Hz
+gpla67.ini is installed unchanged, and a rescaled one would be scaled twice.
 """
 
 import argparse
@@ -68,6 +70,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gplpatch  # noqa: E402  (PE mapping + the +8 rebase)
+import gplaihook  # noqa: E402  (the AI ini hook, family S)
 
 STOCK_RATE = 36.0
 REF_RATE = 60.0
@@ -1952,7 +1955,8 @@ def classify(stock, ref):
 DROPPED_SITES = []
 
 
-def build(exe_path, ref_xml, rate):
+def build(exe_path, ref_xml, rate, ai_inputs):
+    """`ai_inputs` is (36 Hz AI ini, oracle stock ini, oracle reference ini) for the AI hook."""
     del DROPPED_SITES[:]
     data = io.open(exe_path, "rb").read()
     image = AuthoredImage(gplpatch.Image(data))
@@ -2820,6 +2824,15 @@ def build(exe_path, ref_xml, rate):
     place(iir, "rec+72 ground-clearance filter, two-constant form so the DC gain stays 1",
           NET_IIR_VA, NET_IIR_STOCK)
 
+    # The AI ini hook: the exe scales gpla67.ini's values itself as it parses them, so the
+    # 36 Hz ini is installed unchanged. See gplaihook.py.
+    table = gplaihook.name_exponents(*ai_inputs)
+    for va, stock, out, note in gplaihook.sites(image, data, rate, table,
+                                                AI_EXTRA_FLOAT_SITES):
+        s = Site(va, va, stock, out, "rate-conversion", note=note)
+        s.out = out
+        sites.append(s)
+
     # Authored -> donor space FIRST, so dedupe compares real addresses that exist on
     # this exe rather than on the one the tables were written against.
     _place_authored_sites(image, sites)
@@ -2888,8 +2901,9 @@ def emit(sites, rate, substeps, physics_hz, ref_name):
     out.write("        timer rate    %g Hz  (2x sim)\n" % (2 * rate))
     out.write("        physics       %g Hz = %g x %d substeps per tick, exact\n"
               % (physics_hz, rate, substeps))
-    out.write("        The AI's OTHER half is in gpla67.ini, in ticks, and no exe\n")
-    out.write("        patch touches it. See STATUS.md. -->\n\n")
+    out.write("        The AI's OTHER half is in gpla67.ini, in ticks. This patch scales\n")
+    out.write("        it as GPL parses it (tools/gplaihook.py), so install the 36 Hz\n")
+    out.write("        gpla67.ini unchanged: a rescaled one would be scaled twice. -->\n\n")
 
     # THE SECTIONS THIS PATCH'S CAVES LIVE IN, DECLARED BY THIS PATCH.
     #
@@ -2941,6 +2955,14 @@ def main():
     ap.add_argument("--reference",
                     help="the known-good 60 fps patch the rules are derived from. "
                          "Default: <game-dir>/tools/60FPS/60fpsv2/60FPSv2.xml")
+    ap.add_argument("--ai-ini",
+                    help="the 36 Hz AI ini whose key names and sections the AI hook's table "
+                         "is resolved over. Default: <game-dir>/gpla67.ini.36")
+    ap.add_argument("--oracle-stock",
+                    help="gplaiscale's oracle, 36 Hz half. Default: <game-dir>/gpl_ai.ini.98")
+    ap.add_argument("--oracle-reference",
+                    help="gplaiscale's oracle, 60 Hz half. "
+                         "Default: <game-dir>/tools/60FPS/60fpsv2/gpl_ai_60fps.ini")
     ap.add_argument("--out", help="write the XML here (default: stdout)")
     ap.add_argument("--companion",
                     help="another patch this one will be applied alongside. Every address "
@@ -2957,8 +2979,10 @@ def main():
                                    "the 60 fps reference patch",
                                    "tools", "60FPS", "60fpsv2", "60FPSv2.xml")
     args.exe, args.reference = exe, reference
+    _, ai_ini, oracle_stock, oracle_reference = gplaihook.inputs(args)
 
-    image, sites, substeps, physics_hz = build(args.exe, args.reference, args.rate)
+    image, sites, substeps, physics_hz = build(args.exe, args.reference, args.rate,
+                                               (ai_ini, oracle_stock, oracle_reference))
 
     kinds = {}
     for s in sites:

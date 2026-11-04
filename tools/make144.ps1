@@ -1,14 +1,17 @@
 <#
 .SYNOPSIS
-  One-shot gplc67 build: generate the AI constants XML, rescale the AI ini, build the exe.
+  One-shot gplc67 build: generate the rate XML, check its AI scaling, build the exe.
 
 .DESCRIPTION
-  Runs the three tools in order, producing for -Rate 144:
+  Runs the tools in order, producing for -Rate 144:
 
-      patches\78 144fps v34 <link>.xml       (gplrategen.py)
-      patches\gpla67-144.ini                 (gplaiscale.py)
-      patches\gpla67-144-changes.md          (gplaiscale.py: every AI key, its unit and value)
+      patches\78 144fps v35 <link>.xml       (gplrategen.py, with gplaihook.py)
       out\gplc67-144[-prib]-<link>.exe       (gplexegen.ps1 + GPLPatchDLL.dll)
+
+  THE EXE SCALES THE AI INI ITSELF. The rate XML hooks the float setter GPL parses every ini
+  value with and multiplies the rate-dependent AI keys of gpla67.ini as they are read
+  (tools\gplaihook.py), so the 36 Hz gpla67.ini -- GEM+'s, or a player's own -- is installed
+  UNCHANGED. A rescaled gpla67.ini would be scaled twice; nothing here makes one.
 
   and for -Rate 36 the exe alone, gplc67[-prib]-<link>.exe: GEM's 21 numbered XMLs on the
   base, then the optional XMLs below in a fixed order -- carset names (-GemExtras), the rate
@@ -24,8 +27,8 @@
   only writer, its frozen sound interpolator constant, and its taskBegin cave reading
   dword_94D25C instead of dword_94D264.
 
-  Install by copying the exe over the game's gplc67.exe and the ini over the game's
-  gpla67.ini, or pass -Install and let it do that with a hash check.
+  Install by copying the exe over the game's gplc67.exe and the 36 Hz ini (-Ini36) over the
+  game's gpla67.ini, or pass -Install and let it do that with a hash check.
 
   Any step failing stops the whole run. Every tool has its own refusal discipline --
   wrong stock bytes, XML collisions, sign-flipped immediates all abort rather than
@@ -63,10 +66,8 @@
 
 .PARAMETER Ini36
   A copy of gpla67.ini as it was before any rescaling. Read, never written. Default:
-  <GplDir>\gpla67.ini.36. At -Rate 36 it is what -Install puts back as gpla67.ini.
-  Every value that is not rate-dependent passes through unchanged, so a personally tweaked
-  .36 makes a personally tweaked patches\gpla67-144.ini. Keep it GEM+'s stock file for a
-  build meant to be published.
+  <GplDir>\gpla67.ini.36. -Install puts it back as gpla67.ini at every rate: the exe scales
+  it. The AI hook's table is resolved over its key names.
 
 .PARAMETER Rate
   Simulation rate in Hz. Default 144. The exe build takes 144, or 36 for GPL's own rate with
@@ -87,14 +88,14 @@
   every out\ variant since 2026-10-11 has been built without.
 
 .PARAMETER OutDir
-  Where the exe and its manifest go. Default <repo>\out. The rate XML and the rescaled AI ini
-  go to <repo>\patches, which is published.
+  Where the exe and its manifest go. Default <repo>\out. The rate XML goes to
+  <repo>\patches, which is published.
 
 .PARAMETER SkipExe
-  Generate the XML and the ini but do not build the exe.
+  Generate and check the XML but do not build the exe.
 
 .PARAMETER Install
-  Copy the exe over the game's gplc67.exe and the ini over its gpla67.ini, then hash
+  Copy the exe over the game's gplc67.exe and the 36 Hz ini over its gpla67.ini, then hash
   both to prove the copies landed. Use this rather than copying by hand: the game path
   contains [Games], which PowerShell reads as a wildcard character class, so a plain
   Copy-Item/Get-FileHash on it silently finds nothing -- and gpla67.ini ships READ-ONLY,
@@ -184,6 +185,8 @@ $loadXml = Join-Path $patches 'gplvr-load.xml'
 
 $needDonor = -not $stock36 -or $GemExtras -or $FfbNoSpringDamper -or $FfbDeeperNotch
 $needIni36 = -not $stock36 -or $Install
+$oracle98 = Join-Path $gplDir 'gpl_ai.ini.98'
+$oracle60 = Join-Path $gplDir 'tools\60FPS\60fpsv2\gpl_ai_60fps.ini'
 $needs = @(
     @{ p = $gplDir; f = '-GplDir';  d = $true;  what = 'the GPL install directory' },
     @{ p = $gpl67;  f = '-GplDir';  d = $true;  what = "the gpl67 mod XMLs (Mods\GEM+\gpl67)" },
@@ -191,6 +194,10 @@ $needs = @(
 )
 if ($needDonor) { $needs += @{ p = $donor; f = '-Donor'; d = $false; what = 'an unpatched gplc67.exe of the same link to read stock values from' } }
 if ($needIni36) { $needs += @{ p = $ini36; f = '-Ini36'; d = $false; what = 'an unpatched 36 Hz gpla67.ini' } }
+if (-not $stock36) {
+    $needs += @{ p = $oracle98; f = '-GplDir'; d = $false; what = "gpl_ai.ini.98, the AI scaling oracle's 36 Hz half" }
+    $needs += @{ p = $oracle60; f = '-GplDir'; d = $false; what = "gpl_ai_60fps.ini, the AI scaling oracle's 60 Hz half" }
+}
 if ($Pribluda)  { $needs += @{ p = $pribXml; f = '-GplDir'; d = $false; what = 'enablepribluda.xml, as pribluda ships it' } }
 if ($LoadGplvr) { $needs += @{ p = $loadXml; f = '(the repo)'; d = $false; what = 'patches\gplvr-load.xml' } }
 foreach ($need in $needs) {
@@ -241,12 +248,13 @@ if ($GemExtras -and $Link -ne 'UK') {
     throw "-GemExtras is UK-only: the carried file offsets are the UK link's."
 }
 
-$aiXml   = Join-Path $patches ('78 {0}fps v34 {1}.xml' -f $Rate, $Link)
+$aiXml   = Join-Path $patches ('78 {0}fps v35 {1}.xml' -f $Rate, $Link)
 $name    = 'gplc67' + $(if ($stock36) { '' } else { '-{0}' -f $Rate }) +
            $(if ($Pribluda) { '-prib' } else { '' }) + '-' + $linkTag
 $outExe  = Join-Path $outDir ($name + '.exe')
 $manifest= Join-Path $outDir ($name + '.json')
-$aiIni   = if ($stock36) { $ini36 } else { Join-Path $patches ('gpla67-{0}.ini' -f $Rate) }
+# The ini the game gets, at every rate: the exe scales it as it reads it.
+$aiIni   = $ini36
 
 New-Item -ItemType Directory -Force $outDir | Out-Null
 
@@ -266,17 +274,19 @@ if ($FfbNoSpringDamper -or $FfbDeeperNotch) {
 }
 
 if ($stock36) {
-    Write-Host "`n== 1-2/4 skipped: 36 Hz is GPL's own rate, no rate XML and no ini rescale =="
+    Write-Host "`n== 1-2/4 skipped: 36 Hz is GPL's own rate, no rate XML and no AI scaling =="
 } else {
-    Write-Host "`n== 1/4 gplrategen.py: the $Rate Hz patch XML ($Link) =="
+    Write-Host "`n== 1/4 gplrategen.py: the $Rate Hz patch XML ($Link), AI ini hook included =="
     & $py (Join-Path $tools 'gplrategen.py') --rate $Rate --game-dir $gplDir `
-        --exe $donor --out $aiXml
+        --exe $donor --ai-ini $ini36 --out $aiXml
     if ($LASTEXITCODE) { throw "gplrategen.py failed ($LASTEXITCODE)" }
 
-    Write-Host "`n== 2/4 gplaiscale.py: AI ini for $Rate Hz =="
-    & $py (Join-Path $tools 'gplaiscale.py') --rate $Rate --game-dir $gplDir `
-        --input $ini36 --out $aiIni --markdown (Join-Path $patches ('gpla67-{0}-changes.md' -f $Rate))
-    if ($LASTEXITCODE) { throw "gplaiscale.py failed ($LASTEXITCODE)" }
+    # The no-game test: the hook's table applied to the 36 Hz ini must match gplaiscale's
+    # rescale of it, bit for bit at 144.
+    Write-Host "`n== 2/4 gplaihook.py --check =="
+    & $py (Join-Path $tools 'gplaihook.py') --check --rate $Rate --game-dir $gplDir `
+        --exe $donor --ai-ini $ini36
+    if ($LASTEXITCODE) { throw "gplaihook.py --check failed ($LASTEXITCODE)" }
 }
 
 if ($SkipExe) { Write-Host "`n-SkipExe: done."; exit 0 }
@@ -319,7 +329,7 @@ if (-not (IsLargeAddressAware $outExe)) { throw "$outExe is not /LARGEADDRESSAWA
 
 Write-Host "`nDone."
 Write-Host "  exe : $outExe   -> copy over $gplDir\gplc67.exe"
-Write-Host "  ini : $aiIni    -> copy over $gplDir\gpla67.ini"
+Write-Host "  ini : $aiIni    -> copy over $gplDir\gpla67.ini (36 Hz; the exe scales it)"
 
 if ($Install) {
     Write-Host "`n== install =="
@@ -335,5 +345,5 @@ if ($Install) {
         if ($a -ne $b) { throw "install of $dst did not take (hash mismatch)" }
         Write-Host ("  ok  {0}  {1}" -f $dst, $a.Substring(0, 16))
     }
-    Write-Host ("  {0} is the 36 Hz source and was not touched." -f $ini36)
+    Write-Host ("  {0} was copied, not modified." -f $ini36)
 }

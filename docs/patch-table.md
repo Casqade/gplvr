@@ -23,7 +23,7 @@ steps-per-tick to a wrong constant. Its `taskBegin` cave read `dword_94D25C` ins
 as exact reciprocals rather than 77G's four-decimal roundings, which integrated as though
 the rate were 144.0092 Hz.
 
-The table below holds **230 sites**, and that is the `<BinaryPatch>` count in the shipped
+The table below holds **232 sites**, and that is the `<BinaryPatch>` count in the shipped
 file. It is not the whole story of what was read: **19 more are parsed out of the 60 fps
 reference and deliberately dropped**, listed in section Z.
 
@@ -33,7 +33,7 @@ rather than write the immediate this patch replaces the whole instruction with a
 a stub that does `push imm32` -- family O. The fourth, `0x004E8078`, would fit perfectly
 well; it is dropped because nothing reads it (report 18).
 
-The 230 emitted are not all inherited: many are synthesised here -- the tick-count tables,
+The 232 emitted are not all inherited: many are synthesised here -- the tick-count tables,
 the caves, the operand relocations, the handshake -- and have no counterpart in the 60 fps
 patch at all. The 19 dropped are the only ones read and then discarded.
 
@@ -600,6 +600,31 @@ one.
 | `00988A04` | `00988A04` | *code cave* | 0 | 0.840896428 | rate-conversion | 4 | FFB filter 1 - alpha = 0.84089642, the SECOND tap the stock code does not have. One constant on both taps has DC gain 1; substituting alpha alone would collapse the wheel to 19% of the physics' output |
 | `00988A80` | `00988A80` | *code cave* | `00000000000000000000000000000000000000000000000000000000000000` | `D80D008A9800D9052CAE7800D80D048A9800DEC1D9152CAE7800E9FCB8B1FF` | rate-conversion | 31 | FFB filter cave: fmul alpha; fld state; fmul (1-alpha); faddp; fst state; jmp back |
 
+### S. The AI ini hook: gpla67.ini scaled as it is parsed  (2 sites)
+
+GPL turns every ini value into a float in one place: slot +8 of the float binding vtable,
+`0x405250`, whose only reference is the dword at `0x536B20`. That dword now points at a copy
+in a modtext cave which parses the same way and then, for a binding of the three AI tables
+gpla67.ini fills (0x42 descriptors, 0x44 line states, 0x46 car classes) whose key pointer is
+in its table, multiplies by `(rate/36)^k`. The table is `gplaiscale.py`'s exponents reduced
+to one per key name -- 36 names -- plus the two names whose default only family K scales
+(`stay_on_track_trans_time`, `goal_dlat_accel_averaging`), so a player who adds either to
+the ini gets it scaled too. `gplaihook.py --check` proves the table reproduces gplaiscale's
+rescale of the 36 Hz ini bit for bit at 144.
+
+So the 36 Hz `gpla67.ini` is installed unchanged, and a player's own edits are scaled too.
+Nothing is scaled twice: only text passes through the setter, every load resets its table to
+the defaults first, and nothing writes these tables back to a file. A gpla67.ini already
+rescaled by gplaiscale WOULD be scaled twice -- install the 36 Hz file. track.ini (0x45) is
+left alone: its rate-dependent values are converted where they are read (B, D). Report 108.
+The cave's table holds key POINTERS, which sit in the +8 window, so this is one of the
+payloads that makes the XML link-specific.
+
+| address | XML address | containing function | stock | at 144 Hz | k | w | what and why |
+|---|---|---|---|---|---|---|---|
+| `00536B20` | `00536B20` | *.rdata/.data constant* | 4215376 | 9967488 | rate-conversion | 4 | AI ini hook: the float binding vtable's set-from-text slot -> the cave at 00981780 |
+| `00981780` | `00981780` | *code cave* | 412 zero bytes | 412 bytes (`568BF1578B7E22576874615400FF7424`...) | rate-conversion | 412 | AI ini hook: the float setter plus (rate/36)^k for 38 key names (38 key pointers) of tables 0x42/0x44/0x46 -- alt_accel_k1 rate^-2, alt_accel_k2 rate^-1, base_gearshift_hiatus rate^+1, base_race_start_hiatus rate^+1, check_driver_mistake_interval rate^+1, cornering_dlat_accel_k1 rate^-2, cornering_dlat_accel_k2 rate^-1, cornering_dlat_trans_time rate^+1, cornering_long_term_lookahead rate^+1, cornering_short_term_lookahead rate^+1, crashing_recovery_yaw_velocity rate^-1, dlat_accel_k1 rate^-2, dlat_accel_k2 rate^-1, dlat_lookahead rate^+1, dlat_trans_time rate^+1, gear_shift_rpm_decrement rate^-1, goal_dlat_accel_averaging rate^+1, in_session_driver_mod_interval rate^+1, inverse_slipcurve_k rate^-2, long_term_check_min_speed rate^-1, long_term_lookahead rate^+1, low_speed_override_threshold rate^-1, max_lat_acc_from_speed rate^-1, max_ws_interval rate^+1, mechanical_failure_interval rate^+1, min_ws_interval rate^+1, nominal_max_accel rate^-2, nominal_traction_circle rate^-2, pitch_accel_coeff rate^+2, roll_accel_coeff rate^+2, short_term_lookahead rate^+1, stay_on_track_trans_time rate^+1, straightaway_pass_closing_velocity rate^-1, suspension_mechanical_drag_coeff rate^-2, switch_to_cornering_dlat_velocity rate^-1, tire_failure_mechanical_drag_coeff rate^-2, yaw_accel_k1 rate^-2, yaw_accel_k2 rate^-1 |
+
 ### Z. Parsed but NOT emitted  (19 sites)
 
 These are in the 60 fps reference and deliberately excluded. The rate carriers are
@@ -648,10 +673,11 @@ Both are dropped entirely, leaving stock bytes.
 | `0044B4BC` | gpl_aiUpdateAllDrivers +0x1BC | engine-wear dt: its 9-tick gate is scaled instead, which keeps the real 0.25 s interval; scaling both would double-convert |
 | `0053919C` | *.rdata/.data constant* | the minrace/maxrace .lp dlong-speed floor in sub_44A400: a .lp-world constant, 36 Hz forever, that the reference scaled as if current-rate |
 
-## gpla67.ini -- 96 rescaled keys
+## gpla67.ini -- 96 values the exe scales as it reads them
 
-`tools/gplaiscale.py` rescales the AI ini from `gpla67.ini.36`. It derives each key's
-exponent from an ORACLE -- the diff between the stock 36 Hz ini and the reference's 60 Hz
+The ini is installed at 36 Hz and family S scales these values while GPL parses it; the
+column is what GPL then holds. The exponents are `tools/gplaiscale.py`'s, which derives each
+key's exponent from an ORACLE -- the diff between the stock 36 Hz ini and the reference's 60 Hz
 ini -- then applies a table of overrides where the reference is dimensionally wrong. The
 two override tables and the reasoning behind each entry are in the module's docstring; the
 most consequential are the `dlat_accel_k1/k2` spring-damper pairs, which the reference
@@ -751,7 +777,7 @@ time-to-collision that is ALREADY in current-rate ticks.
 | `[physics]` | `alt_accel_k1` | 0.07 | 0.004375 | -2 | k1 for altitude control spring/damper |
 | `[physics]` | `alt_accel_k2` | 0.32 | 0.08 | -1 | k2 for altitude control spring/damper |
 | `[physics]` | `gear_shift_rpm_decrement` | 195 | 48.75 | -1 | during gear shift decrement RPM each tick by this amount |
-| `[physics]` | `inverse_slipcurve_k` | 0.1667 | 0.0104187 | -2 | in (meters/tick^2)/radian; calculated by JDK for use with fnSlipcurve table by yaw pipeline |
+| `[physics]` | `inverse_slipcurve_k` | 0.1667 | 0.0104188 | -2 | in (meters/tick^2)/radian; calculated by JDK for use with fnSlipcurve table by yaw pipeline |
 | `[physics]` | `max_lat_acc_from_speed` | 0.0125 | 0.003125 | -1 | value * speed = max. lat accel allowed |
 | `[physics]` | `max_ws_interval` | 108 | 432 | +1 | max time(ticks) to stop wheelspin |
 | `[physics]` | `min_ws_interval` | 54 | 216 | +1 | min time(ticks) to stop wheelspin |
@@ -866,7 +892,7 @@ our adj-coeff cave lives.
 | `gplc67_36.exe` | every generator | the unpatched reference every stock value is checked against, and the CD-key donor for the two `-CarryBytes` regions |
 | `60FPSv2.xml` | gplrategen | the known-good 60 fps patch every rate^k exponent is read off |
 | `gpl_ai.ini.98` + `gpl_ai_60fps.ini` | gplaiscale | the 36/60 pair that acts as the exponent oracle for the ini |
-| `gpla67.ini.36` | gplaiscale | the 36 Hz AI ini that is rescaled |
+| `gpla67.ini.36` | gplrategen, gplaihook | the 36 Hz AI ini whose key names family S's table is resolved over, and the file installed as `gpla67.ini` |
 
 ### Nothing protects our bytes from a later XML
 
@@ -881,42 +907,13 @@ intended sites. The donor half of that rule was added after 77G's destruction of
 `gpl_tickPeriodSeconds` stayed invisible for the whole campaign, because 77G was in every
 build being compared.
 
-## DEFERRED: folding the ini rescale into the exe patch
+## DONE (v35): the ini rescale folded into the exe patch
 
-**Written off as future work, 2026-09-09.** Today the build ships two artefacts: this XML,
-and a rescaled `gpla67.ini` produced by `tools/gplaiscale.py`. The ini half is the awkward
-one to distribute — it overwrites a file players edit themselves, it cannot be layered with
-anyone else's AI tuning, and "install this exe AND replace your ini" is two steps where one
-would do.
-
-The question is whether the ini could be eliminated by patching its CONSUMERS instead:
-convert each value at the point it is read, the way families B, D and E already do for the
-`.lp` world, so a stock 36 Hz `gpla67.ini` keeps working unchanged at any rate.
-
-**It is possible, and it is a large piece of work.** What makes it possible is that the ini
-is not read directly by scattered code: it is parsed once into the PARAMETER-DESCRIPTOR
-TABLE at `0x554658..0x55595F`, and family K already patches defaults in that table. So
-there is a single funnel. What makes it large:
-
-* **96 keys, each needing its consumer traced.** The exponent alone is not enough — the
-  campaign's sharpest rule is that two constants multiplying the same tick delta can need
-  opposite treatment, so every one needs the "does the consumer already divide by the rate?"
-  question answered individually. That is the same work the ini oracle does today for free,
-  by diffing a hand-made 60 Hz ini against the stock one.
-* **The oracle disappears.** `gpl_ai.ini.98` vs `gpl_ai_60fps.ini` is what makes the current
-  rescaler trustworthy: the exponents are READ OFF a known-good pair rather than reasoned
-  out. Patching consumers throws that away and replaces measurement with argument.
-* **Values arrive as text.** The descriptor table holds defaults, but a key present in the
-  user's ini overrides its default at parse time, so the conversion has to happen after
-  parsing — at the reader, or in a post-parse pass over the table.
-* **Nine of fifteen line states are unnamed in the ini** and seeded from descriptor defaults
-  only, so the two paths already differ and both would need covering.
-
-The honest trade: it removes a distribution wart and gains compatibility with other people's
-AI tuning, at the cost of replacing a measured, oracle-checked rescale with 96 hand-derived
-exponents. Not worth doing until someone actually wants to ship this to players, and if it
-is done it should keep `gplaiscale.py` alive as the CROSS-CHECK — generate both and assert
-they agree.
+Deferred on 2026-09-09 as "96 keys, each needing its consumer traced". Report 108 found the
+cheaper design: every ini value passes through ONE function, the float setter at `0x405250`,
+so scaling happens there, by key name, with gplaiscale's own exponents -- no consumer had to
+be traced, and the oracle stays the source of the table and its test. That is family S. The
+build no longer ships a rescaled `gpla67.ini`.
 
 ## DEFERRED: wiring the player's slipstream into physics
 
