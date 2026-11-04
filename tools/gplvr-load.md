@@ -5,6 +5,14 @@ itself, so gplvr works however the player launches -- a GEM+ shortcut that drops
 race, a desktop shortcut, GPLShell -- with no injector and no `CreateRemoteThread` for an
 antivirus to object to.
 
+The patch itself is `patches/gplvr-load.xml`.
+
+**Order and pribluda do not matter** (checked 2026-11-04 with the real GPLPatchDLL): the exe
+comes out byte-identical whether it is applied first, last, before or after
+`enablepribluda.xml`, and with or without pribluda -- on a clean base and on a pribpatcher'd one
+alike. No XML among the 77 on this machine writes either of its sites or the `LoadLibraryA`
+operand its stub reads, so GEM+'s name order is safe for it.
+
 **The XML carries no comments on purpose.** None of the 49 GEM XMLs on this machine contains
 one, and GPLPatchDLL has rejected a generated file before with no diagnostic at all, so the
 documentation lives here instead of in the patch.
@@ -46,7 +54,7 @@ address is link-agnostic by construction. The trick is `enablepribluda.xml`'s, n
 
 **The result of `LoadLibraryA` is deliberately ignored**, so a missing or wrong-architecture
 `gplvr.dll` leaves the game running vanilla rather than failing to start. The only symptom is
-that no `gplvr.log` appears.
+that no new run folder with a `gplvr.log` appears under `gplvr\logs`.
 
 ## Why this site and not pribluda's
 
@@ -96,7 +104,8 @@ only and refuses any XML using a directive it does not implement.
 
 ## Testing it
 
-1. `gplvr.log` appears in the `gplvr` folder, with `gplvr attached to ...` naming the exe.
+1. A new run folder appears under `gplvr\logs` with a `gplvr.log` and no `gplvr-loader.log`
+   (no loader ran), its first line `gplvr 1.0 (...) attached to ...` naming the exe.
 2. The log's `IAT: main module ChangeDisplaySettingsA -> hooked` style lines are present, which
    is what being early enough buys.
 3. The game still starts with `gplvr.dll` renamed away (fail-open).

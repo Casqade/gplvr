@@ -36,6 +36,7 @@
 #include "SkidFlood.h"
 #include "Stereo.h"
 #include "Log.h"
+#include "LogDir.h"
 #include "Window.h"
 
 #include <windows.h>
@@ -257,7 +258,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // And gplvr's own folder, which is where this log, gplvr.ini and everything else of
         // ours is: the game can be launched with any executable in any layout, so "which ini
         // did it read" is a question the log has to answer rather than the reader assume.
-        logf("gplvr attached to %s -- built %s, from %s", exe, buildStamp(), pathsOwnDirectory());
+        logf("gplvr %s (%s, built %s) attached to %s, from %s", buildVersion(), buildCommit(),
+             buildStamp(), exe, pathsOwnDirectory());
+        logf("logs in %s", logDirectory());
 
         // Where this image keeps its globals, before anything reads or writes one. Links of
         // 1.2.0.2 ship identical code with the tail of `.data` 8 or 16 bytes apart, so a guard

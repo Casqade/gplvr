@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(gplvr CXX)
+project(gplvr VERSION 1.0 LANGUAGES CXX RC)
 
 # There are two builds here, and they are different bitnesses on purpose.
 #
@@ -30,21 +30,33 @@ if(NOT EXISTS "${GPLVR_OPENXR_INCLUDE}/openxr/openxr.h")
         "See third_party/openxr-1.1.61/README.md for what belongs there.")
 endif()
 
+set(GPLVR_STAMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+add_custom_target(gplvr_build_stamp
+    COMMAND ${CMAKE_COMMAND} -DOUT=${GPLVR_STAMP_DIR}/GplvrBuildStamp.h
+            -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR} -DVERSION=${PROJECT_VERSION}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/BuildStamp.cmake
+    COMMENT "gplvr build stamp")
+
 # The survey tool, built for whichever bitness this configuration is. It links no OpenXR
 # import library: runtime/openxr/<bitness>/openxr_loader.dll is opened by path at run
 # time, so a missing or broken loader is a logged failure rather than a process that
 # will not start.
 function(gplvr_add_survey target output)
     add_executable(${target}
+        src/BuildStamp.cpp
         src/Log.cpp
+        src/LogDir.cpp
         src/Paths.cpp
+        src/Version.rc
         src/openxr/Xr.cpp
         src/openxr/GplvrXr.cpp
         src/openxr/XrInput.cpp
         src/presenter/Consumer.cpp
     )
     set_target_properties(${target} PROPERTIES OUTPUT_NAME "${output}")
-    target_include_directories(${target} PRIVATE src "${GPLVR_OPENXR_INCLUDE}")
+    target_include_directories(${target} PRIVATE src "${GPLVR_OPENXR_INCLUDE}" "${GPLVR_STAMP_DIR}")
+    target_compile_definitions(${target} PRIVATE GPLVR_RC_PRESENTER)
+    add_dependencies(${target} gplvr_build_stamp)
     target_link_libraries(${target} PRIVATE d3d11 dxgi d3dcompiler user32)
 
     # The loader is opened by a path relative to the executable, so stage it there
@@ -94,6 +106,7 @@ else()
         src/Interpolation.cpp
         src/Letterbox.cpp
         src/Log.cpp
+        src/LogDir.cpp
         src/MenuScale.cpp
         src/MirrorCache.cpp
         src/MirrorConfig.cpp
@@ -128,6 +141,7 @@ else()
         src/VrInput.cpp
         src/VrMenu.cpp
         src/VrText.cpp
+        src/Version.rc
         src/Window.cpp
         src/presenter/Producer.cpp
         src/fast_text/FastText.cpp
@@ -167,14 +181,9 @@ else()
         src/baked_gpl/TrackBake.cpp
     )
     set_target_properties(gplvr PROPERTIES OUTPUT_NAME "gplvr" PREFIX "")
-    target_include_directories(gplvr PRIVATE src)
-    set(GPLVR_STAMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-    add_custom_target(gplvr_build_stamp
-        COMMAND ${CMAKE_COMMAND} -DOUT=${GPLVR_STAMP_DIR}/GplvrBuildStamp.h
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/BuildStamp.cmake
-        COMMENT "gplvr build stamp")
+    target_include_directories(gplvr PRIVATE src "${GPLVR_STAMP_DIR}")
+    target_compile_definitions(gplvr PRIVATE GPLVR_RC_DLL)
     add_dependencies(gplvr gplvr_build_stamp)
-    target_include_directories(gplvr PRIVATE "${GPLVR_STAMP_DIR}")
     # No d3d11 or opengl32 import here on purpose. GlInterop.cpp resolves both by name,
     # so neither is loaded into the game until VR is switched on -- and with the D3D7
     # rasterizer selected there is no GL at all, which has to stay a logged note rather
@@ -188,7 +197,16 @@ else()
     # -- the loader --------------------------------------------------------------
     # Starts the game suspended, injects gplvr.dll, resumes. See the comment at the top
     # of GplvrLoader.cpp for why this rather than a proxy DLL.
-    add_executable(gplvr_loader WIN32 src/loader/GplvrLoader.cpp)
+    add_executable(gplvr_loader WIN32
+        src/loader/GplvrLoader.cpp
+        src/BuildStamp.cpp
+        src/LogDir.cpp
+        src/Paths.cpp
+        src/Version.rc
+    )
+    target_include_directories(gplvr_loader PRIVATE src "${GPLVR_STAMP_DIR}")
+    target_compile_definitions(gplvr_loader PRIVATE GPLVR_RC_LOADER)
+    add_dependencies(gplvr_loader gplvr_build_stamp)
     # Its own PDB name: with OUTPUT_NAME "gplvr" the loader's link would write gplvr.pdb over
     # the DLL's.
     set_target_properties(gplvr_loader PROPERTIES OUTPUT_NAME "gplvr" PDB_NAME "gplvr-loader")

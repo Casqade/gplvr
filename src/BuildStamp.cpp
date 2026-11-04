@@ -6,4 +6,8 @@ namespace gplvr {
 
 const char* buildStamp() { return GPLVR_BUILD_STAMP; }
 
+const char* buildVersion() { return GPLVR_VERSION; }
+
+const char* buildCommit() { return GPLVR_BUILD_COMMIT; }
+
 }  // namespace gplvr

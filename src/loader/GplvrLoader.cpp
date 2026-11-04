@@ -33,6 +33,9 @@
 #include <cstdio>
 #include <string>
 
+#include "BuildStamp.h"
+#include "LogDir.h"
+
 namespace {
 
 FILE* g_log = nullptr;
@@ -226,9 +229,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     const std::wstring loaderDir = loaderDirectory();
     const std::wstring ini = loaderDir + L"gplvr.ini";
 
-    _wfopen_s(&g_log, (loaderDir + L"gplvr-loader.log").c_str(), L"w");
-    logLine("gplvr loader starting");
+    // The loader starts every run: a new folder under gplvr\logs, which the game and the
+    // presenter inherit through GPLVR_LOG_DIR (LogDir.h).
+    char logPath[MAX_PATH] = {};
+    if (gplvr::logDirectoryFile(logPath, sizeof(logPath), "gplvr-loader.log", true))
+        fopen_s(&g_log, logPath, "w");
+    logLine("gplvr loader %s (%s, built %s)", gplvr::buildVersion(), gplvr::buildCommit(),
+            gplvr::buildStamp());
     logLine("gplvr = %ls", loaderDir.c_str());
+    logLine("logs  = %s", gplvr::logDirectory());
 
     const CommandLine command = parseCommandLine();
     if (command.exeWithoutValue) {

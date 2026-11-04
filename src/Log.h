@@ -1,7 +1,7 @@
 #pragma once
 
-// Line-buffered log in gplvr's own folder -- see Paths.h, which is beside gplvr.dll in the game
-// and beside gplvr-xr.exe in the presenter. Every line is flushed, because the interesting
+// Line-buffered log in this launch's run folder, gplvr\logs\<date_time>\ -- see LogDir.h, which
+// the game's gplvr.dll and the presenter share. Every line is flushed, because the interesting
 // failures are the ones that end in a crash.
 
 namespace gplvr {

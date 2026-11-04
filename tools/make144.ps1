@@ -5,7 +5,7 @@
 .DESCRIPTION
   Runs the three tools in order, producing for -Rate 144:
 
-      tools\78 144fps v34 <link>.xml         (gplrategen.py)
+      patches\78 144fps v34 <link>.xml       (gplrategen.py)
       out\gpla67-144.ini                     (gplaiscale.py)
       out\gplc67-144[-prib]-<link>.exe       (gplexegen.ps1 + GPLPatchDLL.dll)
 
@@ -74,7 +74,7 @@
   start. The same three .text sites are right for both links.
 
 .PARAMETER LoadGplvr
-  Apply tools\gplvr-load.xml: the exe loads gplvr\gplvr.dll itself before gpl_winMain, so
+  Apply patches\gplvr-load.xml: the exe loads gplvr\gplvr.dll itself before gpl_winMain, so
   gplvr runs however the game is launched, without gplvr.exe. See tools\gplvr-load.md.
 
 .PARAMETER GemExtras
@@ -156,6 +156,8 @@ if (-not (Test-Path -LiteralPath $py)) { throw "-Python does not exist: $py" }
 
 $proj    = Split-Path -Parent $PSScriptRoot          # the repo root
 $tools   = Join-Path $proj 'tools'
+# Our own XMLs, the ones this script writes (rate, FFB) and the ones it only reads.
+$patches = Join-Path $proj 'patches'
 $outDir  = if ($OutDir) { $OutDir } else { Join-Path $proj 'out' }
 $gplDir  = $GplDir
 $gpl67   = Join-Path $gplDir 'Mods\GEM+\gpl67'
@@ -173,7 +175,7 @@ $donor   = if ($Donor) { $Donor }
 # Likewise: a copy of gpla67.ini as it was before any rescaling. Read, never written.
 $ini36   = if ($Ini36) { $Ini36 } else { Join-Path $gplDir 'gpla67.ini.36' }
 $pribXml = Join-Path $gplDir 'enablepribluda.xml'
-$loadXml = Join-Path $tools 'gplvr-load.xml'
+$loadXml = Join-Path $patches 'gplvr-load.xml'
 
 $needDonor = -not $stock36 -or $GemExtras -or $FfbNoSpringDamper -or $FfbDeeperNotch
 $needIni36 = -not $stock36 -or $Install
@@ -185,7 +187,7 @@ $needs = @(
 if ($needDonor) { $needs += @{ p = $donor; f = '-Donor'; d = $false; what = 'an unpatched gplc67.exe of the same link to read stock values from' } }
 if ($needIni36) { $needs += @{ p = $ini36; f = '-Ini36'; d = $false; what = 'an unpatched 36 Hz gpla67.ini' } }
 if ($Pribluda)  { $needs += @{ p = $pribXml; f = '-GplDir'; d = $false; what = 'enablepribluda.xml, as pribluda ships it' } }
-if ($LoadGplvr) { $needs += @{ p = $loadXml; f = '(the repo)'; d = $false; what = 'tools\gplvr-load.xml' } }
+if ($LoadGplvr) { $needs += @{ p = $loadXml; f = '(the repo)'; d = $false; what = 'patches\gplvr-load.xml' } }
 foreach ($need in $needs) {
     $ok = if ($need.d) { Test-Path -LiteralPath $need.p -PathType Container }
           else { Test-Path -LiteralPath $need.p -PathType Leaf }
@@ -234,7 +236,7 @@ if ($GemExtras -and $Link -ne 'UK') {
     throw "-GemExtras is UK-only: the carried file offsets are the UK link's."
 }
 
-$aiXml   = Join-Path $tools ('78 {0}fps v34 {1}.xml' -f $Rate, $Link)
+$aiXml   = Join-Path $patches ('78 {0}fps v34 {1}.xml' -f $Rate, $Link)
 $name    = 'gplc67' + $(if ($stock36) { '' } else { '-{0}' -f $Rate }) +
            $(if ($Pribluda) { '-prib' } else { '' }) + '-' + $linkTag
 $outExe  = Join-Path $outDir ($name + '.exe')
@@ -246,8 +248,8 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 # The two optional FFB patches. NEITHER IS A RATE FIX -- GPL's FFB averager runs inside the
 # physics substep loop, so it is 288 Hz at every tick rate. They are preferences, off by
 # default, and equally valid on a 36 Hz build.
-$ffbCondXml = Join-Path $tools '81 ffb no spring damper v2.xml'
-$ffbCurveXml = Join-Path $tools '82 ffb deeper notch v2.xml'
+$ffbCondXml = Join-Path $patches '81 ffb no spring damper v2.xml'
+$ffbCurveXml = Join-Path $patches '82 ffb deeper notch v2.xml'
 if ($FfbNoSpringDamper -or $FfbDeeperNotch) {
     Write-Host "`n== 0c/4 gplffb.py: optional force-feedback patches =="
     $ffbArgs = @('--game-dir', $gplDir, '--exe', $donor)
@@ -289,9 +291,9 @@ $gem = @(
 $xmlList = @(
     $gem | ForEach-Object {
         Join-Path $gpl67 $_
-        if ($_ -eq '05.xml') { Join-Path $tools '05_unbindfix.xml' }
+        if ($_ -eq '05.xml') { Join-Path $patches '05_unbindfix.xml' }
     }
-) + $(if ($GemExtras) { @(Join-Path $tools 'gpl67-carset-names.xml') } else { @() }
+) + $(if ($GemExtras) { @(Join-Path $patches 'gpl67-carset-names.xml') } else { @() }
 ) + $(if (-not $stock36) { @($aiXml) } else { @() }
 ) + $(if ($FfbNoSpringDamper) { @($ffbCondXml) } else { @() }
 ) + $(if ($FfbDeeperNotch) { @($ffbCurveXml) } else { @() }

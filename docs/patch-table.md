@@ -803,7 +803,7 @@ preferences that are equally valid on a stock 36 Hz build. The one rate coupling
 path, the smoothing filter, is in every build as family R above; it used to be a third
 optional XML here.
 
-#### `81 ffb no spring damper v1.xml` -- `-FfbNoSpringDamper` -- NOT APPLIED
+#### `81 ffb no spring damper v2.xml` -- `-FfbNoSpringDamper` -- NOT APPLIED
 Zeroes two coefficients at `0x004A1116` and `0x004A113F`: the centring spring and the
 damper GPL installs in the wheel itself at FFB init. They are DirectInput CONDITION
 effects, computed by the wheel's own firmware from wheel position and velocity, so they
@@ -811,7 +811,7 @@ never pass through the tick loop and never see the car -- a fixed feel laid over
 signal, which travels separately as a constant-force effect. A preference, not a fix, and
 equally valid at 36 Hz.
 
-#### `82 ffb deeper notch v1.xml` -- `-FfbDeeperNotch` -- NOT APPLIED
+#### `82 ffb deeper notch v2.xml` -- `-FfbDeeperNotch` -- NOT APPLIED
 Rescales the negative half of the force curve by `depth/1.20` (25 sites), deepening the
 centre notch. A preference, tunable with `-FfbNotchDepth`.
 

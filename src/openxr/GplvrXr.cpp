@@ -26,7 +26,9 @@
 // --runtime sets XR_RUNTIME_JSON for this process only, which is how you point the
 // loader straight at one vendor's runtime without changing any machine-wide setting.
 
+#include "BuildStamp.h"
 #include "Log.h"
+#include "LogDir.h"
 #include "openxr/Xr.h"
 #include "openxr/XrInput.h"
 #include "presenter/Consumer.h"
@@ -660,8 +662,10 @@ int wmain(int argc, wchar_t** argv) {
     const Options options = parseCommandLine(argc, argv);
     logOpen("gplvr-xr.log");
     logEcho(options.presentInstance == nullptr);
-    logf("gplvr-xr -- %u-bit, %s", (unsigned)(sizeof(void*) * 8),
+    logf("gplvr-xr %s (%s, built %s) -- %u-bit, %s", buildVersion(), buildCommit(), buildStamp(),
+         (unsigned)(sizeof(void*) * 8),
          options.presentInstance ? "presenting for the game" : "OpenXR survey");
+    logf("logs in %s", logDirectory());
 
     Consumer consumer;
     const bool presenting =
