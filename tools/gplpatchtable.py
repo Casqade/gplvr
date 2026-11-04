@@ -37,7 +37,7 @@ import gplrategen as G  # noqa: E402
 import gplaiscale as A  # noqa: E402
 
 DEFAULT_INI_144 = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "out", "gpla67-144.ini")
+    os.path.abspath(__file__))), "patches", "gpla67-144.ini")
 
 # IDB symbol snapshot, gpl_/mod_ only. Taken 2026-09-13 from the primary instance.
 # The last block is the exception: unnamed functions that contain sites or neighbour the
@@ -657,8 +657,10 @@ runtime, so the sim push at `0x0040BCA8` and the timer push at `0x004E8426` must
 consistent with each other."""),
     ("P", "Multiplayer, replay and GUI: the pieces 77G used to supply", """
 Re-derived so that no third-party patch is needed. The frame-rate handshake stamps a build
-signature into the join record and compares it during the qualify handshake, so a 144 Hz
-client cannot silently join a 36 Hz server and desync (report 17). The replay chunk
+signature into the join record, and the SERVER compares it during the qualify handshake, so
+a 144 Hz server refuses 36 Hz, 60FPSv2 and 77G clients (report 17). The check runs only on
+the server: a stock 36 Hz server has no such check and still accepts a 144 Hz client, which
+then desyncs -- join only servers running the same build. The replay chunk
 version carries the recording rate in its high byte, a cooperative tag for external tools
 reading a frame-indexed replay. The GUI throttle delivers a widget callback when the id
 differs from the last one or when 4 scheduler ticks have passed -- 77G's every-4th-callback

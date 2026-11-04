@@ -518,8 +518,10 @@ consistent with each other.
 ### P. Multiplayer, replay and GUI: the pieces 77G used to supply  (11 sites)
 
 Re-derived so that no third-party patch is needed. The frame-rate handshake stamps a build
-signature into the join record and compares it during the qualify handshake, so a 144 Hz
-client cannot silently join a 36 Hz server and desync (report 17). The replay chunk
+signature into the join record, and the SERVER compares it during the qualify handshake, so
+a 144 Hz server refuses 36 Hz, 60FPSv2 and 77G clients (report 17). The check runs only on
+the server: a stock 36 Hz server has no such check and still accepts a 144 Hz client, which
+then desyncs -- join only servers running the same build. The replay chunk
 version carries the recording rate in its high byte, a cooperative tag for external tools
 reading a frame-indexed replay. The GUI throttle delivers a widget callback when the id
 differs from the last one or when 4 scheduler ticks have passed -- 77G's every-4th-callback
@@ -814,6 +816,16 @@ equally valid at 36 Hz.
 #### `82 ffb deeper notch v2.xml` -- `-FfbDeeperNotch` -- NOT APPLIED
 Rescales the negative half of the force curve by `depth/1.20` (25 sites), deepening the
 centre notch. A preference, tunable with `-FfbNotchDepth`.
+
+#### The six listening variants in `out\`, 2026-10-24
+Built so the two preferences can be judged separately, at both rates, since neither
+depends on the rate: `gplc67-144-prib-uk-{nosd,notch,nosd-notch}.exe` and
+`gplc67-prib-uk-{nosd,notch,nosd-notch}.exe`. Each is its own base rebuilt with the
+switches added and nothing else changed, and in both families the no-FFB control came out
+byte-identical to the shipped `gplc67-144-prib-uk.exe` / `gplc67-prib-uk.exe`, so the
+diff against the control is the FFB patch alone: 6 bytes for `-FfbNoSpringDamper`,
+79 bytes in 21 runs for `-FfbDeeperNotch`. They are listening tests, not build outputs --
+delete them once the preference is settled and record the answer here.
 
 ## What the build depends on that is NOT ours
 

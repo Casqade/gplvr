@@ -1240,7 +1240,9 @@ STANDALONE_REPLAY_VERSION_STOCK = bytes.fromhex("02000000")
 # into the join record, and gpl_netJoinQualifyDriver -- the function that emits "you are
 # not qualified to drive in this race" -- compares it against the server's own before the
 # password, laptime and rating checks. Mixing frame rates online desynchronises, so a
-# 144 Hz build must refuse 36 and 60 Hz clients and be refused by them.
+# 144 Hz server must refuse 36 and 60 Hz clients. The check runs only on the server
+# (gpl_netJoinQualifyDriver is called only from gpl_netHandleJoinRequest): 60FPSv2 and 77G
+# servers refuse a 144 Hz client, but a stock 36 Hz server has no check and accepts it.
 #
 # 60FPSv2 derives its signature by READING ITS OWN CODE at 0x004E842C (`push 2*rate`), so
 # the fingerprint is a hash of how taskBegin was patched. We cannot reuse that: standalone

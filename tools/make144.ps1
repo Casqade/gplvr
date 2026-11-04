@@ -6,7 +6,8 @@
   Runs the three tools in order, producing for -Rate 144:
 
       patches\78 144fps v34 <link>.xml       (gplrategen.py)
-      out\gpla67-144.ini                     (gplaiscale.py)
+      patches\gpla67-144.ini                 (gplaiscale.py)
+      patches\gpla67-144-changes.md          (gplaiscale.py: every AI key, its unit and value)
       out\gplc67-144[-prib]-<link>.exe       (gplexegen.ps1 + GPLPatchDLL.dll)
 
   and for -Rate 36 the exe alone, gplc67[-prib]-<link>.exe: GEM's 21 numbered XMLs on the
@@ -63,6 +64,9 @@
 .PARAMETER Ini36
   A copy of gpla67.ini as it was before any rescaling. Read, never written. Default:
   <GplDir>\gpla67.ini.36. At -Rate 36 it is what -Install puts back as gpla67.ini.
+  Every value that is not rate-dependent passes through unchanged, so a personally tweaked
+  .36 makes a personally tweaked patches\gpla67-144.ini. Keep it GEM+'s stock file for a
+  build meant to be published.
 
 .PARAMETER Rate
   Simulation rate in Hz. Default 144. The exe build takes 144, or 36 for GPL's own rate with
@@ -83,7 +87,8 @@
   every out\ variant since 2026-10-11 has been built without.
 
 .PARAMETER OutDir
-  Where the exe, its manifest and the ini go. Default <repo>\out.
+  Where the exe and its manifest go. Default <repo>\out. The rate XML and the rescaled AI ini
+  go to <repo>\patches, which is published.
 
 .PARAMETER SkipExe
   Generate the XML and the ini but do not build the exe.
@@ -241,7 +246,7 @@ $name    = 'gplc67' + $(if ($stock36) { '' } else { '-{0}' -f $Rate }) +
            $(if ($Pribluda) { '-prib' } else { '' }) + '-' + $linkTag
 $outExe  = Join-Path $outDir ($name + '.exe')
 $manifest= Join-Path $outDir ($name + '.json')
-$aiIni   = if ($stock36) { $ini36 } else { Join-Path $outDir ('gpla67-{0}.ini' -f $Rate) }
+$aiIni   = if ($stock36) { $ini36 } else { Join-Path $patches ('gpla67-{0}.ini' -f $Rate) }
 
 New-Item -ItemType Directory -Force $outDir | Out-Null
 
@@ -270,7 +275,7 @@ if ($stock36) {
 
     Write-Host "`n== 2/4 gplaiscale.py: AI ini for $Rate Hz =="
     & $py (Join-Path $tools 'gplaiscale.py') --rate $Rate --game-dir $gplDir `
-        --input $ini36 --out $aiIni
+        --input $ini36 --out $aiIni --markdown (Join-Path $patches ('gpla67-{0}-changes.md' -f $Rate))
     if ($LASTEXITCODE) { throw "gplaiscale.py failed ($LASTEXITCODE)" }
 }
 
