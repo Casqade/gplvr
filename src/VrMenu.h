@@ -109,6 +109,10 @@ bool vrMenuReplayClickHeld();
 // The GL context is going away: forget the font's display lists.
 void vrMenuReleaseGl(const GlFunctions& gl, bool contextAlive);
 
+// Every font size the VR menu, its tweak strips and the radials draw with, each once, into
+// `out`; returns how many. For the prebuild, which makes them all before the first race.
+int vrMenuFontPixels(int* out, int capacity);
+
 // The once-a-second line. False when nothing has happened worth a line.
 bool vrMenuFormatStatus(char* out, size_t size);
 

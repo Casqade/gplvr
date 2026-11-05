@@ -10,6 +10,7 @@
 #include "Paths.h"
 #include "Pribluda.h"
 #include "QuickMenu.h"
+#include "Radial.h"
 #include "RenderTarget.h"
 #include "ReplayPanel.h"
 #include "ReplayQuickMenu.h"
@@ -136,6 +137,10 @@ constexpr int kStripCanvasWidth = 1024;
 // tweak mode cannot see the menu's help line, and leaving the mode to read what the buttons do
 // is exactly the trip the list exists to save.
 constexpr int kStripCanvasHeight = 400;
+static_assert(kMenuCanvasWidth <= kMenuPanelWidth && kMenuCanvasHeight <= kMenuPanelHeight &&
+                  kStripCanvasWidth <= kMenuPanelWidth &&
+                  kStripCanvasHeight <= kMenuPanelHeight,
+              "the menu's canvases must fit the VR menu panel's one size (Producer.h)");
 
 // Font sizes in canvas pixels. The menu's body has to fit "Save mirror aim" in the label
 // column and the small size has to fit the longest help line across the title band; the
@@ -629,9 +634,48 @@ bool rendererWarning(char* out, size_t size) {
     return true;
 }
 
+// THE HEADSET'S IMAGES ARE SMALLER THAN RENDER SCALE ASKS FOR. They are allocated at each race
+// entry, at the largest size that fits what GPL left of a 32-bit address space (report 113), so
+// the answer is per track; a scale that did not fit is a sharper picture the driver is not
+// getting, and nothing else would say so. In the front end it is the last race's.
+bool renderScaleWarning(char* out, size_t size) {
+    HeadsetSizing sizing;
+    if (!presenterHeadsetSizing(sizing)) return false;
+    if (!sizing.windowPicture && sizing.fraction >= 1.0f) return false;
+    const char* where = sizing.inRace ? "on this track" : "on the last track";
+    if (sizing.windowPicture)
+        _snprintf_s(out, size, _TRUNCATE,
+                    "Not enough memory for the headset's images %s: it shows the game "
+                    "window's picture. Lower Render scale and restart.",
+                    where);
+    else
+        _snprintf_s(out, size, _TRUNCATE,
+                    "Not enough memory for Render scale %.2f %s: running at an effective "
+                    "%.2f. Lower it, or make gplc67.exe large-address-aware.",
+                    g_options.vrRenderScale, where, g_options.vrRenderScale * sizing.fraction);
+    return true;
+}
+
+// Every warning the footer carries, joined, and how many there are.
+int menuWarnings(char* out, size_t size) {
+    out[0] = '\0';
+    int  count = 0;
+    char one[200];
+    if (renderScaleWarning(one, sizeof(one))) {
+        _snprintf_s(out, size, _TRUNCATE, "%s", one);
+        ++count;
+    }
+    if (rendererWarning(one, sizeof(one))) {
+        size_t used = std::strlen(out);
+        _snprintf_s(out + used, size - used, _TRUNCATE, "%s%s", count ? " " : "", one);
+        ++count;
+    }
+    return count;
+}
+
 int footerLines() {
-    char warning[200];
-    return kHelpLines + (rendererWarning(warning, sizeof(warning)) ? kRendererWarningLines : 0);
+    char warning[400];
+    return kHelpLines + menuWarnings(warning, sizeof(warning)) * kRendererWarningLines;
 }
 
 // What a row's new value implies elsewhere. There is nothing here today: the one rule that
@@ -2921,8 +2965,8 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
     }
 
     if (g_state.mode == Mode::Menu) {
-        char warning[200];
-        if (rendererWarning(warning, sizeof(warning))) {
+        char warning[400];
+        if (menuWarnings(warning, sizeof(warning))) {
             wrapInto(block, slot, width, warning);
             block.warningLines = block.count;
         }
@@ -4216,6 +4260,21 @@ void vrMenuReleaseGl(const GlFunctions& gl, bool contextAlive) {
     g_state.canvasSignatureValid = false;
     g_state.layerVisible = false;
     g_state.lastBuildQpc = 0;
+}
+
+int vrMenuFontPixels(int* out, int capacity) {
+    int radialBody = 0;
+    int radialSmall = 0;
+    radialFontPixels(radialBody, radialSmall);
+    const int wanted[] = {kMenuBodyPixels, kMenuSmallPixels, kStripBodyPixels, radialBody,
+                          radialSmall};
+    int count = 0;
+    for (int pixels : wanted) {
+        bool seen = false;
+        for (int i = 0; i < count; ++i) seen = seen || out[i] == pixels;
+        if (!seen && count < capacity) out[count++] = pixels;
+    }
+    return count;
 }
 
 bool vrMenuFormatStatus(char* out, size_t size) {

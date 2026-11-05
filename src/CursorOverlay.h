@@ -85,6 +85,11 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide);
 // present: that puts the trail straight back.
 void cursorOverlayRestore(const GlFunctions& gl);
 
+// The framebuffer `framebuffer` is about to be deleted: a save taken from it is dropped, since
+// its frame is gone and the restore would otherwise bind a dead (or reused) name. Called by
+// whoever deletes a framebuffer the cursor may have been drawn into.
+void cursorOverlayForgetSaveFrom(GLuint framebuffer);
+
 // Forget the cursor and backing-store textures because the GL context they belong to is
 // going away. The names are dropped rather than deleted -- glDeleteTextures against a dead or replaced context
 // either does nothing or destroys somebody else's object of the same name. The next

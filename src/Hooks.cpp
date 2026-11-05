@@ -2750,6 +2750,14 @@ void loadOptions(const char* fileName) {
         g_options.vrMonitorEye = kMonitorBoth;
     g_options.vrTransferFinish =
         GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
+    g_options.vrDirectToShared =
+        GetPrivateProfileIntA("gplvr", "vrDirectToShared", 1, path) != 0;
+    logf("options: vrDirectToShared=%d (%s)", g_options.vrDirectToShared ? 1 : 0,
+         g_options.vrDirectToShared
+             ? "the frame is rendered straight into the shared texture, and the render target "
+               "is a depth buffer alone"
+             : "the frame is rendered into a colour texture of our own and copied across at "
+               "publish");
     g_options.pribludaUpdateInterval =
         GetPrivateProfileIntA("gplvr", "pribludaUpdateInterval", 2, path);
     if (g_options.pribludaUpdateInterval < 1) g_options.pribludaUpdateInterval = 1;

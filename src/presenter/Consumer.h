@@ -90,6 +90,10 @@ public:
         float      heightMetres = 0.0f;
         uint32_t   textureWidth = 0;
         uint32_t   textureHeight = 0;
+        // The part of the texture image `sequence` fills: the bottom-left of the image the
+        // right way up, which is where drawMenu puts it in a swapchain of the texture's size.
+        uint32_t   imageWidth = 0;
+        uint32_t   imageHeight = 0;
         int32_t    sequence = 0;
     };
     bool menuPanel(MenuPanel& out);

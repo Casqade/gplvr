@@ -686,10 +686,18 @@ struct Options {
     // torn, half-drawn or stale frames in the headset, the unlock does not synchronise here.
     bool vrTransferFinish = true;
 
-    // `vrDirectToShared` (report 80) was here until 2026-11-04. It rendered the frame straight
-    // into the presenter's shared texture, holding the interop lock for the whole frame, so
-    // the copy at publish never ran. It worked and bought nothing: the GPU copy halved, but
-    // the CPU cost of the transfer is the WGL_NV_DX_interop lock, not the bytes. Removed.
+    // Render the frame straight into the presenter's shared texture (report 80) rather than
+    // into a colour texture of our own that is copied across at publish. 1 (default) or 0.
+    //
+    // Removed on 2026-11-04 for buying no frame time -- the transfer's CPU cost is the
+    // WGL_NV_DX_interop lock, not the bytes -- and back on 2026-11-06 for MEMORY: registering
+    // a shared texture with GL maps all of it into this 32-bit process (307 MiB per slot at
+    // 12688x6344), and a colour texture of our own needs as much again in one piece. Direct,
+    // the target is a depth buffer alone. The interop lock is held for the whole frame.
+    //
+    // A lock or an attachment that fails gives the target a colour texture of its own for the
+    // rest of the session and says so.
+    bool vrDirectToShared = true;
 
     // GPL'S STAMPED TEXT IS NEVER DROPPED. `vrSkipStampText` threw away stamps that could
     // not reach the headset -- a few thousand glyphs a frame into a surface the eyes never

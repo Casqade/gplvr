@@ -77,8 +77,20 @@ bool presenterLatestInputNames(SharedInputNames& names, int32_t& generation);
 
 // The VR menu's own quad layer.
 //
-// Begin makes the menu's texture the GL draw target, cleared transparent, creating it at
-// this size if it is not already; the size chosen comes back in actualWidth/actualHeight.
+// ONE SIZE FOR EVERY USER, made once. The layer is drawn by the VR menu (1024x640, its tweak
+// strips 1024x400, HUD tweak 1024 by the HUD panel's shape), the in-car and replay radials
+// (640x640) and the replay panel (1280x200, a dialog by its own size). Its textures are made at
+// the widest of them by the tallest fixed one, in the front end before the first race entry
+// (Producer's prebuild), and every image is drawn into the bottom-left of that at its own size,
+// so switching between them, or opening one in a race, allocates nothing. Each user's canvas
+// static_asserts against these; a request past them (HUD tweak on a monitor squarer than 16:10,
+// a big dialog) is scaled down whole to fit, and actualWidth/actualHeight say to what.
+inline constexpr int kMenuPanelWidth = 1280;
+inline constexpr int kMenuPanelHeight = 640;
+
+// Begin makes the menu's texture the GL draw target, cleared transparent, with a viewport of
+// the image's size at GL's origin (making the textures if the prebuild did not); the size
+// drawn at comes back in actualWidth/actualHeight.
 // End must follow every successful Begin in the same frame and restores the previous
 // draw target. Publish then copies the finished image into a shared slot under a lock of
 // its own -- NOT the frame transfer's batched one, which carries exactly one panel
@@ -189,9 +201,26 @@ int32_t presenterConsumedSequence();
 // to true until the presenter has reported, so nothing is disabled on a guess.
 bool presenterFovMutable();
 
-// Whether the headset's frame textures exist at its full size, so that work which takes a lot
-// of address space -- a track bake -- can no longer starve them. True when there is nothing to
-// wait for: flat mode, or a presenter that is off or failed.
-bool presenterHeadsetMemoryHeld();
+// Whether the headset's images for this race exist, so that work which takes a lot of address
+// space -- a track bake -- can no longer starve them (report 113). The images are made at race
+// entry and released when the race is left.
+//
+//   Ready              nothing to wait for: they are settled for this race, or none will be made
+//                      (flat mode, a presenter that is off or failed, no off-screen target, or
+//                      the engine's mode cannot be read)
+//   AwaitingRaceEntry  the front end is up, or the race's first frame has not been published:
+//                      they are made when the car is entered
+//   AwaitingPresenter  the presenter has not reported its runtime yet
+enum class HeadsetMemory { Ready, AwaitingRaceEntry, AwaitingPresenter };
+HeadsetMemory presenterHeadsetMemory();
+
+// What the headset's images were sized to at the last race entry, for the VR menu's warning.
+// False before the first race entry of this GL context.
+struct HeadsetSizing {
+    bool  inRace = false;         // that race is still on
+    float fraction = 1.0f;        // of the presenter's request, per side
+    bool  windowPicture = false;  // nothing fitted: the headset shows the game window's picture
+};
+bool presenterHeadsetSizing(HeadsetSizing& out);
 
 }  // namespace gplvr

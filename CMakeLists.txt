@@ -88,6 +88,7 @@ else()
     # -- the mod itself ----------------------------------------------------------
     add_library(gplvr SHARED
         src/dllmain.cpp
+        src/AddressSpace.cpp
         src/BuildStamp.cpp
         src/Billboard.cpp
         src/CrashGuard.cpp
@@ -145,6 +146,7 @@ else()
         src/Version.rc
         src/Window.cpp
         src/presenter/Producer.cpp
+        src/presenter/HeadsetMemory.cpp
         src/fast_text/FastText.cpp
         src/fast_text/TextDraw.cpp
         src/baked/Assets.cpp

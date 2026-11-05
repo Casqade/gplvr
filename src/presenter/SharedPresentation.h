@@ -42,9 +42,10 @@
 namespace gplvr {
 
 inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
+// 16: the VR menu panel is one fixed size and each slot names the part its image fills;
 // 15: the VR menu's own quad layer and the runtime's input-source names;
 // 14: controller input added; 13: eyeSubImageScale removed (rebuild both)
-inline constexpr uint32_t kControlVersion = 15;
+inline constexpr uint32_t kControlVersion = 16;
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -481,6 +482,13 @@ struct ControlBlock {
     uint32_t            menuTextureHeight = 0;
     volatile int32_t    menuGeneration = 0;
     volatile int32_t    menuSequence = 0;
+
+    // The part of each slot its image fills, width then height, written with the image and
+    // before the sequence that names it. The textures are made once at the largest size any
+    // user of the panel draws (the VR menu, its tweak strips, the radial quick menus, the
+    // replay panel), so a smaller image fills GL's origin: rows 0..h-1 of the bottom-up
+    // texture, which is the bottom-left w x h of the image once it is turned the right way up.
+    uint32_t menuImageSize[kFrameSlots][2] = {};
 
     // Non-zero while the layer is to be shown. Written last, so a menu coming back is
     // never shown for a display frame carrying the image from before it closed.

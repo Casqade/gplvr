@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace gplvr {
@@ -202,6 +203,8 @@ struct Walk {
     // is full of poses -- wheels, steering, suspension -- and none of them is this walk's
     // business unless a mirror hangs off it.
     const char* unresolvedWhy = nullptr;
+    uintptr_t   unresolvedNode = 0;  // the first pose the walk could not compose
+    uint32_t    unresolvedWords[4] = {};
     bool        mirrorUnderUnresolved = false;
     bool        stackOverflow = false;
     // Branches the depth cap stopped. Fatal only at the end, so one deep branch refuses the car
@@ -445,10 +448,13 @@ void walkFrom(Walk& walk, uintptr_t root, const Xform& rootPlace) {
                 if (!plausible) {
                     // Not a pose, whatever its type byte said. Fail closed: the subtree is still
                     // walked, and only a mirror found under it refuses the car.
-                    if (!walk.unresolvedWhy)
+                    if (!walk.unresolvedWhy) {
                         walk.unresolvedWhy =
                             "a mirror polygon hangs off a node whose type says pose but whose "
                             "translation is not a number a car could hold, so it is not one";
+                        walk.unresolvedNode = frame.node;
+                        std::memcpy(walk.unresolvedWords, words, sizeof(walk.unresolvedWords));
+                    }
                     push(words[8], frame.place, frame.mip, true);
                     break;
                 }
@@ -710,6 +716,12 @@ bool mirrorGeometryDerive(int team, MirrorSurfaceSet& out) {
     //
     // A pose has exactly one child, so descending costs no geometry. Bounded in case an install
     // nests the placement.
+    //
+    // ITS TRANSLATION IS NOT CHECKED, because it is never used: the placement is skipped, not
+    // composed, so only its child pointer matters. The translation is where the car stands on the
+    // track, and the car-sized bound poseTransform applies to the poses INSIDE the car refused the
+    // placement on the Isle of Man -- (-790, -8813, 88) m, 2026-11-06 -- which left the walk
+    // starting on it and refused every car there, and only there.
     uintptr_t root = cockpit;
     int       skipped = 0;
     while (skipped < 4) {
@@ -721,13 +733,6 @@ bool mirrorGeometryDerive(int team, MirrorSurfaceSet& out) {
         uint32_t words[9];
         if (!readWords(root, words, sizeof(words))) break;
         if (!plausiblePointer(words[8])) break;
-
-        float R[9];
-        Vec3  t;
-        bool  rotated = false;
-        bool  plausible = false;
-        poseTransform(words, R, t, rotated, plausible);
-        if (!plausible) break;
         root = words[8];
         ++skipped;
     }
@@ -756,6 +761,14 @@ bool mirrorGeometryDerive(int team, MirrorSurfaceSet& out) {
     }
     if (walk.mirrorUnderUnresolved) {
         out.refusal = walk.unresolvedWhy;
+        if (walk.unresolvedNode)
+            _snprintf_s(out.refusalNode, sizeof(out.refusalNode), _TRUNCATE,
+                        "node %08X type 0x%02X, translation words %08X %08X %08X",
+                        static_cast<unsigned>(walk.unresolvedNode),
+                        static_cast<unsigned>(walk.unresolvedWords[0] & 0xFF),
+                        static_cast<unsigned>(walk.unresolvedWords[1]),
+                        static_cast<unsigned>(walk.unresolvedWords[2]),
+                        static_cast<unsigned>(walk.unresolvedWords[3]));
         return false;
     }
     if (walk.polys == 0) {
@@ -787,8 +800,9 @@ uintptr_t mirrorGeometryCockpit(int team) {
 
 void mirrorGeometryReport(int team, const MirrorSurfaceSet& set) {
     if (!set.derived) {
-        logf("mirror geometry: team %d NOT derived -- %s. The hardcoded glasses stay in use.",
-             team, set.refusal ? set.refusal : "no reason was recorded");
+        logf("mirror geometry: team %d NOT derived -- %s%s%s%s. The hardcoded glasses stay in use.",
+             team, set.refusal ? set.refusal : "no reason was recorded",
+             set.refusalNode[0] ? " (" : "", set.refusalNode, set.refusalNode[0] ? ")" : "");
         return;
     }
     logf("mirror geometry: team %d has %d mirror surface%s, read out of the loaded model", team,

@@ -78,6 +78,12 @@ private:
 void replayPanelNoteDraw(const char* kind, int x, int y, int width, int height, bool taken,
                          const char* detail);
 
+// Make the layer GPL's 2D is collected into, at the layout's size, ahead of its first replay or
+// dialog. Called at race entry, before the headset's memory is measured, so a replay or a
+// dialog in the race allocates nothing new. True when the layer exists (already, or now) and
+// its size in `width`/`height`; false with `why` when it does not.
+bool replayPanelPrebuild(int& width, int& height, const char*& why);
+
 // GPL repainted its 3D view: the next capture starts from an empty layer. From the scene hook,
 // for GPL's own frame only -- an extra render repaints the eyes, not GPL's layout.
 void replayPanelNoteScene();

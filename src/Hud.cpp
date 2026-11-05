@@ -90,13 +90,6 @@ bool firstSightOf(void* surface) {
     return true;
 }
 
-// What the last frame actually asked for, reported when the number changes. This is the
-// one line that says whether the HUD block in gpl_simFrameRender is running at all:
-// zero means gpl_optShowTimes is closed or the HUD is drawn by something else entirely,
-// and twenty-odd means it is reaching us and the question is only where it lands.
-int g_lastReportedCount = 0;
-int g_countReports = 8;
-
 // Handles that resolved to a freed table slot. Above zero means gplvr is holding a surface
 // handle past its life -- which used to be a crash and is now a refusal, but is still a bug
 // wherever the handle came from.
@@ -367,37 +360,24 @@ void emit(const Call& call) {
     g_original(right, call.colour, x - disparity / 2, y, call.text, call.background);
 }
 
-// -- THE 2D CENSUS ---------------------------------------------------------------------
+// -- THE OTHER 2D ENTRY POINTS ---------------------------------------------------------
 //
-// If the in-race HUD is not text then it is bitmaps, and `drawDebugText` is the ONLY text
-// entry in the rasterizer's whole export list -- the 2D entries are bitmapDraw,
-// bitmapScale, stampDraw and fillRect. The user's `vrOffscreen = 1` symptom points
-// straight at this: only the oil and pressure gauges survive, which is what happens to
-// LEFT-ANCHORED items when the surface grows to 6344 wide and everything anchored centre
-// or right lands outside the eye on show.
+// bitmapDraw places GPL's 2D art once per eye, moves the mirror copy-out into its glass's
+// region of mirror.mip, and feeds the replay panel; the six other 2D globals (fillRect,
+// bitmapScale, drawLine, drawPixel, aaLine, aaTriangle) flush the fast text path's batch and
+// feed the replay panel.
 //
 // The signature is read from roglv2, not guessed: bitmapDraw(int, int, int, int) at
 // 0x20001950 looks its FIRST argument up in the handle table as the source and its FOURTH
 // as the destination, and hands the middle pair to rogl_blitDispatch as the position.
-//
-// This only counts and names destinations. It changes nothing about the drawing.
 typedef int(__cdecl* BitmapDrawFn)(int source, int x, int y, int dest);
 
 void**       g_bitmapDrawSlot = nullptr;
 BitmapDrawFn g_bitmapDrawOriginal = nullptr;
 
-// SCOPED TO THE PHASE UNDER TEST, because a budget that is not gets spent before it
-// arrives. The first run of this census named ten destinations between 2.2 and 2.6
-// seconds -- all of them front-end menu art -- and had nothing left for the eighty
-// seconds of racing it was built for. That is the third instrument in this file to fail
-// the same way: the mirror reports spent themselves at the seat, the surface dedupe
-// silenced itself on a repeat, and now this. Everything here resets when the engine
-// changes mode, so the race gets its own budget and its own table.
-int   g_seenDest[24] = {};
-int   g_seenDestCount = 0;
-int   g_bitmapDrawReports = 12;
+// The report budgets below reset when the engine changes mode, so a race is not left with
+// what the front end spent.
 int   g_bitmapDrawCount = 0;
-int   g_bitmapDrawHighWater = 0;
 bool  g_wasFrontEnd = true;
 
 // How many bitmapDraw calls the per-eye branch took, against how many it saw. A split that
@@ -407,7 +387,7 @@ int   g_bitmapSplitCount = 0;
 int   g_bitmapSplitReports = 4;
 
 // Destinations whose refusal has been named already, so a per-frame call does not print a line
-// a frame. Separate from g_seenDest, which the census owns and spends on its own budget.
+// a frame.
 int   g_refusedDest[16] = {};
 int   g_refusedDestCount = 0;
 int   g_bitmapRefuseReports = 8;
@@ -443,25 +423,19 @@ struct Census {
     const char* name;
     void**      slot;
     void*       original;
-    int         count;
-    int         high;
-    int         reports;
 };
 
 Census g_census[] = {
-    {"fillRect", nullptr, nullptr, 0, 0, 6},    {"bitmapScale", nullptr, nullptr, 0, 0, 6},
-    {"drawLine", nullptr, nullptr, 0, 0, 6},    {"drawPixel", nullptr, nullptr, 0, 0, 6},
-    {"aaLine", nullptr, nullptr, 0, 0, 6},      {"aaTriangle", nullptr, nullptr, 0, 0, 6},
+    {"fillRect", nullptr, nullptr},    {"bitmapScale", nullptr, nullptr},
+    {"drawLine", nullptr, nullptr},    {"drawPixel", nullptr, nullptr},
+    {"aaLine", nullptr, nullptr},      {"aaTriangle", nullptr, nullptr},
 };
 constexpr int kCensusCount = sizeof(g_census) / sizeof(g_census[0]);
-// fillRect's index in the table above. It gets its own column in the per-frame signature: a
-// black letterbox bar is a filled rectangle, and the artifact being hunted is described as
-// something drawn OVER a frame that was already complete.
+// fillRect's index in the table above: a fill in a race is one of GPL's dialogs (below).
 constexpr int kCensusFillRect = 0;
 
-int censusEnter(int which, int a1, int a2, int a3, int a4) {
+int censusEnter(int which) {
     Census& c = g_census[which];
-    ++c.count;
     // THE ORDERING CONTRACT THE FAST TEXT PATH GIVES UP IN VR. It normally holds all seven 2D
     // globals so that any other 2D call flushes its pending quads first, and a run of text
     // issued before a polygon is on the framebuffer before it. With stampDraw its only global,
@@ -471,19 +445,12 @@ int censusEnter(int which, int a1, int a2, int a3, int a4) {
     // position for all of them, and a replay draws aaLines at new values every frame.
     if (replayPanelCapturing())
         replayPanelNoteDraw(c.name, 0, 0, 0, 0, false, "a primitive, listed once per kind");
-    if (c.reports > 0 && c.count <= 2) {
-        --c.reports;
-        void* dest = reinterpret_cast<void*>(static_cast<intptr_t>(a1));
-        logf("hud: %s(%d, %d, %d, %d, ...) -- call %d this frame. If a1 is the "
-             "destination it is %dx%d.",
-             c.name, a1, a2, a3, a4, c.count, bitmapWidth(dest), bitmapHeight(dest));
-    }
     return 0;
 }
 
 template <int N>
 int __cdecl censusThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8) {
-    censusEnter(N, a1, a2, a3, a4);
+    censusEnter(N);
     void* original = g_census[N].original;
     // A FILL IN A RACE IS ONE OF GPL'S DIALOGS -- F1's help is a 640x480 root over a translucent
     // box -- and the dialog goes to a panel of its own over the stereo picture, at GPL's own
@@ -525,22 +492,6 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     ++g_bitmapDrawCount;
     // Anything the fast text path still has batched goes down first -- see censusEnter.
     fastTextFlushNow();
-
-    if (g_bitmapDrawReports > 0) {
-        bool known = false;
-        for (int i = 0; i < g_seenDestCount; ++i)
-            if (g_seenDest[i] == dest) known = true;
-        if (!known) {
-            if (g_seenDestCount < 24) g_seenDest[g_seenDestCount++] = dest;
-            --g_bitmapDrawReports;
-            logf("hud: bitmapDraw -> destination %d, first seen at %d,%d (source %d). The "
-                 "stereo source surface is %p and the eyes are %p/%p; a destination equal "
-                 "to the stereo source is 2D landing on the whole side-by-side buffer, "
-                 "which is one HUD across both eyes.",
-                 dest, x, y, source, stereoSourceSurface(), stereoEyeSurface(0),
-                 stereoEyeSurface(1));
-        }
-    }
 
     // gpl_sceneRender's mirror copy-out is bitmapDraw(mirror.mip's bitmap, 0, 0, mirror
     // camera surface): roglv2 binds the FIRST argument's texture and reads the FOURTH's
@@ -625,10 +576,11 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     // EVERY TERM NAMES ITSELF. A split that declines without saying why reads exactly like one
     // that was never needed, and the replay control band spent a build looking like a placement
     // problem because this branch was silent.
+    // The front end is one image for both eyes, so there is nothing to split there.
+    if (windowInFrontEnd()) return g_bitmapDrawOriginal(source, x, y, dest);
+
     const char* refusal = nullptr;
-    if (windowInFrontEnd())
-        refusal = "the engine is in the front end";
-    else if (!left || !right)
+    if (!left || !right)
         refusal = "there are no eye surfaces";
     else if (!destinationCanSplit(destSurface, fullWidth, fullHeight))
         refusal = "the eyes are not carved out of this destination, so a per-eye re-issue has "
@@ -762,35 +714,42 @@ void hudBind(const Binding& binding) {
     // `call ds:gpl_rasterDrawDebugText` and gpl_rasterResolveEntryPoints fills that from
     // GetProcAddress at 0x004E2338, which writes kDebugTextSlot. Anything else here means we
     // are holding a slot nothing calls.
-    // The 2D census rides alongside. It is a counter, not a behaviour change, and it
-    // fails quietly: if the global cannot be found or written, the HUD work above is
-    // unaffected.
+    // The other 2D globals. The HUD work above does not depend on them; what does (the per-eye
+    // art, the mirror copy-out, the replay panel) is named in the line below.
     g_bitmapDrawSlot = rasterGlobal(binding.image, "bitmapDraw");
     if (g_bitmapDrawSlot && *g_bitmapDrawSlot) {
         g_bitmapDrawOriginal = reinterpret_cast<BitmapDrawFn>(*g_bitmapDrawSlot);
-        void* census = reinterpret_cast<void*>(&bitmapDrawThunk);
-        if (patchBytes(g_bitmapDrawSlot, &census, sizeof(census))) {
-            logf("hud: bitmapDraw census installed at global %p -- destinations will be "
-                 "named once each, to settle whether the in-race HUD is bitmaps rather "
-                 "than text.",
-                 reinterpret_cast<void*>(g_bitmapDrawSlot));
-        } else {
-            g_bitmapDrawOriginal = nullptr;
-        }
+        void* thunk = reinterpret_cast<void*>(&bitmapDrawThunk);
+        if (!patchBytes(g_bitmapDrawSlot, &thunk, sizeof(thunk))) g_bitmapDrawOriginal = nullptr;
     }
 
+    char missing[128] = "";
+    size_t used = 0;
+    if (!g_bitmapDrawOriginal) {
+        strcpy_s(missing, " bitmapDraw");
+        used = strlen(missing);
+    }
     for (int i = 0; i < kCensusCount; ++i) {
         g_census[i].slot = rasterGlobal(binding.image, g_census[i].name);
-        if (!g_census[i].slot || !*g_census[i].slot) continue;
-        g_census[i].original = *g_census[i].slot;
-        void* thunk = censusThunkFor(i);
-        if (!patchBytes(g_census[i].slot, &thunk, sizeof(thunk)))
-            g_census[i].original = nullptr;
+        if (g_census[i].slot && *g_census[i].slot) {
+            g_census[i].original = *g_census[i].slot;
+            void* thunk = censusThunkFor(i);
+            if (!patchBytes(g_census[i].slot, &thunk, sizeof(thunk)))
+                g_census[i].original = nullptr;
+        }
+        if (!g_census[i].original && used < sizeof(missing) - 1) {
+            int wrote = _snprintf_s(missing + used, sizeof(missing) - used, _TRUNCATE, " %s",
+                                    g_census[i].name);
+            if (wrote > 0) used += static_cast<size_t>(wrote);
+        }
     }
-    logf("hud: the rest of the 2D surface is censused too -- fillRect, bitmapScale, "
-         "drawLine, drawPixel, aaLine, aaTriangle. The HUD is visible in flat mode while "
-         "drawDebugText, bitmapDraw and stampDraw are silent for a whole race, so it is "
-         "one of these or it is 3D geometry.");
+    if (missing[0])
+        logf("hud: these 2D globals could not be found or written:%s -- the per-eye 2D art, the "
+             "mirror copy-out (bitmapDraw) and the replay panel lose whatever goes through them",
+             missing);
+    else
+        logf("hud: bitmapDraw, fillRect, bitmapScale, drawLine, drawPixel, aaLine and "
+             "aaTriangle are thunked");
 
     logf("hud: stampDraw is NOT thunked here -- the fast text path owns that global and draws "
          "GPL's glyphs from its own atlas, once per eye, where vrGplTextScale and "
@@ -876,55 +835,13 @@ void hudBeginFrame() {
     bool inFrontEnd = windowInFrontEnd();
     if (inFrontEnd != g_wasFrontEnd) {
         g_wasFrontEnd = inFrontEnd;
-        g_seenDestCount = 0;
-        g_bitmapDrawReports = 12;
-        g_bitmapDrawHighWater = 0;
         g_bitmapSplitCount = 0;
         g_bitmapSplitReports = 4;
         g_refusedDestCount = 0;
         g_bitmapRefuseReports = 8;
-        for (int i = 0; i < kCensusCount; ++i) {
-            g_census[i].reports = 6;
-            g_census[i].high = 0;
-        }
-        g_lastReportedCount = 0;
-        g_countReports = 8;
         g_seenCount = 0;
-        logf("hud: census reset -- the engine has entered %s, and the counts below are "
-             "that phase's own.",
-             inFrontEnd ? "the front end" : "a world mode");
-    }
-
-    for (int i = 0; i < kCensusCount; ++i) {
-        Census& c = g_census[i];
-        if (c.count > c.high && c.reports > 0) {
-            c.high = c.count;
-            logf("hud: up to %d %s call(s) in one frame now.", c.high, c.name);
-        }
-        c.count = 0;
-    }
-
-    if (g_bitmapDrawCount > g_bitmapDrawHighWater && g_bitmapDrawReports > 0) {
-        g_bitmapDrawHighWater = g_bitmapDrawCount;
-        logf("hud: up to %d bitmapDraw call(s) in one frame now, across %d distinct "
-             "destination(s).",
-             g_bitmapDrawHighWater, g_seenDestCount);
     }
     g_bitmapDrawCount = 0;
-
-    // A NEW HIGH-WATER MARK, not every change. The front end alternates between zero and
-    // one call as the version string comes and goes, and reporting each flip would spend
-    // the whole budget in the menu and have nothing left for the race -- which is the
-    // failure the surface reporting already made once.
-    if (g_callCount > g_lastReportedCount && g_countReports > 0) {
-        --g_countReports;
-        g_lastReportedCount = g_callCount;
-        logf("hud: up to %d drawDebugText call(s) in one frame now. The in-race block in "
-             "gpl_simFrameRender is about twenty; if that number never appears while "
-             "driving then gpl_optShowTimes is closed or the HUD is not drawn with this "
-             "entry point at all.",
-             g_callCount);
-    }
     g_callCount = 0;
 }
 

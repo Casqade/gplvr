@@ -7,6 +7,7 @@
 // tracks\<dir>\<dir>.3do whose PRIM size and vertex count match the object GPL draws is a
 // candidate, and the first whose baked vertices also match GPL's first and last 64 is the track.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace baked {
@@ -52,5 +53,8 @@ void trackBakeRebake();
 // The process's free address space now (GlobalMemoryStatusEx's ullAvailVirtual); 0 when the call
 // fails.
 uint64_t trackBakeFreeAddressSpace();
+
+// A bake job has started and not finished.
+bool trackBakeRunning();
 
 }  // namespace gplvr

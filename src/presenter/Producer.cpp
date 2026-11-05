@@ -1,7 +1,10 @@
 #include "presenter/Producer.h"
 
 #include "RenderTarget.h"
+#include "baked_gpl/TrackBake.h"
+#include "presenter/HeadsetMemory.h"
 
+#include "AddressSpace.h"
 #include "CursorOverlay.h"
 #include "FrameBudget.h"
 #include "FrameTrace.h"
@@ -14,6 +17,8 @@
 #include "Stereo.h"
 #include "VrCamera.h"
 #include "VrMenu.h"
+#include "VrText.h"
+#include "ReplayPanel.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -95,6 +100,17 @@ struct State {
     GLint            menuPreviousFramebuffer = 0;
     bool             menuBound = false;
     bool             menuReportedFailure = false;
+    // The image being drawn: the bottom-left of menuWidth x menuHeight (kMenuPanelWidth x
+    // kMenuPanelHeight), at GL's origin. Published per slot and read by the monitor's copy.
+    int              menuImageWidth = 0;
+    int              menuImageHeight = 0;
+    // The context the menu's resources were last built ahead for (prebuildMenu), so they are
+    // built once per context: again after a context change or loss and after a restart.
+    HGLRC            menuPrebuiltContext = nullptr;
+    // A request past the panel's size, scaled to fit: the last one said, and lines left.
+    int              menuScaledWidth = 0;
+    int              menuScaledHeight = 0;
+    int              menuScaledReports = 8;
 
     // The panel on the monitor. The views this frame's eyes were rendered from, kept for the monitor draw
     // that follows the transfer; whether that draw took over pribluda's monitor HUD this
@@ -106,11 +122,15 @@ struct State {
     int         monitorHudReports = 32;
     bool        monitorHudGlError = false;
 
-    // The shared frame textures' size, which only grows (see presenterFrame), and the frame's
-    // own size is whatever the game rendered; a smaller frame sits in the texture's top-left
-    // corner as the image is read.
+    // The shared frame textures' size: the race's images while a race is on, the window's frame in
+    // the front end (see presenterFrame). The frame's own size is whatever the game rendered; a
+    // smaller frame sits in the texture's top-left corner as the image is read.
     int  width = 0;
     int  height = 0;
+    // Textures made and not yet announced to the presenter. They are announced with the first
+    // frame published into them, so the presenter goes on showing the last image of the old ones
+    // (it holds its own references) until there is a picture in the new ones.
+    bool texturesUnannounced = false;
     // Creation attempts that failed since the last success, and when the last one failed. A
     // failure is retried once a second rather than ending the channel: the game may be holding
     // the address space for a moment (a track bake on a 2 GB process) and give it back.
@@ -124,9 +144,39 @@ struct State {
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
 
-    // The window's picture, taken early by presenterDrawVrRay so the ray stays out of it. Set
-    // there, cleared by presenterBlitToWindow, which would otherwise take it again.
+    // The window's picture, taken early -- by presenterEndFrame on the direct path, where the
+    // frame is still GL's only until the publish, and by presenterDrawVrRay so the ray stays out
+    // of it. Cleared by presenterBlitToWindow, which would otherwise take it again.
     bool windowBlitDone = false;
+
+    // THE HEADSET'S MEMORY, settled at race entry (settleForRace) and released when the race is
+    // left (leaveRace), report 113: the shared textures and the render target together, at the
+    // largest size that leaves a waiting bake its budget. renderEye* is the per-eye size the game
+    // renders at in this race -- the presenter's request, or less when that did not fit -- and 0
+    // in the front end or when no render target fitted.
+    bool  targetResolved = false;  // framebuffer objects exist, so a target can be built
+    bool  raceSettled = false;     // a race is on and its images are settled
+    int   renderEyeWidth = 0;
+    int   renderEyeHeight = 0;
+    float renderFraction = 1.0f;  // of the presenter's request, per side
+    // The last settle's outcome, for the VR menu (presenterHeadsetSizing).
+    bool  sizingKnown = false;
+    bool  sizingWindowPicture = false;
+    double imagesMiB = 0.0;  // address space the race's images took
+    RaceAddressWatch raceWatch;
+    // Gates that kept a race from being settled, counted and logged when the answer changes.
+    const char* raceGateReported = "";
+    int         raceGateCount = 0;
+
+    // vrDirectToShared, report 80. `direct` is whether the target was settled without a colour
+    // texture of its own. The slot the frame is being drawn straight into -- locked from before
+    // its first draw call until it is published -- or -1. `directGaveUp` is one-way: a lock or an
+    // attachment that fails gives the target a colour texture of its own for good, because a path
+    // that alternates between the two would be neither measurable nor debuggable.
+    bool direct = false;
+    int  directSlot = -1;
+    bool directGaveUp = false;
+    bool directReported = false;
 
     // Pose diagnostics, logged every two seconds. viewLag counts, per published frame, how
     // many view sets the presenter had published after the one the eyes were rendered from
@@ -340,23 +390,65 @@ void releaseMenuTextures(State& state) {
     state.menuTexture = 0;
     state.menuWidth = 0;
     state.menuHeight = 0;
+    state.menuImageWidth = 0;
+    state.menuImageHeight = 0;
     state.menuBound = false;
     if (state.block) InterlockedExchange(
         reinterpret_cast<volatile LONG*>(&state.block->menuVisible), 0);
 }
 
-void releaseTextures(State& state) {
+// Hand back a slot that is being rendered into without publishing it. The frame in it is
+// lost, which is the right outcome everywhere this is called from: the textures are about
+// to be unregistered, or the frame is not the target's. Unregistering one that GL still holds
+// is the same fault as unlocking one that is still attached.
+void dropDirect(State& state) {
+    if (state.directSlot < 0) return;
+    renderTargetAttachColour(state.gl, 0);
+    glInteropUnlock(state.gl, state.interopDevice, state.shared[state.directSlot]);
+    state.directSlot = -1;
+}
+
+// The frame's two slots alone. The HUD and VR menu panels have generations of their own and are
+// left as they are.
+void releaseFrameTextures(State& state) {
+    dropDirect(state);
     for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
         glInteropUnregister(state.gl, state.interopDevice, state.shared[slot]);
         if (state.textures[slot]) state.textures[slot]->Release();
         state.textures[slot] = nullptr;
     }
+    state.texturesUnannounced = false;
+}
+
+void releaseTextures(State& state) {
+    releaseFrameTextures(state);
     releaseHudTextures(state);
     releaseMenuTextures(state);
 }
 
+// Tell the presenter the frame textures are new. Called with the first frame published into them,
+// so the sizes settleForRace tries and throws away are never announced, and the presenter never
+// opens textures that hold no picture yet.
+void publishTextures(State& state) {
+    state.texturesUnannounced = false;
+    state.block->textureWidth = static_cast<uint32_t>(state.width);
+    state.block->textureHeight = static_cast<uint32_t>(state.height);
+    state.block->textureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    state.block->textureBottomUp = 1;
+
+    // Publish the descriptions before the generation that advertises them, and the
+    // generation before the state. The presenter reads them in the opposite order.
+    InterlockedIncrement(
+        reinterpret_cast<volatile LONG*>(&state.block->textureGeneration));
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->producerState),
+                        static_cast<LONG>(ProcessState::TexturesReady));
+
+    logf("vr: published %u shared textures at %dx%d, generation %d", kFrameSlots, state.width,
+         state.height, state.block->textureGeneration);
+}
+
 bool createTextures(State& state, int width, int height) {
-    releaseTextures(state);
+    releaseFrameTextures(state);
     state.width = width;
     state.height = height;
 
@@ -378,36 +470,326 @@ bool createTextures(State& state, int width, int height) {
         if (FAILED(state.device->CreateTexture2D(&desc, nullptr,
                                                  &state.textures[slot]))) {
             logf("vr: CreateTexture2D %dx%d failed for slot %u", width, height, slot);
-            releaseTextures(state);
+            releaseFrameTextures(state);
             state.width = 0;
             state.height = 0;
             return false;
         }
+        // Registering with GL maps the whole texture into this 32-bit process (measured
+        // 2026-11-06: 307.1 MiB a slot at 12688x6344; creating it in Direct3D takes nothing).
         if (!glInteropRegister(state.gl, state.interopDevice, state.textures[slot],
                                state.shared[slot])) {
-            releaseTextures(state);
+            releaseFrameTextures(state);
             state.width = 0;
             state.height = 0;
             return false;
         }
         storeSharedHandle(state.block->textures[slot], state.shared[slot].shareHandle);
     }
-
-    state.block->textureWidth = static_cast<uint32_t>(width);
-    state.block->textureHeight = static_cast<uint32_t>(height);
-    state.block->textureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-    state.block->textureBottomUp = 1;
-
-    // Publish the descriptions before the generation that advertises them, and the
-    // generation before the state. The presenter reads them in the opposite order.
-    InterlockedIncrement(
-        reinterpret_cast<volatile LONG*>(&state.block->textureGeneration));
-    InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->producerState),
-                        static_cast<LONG>(ProcessState::TexturesReady));
-
-    logf("vr: published %u shared textures at %dx%d, generation %d", kFrameSlots, width,
-         height, state.block->textureGeneration);
+    state.texturesUnannounced = true;
     return true;
+}
+
+void directGiveUp(State& state, const char* why) {
+    if (state.directGaveUp) return;
+    state.directGaveUp = true;
+    state.direct = false;
+    dropDirect(state);
+    logf("vr: rendering straight into the shared texture is off for this session -- %s. The "
+         "render target gets a colour texture of its own and the frame is copied at publish.",
+         why);
+    renderTargetUseOwnColour(state.gl);
+}
+
+// Take the slot the next frame will be drawn into, lock it, and make it the off-screen
+// target's colour attachment.
+//
+// Called after every publish as well as at the top of a frame, because an extra render is a
+// whole frame of its own and publishes on its own: between two of them there is no other moment
+// at which a new slot could be taken. Inert in the front end, where the target is not drawn into.
+void acquireDirect(State& state) {
+    if (!state.direct || state.directGaveUp) return;
+    if (state.stage != Stage::Publishing || state.directSlot >= 0) return;
+    int width = 0;
+    int height = 0;
+    if (!renderTargetSize(width, height)) return;
+
+    // The same arithmetic the publish uses: the presenter reads slot
+    // (frameSequence % kFrameSlots), so the frame about to be drawn is numbered
+    // frameSequence + 1 and belongs in the other one.
+    uint32_t               slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
+    const GlSharedTexture& shared = state.shared[slot];
+
+    // The target is active, so this frame WILL be drawn into it: anything short of a slot to
+    // draw into would lose it, and the target takes a colour texture of its own instead.
+    if (!shared.interopObject || !shared.name || width > state.width || height > state.height) {
+        directGiveUp(state, "there is no shared texture of the frame's size to draw into");
+        return;
+    }
+    if (!glInteropLockDirect(state.gl, state.interopDevice, shared)) {
+        directGiveUp(state, "wglDXLockObjectsNV would not give GL the slot");
+        return;
+    }
+    if (!renderTargetAttachColour(state.gl, shared.name)) {
+        glInteropUnlock(state.gl, state.interopDevice, shared);
+        directGiveUp(state, "the shared texture would not serve as the off-screen "
+                            "framebuffer's colour attachment");
+        return;
+    }
+
+    state.directSlot = static_cast<int>(slot);
+    if (!state.directReported) {
+        state.directReported = true;
+        logf("vr: the frame is rendered straight into the shared texture -- slot %u, GL "
+             "texture %u, %dx%d of a %dx%d texture. No copy at publish; the interop lock is "
+             "held for the whole frame.",
+             slot, shared.name, width, height, state.width, state.height);
+    }
+}
+
+// -- the headset's memory ------------------------------------------------------------------
+//
+// The shared textures and the render target are the two biggest allocations in the process, and
+// in a 32-bit one they are made of ADDRESS SPACE: registering a shared texture with GL maps all of
+// it into the game (measured, 307 MiB a slot at 12688x6344), and the target's buffers want their
+// size in one piece. Both are made at race entry and released when the race is left (report 113).
+//
+// Race entry is the first published frame in a world mode. By then GPL's session start has loaded
+// the track, the cars and the replay ring (gpl_sessionStartLoadTrackAndReplay sets session state
+// 4 only after both), the lobby's first world pass has made the track's bake job and dropped the
+// previous track's scene, and the first world frame has made the HUD panel; the bake job waits
+// for this (presenterHeadsetMemory). So the free space measured here holds everything GPL loaded,
+// and the images take the largest size of the presenter's request that fits in it. The bake comes
+// AFTER them and works in what they leave, by its own budget rule; a bake that does not fit fails
+// as any other would, and the VR menu says the GPL VR renderer is off on this track.
+
+enum class HeadsetFit { Fits, TooBig, DirectRefused };
+
+HeadsetFit tryHeadsetSize(State& state, int eyeWidth, int eyeHeight, int frameWidth,
+                          int frameHeight, bool direct, const char*& refusal) {
+    GlFunctions& gl = state.gl;
+    int          targetWidth = eyeWidth * 2;
+    int          targetHeight = eyeHeight;
+    int          textureWidth = targetWidth > frameWidth ? targetWidth : frameWidth;
+    int          textureHeight = targetHeight > frameHeight ? targetHeight : frameHeight;
+    HeadsetFit   fit = HeadsetFit::Fits;
+
+    if (!createTextures(state, textureWidth, textureHeight)) {
+        refusal = "the shared textures could not be created";
+        return HeadsetFit::TooBig;
+    }
+    if (!renderTargetBuild(gl, targetWidth, targetHeight, !direct)) {
+        refusal = "the render target was refused";
+        fit = HeadsetFit::TooBig;
+    } else if (direct) {
+        // Committed through slot 0, attached as the frame will attach it: the clear makes the
+        // driver allocate the depth buffer now, and proves the attachment works before any frame
+        // depends on it.
+        const GlSharedTexture& shared = state.shared[0];
+        if (!glInteropLockDirect(gl, state.interopDevice, shared)) {
+            refusal = "the shared texture could not be locked to GL";
+            fit = HeadsetFit::DirectRefused;
+        } else {
+            bool attached = renderTargetAttachColour(gl, shared.name);
+            bool committed = attached && renderTargetCommit(gl);
+            renderTargetAttachColour(gl, 0);
+            glInteropUnlock(gl, state.interopDevice, shared);
+            if (!attached) {
+                refusal = "the shared texture would not serve as the target's colour";
+                fit = HeadsetFit::DirectRefused;
+            } else if (!committed) {
+                refusal = "the driver could not commit the target";
+                fit = HeadsetFit::TooBig;
+            }
+        }
+    } else if (!renderTargetCommit(gl)) {
+        refusal = "the driver could not commit the target";
+        fit = HeadsetFit::TooBig;
+    }
+
+    if (fit != HeadsetFit::Fits) {
+        renderTargetDestroy(gl);
+        releaseFrameTextures(state);
+        state.width = 0;
+        state.height = 0;
+    }
+    return fit;
+}
+
+// Race entry: the front end's window-sized textures go, then the largest fraction of the request
+// that the driver will make is kept (report 113). When none is, the frame textures
+// are the window's frame and the headset shows the game window's picture, said in the log and in
+// the VR menu. That fallback is made whatever it leaves: it is the least picture the headset can
+// have, and it is the size the front end already held.
+void settleForRace(State& state, int frameWidth, int frameHeight) {
+    if (!state.qpcFrequency) {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        state.qpcFrequency = frequency.QuadPart;
+    }
+    state.raceSettled = true;
+    state.sizingKnown = true;
+    state.sizingWindowPicture = false;
+    state.renderEyeWidth = 0;
+    state.renderEyeHeight = 0;
+    state.renderFraction = 1.0f;
+    state.imagesMiB = 0.0;
+    int  askedWidth = static_cast<int>(state.block->targetEyeWidth);
+    int  askedHeight = static_cast<int>(state.block->targetEyeHeight);
+    bool direct = g_options.vrDirectToShared && !state.directGaveUp && state.gl.dxLockObjects &&
+                  state.gl.dxUnlockObjects && state.interopDevice;
+
+    // Measured with nothing of ours in it but the panels, which stay. The replay panel's layer
+    // is made first, at this mode's layout size, so a replay or a dialog in the race takes
+    // nothing the measurement did not see.
+    renderTargetDestroy(state.gl);
+    releaseFrameTextures(state);
+    state.width = 0;
+    state.height = 0;
+    AddressSpace beforeReplay = addressSpaceNow();
+    int          replayWidth = 0;
+    int          replayHeight = 0;
+    const char*  replayWhy = nullptr;
+    bool         replayLayer = replayPanelPrebuild(replayWidth, replayHeight, replayWhy);
+    AddressSpace start = addressSpaceNow();
+    char         replayPart[160] = {};
+    if (replayLayer)
+        _snprintf_s(replayPart, _TRUNCATE, "%dx%d (%.0f MiB of address space)", replayWidth,
+                    replayHeight,
+                    (static_cast<double>(beforeReplay.freeBytes) -
+                     static_cast<double>(start.freeBytes)) /
+                        1048576.0);
+    else
+        _snprintf_s(replayPart, _TRUNCATE, "NOT made -- %s; made on first use instead",
+                    replayWhy ? replayWhy : "no reason given");
+    logf("vr: race entry -- settling the headset's images: %dx%d per eye asked for, the frame "
+         "drawn %s; address space free %.0f MiB, %.0f in one piece; HUD panel %s, VR menu "
+         "panel %s, replay panel layer %s",
+         askedWidth, askedHeight,
+         direct ? "straight into the shared textures" : "into a colour texture of our own",
+         start.freeBytes / 1048576.0, start.largestFreeBytes / 1048576.0,
+         state.hudWidth ? "already made" : "not made yet",
+         state.menuWidth ? "already made" : "not made yet", replayPart);
+
+    const char* lastRefusal = "";
+    for (size_t i = 0; i < kRenderFractionCount;) {
+        float fraction = kRenderFractions[i];
+        int   eyeWidth = headsetEyeSide(askedWidth, fraction);
+        int   eyeHeight = headsetEyeSide(askedHeight, fraction);
+
+        const char* refusal = "";
+        HeadsetFit  fit = tryHeadsetSize(state, eyeWidth, eyeHeight, frameWidth, frameHeight,
+                                         direct, refusal);
+        if (fit == HeadsetFit::Fits) {
+            state.direct = direct;
+            state.renderEyeWidth = eyeWidth;
+            state.renderEyeHeight = eyeHeight;
+            state.renderFraction = fraction;
+            AddressSpace end = addressSpaceNow();
+            state.imagesMiB =
+                (static_cast<double>(start.freeBytes) - static_cast<double>(end.freeBytes)) /
+                1048576.0;
+            logf("vr: the headset's images are %dx%d per eye%s -- %s; address space free %.0f "
+                 "MiB, %.0f in one piece, after %.0f MiB for them",
+                 eyeWidth, eyeHeight,
+                 fraction < 1.0f ? " (LESS than asked for: what fitted)" : ", as asked for",
+                 direct ? "the target is a depth buffer and the frame is drawn into the shared "
+                          "texture"
+                        : "the target has a colour texture of its own",
+                 end.freeBytes / 1048576.0, end.largestFreeBytes / 1048576.0, state.imagesMiB);
+            if (fraction < 1.0f)
+                logf("vr: vrRenderScale %.2f is running at an effective %.2f on this track (%.0f%% "
+                     "of its size on each side). Lower it to fit, or make gplc67.exe "
+                     "large-address-aware (4 GiB instead of 2) to have room for more.",
+                     g_options.vrRenderScale, g_options.vrRenderScale * fraction,
+                     fraction * 100.0f);
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            state.raceWatch.start(end, now.QuadPart, state.qpcFrequency);
+            return;
+        }
+        logf("vr: %dx%d per eye (%.0f%% of the request) does not fit -- %s", eyeWidth,
+             eyeHeight, fraction * 100.0f, refusal);
+        lastRefusal = refusal;
+        if (fit == HeadsetFit::DirectRefused) {
+            direct = false;
+            logf("vr: trying the same size with a colour texture of our own instead");
+            continue;
+        }
+        ++i;
+    }
+
+    // Nothing fitted: no render target, and frame textures the size of the window the game
+    // draws into instead, which is the picture the headset gets.
+    state.sizingWindowPicture = true;
+    if (createTextures(state, frameWidth, frameHeight)) {
+        AddressSpace end = addressSpaceNow();
+        state.imagesMiB =
+            (static_cast<double>(start.freeBytes) - static_cast<double>(end.freeBytes)) /
+            1048576.0;
+        logf("vr: no render size fitted on this track (the last refusal: %s) -- the headset gets "
+             "the game window's own %dx%d picture; address space free %.0f MiB, %.0f in one "
+             "piece",
+             lastRefusal, frameWidth, frameHeight, end.freeBytes / 1048576.0,
+             end.largestFreeBytes / 1048576.0);
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        state.raceWatch.start(end, now.QuadPart, state.qpcFrequency);
+    } else {
+        logf("vr: no render size fitted on this track, and the window-sized textures could not be "
+             "made either (%.0f MiB of address space free) -- the headset holds its last image "
+             "and they are retried once a second",
+             freeAddressSpaceMiB());
+    }
+}
+
+// Race exit (the engine is back in the front end's mode): the race's images go before GPL can
+// load another session, and the front end gets textures of its window's frame. The HUD panel goes
+// too -- only a race draws it -- so its registration does not stay behind as a hole in the middle
+// of the address space; the next race's first frame makes it again.
+void leaveRace(State& state, const char* how, int frameWidth, int frameHeight) {
+    state.raceWatch.report(how, state.imagesMiB);
+    AddressSpace before = addressSpaceNow();
+    dropDirect(state);
+    renderTargetDestroy(state.gl);
+    releaseHudTextures(state);
+    state.raceSettled = false;
+    state.direct = false;
+    state.renderEyeWidth = 0;
+    state.renderEyeHeight = 0;
+    state.wrongSizeHeld = 0;
+    bool made = true;
+    if (state.width != frameWidth || state.height != frameHeight)
+        made = createTextures(state, frameWidth, frameHeight);
+    AddressSpace after = addressSpaceNow();
+    logf("vr: race exit (%s) -- the headset's images and the HUD panel released; the front end's "
+         "frame textures are %dx%d%s; address space free %.0f -> %.0f MiB, %.0f -> %.0f in one "
+         "piece",
+         how, frameWidth, frameHeight, made ? "" : " (NOT made: retried once a second)",
+         before.freeBytes / 1048576.0, after.freeBytes / 1048576.0,
+         before.largestFreeBytes / 1048576.0, after.largestFreeBytes / 1048576.0);
+}
+
+// The GL context that held the race's images is gone (or the channel stops): nothing of the race
+// is left, and the next world-mode frame settles again.
+void forgetRace(State& state) {
+    state.raceSettled = false;
+    state.direct = false;
+    state.renderEyeWidth = 0;
+    state.renderEyeHeight = 0;
+    state.sizingKnown = false;
+}
+
+// A frame in a world mode that cannot be settled, or a frame whose mode cannot be read: counted,
+// and logged when the reason changes.
+void noteRaceGate(State& state, const char* reason) {
+    if (reason == state.raceGateReported) return;
+    state.raceGateReported = reason;
+    if (!reason) return;
+    ++state.raceGateCount;
+    logf("vr: the headset's images are not settled per race -- %s (%d time%s this session); the "
+         "frame textures follow the window's frame",
+         reason, state.raceGateCount, state.raceGateCount == 1 ? "" : "s");
 }
 
 // Pribluda's panel is 2048 texels wide whatever the monitor is: at the default 0.6 m that
@@ -566,6 +948,106 @@ bool createMenuTextures(State& state, int width, int height) {
     return true;
 }
 
+// The GL calls the menu's layer needs, resolved; false when one is missing.
+bool menuGlUsable(State& state) {
+    GlFunctions& gl = state.gl;
+    if (!gl.bindFramebuffer) glResolveFramebuffer(gl);
+    return gl.bindFramebuffer && gl.framebufferTexture2D && gl.checkFramebufferStatus &&
+           gl.genFramebuffers && gl.deleteFramebuffers && gl.blitFramebuffer && gl.clear &&
+           gl.clearColor && gl.viewport && gl.getIntegerv && gl.texImage2D &&
+           gl.texParameteri && gl.dxLockObjects && gl.dxUnlockObjects;
+}
+
+// One copy into each of the panel's shared slots, from its cleared GL texture, so the driver's
+// first interop lock and blit on them happen here rather than at the menu's first open. Nothing
+// is published: the sequence and menuVisible are untouched, and the presenter opens the slots
+// only once the layer is visible. False when a copy failed (logged by glInteropPublishPanel).
+bool warmMenuSlots(State& state) {
+    GlFunctions& gl = state.gl;
+    if (!gl.pushAttrib || !gl.popAttrib || !gl.disable) return false;
+    GLint        previousDraw = 0;
+    GLint        previousRead = 0;
+    gl.getIntegerv(kGlFramebufferBinding, &previousDraw);
+    gl.getIntegerv(kGlReadFramebufferBinding, &previousRead);
+    gl.pushAttrib(static_cast<GLbitfield>(GL_COLOR_BUFFER_BIT | GL_SCISSOR_BIT));
+    gl.disable(GL_SCISSOR_TEST);
+    gl.bindFramebuffer(kGlDrawFramebuffer, state.menuFramebuffer);
+    gl.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl.clear(GL_COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(kGlDrawFramebuffer, static_cast<GLuint>(previousDraw));
+    gl.popAttrib();
+
+    bool copied = true;
+    for (uint32_t slot = 0; slot < kFrameSlots && copied; ++slot) {
+        GlPanelCopy copy;
+        copy.shared = &state.menuShared[slot];
+        copy.sourceFramebuffer = state.menuFramebuffer;
+        copy.width = state.menuWidth;
+        copy.height = state.menuHeight;
+        copied = glInteropPublishPanel(gl, state.interopDevice, copy);
+    }
+    // The copy leaves the read binding at 0; the frame this runs in may have had its own.
+    gl.bindFramebuffer(kGlReadFramebuffer, static_cast<GLuint>(previousRead));
+    return copied;
+}
+
+// THE VR MENU'S RESOURCES, BUILT AHEAD OF THE RACE: the panel's shared textures and their
+// interop registration, the GL texture and framebuffer the menus draw into, and every font size
+// the VR menu, its tweak strips and the radials draw with. Called in the front end before the
+// first race entry, so the race-entry settle measures the address space with them in place and
+// opening a menu in a race allocates nothing. Kept until the GL context goes or the presenter
+// stops, and built again in the next context. What could not be made is made on first use
+// instead, as before, and said here.
+void prebuildMenu(State& state) {
+    if (state.menuPrebuiltContext == state.glContext) return;
+    state.menuPrebuiltContext = state.glContext;
+
+    AddressSpace before = addressSpaceNow();
+    const char*  panelFailed = nullptr;
+    if (!menuGlUsable(state))
+        panelFailed = "GL lacks the framebuffer, blit or interop-lock calls the layer needs";
+    else if (!state.menuFramebuffer &&
+             !createMenuTextures(state, kMenuPanelWidth, kMenuPanelHeight))
+        panelFailed = "its textures could not be made (see the line above)";
+    bool warmed = !panelFailed && warmMenuSlots(state);
+
+    int         sizes[8] = {};
+    int         count = vrMenuFontPixels(sizes, 8);
+    int         fontFailedAt = 0;
+    const char* fontWhy = nullptr;
+    char        sizeList[64] = {};
+    size_t      used = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!fontFailedAt && !vrTextPrebuild(state.gl, sizes[i], fontWhy))
+            fontFailedAt = sizes[i];
+        int wrote = _snprintf_s(sizeList + used, sizeof(sizeList) - used, _TRUNCATE, "%s%d",
+                                i ? "/" : "", sizes[i]);
+        if (wrote > 0) used += static_cast<size_t>(wrote);
+    }
+    AddressSpace after = addressSpaceNow();
+
+    if (!panelFailed && !fontFailedAt) {
+        logf("vr menu: built ahead of the race -- panel %dx%d (%s), fonts %d sizes (%s px), "
+             "%d built; address space free %.0f -> %.0f MiB, %.0f -> %.0f in one piece",
+             state.menuWidth, state.menuHeight,
+             warmed ? "both slots copied into once"
+                    : "the first copy into its slots FAILED and is left to the first open",
+             count, sizeList, vrTextBuiltCount(), before.freeBytes / 1048576.0,
+             after.freeBytes / 1048576.0,
+             before.largestFreeBytes / 1048576.0, after.largestFreeBytes / 1048576.0);
+        return;
+    }
+    char fontPart[160] = {};
+    if (fontFailedAt)
+        _snprintf_s(fontPart, _TRUNCATE, "the %d px font was not built (%s)", fontFailedAt,
+                    fontWhy ? fontWhy : "no reason given");
+    logf("vr menu: NOT fully built ahead of the race -- %s%s%s%s; what is missing is made on "
+         "its first use instead, in whatever mode that is; address space free %.0f -> %.0f MiB",
+         panelFailed ? "the panel: " : "", panelFailed ? panelFailed : "",
+         panelFailed && fontFailedAt ? "; " : "", fontFailedAt ? fontPart : "",
+         before.freeBytes / 1048576.0, after.freeBytes / 1048576.0);
+}
+
 // --- the one-shot field-of-view probe -------------------------------------------
 
 // 32-bit BGRA, bottom-up -- which is the order glReadPixels already returns, so the
@@ -672,8 +1154,10 @@ constexpr float kMonitorHudNear = 0.02f;  // metres; a corner closer than this i
 // with, then drawn as a textured quad with a homogeneous w per vertex, so the texture is
 // interpolated perspective-correctly exactly as the eye camera would have drawn it. False
 // when the quad is behind the eye, off the picture, or the eye is not in the picture.
+// `uMax`/`vMax`: the part of the texture the image fills from GL's origin (the VR menu's
+// image is the bottom-left of its panel).
 bool drawPanelInEye(State& state, const WindowPicture& picture, int eye, bool seat,
-                    const float corners[4][3]) {
+                    const float corners[4][3], float uMax = 1.0f, float vMax = 1.0f) {
     GlFunctions&      gl = state.gl;
     const SharedView& view = state.monitorViews[eye];
     int rx = static_cast<int>(state.block->eyeRect[eye][0]);
@@ -750,7 +1234,7 @@ bool drawPanelInEye(State& state, const WindowPicture& picture, int eye, bool se
     gl.begin(GL_QUADS);
     for (int i = 0; i < 4; ++i) {
         float w = window[i][2];
-        gl.texCoord2f(kTexture[i][0], kTexture[i][1]);
+        gl.texCoord2f(kTexture[i][0] * uMax, kTexture[i][1] * vMax);
         gl.vertex4f(window[i][0] * w, window[i][1] * w, 0.0f, w);
     }
     gl.end();
@@ -905,10 +1389,17 @@ void drawMonitorHud(State& state, int monitorEye) {
         // head-locked panel publishes in the view's space, and drawing that as if it were
         // seat-relative would put the menu somewhere the headset does not have it.
         const bool menuSeat = state.block->menuSpace == kMenuSpaceSeat;
+        float uMax = 1.0f;
+        float vMax = 1.0f;
+        if (state.menuImageWidth > 0 && state.menuImageHeight > 0) {
+            uMax = static_cast<float>(state.menuImageWidth) / static_cast<float>(state.menuWidth);
+            vMax = static_cast<float>(state.menuImageHeight) /
+                   static_cast<float>(state.menuHeight);
+        }
         if (monitorEye == kMonitorBoth || monitorEye == kMonitorLeft)
-            drawPanelInEye(state, picture, 0, menuSeat, menuCorners);
+            drawPanelInEye(state, picture, 0, menuSeat, menuCorners, uMax, vMax);
         if (monitorEye == kMonitorBoth || monitorEye == kMonitorRight)
-            drawPanelInEye(state, picture, 1, menuSeat, menuCorners);
+            drawPanelInEye(state, picture, 1, menuSeat, menuCorners, uMax, vMax);
     }
 
     gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(savedTexture));
@@ -961,7 +1452,7 @@ bool presenterStart() {
     }
     // Not a failure if it does not resolve: the frame then goes into the window's own
     // back buffer, exactly as it did before there was an off-screen path at all.
-    renderTargetResolve(state.gl);
+    state.targetResolved = renderTargetResolve(state.gl);
 
     wchar_t instance[32] = {};
     if (!createControlBlock(state, instance)) {
@@ -1031,12 +1522,19 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     if (!currentContext) {
         if (state.glContext) {
             logf("vr: the GL context has gone away; releasing until one comes back");
+            // The target and the held slot belonged to that context: forgotten, not deleted, and
+            // the headset's memory is settled again at the next world-mode frame in the next one.
+            state.raceWatch.report("the GL context went away", state.imagesMiB);
+            state.directSlot = -1;
+            renderTargetForget();
+            forgetRace(state);
             releaseTextures(state);
             // The cursor texture belongs to that context too, and it is not in
             // releaseTextures because it is not one of the shared frame textures. The
             // menu's font lists are display lists, which belong to it just as much.
             cursorOverlayReleaseGl();
             vrMenuReleaseGl(state.gl, false);
+            state.menuPrebuiltContext = nullptr;
             state.glContext = nullptr;
             state.width = 0;
             state.height = 0;
@@ -1049,11 +1547,16 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
             logf("vr: the GL context changed (%p -> %p), rebuilding the shared textures",
                  (void*)state.glContext, (void*)currentContext);
         state.glContext = currentContext;
+        state.raceWatch.report("the GL context changed", state.imagesMiB);
+        state.directSlot = -1;
+        renderTargetForget();
+        forgetRace(state);
         releaseTextures(state);
         cursorOverlayReleaseGl();
         // The old context is gone, so the lists are forgotten rather than deleted; the
-        // next draw builds them again in the new one.
+        // next draw builds them again in the new one, or prebuildMenu below does first.
         vrMenuReleaseGl(state.gl, false);
+        state.menuPrebuiltContext = nullptr;
         glInteropCloseDevice(state.gl, state.interopDevice);
         state.interopDevice = glInteropOpenDevice(state.gl, state.device);
         if (!state.interopDevice) {
@@ -1064,15 +1567,44 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
         state.height = 0;
     }
 
-    // What the game should render into, in pixels, both eyes side by side. The
-    // presenter publishes the size it actually created its swapchains at -- scaled by
-    // vrRenderScale and clamped to the runtime's maximum -- so there is one number and
-    // not two that have to agree.
+    // The VR menu's resources, once per context and never inside a settled race: in the
+    // front end before the first race entry, or -- after a context change or a restart in a
+    // race -- in the frame that settles the race again, before it measures.
+    if (!state.raceSettled) prebuildMenu(state);
+
+    // What the game should render into, in pixels, both eyes side by side. The presenter
+    // publishes the size it created its swapchains at -- scaled by vrRenderScale and clamped
+    // to the runtime's maximum -- and the target is built at that, or at the largest size
+    // below it that fits, at race entry: the first frame published in a world mode
+    // (settleForRace). It goes when the engine is back in the front end's mode (leaveRace), and
+    // the frame that found that out is not published: it was drawn into the race's target in
+    // the front end's mode, and the headset keeps the race's last frame until the menu's first.
     if (g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
-        renderTargetRequestSize(static_cast<int>(block->targetEyeWidth) * 2,
-                                static_cast<int>(block->targetEyeHeight));
-    } else {
-        renderTargetRequestSize(0, 0);
+        EngineMode  mode = renderTargetEngineMode();
+        const char* gate = nullptr;
+        if (mode == EngineMode::Unknown)
+            gate = "the engine's display mode cannot be read yet (see the target: lines)";
+        else if (mode == EngineMode::World && renderTargetUnavailable())
+            gate = "there is no off-screen target this session, so the frame is the window's "
+                   "(see the target: lines)";
+        noteRaceGate(state, gate);
+        if (!gate && (mode == EngineMode::World) != state.raceSettled) {
+            int windowWidth = 0;
+            int windowHeight = 0;
+            glDrawableSize(state.gl, windowWidth, windowHeight);
+            if (mode == EngineMode::World) {
+                settleForRace(state, windowWidth, windowHeight);
+            } else {
+                leaveRace(state, "the engine is back in the front end's mode", windowWidth,
+                          windowHeight);
+                return;
+            }
+        }
+    }
+    if (state.raceSettled) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        state.raceWatch.sample(now.QuadPart, trackBakeRunning());
     }
 
     int width = 0;
@@ -1083,23 +1615,17 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     if (!renderTargetSize(width, height) && !glDrawableSize(state.gl, width, height))
         return;
 
-    // THE SHARED TEXTURES ARE SIZED FOR THE HEADSET AS SOON AS IT IS KNOWN, AND NEVER SHRINK.
-    // They were sized to each frame, so a return to the front end shrank them to the window's
-    // size and entering the car grew them again -- and on a 2 GB process, with a big track's
-    // bake holding the address space at that moment, the re-registration failed with
-    // GL_OUT_OF_MEMORY and the headset stopped for the session (the beta on Isle of Man). Held
-    // at the headset's size from the first frame, they are allocated before any track is baked,
-    // which waits for them (presenterHeadsetMemoryHeld). A smaller frame -- the front end's --
-    // is copied into the top-left of the image and its rect published, which is all the
-    // presenter reads.
+    // THE SHARED TEXTURES ARE MADE BY settleForRace AND leaveRace, NOT HERE. A race's are made
+    // before its track bake starts, which waits for them (presenterHeadsetMemory) -- the
+    // re-registration that once failed with GL_OUT_OF_MEMORY at race entry did so while a big
+    // track's bake already held the address space (the beta on Isle of Man). A smaller frame is
+    // copied into the top-left of the image and its rect published, which is all the presenter
+    // reads. Here they only grow, when the frame is past them: the window grew (a monitor
+    // change), or a failed creation is retried.
     int needWidth = width;
     int needHeight = height;
-    if (g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
-        int headsetWidth = static_cast<int>(block->targetEyeWidth) * 2;
-        int headsetHeight = static_cast<int>(block->targetEyeHeight);
-        if (headsetWidth > needWidth) needWidth = headsetWidth;
-        if (headsetHeight > needHeight) needHeight = headsetHeight;
-    }
+    if (state.renderEyeWidth * 2 > needWidth) needWidth = state.renderEyeWidth * 2;
+    if (state.renderEyeHeight > needHeight) needHeight = state.renderEyeHeight;
     if (needWidth > state.width || needHeight > state.height) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
@@ -1122,6 +1648,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
                       textureWidth, textureHeight);
             frameTraceArm(12, why);
         }
+        bool wasDirect = state.directSlot >= 0;
         if (!createTextures(state, textureWidth, textureHeight)) {
             ++state.textureFailures;
             state.textureFailedQpc = now.QuadPart;
@@ -1138,6 +1665,13 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
                  textureWidth, textureHeight, state.textureFailures);
             state.textureFailures = 0;
         }
+        // On the direct path this frame was drawn into a texture that has just been thrown
+        // away with the rest, so there is nothing to publish: take a slot of the new size
+        // and let the next frame be the first one at it.
+        if (wasDirect) {
+            acquireDirect(state);
+            return;
+        }
     }
 
     // A PAIR RENDERED AT THE WRONG SIZE IS HELD. On race entry the first frames render into the
@@ -1145,9 +1679,11 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     // above; published, each tall eye is shown in a square view, squashed or clipped. Nothing is
     // published for them, so the headset keeps its last frame. Capped, because a target the
     // driver cannot allocate stays on the window for good and its frames must still go out.
-    if (sideBySide && g_options.vr && block->targetEyeWidth && block->targetEyeHeight) {
-        int  wantWidth = static_cast<int>(block->targetEyeWidth) * 2;
-        int  wantHeight = static_cast<int>(block->targetEyeHeight);
+    // The size wanted is the one the target was BUILT at, which settleForRace may have made
+    // smaller than the presenter's request; with no target at all there is nothing to wait for.
+    if (sideBySide && g_options.vr && state.renderEyeWidth && state.renderEyeHeight) {
+        int  wantWidth = state.renderEyeWidth * 2;
+        int  wantHeight = state.renderEyeHeight;
         bool wrongSize = width != wantWidth || height != wantHeight;
         frameTracePresenter(width, height, wantWidth, wantHeight,
                             wrongSize && state.wrongSizeHeld < kWrongSizeHoldFrames);
@@ -1232,7 +1768,18 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     // The slot must be the one the published sequence names, not the one before it:
     // the presenter reads slot (frameSequence % kFrameSlots), so the frame we are about
     // to write is numbered frameSequence + 1 and belongs in that slot.
-    uint32_t slot = static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
+    //
+    // On the direct path the frame is already IN a slot -- chosen by this same arithmetic
+    // when it was locked, before the frame's first draw call -- and that one is what gets
+    // published, whatever the arithmetic says now. A slot held for a frame the target did not
+    // draw goes back first: that frame is in the window, and takes the copy.
+    if (state.directSlot >= 0 &&
+        (!renderTargetActive() ||
+         renderTargetAttachedColour() != state.shared[state.directSlot].name))
+        dropDirect(state);
+    uint32_t slot = state.directSlot >= 0
+                        ? static_cast<uint32_t>(state.directSlot)
+                        : static_cast<uint32_t>(state.frameSequence + 1) % kFrameSlots;
 
     // The poses go in the SAME slot as the pixels they belong to. Version 1 kept one
     // shared copy, written before frameSequence moved, so a consumer could latch
@@ -1282,25 +1829,57 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     int           transferring = frameBudgetEnter(kSpanTransfer);
     LARGE_INTEGER transferBegin, transferEnd;
     QueryPerformanceCounter(&transferBegin);
-    bool transferred = glInteropCopyBackBuffer(state.gl, state.interopDevice,
-                                               state.shared[slot], width, height,
-                                               renderTargetFramebuffer(),
-                                               g_options.vrTransferFinish,
-                                               copyPanel ? &panelCopy : nullptr);
+    bool transferred;
+    if (state.directSlot >= 0) {
+        // The pixels are already where the presenter will read them. What is left is
+        // everything that still has to happen while GL holds the texture: the pointer's
+        // saved pixels go back into the frame, the texture comes off the framebuffer -- the
+        // unlock fails if it does not -- and the panel rides out under the same unlock.
+        //
+        // The window's picture was taken in presenterEndFrame, for the same reason the
+        // restore is here: after the unlock this texture belongs to Direct3D.
+        cursorOverlayRestore(state.gl);
+        renderTargetAttachColour(state.gl, 0);
+        transferred = glInteropPublishDirect(state.gl, state.interopDevice,
+                                             state.shared[slot], g_options.vrTransferFinish,
+                                             copyPanel ? &panelCopy : nullptr);
+        state.directSlot = -1;
+    } else {
+        transferred = glInteropCopyBackBuffer(state.gl, state.interopDevice,
+                                              state.shared[slot], width, height,
+                                              renderTargetFramebuffer(),
+                                              g_options.vrTransferFinish,
+                                              copyPanel ? &panelCopy : nullptr);
+    }
     QueryPerformanceCounter(&transferEnd);
     frameBudgetLeave(transferring);
     presenterNoteTransfer(transferEnd.QuadPart - transferBegin.QuadPart);
-    // A panel image not copied because the frame failed stays pending for the next frame.
-    if (!transferred) return;
+    // A panel image not copied because the frame failed stays pending for the next frame. On the
+    // direct path a slot is taken for the next frame all the same, or the target would draw it
+    // with no colour attached.
+    if (!transferred) {
+        acquireDirect(state);
+        return;
+    }
 
     // The copy above ends in wglDXUnlockObjectsNV, which completes the GL work on the shared
     // textures, and by default in glFinish as well (vrTransferFinish), so the pixels are
     // complete before the sequence that advertises them is published. That ordering is the
     // whole reason no lock is needed here.
+    //
+    // New textures are announced with their first frame: the generation before the sequence, so
+    // a presenter that opens them latches this frame, which is in them.
+    if (state.texturesUnannounced) publishTextures(state);
     ++state.frameSequence;
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->frameSequence),
                         state.frameSequence);
     renderPacingNotePublished();
+
+    // The next frame's slot is taken here rather than at the top of the next frame: an
+    // extra render draws and publishes a whole frame of its own between the two, and the
+    // game's own next frame starts drawing without passing through presenterBeginFrame
+    // again when it does.
+    acquireDirect(state);
 
     // The HUD panel copied under the same lock goes out now, after the same synchronisation,
     // so the presenter can never copy one that is still being written.
@@ -1368,6 +1947,19 @@ void presenterEndFrame() {
     State& state = g_state;
     if (state.stage == Stage::Off) return;
     renderTargetEndFrame(state.gl);
+
+    // On the direct path the window's picture is read out of the shared texture, so it has
+    // to be taken here -- the frame is finished and the texture is still locked to GL. The
+    // publish that follows hands it to Direct3D, after which GL may not read it at all.
+    //
+    // Only the blit moves. The panel that goes over the picture is drawn into the window's
+    // own buffer and stays where it was, after the publish, so it still uses the views this
+    // frame was rendered from.
+    if (state.directSlot >= 0 && renderTargetActive()) {
+        frameBudgetSwitch(kSpanWindowBlit);
+        renderTargetBlitToWindow(state.gl, g_options.vrMonitorEye);
+        state.windowBlitDone = true;
+    }
 }
 
 void presenterBlitToWindow(int eye) {
@@ -1511,11 +2103,21 @@ void presenterBeginFrame() {
     if (!g_options.vr) {
         // Not merely "do not bind": the engine's back buffer size has to go back to what
         // roglv2 believes, or the next frame is laid out for a surface that is no longer
-        // the render target.
+        // the render target. A slot still held goes back first -- the framebuffer it is
+        // attached to is about to be deleted.
+        dropDirect(state);
         renderTargetRelease(state.gl);
         return;
     }
     renderTargetBeginFrame(state.gl);
+
+    // After the bind, not before it. Inert whenever a slot is already held, which is the usual
+    // case -- the publish takes the next one as soon as it lets the last one go. A frame the
+    // target will not draw (the front end) gives back a slot taken for it at the last publish.
+    if (renderTargetActive())
+        acquireDirect(state);
+    else
+        dropDirect(state);
 }
 
 namespace {
@@ -1546,13 +2148,29 @@ bool presenterFovMutable() {
     return state.block->fovMutable != 0;
 }
 
-bool presenterHeadsetMemoryHeld() {
+HeadsetMemory presenterHeadsetMemory() {
     State& state = g_state;
-    if (!g_options.vr || state.stage == Stage::Off || state.stage == Stage::Failed) return true;
-    if (state.stage != Stage::Publishing || !state.block) return false;
-    if (!state.block->targetEyeWidth || !state.block->targetEyeHeight) return false;
-    return state.width >= static_cast<int>(state.block->targetEyeWidth) * 2 &&
-           state.height >= static_cast<int>(state.block->targetEyeHeight);
+    if (!g_options.vr || state.stage == Stage::Off || state.stage == Stage::Failed)
+        return HeadsetMemory::Ready;
+    if (state.stage != Stage::Publishing || !state.block) return HeadsetMemory::AwaitingPresenter;
+    // Settled covers the shared textures and the render target together, at whatever size fitted
+    // -- including none, when nothing did and there is nothing left to protect.
+    if (state.raceSettled) return HeadsetMemory::Ready;
+    // The same gates presenterFrame settles behind: where it never settles, nothing is waited for.
+    if (!state.block->targetEyeWidth || !state.block->targetEyeHeight || !state.targetResolved ||
+        renderTargetUnavailable() || renderTargetEngineMode() == EngineMode::Unknown)
+        return HeadsetMemory::Ready;
+    return HeadsetMemory::AwaitingRaceEntry;
+}
+
+bool presenterHeadsetSizing(HeadsetSizing& out) {
+    State& state = g_state;
+    out = HeadsetSizing();
+    if (state.stage != Stage::Publishing || !state.sizingKnown) return false;
+    out.inRace = state.raceSettled;
+    out.windowPicture = state.sizingWindowPicture;
+    out.fraction = state.sizingWindowPicture ? 0.0f : state.renderFraction;
+    return true;
 }
 
 int32_t presenterViewSequence() {
@@ -1712,11 +2330,7 @@ bool presenterMenuBegin(int width, int height, int& actualWidth, int& actualHeig
     if (width <= 0 || height <= 0) return false;
 
     GlFunctions& gl = state.gl;
-    if (!gl.bindFramebuffer) glResolveFramebuffer(gl);
-    if (!gl.bindFramebuffer || !gl.framebufferTexture2D || !gl.checkFramebufferStatus ||
-        !gl.genFramebuffers || !gl.deleteFramebuffers || !gl.blitFramebuffer || !gl.clear ||
-        !gl.clearColor || !gl.viewport || !gl.getIntegerv || !gl.texImage2D ||
-        !gl.texParameteri || !gl.dxLockObjects || !gl.dxUnlockObjects) {
+    if (!menuGlUsable(state)) {
         if (!state.menuReportedFailure) {
             state.menuReportedFailure = true;
             logf("vr: the VR menu's layer needs framebuffer objects, framebuffer blits and "
@@ -1725,19 +2339,52 @@ bool presenterMenuBegin(int width, int height, int& actualWidth, int& actualHeig
         return false;
     }
 
-    if ((state.menuWidth != width || state.menuHeight != height || !state.menuFramebuffer) &&
-        !createMenuTextures(state, width, height))
-        return false;
+    // Made by prebuildMenu in the front end; here only when that did not happen or failed.
+    if (!state.menuFramebuffer) {
+        AddressSpace before = addressSpaceNow();
+        if (!createMenuTextures(state, kMenuPanelWidth, kMenuPanelHeight)) return false;
+        AddressSpace after = addressSpaceNow();
+        logf("vr menu: the panel was not built ahead of the race, so it is made on first use "
+             "(%s); address space free %.0f -> %.0f MiB",
+             state.raceSettled ? "IN A RACE, outside the race-entry measurement"
+                               : "in the front end",
+             before.freeBytes / 1048576.0, after.freeBytes / 1048576.0);
+    }
+
+    // The image at its own size in the bottom-left of the panel, or scaled down whole when it
+    // is larger than the panel.
+    int imageWidth = width;
+    int imageHeight = height;
+    if (imageWidth > state.menuWidth || imageHeight > state.menuHeight) {
+        double scale = static_cast<double>(state.menuWidth) / imageWidth;
+        double scaleY = static_cast<double>(state.menuHeight) / imageHeight;
+        if (scaleY < scale) scale = scaleY;
+        imageWidth = static_cast<int>(imageWidth * scale);
+        imageHeight = static_cast<int>(imageHeight * scale);
+        if (imageWidth < 1) imageWidth = 1;
+        if (imageHeight < 1) imageHeight = 1;
+        if ((width != state.menuScaledWidth || height != state.menuScaledHeight) &&
+            state.menuScaledReports > 0) {
+            --state.menuScaledReports;
+            state.menuScaledWidth = width;
+            state.menuScaledHeight = height;
+            logf("vr menu: a %dx%d image is larger than the %dx%d panel and is drawn at %dx%d",
+                 width, height, state.menuWidth, state.menuHeight, imageWidth, imageHeight);
+        }
+    }
 
     gl.getIntegerv(kGlFramebufferBinding, &state.menuPreviousFramebuffer);
     gl.bindFramebuffer(kGlFramebuffer, state.menuFramebuffer);
-    gl.viewport(0, 0, state.menuWidth, state.menuHeight);
+    // The whole texture is cleared, so the edge of the image samples transparent.
+    gl.viewport(0, 0, imageWidth, imageHeight);
     gl.clearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.clear(GL_COLOR_BUFFER_BIT);
 
     state.menuBound = true;
-    actualWidth = state.menuWidth;
-    actualHeight = state.menuHeight;
+    state.menuImageWidth = imageWidth;
+    state.menuImageHeight = imageHeight;
+    actualWidth = imageWidth;
+    actualHeight = imageHeight;
     return true;
 }
 
@@ -1765,12 +2412,15 @@ bool presenterMenuPublish(const SharedPose& pose, int32_t space, float widthMetr
     GlPanelCopy copy;
     copy.shared = &state.menuShared[slot];
     copy.sourceFramebuffer = state.menuFramebuffer;
-    copy.width = state.menuWidth;
-    copy.height = state.menuHeight;
+    copy.width = state.menuImageWidth > 0 ? state.menuImageWidth : state.menuWidth;
+    copy.height = state.menuImageHeight > 0 ? state.menuImageHeight : state.menuHeight;
     if (!glInteropPublishPanel(state.gl, state.interopDevice, copy)) return false;
 
-    // The placement goes out BEFORE the sequence that advertises the image, so the
-    // presenter can never place this frame's picture at the last frame's pose.
+    // The placement and the image's size go out BEFORE the sequence that advertises the
+    // image, so the presenter can never place this frame's picture at the last frame's pose
+    // or read it at the last frame's size.
+    block->menuImageSize[slot][0] = static_cast<uint32_t>(copy.width);
+    block->menuImageSize[slot][1] = static_cast<uint32_t>(copy.height);
     block->menuPose = pose;
     block->menuSpace = space;
     block->menuWidthMetres = widthMetres;
@@ -1805,7 +2455,12 @@ void presenterStop() {
             static_cast<LONG>(ProcessState::Stopped));
     }
 
+    state.raceWatch.report("the presenter stopped", state.imagesMiB);
     releaseTextures(state);
+    state.menuPrebuiltContext = nullptr;
+    // Nothing draws into the target once the channel is off, so its memory goes back too.
+    if (state.gl.module) renderTargetDestroy(state.gl);
+    forgetRace(state);
     glInteropCloseDevice(state.gl, state.interopDevice);
     state.interopDevice = nullptr;
 

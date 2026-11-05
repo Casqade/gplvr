@@ -116,6 +116,7 @@ enum class Refusal {
     PointerHidden,
     ShapeUnreadable,
     ReplayPanel,
+    NoContext,
 };
 
 struct State {
@@ -144,6 +145,9 @@ struct State {
     bool loggedRestore = false;
     int  orphanReportsLeft = 4;
     bool warnedNoRebind = false;
+    int  droppedSaves = 0;          // saves whose framebuffer was deleted before the restore
+    int  droppedReportsLeft = 4;
+    bool loggedRestoreWithoutContext = false;
 
     GLenum lastError = GL_NO_ERROR;
     int    errorReportsLeft = 8;
@@ -183,6 +187,9 @@ const char* refusalText(Refusal reason, char* scratch, size_t scratchSize) {
         case Refusal::ReplayPanel:
             return "the replay panel is up and draws the pointer on itself, where the "
                    "controls are";
+        case Refusal::NoContext:
+            return "no GL context is current (the game unbinds it before tearing the "
+                   "window down), so a GL call here would do nothing";
     }
     return "unknown";
 }
@@ -642,11 +649,36 @@ bool cursorOverlayDrawShape(const GlFunctions& gl, float x, float y, float scale
     return true;
 }
 
+void cursorOverlayForgetSaveFrom(GLuint framebuffer) {
+    if (!g_pending.armed || !framebuffer || g_pending.framebuffer != framebuffer) return;
+    g_pending.armed = false;
+    ++g_cursor.droppedSaves;
+    if (g_cursor.droppedReportsLeft > 0) {
+        --g_cursor.droppedReportsLeft;
+        logf("cursor: framebuffer %u is being deleted while it holds the pointer, so the pixels "
+             "saved from under it are dropped; that frame is gone and there is nothing to put "
+             "them back into (%d time%s this session)%s",
+             framebuffer, g_cursor.droppedSaves, g_cursor.droppedSaves == 1 ? "" : "s",
+             g_cursor.droppedReportsLeft ? "" : " (not reported again)");
+    }
+}
+
 void cursorOverlayRestore(const GlFunctions& gl) {
     if (!g_pending.armed) return;
     g_pending.armed = false;
 
     if (!entryPointsPresent(gl)) return;
+
+    // With no context current the framebuffer the pixels came from has gone with it, and
+    // every call below would do nothing.
+    if (gl.wglGetCurrentContext && !gl.wglGetCurrentContext()) {
+        if (!g_cursor.loggedRestoreWithoutContext) {
+            g_cursor.loggedRestoreWithoutContext = true;
+            logf("cursor: the restore found no GL context current, so the saved pixels are "
+                 "dropped (the game is tearing its window down)");
+        }
+        return;
+    }
 
     // The framebuffer the pixels came from -- which is NOT the one bound now. By this
     // point presenterEndFrame has unbound the off-screen target and the window blit has
@@ -758,6 +790,10 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     // panel's layer while it is up, and the pointer stays off the eyes then too.
     if (replayPanelShown() || replayQuickMenuOpen()) {
         noteRefusal(Refusal::ReplayPanel);
+        return;
+    }
+    if (gl.wglGetCurrentContext && !gl.wglGetCurrentContext()) {
+        noteRefusal(Refusal::NoContext);
         return;
     }
 

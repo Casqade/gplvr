@@ -617,6 +617,13 @@ bool Consumer::menuPanel(MenuPanel& out) {
     out.heightMetres = block_->menuHeightMetres;
     out.textureWidth = menuWidth_;
     out.textureHeight = menuHeight_;
+    // The slot's own size, read after its sequence like the pose. Zero or past the texture
+    // means the whole texture.
+    const uint32_t slot = static_cast<uint32_t>(out.sequence) % kFrameSlots;
+    out.imageWidth = block_->menuImageSize[slot][0];
+    out.imageHeight = block_->menuImageSize[slot][1];
+    if (!out.imageWidth || out.imageWidth > menuWidth_) out.imageWidth = menuWidth_;
+    if (!out.imageHeight || out.imageHeight > menuHeight_) out.imageHeight = menuHeight_;
     return out.widthMetres > 0.0f && out.heightMetres > 0.0f;
 }
 

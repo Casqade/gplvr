@@ -275,6 +275,30 @@ bool glInteropCopyBackBuffer(const GlFunctions& gl, HANDLE interopDevice,
                              const GlSharedTexture& shared, int width, int height,
                              GLuint sourceFramebuffer, bool finish, GlPanelCopy* panel);
 
+// The direct path: the frame is drawn INTO the shared texture and the copy above never
+// runs. See report 80 and vrDirectToShared.
+//
+// The lock is taken before the frame's first draw call and held until it is published, so
+// a slot is unavailable to Direct3D for the whole frame rather than for the moment of a
+// copy. The texture is registered WRITE_DISCARD, which is what rendering into it wants and
+// also means a frame never starts from the previous one's pixels.
+bool glInteropLockDirect(const GlFunctions& gl, HANDLE interopDevice,
+                         const GlSharedTexture& shared);
+
+// Finish a frame rendered straight into `shared`: copy the HUD panel if there is one, then
+// unlock, and glFinish when `finish`. The unlock is the synchronisation, exactly as it is
+// for the copy.
+//
+// THE CALLER MUST HAVE DETACHED the texture from every framebuffer first. GL may not still
+// be holding a shared object at the unlock -- the bug that made the race black, recorded at
+// the detach inside the copy.
+bool glInteropPublishDirect(const GlFunctions& gl, HANDLE interopDevice,
+                            const GlSharedTexture& shared, bool finish, GlPanelCopy* panel);
+
+// Hand a slot locked by glInteropLockDirect back without publishing anything, for a probe or a
+// frame that is being thrown away. The same detach rule applies.
+bool glInteropUnlock(const GlFunctions& gl, HANDLE interopDevice, const GlSharedTexture& shared);
+
 // Copy ONE panel into its shared texture under a lock of its own, outside the frame
 // transfer entirely.
 //

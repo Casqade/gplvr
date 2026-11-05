@@ -38,6 +38,8 @@ constexpr int kBandRows = 50;
 constexpr int kCanvasScale = 2;
 constexpr int kCanvasWidth = kDesignWidth * kCanvasScale;
 constexpr int kCanvasHeight = 2 * kBandRows * kCanvasScale;
+static_assert(kCanvasWidth <= kMenuPanelWidth && kCanvasHeight <= kMenuPanelHeight,
+              "the replay bands must fit the VR menu panel's one size (Producer.h)");
 
 // Where the panel hangs in the seat's frame: ahead of and below the eyes, turned to face them,
 // like a tablet held at the wheel. Far enough to focus without effort; the width makes one of
@@ -526,6 +528,32 @@ bool gplReplayScreenShown() {
 
 bool replayPanelCapturing() { return currentMode() != Mode::None; }
 
+bool replayPanelPrebuild(int& width, int& height, const char*& why) {
+    width = 0;
+    height = 0;
+    why = nullptr;
+    if (!g_options.vr) {
+        why = "vr is off, and the panel is used only in the headset";
+        return false;
+    }
+    if (!resolveGl()) {
+        why = "GL lacks the calls the layer needs (see the replay panel: line)";
+        return false;
+    }
+    Bands bands;
+    if (!currentBands(bands)) {
+        why = "the engine's mode is smaller than GPL's 640x480 layout";
+        return false;
+    }
+    if (!ensureLayer(bands.width, bands.height)) {
+        why = "the layer could not be made (see the replay panel: line)";
+        return false;
+    }
+    width = g_panel.width;
+    height = g_panel.height;
+    return true;
+}
+
 void replayPanelNoteFill(int x, int y, int width, int height) {
     if (!g_options.vr || windowInFrontEnd() || gplReplayScreenShown()) return;
     Bands bands;
@@ -786,8 +814,9 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
     gl.matrixMode(GL_PROJECTION);
     gl.pushMatrix();
     gl.loadIdentity();
-    // Origin top-left, the VR menu's own convention for this texture.
-    gl.ortho(0.0, static_cast<double>(actualWidth), static_cast<double>(actualHeight), 0.0,
+    // Origin top-left, the VR menu's own convention for this texture, in canvas pixels: a
+    // dialog past the layer's size is drawn into the smaller image presenterMenuBegin gave.
+    gl.ortho(0.0, static_cast<double>(canvasWidth), static_cast<double>(canvasHeight), 0.0,
              -1.0, 1.0);
     gl.matrixMode(GL_MODELVIEW);
     gl.pushMatrix();

@@ -36,9 +36,18 @@ enum VrTextSlot {
     kVrTextSlots,
 };
 
-// Build the lists for `pixelHeight` in that slot, or keep the ones already built for it.
-// False means there is no text, and the reason has been logged once.
+// Point that slot at the lists for `pixelHeight`, building them when no font of that size is
+// kept yet. Fonts are kept by size (up to four), so a slot moving between sizes that are
+// already built builds nothing. False means there is no text, and the reason has been logged
+// once.
 bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight);
+
+// Build the lists for `pixelHeight` in the current context ahead of their first use, or keep
+// the ones already built. False with `why` when they could not be made.
+bool vrTextPrebuild(const GlFunctions& gl, int pixelHeight, const char*& why);
+
+// How many font sizes are built now, for the log.
+int vrTextBuiltCount();
 
 // Drop the lists, the canvas texture and its framebuffer. `contextAlive` false when the
 // context they belong to has gone: they are then forgotten rather than deleted, because

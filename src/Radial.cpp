@@ -32,6 +32,8 @@ constexpr float kSliceGapDegrees = 1.5f;
 constexpr int kBodyPixels = 30;
 constexpr int kSmallPixels = 19;
 constexpr LONGLONG kRebuildHz = 45;
+static_assert(kCanvasSize <= kMenuPanelWidth && kCanvasSize <= kMenuPanelHeight,
+              "the radial must fit the VR menu panel's one size (Producer.h)");
 
 constexpr float kCentre = static_cast<float>(kCanvasSize) * 0.5f;
 
@@ -465,6 +467,11 @@ void radialReleaseGl(Radial& radial) {
     radial.signatureValid = false;
     radial.layerVisible = false;
     radial.lastBuild = 0;
+}
+
+void radialFontPixels(int& bodyPixels, int& smallPixels) {
+    bodyPixels = kBodyPixels;
+    smallPixels = kSmallPixels;
 }
 
 }  // namespace gplvr

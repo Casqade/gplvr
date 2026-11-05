@@ -1,5 +1,7 @@
 #include "RenderTarget.h"
 
+#include "AddressSpace.h"
+#include "CursorOverlay.h"
 #include "FrameBudget.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -7,6 +9,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace gplvr {
@@ -100,8 +103,11 @@ Display g_display;
 
 struct Target {
     GLuint framebuffer = 0;
-    GLuint colour = 0;
+    GLuint colour = 0;  // the target's own, 0 while it draws into the presenter's texture
     GLuint depth = 0;
+    // A texture belonging to somebody else, attached as colour for a frame that renders
+    // straight into it (vrDirectToShared). 0 means the target's own.
+    GLuint borrowed = 0;
     int    width = 0;
     int    height = 0;
 
@@ -563,17 +569,22 @@ bool splitBindingWorks(const GlFunctions& gl, GLuint framebuffer) {
 
     for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
 
+    // The read binding found here goes back afterwards: the target is built in the middle of a
+    // front-end frame, with whatever that frame has bound.
+    GLint previous = 0;
+    gl.getIntegerv(kGlReadFramebufferBinding, &previous);
     GLint bound = 0;
     gl.bindFramebuffer(kGlReadFramebuffer, framebuffer);
     gl.getIntegerv(kGlReadFramebufferBinding, &bound);
     const bool took = static_cast<GLuint>(bound) == framebuffer &&
                       gl.getError() == GL_NO_ERROR;
-    gl.bindFramebuffer(kGlReadFramebuffer, 0);
+    gl.bindFramebuffer(kGlReadFramebuffer, static_cast<GLuint>(previous));
     for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
     return took;
 }
 
 void destroyFramebuffer(const GlFunctions& gl) {
+    cursorOverlayForgetSaveFrom(g_target.framebuffer);
     if (g_target.framebuffer && gl.deleteFramebuffers)
         gl.deleteFramebuffers(1, &g_target.framebuffer);
     if (g_target.depth && gl.deleteRenderbuffers)
@@ -583,6 +594,7 @@ void destroyFramebuffer(const GlFunctions& gl) {
     g_target.framebuffer = 0;
     g_target.depth = 0;
     g_target.colour = 0;
+    g_target.borrowed = 0;
     g_target.width = 0;
     g_target.height = 0;
     g_target.bound = false;
@@ -640,14 +652,10 @@ bool sizeWithinGlLimits(const GlFunctions& gl, int width, int height) {
     return false;
 }
 
-bool createFramebuffer(const GlFunctions& gl, int width, int height) {
-    destroyFramebuffer(gl);
-
-    // Before allocating 180 MB and finding out the hard way.
-    if (!sizeWithinGlLimits(gl, width, height)) return false;
-
-    // The binding found here goes back afterwards: roglv2 keeps its own copy of the bound
-    // texture and does not rebind one it believes is bound (display +0x38).
+// The target's own colour texture, at its size. The binding found here goes back afterwards:
+// roglv2 keeps its own copy of the bound texture and does not rebind one it believes is bound
+// (display +0x38).
+void createColourTexture(const GlFunctions& gl, int width, int height) {
     GLint previousTexture = 0;
     if (gl.getIntegerv) gl.getIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
     gl.genTextures(1, &g_target.colour);
@@ -659,6 +667,17 @@ bool createFramebuffer(const GlFunctions& gl, int width, int height) {
     gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kGlClampToEdge);
     gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kGlClampToEdge);
     gl.bindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+}
+
+// With `ownColour` false the framebuffer holds depth alone, and is incomplete until a colour
+// texture is attached to it -- which is why it is not checked here.
+bool createFramebuffer(const GlFunctions& gl, int width, int height, bool ownColour) {
+    destroyFramebuffer(gl);
+
+    // Before allocating 180 MB and finding out the hard way.
+    if (!sizeWithinGlLimits(gl, width, height)) return false;
+
+    if (ownColour) createColourTexture(gl, width, height);
 
     // 24-bit depth, where the window's own buffer is 16: DisplayOpenGL asks for
     // cDepthBits = 16 once for the whole process, and an FBO is not bound by that. Free
@@ -668,20 +687,22 @@ bool createFramebuffer(const GlFunctions& gl, int width, int height) {
     gl.renderbufferStorage(kGlRenderbuffer, kGlDepthComponent24, width, height);
     gl.bindRenderbuffer(kGlRenderbuffer, 0);
 
+    GLint previousFramebuffer = 0;
+    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previousFramebuffer);
     gl.genFramebuffers(1, &g_target.framebuffer);
     gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
-    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
-                            g_target.colour, 0);
+    if (ownColour)
+        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                                g_target.colour, 0);
     gl.framebufferRenderbuffer(kGlFramebuffer, kGlDepthAttachment, kGlRenderbuffer,
                                g_target.depth);
 
-    const GLenum status = gl.checkFramebufferStatus(kGlFramebuffer);
-    gl.bindFramebuffer(kGlFramebuffer, 0);
+    GLenum status = ownColour ? gl.checkFramebufferStatus(kGlFramebuffer) : kGlFramebufferComplete;
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previousFramebuffer));
 
     if (status != kGlFramebufferComplete) {
-        logf("target: the %dx%d off-screen framebuffer is incomplete (0x%04X) -- "
-             "falling back to the window's back buffer",
-             width, height, status);
+        logf("target: the %dx%d off-screen framebuffer is incomplete (0x%04X)", width, height,
+             status);
         destroyFramebuffer(gl);
         return false;
     }
@@ -698,9 +719,8 @@ bool createFramebuffer(const GlFunctions& gl, int width, int height) {
                  "window cannot show the off-screen frame -- the headset is unaffected");
     }
 
-    logf("target: rendering off-screen at %dx%d (%.1f MB colour, 24-bit depth, split "
-         "binding %s)",
-         width, height, static_cast<double>(width) * height * 4.0 / (1024.0 * 1024.0),
+    logf("target: built at %dx%d (%s, 24-bit depth, split binding %s)", width, height,
+         ownColour ? "a colour texture of its own" : "colour from the shared texture",
          g_target.splitBinding ? "yes" : "NO");
     return true;
 }
@@ -769,21 +789,149 @@ bool renderTargetResolve(GlFunctions& gl) {
     return g_target.resolved;
 }
 
-void renderTargetRequestSize(int width, int height) {
-    if (width < 0) width = 0;
-    if (height < 0) height = 0;
-    if (width == g_target.requestedWidth && height == g_target.requestedHeight) return;
+bool renderTargetBuild(const GlFunctions& gl, int width, int height, bool ownColour) {
+    if (!g_target.resolved || width <= 0 || height <= 0) return false;
     g_target.requestedWidth = width;
     g_target.requestedHeight = height;
-    logf("target: asked to render at %dx%d", width, height);
+    return createFramebuffer(gl, width, height, ownColour);
+}
+
+EngineMode renderTargetEngineMode() {
+    int width = 0;
+    int height = 0;
+    if (!learnNativeSize(width, height)) return EngineMode::Unknown;
+    return isMenuMode(width, height) ? EngineMode::Menu : EngineMode::World;
+}
+
+bool renderTargetUnavailable() {
+    return !g_target.resolved || g_target.gaveUp || g_surface.gaveUp;
+}
+
+bool renderTargetBuiltSize(int& width, int& height) {
+    if (!g_target.framebuffer) return false;
+    width = g_target.width;
+    height = g_target.height;
+    return true;
+}
+
+void renderTargetDestroy(const GlFunctions& gl) { renderTargetRelease(gl); }
+
+void renderTargetForget() {
+    g_target.framebuffer = 0;
+    g_target.depth = 0;
+    g_target.colour = 0;
+    g_target.borrowed = 0;
+    g_target.width = 0;
+    g_target.height = 0;
+    g_target.bound = false;
+    g_target.active = false;
+}
+
+bool renderTargetCommit(const GlFunctions& gl) {
+    if (!g_target.framebuffer || (!g_target.colour && !g_target.borrowed)) return false;
+    if (!gl.clear || !gl.clearColor || !gl.colorMask || !gl.depthMask || !gl.disable ||
+        !gl.pushAttrib || !gl.popAttrib || !gl.finish || !gl.getError)
+        return false;
+
+    for (int i = 0; i < 16 && gl.getError() != GL_NO_ERROR; ++i) {}
+
+    GLint previous = 0;
+    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previous);
+    gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
+    GLenum status = gl.checkFramebufferStatus(kGlFramebuffer);
+    GLenum error = GL_NO_ERROR;
+    if (status == kGlFramebufferComplete) {
+        // Every bit of state the clear touches goes back afterwards: roglv2 caches what it last
+        // set, and a mask or a scissor changed under it is a fault several frames later.
+        gl.pushAttrib(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_SCISSOR_BIT);
+        gl.disable(GL_SCISSOR_TEST);
+        gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        gl.depthMask(GL_TRUE);
+        gl.clearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        gl.clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        gl.popAttrib();
+        gl.finish();
+        error = gl.getError();
+    }
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+
+    bool committed = status == kGlFramebufferComplete && error == GL_NO_ERROR;
+    if (!committed)
+        logf("target: %dx%d could not be committed by a clear -- framebuffer status 0x%04X, GL "
+             "error 0x%04X",
+             g_target.width, g_target.height, status, error);
+    return committed;
+}
+
+bool renderTargetAttachColour(const GlFunctions& gl, GLuint name) {
+    if (!g_target.framebuffer || !gl.bindFramebuffer || !gl.framebufferTexture2D)
+        return false;
+
+    GLuint wanted = name ? name : g_target.colour;
+
+    // The binding is saved and put back rather than left at the target's own: this runs
+    // both between frames, where nothing is bound, and in the middle of the extra-render
+    // tail, where the target is bound and the frame after this one keeps drawing into it.
+    GLint previous = 0;
+    if (gl.getIntegerv) gl.getIntegerv(kGlFramebufferBinding, &previous);
+    gl.bindFramebuffer(kGlFramebuffer, g_target.framebuffer);
+    gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D, wanted, 0);
+
+    // Detaching -- no texture of our own to put back -- leaves the framebuffer without colour
+    // until the next attachment, and there is nothing to check.
+    if (!wanted) {
+        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+        g_target.borrowed = 0;
+        return true;
+    }
+
+    GLenum status = gl.checkFramebufferStatus ? gl.checkFramebufferStatus(kGlFramebuffer)
+                                              : kGlFramebufferComplete;
+    if (status != kGlFramebufferComplete) {
+        // Put our own back (or nothing) before returning, so a refusal never leaves a borrowed
+        // texture attached to a framebuffer whose owner is about to take it back.
+        gl.framebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, GL_TEXTURE_2D,
+                                g_target.colour, 0);
+        gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+        g_target.borrowed = 0;
+        logf("target: texture %u will not serve as colour attachment 0 of the %dx%d "
+             "off-screen framebuffer (0x%04X)",
+             wanted, g_target.width, g_target.height, status);
+        return false;
+    }
+
+    gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
+    g_target.borrowed = name;
+    return true;
+}
+
+GLuint renderTargetAttachedColour() { return g_target.borrowed; }
+
+bool renderTargetUseOwnColour(const GlFunctions& gl) {
+    if (!g_target.framebuffer) return false;
+    if (!g_target.colour) createColourTexture(gl, g_target.width, g_target.height);
+    if (renderTargetAttachColour(gl, 0) && renderTargetCommit(gl)) {
+        logf("target: drawing into a colour texture of its own from here on, %dx%d",
+             g_target.width, g_target.height);
+        return true;
+    }
+    logf("target: no colour texture of its own could be made at %dx%d -- the off-screen path "
+         "is off and the window's own buffer is used",
+         g_target.width, g_target.height);
+    g_target.gaveUp = true;
+    return false;
 }
 
 void renderTargetBeginFrame(const GlFunctions& gl) {
     frameBudgetSwitch(kSpanRebindSize);
-    const bool wanted = g_target.resolved && !g_target.gaveUp &&
-                        g_target.requestedWidth > 0 && g_target.requestedHeight > 0;
+    // The target is built by renderTargetBuild at race entry and destroyed when the race is left
+    // (the presenter's headset memory, report 113); this only uses it.
+    const bool wanted = g_target.resolved && !g_target.gaveUp && g_target.framebuffer != 0;
     if (!wanted) {
-        if (g_target.framebuffer || g_surface.appliedWidth) renderTargetRelease(gl);
+        if (g_target.gaveUp && g_target.framebuffer)
+            renderTargetRelease(gl);
+        else if (g_surface.appliedWidth || g_target.active)
+            renderTargetSuspend(gl);
         return;
     }
 
@@ -802,7 +950,10 @@ void renderTargetBeginFrame(const GlFunctions& gl) {
             logf("target: the engine's back buffer size could not be reached -- the "
                  "off-screen path is off and the window's own buffer is used");
         }
-        destroyFramebuffer(gl);
+        if (g_target.gaveUp)
+            renderTargetRelease(gl);
+        else
+            renderTargetSuspend(gl);
         return;
     }
 
@@ -815,22 +966,16 @@ void renderTargetBeginFrame(const GlFunctions& gl) {
                  "off-screen is suspended until the sim mode comes back",
                  nativeW, nativeH);
         }
-        renderTargetRelease(gl);
+        renderTargetSuspend(gl);
         return;
     }
     if (g_target.inMenuMode) {
         g_target.inMenuMode = false;
-        logf("target: the back buffer is %dx%d -- resuming off-screen rendering",
-             nativeW, nativeH);
-    }
-
-    if (g_target.width != g_target.requestedWidth ||
-        g_target.height != g_target.requestedHeight) {
-        if (!createFramebuffer(gl, g_target.requestedWidth, g_target.requestedHeight)) {
-            g_target.gaveUp = true;
-            restoreSurfaceSize();
-            return;
-        }
+        AddressSpace space = addressSpaceNow();
+        logf("target: the back buffer is %dx%d -- resuming off-screen rendering at %dx%d "
+             "(address space free %.0f MiB, %.0f in one piece)",
+             nativeW, nativeH, g_target.width, g_target.height, space.freeBytes / 1048576.0,
+             space.largestFreeBytes / 1048576.0);
     }
 
     // The engine has to believe the back buffer is this size BEFORE it lays out a frame
@@ -1273,6 +1418,17 @@ void renderTargetBlitToWindow(const GlFunctions& gl, int monitorEye) {
                  : (monitorEye == kMonitorRight ? "the RIGHT eye" : "both eyes"),
              g_target.width, g_target.height, windowW, windowH);
     }
+}
+
+void renderTargetSuspend(const GlFunctions& gl) {
+    restoreSurfaceSize();
+    if (g_target.bound && gl.bindFramebuffer) gl.bindFramebuffer(kGlFramebuffer, 0);
+    g_target.bound = false;
+    g_target.active = false;
+    // The next blit clears the whole window again, whatever it held meanwhile.
+    g_fit.windowW = 0;
+    g_fit.windowH = 0;
+    g_target.loggedMonitorEye = -1;
 }
 
 void renderTargetRelease(const GlFunctions& gl) {

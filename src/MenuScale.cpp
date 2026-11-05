@@ -1,5 +1,6 @@
 #include "MenuScale.h"
 
+#include "CursorOverlay.h"
 #include "FlatTarget.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -109,6 +110,7 @@ bool splitBindingWorks(const GlFunctions& gl, GLuint framebuffer) {
 
 void destroyFramebuffer() {
     State& s = g_state;
+    cursorOverlayForgetSaveFrom(s.framebuffer);
     if (s.framebuffer && s.gl.deleteFramebuffers) s.gl.deleteFramebuffers(1, &s.framebuffer);
     if (s.depth && s.gl.deleteRenderbuffers) s.gl.deleteRenderbuffers(1, &s.depth);
     if (s.colour && s.gl.deleteTextures) s.gl.deleteTextures(1, &s.colour);

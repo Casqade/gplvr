@@ -1,5 +1,6 @@
 #include "baked_gpl/TrackBake.h"
 
+#include "AddressSpace.h"
 #include "DataRebase.h"
 #include "Hooks.h"
 #include "Log.h"
@@ -13,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -57,21 +59,7 @@ size_t bakeMemoryBudget(uint64_t available) {
 
 // The largest free region of the address space: what a big array's one block must fit in. Report
 // 60 section 10's crash had 243 MB free in all and 45.9 MB in one piece.
-uint64_t largestFreeRegion() {
-    SYSTEM_INFO system = {};
-    GetSystemInfo(&system);
-    auto     at = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
-    auto     end = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
-    uint64_t largest = 0;
-    MEMORY_BASIC_INFORMATION info = {};
-    while (at < end && VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) {
-        if (info.State == MEM_FREE && info.RegionSize > largest) largest = info.RegionSize;
-        uintptr_t next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (next <= at) break;
-        at = next;
-    }
-    return largest;
-}
+uint64_t largestFreeRegion() { return addressSpaceLargestFree(); }
 
 bool readable(const void* address, size_t bytes) {
     MEMORY_BASIC_INFORMATION info = {};
@@ -210,10 +198,10 @@ void runJob(std::shared_ptr<Job> job) {
 
 // -- state ---------------------------------------------------------------------------------------
 
-// The longest a bake waits for the headset's frame textures. They are made at the presenter's
-// first frame, seconds before any track loads; a presenter that never gets there should not
-// keep the renderer off for the session.
-constexpr DWORD kHeadsetWaitMs = 20000;
+// The longest a bake waits for a presenter that has not reported its runtime yet. The wait for
+// race entry itself has no limit: the images are made when the car is entered, and the bake is
+// only drawn from in a race. A presenter that never comes up must not keep the renderer off.
+constexpr DWORD kPresenterWaitMs = 20000;
 
 struct State {
     bool        bound = false;
@@ -228,11 +216,14 @@ struct State {
     // Why this track has no scene, for the VR menu; empty while it is baking or baked.
     std::string failure;
 
-    // A bake waits to start until the headset's frame textures hold their full size
-    // (presenterHeadsetMemoryHeld), so it cannot take the address space they need: the job is
-    // made, and started by a later main walk. Not past kHeadsetWaitMs.
-    bool  jobWaiting = false;
-    DWORD waitingSince = 0;
+    // A bake waits to start until the headset's images are settled for the race
+    // (presenterHeadsetMemory), so it cannot take the address space they need; it then works in
+    // what they leave, by its own budget rule: the job is made, and started by a later main walk.
+    // While the presenter has not reported, not past kPresenterWaitMs.
+    bool          jobWaiting = false;
+    DWORD         waitingSince = 0;
+    DWORD         presenterWaitSince = 0;  // 0 when not waiting on the presenter
+    HeadsetMemory waitReported = HeadsetMemory::Ready;  // the last wait logged for this job
 
     std::shared_ptr<Job>          job;
     std::unique_ptr<baked::Scene> scene;
@@ -385,6 +376,50 @@ void logAddressSpace(const Job& job, const baked::Scene* scene) {
          scene ? sceneBytes(*scene) / 1048576.0 : 0.0);
 }
 
+// Starts the waiting job once the headset's images are settled for the race (report 113). Each
+// kind of wait is logged when it begins, and the start says what ended it.
+void startWhenHeadsetSettled(State& s) {
+    HeadsetMemory memory = presenterHeadsetMemory();
+    DWORD         now = GetTickCount();
+    DWORD         waited = now - s.waitingSince;
+    if (memory == HeadsetMemory::AwaitingPresenter) {
+        if (!s.presenterWaitSince) s.presenterWaitSince = now;
+        if (now - s.presenterWaitSince < kPresenterWaitMs) {
+            if (s.waitReported != memory) {
+                s.waitReported = memory;
+                logf("baked: the bake waits for the presenter to report its runtime, so the "
+                     "headset's images can be settled first (at most %lu s)",
+                     static_cast<unsigned long>(kPresenterWaitMs / 1000));
+            }
+            return;
+        }
+    } else {
+        s.presenterWaitSince = 0;
+    }
+    if (memory == HeadsetMemory::AwaitingRaceEntry) {
+        if (s.waitReported != memory) {
+            s.waitReported = memory;
+            logf("baked: the bake waits for race entry, where the headset's images are settled "
+                 "first; it then works in what they leave (no time limit: the scene is drawn "
+                 "only in a race)");
+        }
+        return;
+    }
+
+    s.jobWaiting = false;
+    if (memory == HeadsetMemory::Ready) {
+        logf("baked: the headset's images are settled for this race after %lu ms -- the bake "
+             "starts in what they left, %.0f MiB free",
+             static_cast<unsigned long>(waited), trackBakeFreeAddressSpace() / 1048576.0);
+    } else {
+        logf("baked: the presenter has not reported its runtime after %lu s -- the bake starts "
+             "anyway with %.0f MiB free; the headset's images will be sized to what it leaves",
+             static_cast<unsigned long>(kPresenterWaitMs / 1000),
+             trackBakeFreeAddressSpace() / 1048576.0);
+    }
+    std::thread(runJob, s.job).detach();
+}
+
 }  // namespace
 
 void trackBakeMainWalk(void* sceneParams) {
@@ -442,29 +477,16 @@ void trackBakeMainWalk(void* sceneParams) {
              "%.0f MiB freed and added to the budget)",
              object, primSize, vertexCount, freed / 1048576.0);
         s.job = job;
-        if (presenterHeadsetMemoryHeld()) {
-            std::thread(runJob, job).detach();
-            return;
-        }
         s.jobWaiting = true;
         s.waitingSince = GetTickCount();
-        logf("baked: the bake waits until the headset's frame textures hold their full size, so "
-             "it cannot take the address space they need (at most %lu s)",
-             static_cast<unsigned long>(kHeadsetWaitMs / 1000));
+        s.presenterWaitSince = 0;
+        s.waitReported = HeadsetMemory::Ready;
+        startWhenHeadsetSettled(s);
         return;
     }
 
     if (s.jobWaiting) {
-        bool  held = presenterHeadsetMemoryHeld();
-        DWORD waited = GetTickCount() - s.waitingSince;
-        if (!held && waited < kHeadsetWaitMs) return;
-        s.jobWaiting = false;
-        logf(held ? "baked: the headset's frame textures are in place after %lu ms -- the bake "
-                    "starts"
-                  : "baked: the headset's frame textures are still not in place after %lu ms -- "
-                    "the bake starts anyway",
-             static_cast<unsigned long>(waited));
-        std::thread(runJob, s.job).detach();
+        startWhenHeadsetSettled(s);
         return;
     }
 
@@ -529,6 +551,11 @@ uint64_t trackBakeFreeAddressSpace() {
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return 0;
     return status.ullAvailVirtual;
+}
+
+bool trackBakeRunning() {
+    const State& s = g_state;
+    return s.job && !s.jobWaiting && !s.job->done.load();
 }
 
 }  // namespace gplvr

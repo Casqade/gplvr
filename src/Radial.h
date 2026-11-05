@@ -97,4 +97,7 @@ bool radialUpdate(Radial& radial, const RadialLayout& layout, const RadialSlice*
 // The GL context is going away; the next open builds its image afresh.
 void radialReleaseGl(Radial& radial);
 
+// The two font sizes a radial draws with, for the menus' prebuild.
+void radialFontPixels(int& bodyPixels, int& smallPixels);
+
 }  // namespace gplvr

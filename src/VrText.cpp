@@ -39,11 +39,22 @@ struct Font {
     int    builtFor = 0;             // the pixel height these lists were built at
     HGLRC  context = nullptr;        // the context they belong to
     int    widths[kCharCount] = {};  // advance per character, in pixels
-    bool   reportedFailure = false;
 };
 
+// The fonts are kept by pixel size, and a slot names the one it was last asked for. Every size
+// the menus draw at (vrTextPrebuild) then stays built side by side, so moving between the VR
+// menu, its tweak strips and the radials only re-points a slot and builds nothing.
+constexpr int kFontPool = 4;
+
 Entries g_entries;
-Font    g_fonts[kVrTextSlots];
+Font    g_pool[kFontPool];
+int     g_slotFont[kVrTextSlots] = {-1, -1};
+bool    g_reportedFailure = false;
+
+const Font* slotFont(int slot) {
+    int index = g_slotFont[slot];
+    return index >= 0 && g_pool[index].base ? &g_pool[index] : nullptr;
+}
 
 bool resolveEntries(const GlFunctions& gl) {
     if (g_entries.resolved) return true;
@@ -83,33 +94,63 @@ bool resolveEntries(const GlFunctions& gl) {
 
 bool validSlot(int slot) { return slot >= 0 && slot < kVrTextSlots; }
 
-}  // namespace
+bool slotUses(int index) {
+    for (int slot = 0; slot < kVrTextSlots; ++slot)
+        if (g_slotFont[slot] == index) return true;
+    return false;
+}
 
-bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight) {
-    if (!validSlot(slot)) return false;
-    if (!resolveEntries(gl)) return false;
-    if (!gl.wglGetCurrentContext || !gl.wglGetCurrentDC) return false;
+// The pool entry holding `pixelHeight` in the current context, built when there is none. -1
+// with `why` set when it cannot be had.
+int fontFor(const GlFunctions& gl, int pixelHeight, const char*& why) {
+    why = nullptr;
+    if (!resolveEntries(gl)) {
+        why = "opengl32 did not give up the font calls (see the vr text: line)";
+        return -1;
+    }
+    if (!gl.wglGetCurrentContext || !gl.wglGetCurrentDC) {
+        why = "wglGetCurrentContext or wglGetCurrentDC did not resolve";
+        return -1;
+    }
 
     if (pixelHeight < 8) pixelHeight = 8;
     if (pixelHeight > 96) pixelHeight = 96;
 
-    Font& font = g_fonts[slot];
-
     HGLRC context = gl.wglGetCurrentContext();
-    if (!context) return false;
-
-    if (font.base && font.builtFor == pixelHeight && font.context == context) return true;
+    if (!context) {
+        why = "no GL context is current";
+        return -1;
+    }
 
     // A context change means the old lists are somebody else's now. Forget them rather
     // than deleting names that no longer belong to us.
-    if (font.base && font.context != context) font.base = 0;
+    for (Font& font : g_pool)
+        if (font.base && font.context != context) font = Font{};
+    for (int index = 0; index < kFontPool; ++index)
+        if (g_pool[index].base && g_pool[index].builtFor == pixelHeight) return index;
+
+    // An empty entry, else one no slot is pointing at.
+    int target = -1;
+    for (int index = 0; index < kFontPool && target < 0; ++index)
+        if (!g_pool[index].base) target = index;
+    for (int index = 0; index < kFontPool && target < 0; ++index)
+        if (!slotUses(index)) target = index;
+    if (target < 0) target = 0;
+    Font& font = g_pool[target];
     if (font.base) {
+        logf("vr text: all %d fonts are in use -- the %d px one is dropped for %d px",
+             kFontPool, font.builtFor, pixelHeight);
         g_entries.deleteLists(font.base, kCharCount);
-        font.base = 0;
+        for (int slot = 0; slot < kVrTextSlots; ++slot)
+            if (g_slotFont[slot] == target) g_slotFont[slot] = -1;
+        font = Font{};
     }
 
     HDC dc = gl.wglGetCurrentDC();
-    if (!dc) return false;
+    if (!dc) {
+        why = "the GL context has no device context";
+        return -1;
+    }
 
     // Monospaced on purpose: a menu laid out in columns is arithmetic rather than
     // measurement, and a fallback substitution by GDI still keeps the metrics this asks
@@ -120,12 +161,13 @@ bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight) {
                                 NONANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN,
                                 "Consolas");
     if (!created) {
-        if (!font.reportedFailure) {
-            font.reportedFailure = true;
+        why = "CreateFontA refused";
+        if (!g_reportedFailure) {
+            g_reportedFailure = true;
             logf("vr text: CreateFontA refused (error %lu) -- there is no menu text",
                  GetLastError());
         }
-        return false;
+        return -1;
     }
 
     HGDIOBJ previous = SelectObject(dc, created);
@@ -145,12 +187,12 @@ bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight) {
     DeleteObject(created);
 
     if (!built) {
-        if (!font.reportedFailure) {
-            font.reportedFailure = true;
-            logf("vr text: %s -- there is no menu text",
-                 base ? "wglUseFontBitmapsA refused the font" : "glGenLists gave no names");
+        why = base ? "wglUseFontBitmapsA refused the font" : "glGenLists gave no names";
+        if (!g_reportedFailure) {
+            g_reportedFailure = true;
+            logf("vr text: %s -- there is no menu text", why);
         }
-        return false;
+        return -1;
     }
 
     font.base = base;
@@ -158,33 +200,59 @@ bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight) {
     font.context = context;
     font.height = metrics.tmHeight;
     font.ascent = metrics.tmAscent;
-    font.reportedFailure = false;
-    logf("vr text: slot %d built at %d px (cell %d, ascent %d)", slot, pixelHeight,
-         font.height, font.ascent);
+    g_reportedFailure = false;
+    logf("vr text: %d px font built (cell %d, ascent %d)", pixelHeight, font.height,
+         font.ascent);
+    return target;
+}
+
+}  // namespace
+
+bool vrTextEnsure(const GlFunctions& gl, int slot, int pixelHeight) {
+    if (!validSlot(slot)) return false;
+    const char* why = nullptr;
+    int         index = fontFor(gl, pixelHeight, why);
+    if (index < 0) return false;
+    g_slotFont[slot] = index;
     return true;
 }
 
+bool vrTextPrebuild(const GlFunctions& gl, int pixelHeight, const char*& why) {
+    return fontFor(gl, pixelHeight, why) >= 0;
+}
+
+int vrTextBuiltCount() {
+    int count = 0;
+    for (const Font& font : g_pool)
+        if (font.base) ++count;
+    return count;
+}
+
 void vrTextRelease(const GlFunctions& gl, bool contextAlive) {
-    for (Font& font : g_fonts) {
+    for (Font& font : g_pool) {
         if (font.base && contextAlive && g_entries.deleteLists)
             g_entries.deleteLists(font.base, kCharCount);
-        font.base = 0;
-        font.height = 0;
-        font.ascent = 0;
-        font.builtFor = 0;
-        font.context = nullptr;
+        font = Font{};
     }
+    for (int& index : g_slotFont) index = -1;
     (void)gl;
     (void)contextAlive;
 }
 
-int vrTextHeight(int slot) { return validSlot(slot) ? g_fonts[slot].height : 0; }
+int vrTextHeight(int slot) {
+    const Font* font = validSlot(slot) ? slotFont(slot) : nullptr;
+    return font ? font->height : 0;
+}
 
-int vrTextAscent(int slot) { return validSlot(slot) ? g_fonts[slot].ascent : 0; }
+int vrTextAscent(int slot) {
+    const Font* font = validSlot(slot) ? slotFont(slot) : nullptr;
+    return font ? font->ascent : 0;
+}
 
 int vrTextWidth(int slot, const char* text) {
-    if (!validSlot(slot) || !text || !g_fonts[slot].base) return 0;
-    const Font& font = g_fonts[slot];
+    const Font* found = validSlot(slot) ? slotFont(slot) : nullptr;
+    if (!found || !text) return 0;
+    const Font& font = *found;
     int         width = 0;
     for (const unsigned char* c = reinterpret_cast<const unsigned char*>(text); *c; ++c) {
         const int index = static_cast<int>(*c) - kFirstChar;
@@ -196,7 +264,8 @@ int vrTextWidth(int slot, const char* text) {
 
 void vrTextDraw(const GlFunctions& gl, int slot, float x, float baselineY,
                 const char* text) {
-    if (!validSlot(slot) || !text || !*text || !g_fonts[slot].base) return;
+    const Font* font = validSlot(slot) ? slotFont(slot) : nullptr;
+    if (!font || !text || !*text) return;
     if (!gl.pixelStorei || !gl.getIntegerv) return;
 
     const size_t length = strlen(text);
@@ -226,7 +295,7 @@ void vrTextDraw(const GlFunctions& gl, int slot, float x, float baselineY,
     g_entries.rasterPos2f(x, baselineY);
     // The lists are indexed from kFirstChar, so the base is shifted and the string is
     // passed as its own bytes -- one call for the whole line.
-    g_entries.listBase(g_fonts[slot].base - kFirstChar);
+    g_entries.listBase(font->base - kFirstChar);
     g_entries.callLists(static_cast<GLsizei>(length), GL_UNSIGNED_BYTE, text);
     g_entries.listBase(0);
 

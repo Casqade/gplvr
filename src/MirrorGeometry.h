@@ -72,6 +72,9 @@ struct MirrorSurfaceSet {
     // was using before: a half-derived answer moves the glasses to somewhere nobody chose.
     bool        derived = false;
     const char* refusal = nullptr;
+    // The node a pose refusal was about -- its address, type and the three translation words --
+    // so the log says what was read rather than only that it was wrong. Empty otherwise.
+    char refusalNode[96] = {};
 
     // The cockpit node the walk started from. It is what says the model has been reloaded
     // underneath the polygon addresses above.

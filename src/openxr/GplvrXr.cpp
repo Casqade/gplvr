@@ -303,6 +303,10 @@ struct HudLayer {
     uint32_t failedHeight = 0;
     int32_t  drawnSequence = 0;
     bool     haveImage = false;
+    // The VR menu's: the part of the swapchain image the drawn sequence fills (its
+    // bottom-left), which is the quad's imageRect. Zero for the HUD, which fills it all.
+    uint32_t drawnImageWidth = 0;
+    uint32_t drawnImageHeight = 0;
     XrSpace  seatSpace = XR_NULL_HANDLE;
     int32_t  seatGeneration = 0;
     int32_t  loggedLayer = -1;
@@ -318,6 +322,8 @@ bool createHudSwapchain(XrSession session, ID3D11Device* device, int64_t format,
     releaseEye(hud.image);
     hud.haveImage = false;
     hud.drawnSequence = 0;
+    hud.drawnImageWidth = 0;
+    hud.drawnImageHeight = 0;
 
     XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags =
@@ -404,6 +410,8 @@ bool updateMenuImage(Consumer& consumer, ID3D11DeviceContext* context,
 
     if (drawn) {
         menu.drawnSequence = panel.sequence;
+        menu.drawnImageWidth = panel.imageWidth;
+        menu.drawnImageHeight = panel.imageHeight;
         menu.haveImage = true;
     }
     return menu.haveImage;
@@ -1881,10 +1889,18 @@ int wmain(int argc, wchar_t** argv) {
                     menuQuad.space = menuSpace;
                     menuQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     menuQuad.subImage.swapchain = menu.image.swapchain;
-                    menuQuad.subImage.imageRect.offset = {0, 0};
-                    menuQuad.subImage.imageRect.extent = {
-                        static_cast<int32_t>(menu.image.width),
-                        static_cast<int32_t>(menu.image.height)};
+                    // The drawn image's part of the swapchain: its bottom-left, because
+                    // the producer draws at GL's origin and drawMenu turns the texture
+                    // the right way up.
+                    uint32_t rectWidth = menu.drawnImageWidth;
+                    uint32_t rectHeight = menu.drawnImageHeight;
+                    if (!rectWidth || rectWidth > menu.image.width) rectWidth = menu.image.width;
+                    if (!rectHeight || rectHeight > menu.image.height)
+                        rectHeight = menu.image.height;
+                    menuQuad.subImage.imageRect.offset = {
+                        0, static_cast<int32_t>(menu.image.height - rectHeight)};
+                    menuQuad.subImage.imageRect.extent = {static_cast<int32_t>(rectWidth),
+                                                          static_cast<int32_t>(rectHeight)};
                     menuQuad.subImage.imageArrayIndex = 0;
                     menuQuad.pose.orientation = {
                         menuPanel.pose.orientationX, menuPanel.pose.orientationY,
