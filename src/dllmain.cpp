@@ -25,6 +25,7 @@
 #include "fast_text/FastText.h"
 #include "Interpolation.h"
 #include "Letterbox.h"
+#include "FlatTarget.h"
 #include "MenuScale.h"
 #include "MirrorDriverArms.h"
 #include "NoSignal.h"
@@ -211,6 +212,8 @@ DWORD WINAPI installThread(LPVOID) {
     renderPacingDiscover(binding);
     renderProfileDiscover(binding);
     renderProfileInstallDriverThunks();
+    // After the profiler's: its SwapBuffers timer, when it is on, becomes this one's original.
+    flatTargetInstall();
     renderPacingInstall();
     // Locates the latch from the tick wait pacing installed at.
     interpolationInstall();

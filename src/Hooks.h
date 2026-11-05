@@ -177,10 +177,10 @@ struct Options {
     int windowY = -1;
 
     // Which monitor the window starts on. N is Windows' \\.\DISPLAYN (gplvr.log lists the
-    // monitors at startup); -1 leaves it where the game opens it. Either way it then follows
+    // monitors at startup); 0 leaves it where the game opens it. Either way it then follows
     // the monitor it is on, so Win+Shift+Arrow moves it. A number that matches no monitor
-    // behaves as -1 and says so in the log.
-    int windowScreen = -1;
+    // behaves as 0 and says so in the log.
+    int windowScreen = 0;
 
     // How the 640x480 front end is scaled up to the window.
     //
@@ -635,6 +635,11 @@ struct Options {
     // from 0 installs it.
     int vrRendererType = 1;
     int flatRendererType = 1;
+
+    // Flat mode: draw each world frame into a framebuffer and copy it into the window at the
+    // swap (FlatTarget.h), so the window's back buffer only ever holds finished frames, and a
+    // window moved to another monitor mid-race gets the frame scaled rather than cropped.
+    bool flatOffscreenFrame = false;
 
     // Multiply the runtime's RECOMMENDED per-eye render size.
     //

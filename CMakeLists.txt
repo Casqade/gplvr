@@ -97,6 +97,7 @@ else()
         src/DrawnMarks.cpp
         src/FlagmanReplay.cpp
         src/FlatFrames.cpp
+        src/FlatTarget.cpp
         src/FrameBudget.cpp
         src/GlApi.cpp
         src/GlInterop.cpp

@@ -6,6 +6,7 @@
 #include "DataRebase.h"
 #include "DrawnMarks.h"
 #include "FlatFrames.h"
+#include "FlatTarget.h"
 #include "FrameBudget.h"
 #include "FrameTrace.h"
 #include "Hud.h"
@@ -1591,6 +1592,9 @@ int __cdecl screenDisplayHook(void* surface) {
     // owns the 640x480 front end -- and the invariant is checked rather than assumed.
     frameBudgetSwitch(kSpanRebindMenu);
     menuScaleBeginFrame();
+    // Flat world modes, the complement of the two above; it copies the frame into the window
+    // at the swap, inside the next present.
+    flatTargetBeginFrame();
 
     // Extra renders go AFTER the present, in the idle tail of the tick.
     //
@@ -2559,8 +2563,8 @@ void loadOptions(const char* fileName) {
     }
     g_options.windowX = GetPrivateProfileIntA("gplvr", "windowX", -1, path);
     g_options.windowY = GetPrivateProfileIntA("gplvr", "windowY", -1, path);
-    g_options.windowScreen = GetPrivateProfileIntA("gplvr", "windowScreen", -1, path);
-    if (g_options.windowScreen < 1) g_options.windowScreen = -1;
+    g_options.windowScreen = GetPrivateProfileIntA("gplvr", "windowScreen", 0, path);
+    if (g_options.windowScreen < 0) g_options.windowScreen = 0;
     g_options.renderWhenUnfocused =
         GetPrivateProfileIntA("gplvr", "renderWhenUnfocused", 0, path) != 0;
     g_options.menuFilter = GetPrivateProfileIntA("gplvr", "menuFilter", 2, path);
@@ -2680,6 +2684,8 @@ void loadOptions(const char* fileName) {
     g_options.flatRendererType = GetPrivateProfileIntA("gplvr", "flatRendererType", 1, path);
     if (g_options.flatRendererType < 0 || g_options.flatRendererType > 2)
         g_options.flatRendererType = 1;
+    g_options.flatOffscreenFrame =
+        GetPrivateProfileIntA("gplvr", "flatOffscreenFrame", 0, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
     g_options.vrRenderScale = static_cast<float>(atof(text));
 
@@ -2791,6 +2797,11 @@ void loadOptions(const char* fileName) {
              "is what makes a frame between two ticks a new picture rather than a copy. It "
              "costs one sim tick of latency (6.94 ms at 144 Hz); frameRate = 0 does not pay "
              "it and does not get the rate.");
+    logf("options: flatOffscreenFrame=%d (%s)", g_options.flatOffscreenFrame ? 1 : 0,
+         g_options.flatOffscreenFrame
+             ? "flat world frames are drawn off-screen and copied into the window at the swap; "
+               "watch the `flat frame:` lines"
+             : "flat world frames are drawn straight into the window");
     logf("options: vrRendererType=%d flatRendererType=%d, this mode's %d (%s)",
          g_options.vrRendererType, g_options.flatRendererType, rendererType(),
          rendererType() == 0

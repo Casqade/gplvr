@@ -1,5 +1,6 @@
 #include "MenuScale.h"
 
+#include "FlatTarget.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "RenderTarget.h"
@@ -250,7 +251,7 @@ BOOL WINAPI screenToClientHook(HWND window, LPPOINT point) {
     if (!original) return FALSE;
 
     BOOL ok = original(window, point);
-    if (ok && point) menuScaleMapClientPoint(*point);
+    if (ok && point && !menuScaleMapClientPoint(*point)) flatTargetMapClientPoint(*point);
     return ok;
 }
 

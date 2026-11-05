@@ -2,6 +2,7 @@
 
 #include "Hooks.h"
 #include "Log.h"
+#include "FlatTarget.h"
 #include "MenuScale.h"
 #include "Pe.h"
 
@@ -632,6 +633,7 @@ int __cdecl screenBeginThunk(void* mode) {
     // The front end's surface is about to be rebuilt underneath any framebuffer we have
     // bound, and roglv2 clears and swaps inside the DisplayOpenGL constructor.
     menuScaleSuspend();
+    flatTargetSuspend();
 
     prepareManagerFor(width, height);
 
@@ -668,6 +670,7 @@ int __cdecl screenBeginThunk(void* mode) {
 // read a few lines below from the engine, which is the only thing that knows.
 int __cdecl screenEndThunk() {
     menuScaleSuspend();
+    flatTargetSuspend();
 
     // THE POP NEEDS THE RESIZE GUARD AS MUCH AS THE PUSH DOES.
     //
@@ -1102,10 +1105,11 @@ bool windowHandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM& lPara
         case WM_MBUTTONDBLCLK: {
             // The platform wndproc takes the click position straight out of lParam with
             // no scaling of any kind, so the front end has to be handed a point in its
-            // own 640x480 space.
+            // own 640x480 space, and a world frame scaled into a resized window a point in
+            // the frame's.
             POINT point = {static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
                            static_cast<LONG>(static_cast<short>(HIWORD(lParam)))};
-            if (menuScaleMapClientPoint(point))
+            if (menuScaleMapClientPoint(point) || flatTargetMapClientPoint(point))
                 lParam = MAKELPARAM(static_cast<short>(point.x),
                                     static_cast<short>(point.y));
             return false;
