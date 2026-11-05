@@ -71,7 +71,7 @@
   the manifest as largeAddressAware.
 
 .EXAMPLE
-  .\gplexegen.ps1 -Source 'H:\[Games]\GrandPrixLegends\gpl.exe' -XmlDir 'H:\[Games]\GrandPrixLegends\Mods\GEM+\gpl67' -Out 'C:\work\gplc67.exe'
+  .\gplexegen.ps1 -Source 'C:\Games\GrandPrixLegends\gpl.exe' -XmlDir 'C:\Games\GrandPrixLegends\Mods\GEM+\gpl67' -Out 'C:\work\gplc67.exe'
 #>
 [CmdletBinding()]
 param(

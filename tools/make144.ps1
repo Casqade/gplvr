@@ -308,7 +308,7 @@ $xmlList = @(
         Join-Path $gpl67 $_
         if ($_ -eq '05.xml') { Join-Path $patches '05_unbindfix.xml' }
     }
-) + $(if ($GemExtras) { @(Join-Path $patches 'gpl67-carset-names.xml') } else { @() }
+) + $(if ($GemExtras) { @(Join-Path $tools 'gpl67-carset-names.xml') } else { @() }
 ) + $(if (-not $stock36) { @($aiXml) } else { @() }
 ) + $(if ($FfbNoSpringDamper) { @($ffbCondXml) } else { @() }
 ) + $(if ($FfbDeeperNotch) { @($ffbCurveXml) } else { @() }
