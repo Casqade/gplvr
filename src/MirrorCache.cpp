@@ -364,7 +364,7 @@ void mirrorCacheCopyBegin() {
         if (!glResolve(c.gl) || !c.gl.getIntegerv || !c.gl.bindTexture) {
             c.failed = true;
             logf("mirror: glGetIntegerv or glBindTexture did not resolve; the copy-out's texture "
-                 "binding is left as GPL leaves it (mirrorCopyRebind does nothing)");
+                 "binding is left as GPL leaves it (the copy-out rebind does nothing)");
             return;
         }
         c.ready = true;

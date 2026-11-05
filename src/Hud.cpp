@@ -553,7 +553,7 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
 
     // The copy binds mirror.mip behind roglv2's texture cache; the binding goes back after it.
     // The flush comes first so the binding noted is the one the cache last saw.
-    if (mirrorCopy && g_options.mirrorCopyRebind) {
+    if (mirrorCopy && kMirrorCopyRebind) {
         rasterFlushPending();
         mirrorCacheCopyBegin();
         int result = g_bitmapDrawOriginal(source, x, y, dest);

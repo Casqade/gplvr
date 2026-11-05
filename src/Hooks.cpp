@@ -163,9 +163,8 @@ bool      g_lastFrameWasStereo = false;
 // the condition can hold for every frame of a long stall and the point is to name it once.
 int       g_heldPairReports = 4;
 
-// GPL's "no signal" static (NoSignal.h) under vrNoSignal = 1: one episode is the run of frames
-// it fills, from the first to the next frame it does not.
-constexpr ULONGLONG kNoSignalHoldMs = 250;
+// GPL's "no signal" static (NoSignal.h): one episode is the run of frames it fills, from the
+// first to the next frame it does not.
 struct NoSignalEpisode {
     ULONGLONG since = 0;     // GetTickCount64 at the episode's first frame, 0 between episodes
     bool      replay = false;  // the replay screen was up when it began
@@ -385,7 +384,7 @@ void reportOncePerSecond() {
     // rendering it. It is the pair of counters that says whether mirrorUpdateInterval is doing
     // anything: a restore count of zero with the option above 1 means the copies never built,
     // and the `mirror:` line above will say why.
-    // `copy-outs C rebound R`: mirrorCopyRebind's copies, and those that left mirror.mip bound
+    // `copy-outs C rebound R`: the copy-out rebind's copies (kMirrorCopyRebind), and those that left mirror.mip bound
     // where roglv2's cache did not know it.
     char     mirror[128] = {};
     unsigned restored = mirrorCacheTakeRestores();
@@ -406,8 +405,8 @@ void reportOncePerSecond() {
     char panes[96] = {};
     if (panesRendered || panesOutOfView)
         _snprintf_s(panes, sizeof(panes), _TRUNCATE,
-                    "mirror panes %u, out of view %u (mirrorSkipOutOfView %d) | ", panesRendered,
-                    panesOutOfView, g_options.mirrorSkipOutOfView);
+                    "mirror panes %u, out of view %u (skip out of view %d) | ", panesRendered,
+                    panesOutOfView, kMirrorSkipOutOfView ? 1 : 0);
 
     // Mirror-only renders are not counted as renders, but their time is in the scene total
     // and so in "ms each": per eye render including the pane renders before it.
@@ -1281,9 +1280,9 @@ int __cdecl screenDisplayHook(void* surface) {
     // flush below the unbind: the quad went to the window, through the target's 6344x3172
     // viewport and off the top of a 2560x1440 buffer, and the eye target kept only the black
     // clear (static probes of 2026-10-18: noise in the target on the one frame with text after
-    // it, black on the two without). That black is what a static past kNoSignalHoldMs published
+    // it, black on the two without). That black is what a static past vrNoSignalDelay published
     // to both eyes.
-    if (g_options.vrNoSignal && noSignalDrawnThisFrame()) rasterFlushPending();
+    if (noSignalDrawnThisFrame()) rasterFlushPending();
 
     // rendererType() = 2's mark, while the frame is still bound.
     bakedMarkFrameEnd();
@@ -1359,14 +1358,14 @@ int __cdecl screenDisplayHook(void* surface) {
         // anything drawn per eye on such a frame now ARRIVES per eye -- without it, noise
         // drawn into both eye rects would still show up as two rectangles in each eye.
         //
-        // GPL's "no signal" static is the exception, under vrNoSignal = 1. It fills the surface
+        // GPL's "no signal" static is the exception. It fills the surface
         // of the camera bound last. On the replay screen that is the 3D view: the window's size,
         // at the top left of the headset-sized frame (the whole-frame dump of 2026-10-15 showed
         // it), over the left eye's previous picture. As a pair that is noise in one eye, which
         // reads as a rendering fault. In a race nothing is published and the headset keeps its
         // last frame, with that frame's own poses, exactly as for a dropped frame; the camera
         // switches that cause it last a frame or three. Once a spell of static has lasted
-        // kNoSignalHoldMs, the part of the frame the static is on goes out as ONE flat image both
+        // vrNoSignalDelay, the part of the frame the static is on goes out as ONE flat image both
         // eyes share, stretched over the whole eye. On the replay screen it goes out at once, the
         // same way: the camera switch it marks lasts a few frames and is not worth holding.
         //
@@ -1385,9 +1384,8 @@ int __cdecl screenDisplayHook(void* surface) {
         // and it belongs to the menu picture like the rest of the lobby. Treated as an episode it
         // was held a frame at a time, which nobody saw -- until spells joined one-frame bursts and
         // the TV's picture went out stretched over both eyes at random frames (2026-10-18).
-        bool noSignal =
-            g_options.vrNoSignal && noSignalDrawnThisFrame() && !windowInFrontEnd();
-        bool staticLeftOver = g_options.vrNoSignal && !noSignal && g_noSignal.since &&
+        bool noSignal = noSignalDrawnThisFrame() && !windowInFrontEnd();
+        bool staticLeftOver = !noSignal && g_noSignal.since &&
                               !g_stereoRenderedFrame && !windowInFrontEnd();
         if (noSignal || staticLeftOver) {
             ULONGLONG nowMs = GetTickCount64();
@@ -1413,7 +1411,8 @@ int __cdecl screenDisplayHook(void* surface) {
             if (!g_noSignal.replay) clearStaticFromTarget = true;
             const int* rect = g_noSignal.rect;
             bool hold = g_publishedAny && !gplReplayScreenShown() &&
-                        (nowMs - g_noSignalSpellSince < kNoSignalHoldMs ||
+                        (nowMs - g_noSignalSpellSince <
+                             static_cast<ULONGLONG>(g_options.vrNoSignalDelay) ||
                          (!noSignal && !g_noSignal.replay));
             if (hold) {
                 ++g_noSignal.held;
@@ -2490,10 +2489,6 @@ void loadOptions(const char* fileName) {
     g_options.mirrorMode = GetPrivateProfileIntA("gplvr", "mirrorMode", kMirrorPerGlass, path);
     if (g_options.mirrorMode < kMirrorSharedHeadCentre || g_options.mirrorMode > kMirrorPerGlass)
         g_options.mirrorMode = kMirrorPerGlass;
-    g_options.mirrorSkipOutOfView =
-        GetPrivateProfileIntA("gplvr", "mirrorSkipOutOfView", 1, path) != 0 ? 1 : 0;
-    g_options.mirrorCopyRebind =
-        GetPrivateProfileIntA("gplvr", "mirrorCopyRebind", 1, path) != 0;
     g_options.mirrorUpdateInterval = GetPrivateProfileIntA("gplvr", "mirrorUpdateInterval", 1, path);
     if (g_options.mirrorUpdateInterval < 0) g_options.mirrorUpdateInterval = 0;
     if (g_options.mirrorUpdateInterval > 16) g_options.mirrorUpdateInterval = 16;
@@ -2532,9 +2527,6 @@ void loadOptions(const char* fileName) {
     g_options.profileStallUs = GetPrivateProfileIntA("gplvr", "profileStallUs", 50, path);
     if (g_options.profileStallUs < 0) g_options.profileStallUs = 0;
     if (g_options.profileStallUs > 10000) g_options.profileStallUs = 10000;
-    g_options.profileTargetHz = GetPrivateProfileIntA("gplvr", "profileTargetHz", 90, path);
-    if (g_options.profileTargetHz < 30) g_options.profileTargetHz = 30;
-    if (g_options.profileTargetHz > 240) g_options.profileTargetHz = 240;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
@@ -2725,15 +2717,16 @@ void loadOptions(const char* fileName) {
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
                              : "no hotkey is polled; the VR menu has every setting they toggle");
 
-    logf("options: mirrorSkipOutOfView=%d (%s)", g_options.mirrorSkipOutOfView,
-         g_options.mirrorSkipOutOfView
+    logf("build: GPLVR_MIRROR_SKIP_OUT_OF_VIEW=%d (%s) GPLVR_MIRROR_COPY_REBIND=%d",
+         kMirrorSkipOutOfView ? 1 : 0,
+         kMirrorSkipOutOfView
              ? "a mirror pane whose glass no eye can see this frame is not rendered; watch "
                "`mirror panes N, out of view M` on the fps line"
-             : "off: every pane is rendered on every mirror frame");
-    logf("options: mirrorMode=%d (%s) mirrorCopyRebind=%d mirrorUpdateInterval=%d (%s) -- the aim of "
+             : "off: every pane is rendered on every mirror frame",
+         kMirrorCopyRebind ? 1 : 0);
+    logf("options: mirrorMode=%d (%s) mirrorUpdateInterval=%d (%s) -- the aim of "
          "the glasses is per car, in gplvr_mirrors.ini, and has no gplvr.ini keys",
          g_options.mirrorMode, mirrorModeText(g_options.mirrorMode),
-         g_options.mirrorCopyRebind ? 1 : 0,
          g_options.mirrorUpdateInterval,
          g_options.mirrorUpdateInterval <= 0
              ? "the mirror is OFF and its texture is filled with black"
@@ -2759,14 +2752,13 @@ void loadOptions(const char* fileName) {
          "frame in %d)",
          g_options.vrTransferFinish ? 1 : 0, g_options.pribludaUpdateInterval,
          g_options.pribludaUpdateInterval);
-    g_options.vrNoSignal = GetPrivateProfileIntA("gplvr", "vrNoSignal", 1, path);
-    if (g_options.vrNoSignal < 0 || g_options.vrNoSignal > 1) g_options.vrNoSignal = 1;
-    logf("options: vrNoSignal=%d (%s)", g_options.vrNoSignal,
-         g_options.vrNoSignal
-             ? "GPL's no-signal static: a race holds the last frame for a moment, then the static "
-               "fills both eyes; the replay screen fills them at once -- watch the `vr: no "
-               "signal` lines"
-             : "GPL's no-signal static is published as a stereo pair, as before");
+    g_options.vrNoSignalDelay = GetPrivateProfileIntA("gplvr", "vrNoSignalDelay", 250, path);
+    if (g_options.vrNoSignalDelay < 0) g_options.vrNoSignalDelay = 0;
+    if (g_options.vrNoSignalDelay > 10000) g_options.vrNoSignalDelay = 10000;
+    logf("options: vrNoSignalDelay=%d ms (GPL's no-signal static: a race holds the last frame "
+         "for that long, then the static fills both eyes; the replay screen fills them at once "
+         "-- watch the `vr: no signal` lines)",
+         g_options.vrNoSignalDelay);
 
     logf("options: vrMenuScale=%.2f vrGamma=%.2f vrGplTextDepth=%.2f vrRenderScale=%.2f "
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
@@ -2811,8 +2803,8 @@ void loadOptions(const char* fileName) {
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
-    logf("options: profileWorkWait=%d profileStallUs=%d profileTargetHz=%d (%s)",
-         g_options.profileWorkWait ? 1 : 0, g_options.profileStallUs, g_options.profileTargetHz,
+    logf("options: profileWorkWait=%d profileStallUs=%d (%s)",
+         g_options.profileWorkWait ? 1 : 0, g_options.profileStallUs,
          g_options.profileWorkWait
              ? "every millisecond of the frame is reported as CPU WORK or CPU WAIT"
              : "no work/wait split -- pre and present stay single numbers");

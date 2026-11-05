@@ -7,6 +7,7 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "Pe.h"
+#include "presenter/Producer.h"
 
 #include <windows.h>
 
@@ -1498,12 +1499,30 @@ bool renderProfileFormatWorkWait(char* out, size_t size, double seconds,
 // work of one render; everything else in the frame -- the latch, the game's logic, the
 // window redraw, the HUD -- happens once whatever the eye count is. A second eye therefore
 // adds one eye's worth of scene and submission and nothing else, and the GPU doubles.
+// The headset rate the frame is measured against. In VR, the rate the presenter queried, else
+// its display period. In flat mode the line projects a two-eye frame for a headset that is not
+// connected, so there is nothing to ask: 90 Hz, the common rate.
+namespace {
+double headroomTargetHz() {
+    constexpr double kFlatProjectionHz = 90.0;
+    if (!g_options.vr) return kFlatProjectionHz;
+    PresenterClock clock;
+    if (!presenterClock(clock)) return kFlatProjectionHz;
+    if (clock.refreshRate > 0.0f) return clock.refreshRate;
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    return clock.period > 0 ? static_cast<double>(frequency.QuadPart) / clock.period
+                            : kFlatProjectionHz;
+}
+}  // namespace
+
 bool renderProfileFormatHeadroom(char* out, size_t size, double seconds,
                                  unsigned long long frames) {
     WorkWait w;
     if (!takeWorkWait(w, seconds, frames)) return false;
 
-    double budget = 1000.0 / g_options.profileTargetHz;
+    double targetHz = headroomTargetHz();
+    double budget = 1000.0 / targetHz;
 
     // A stereo frame already contains both eyes and both mirror passes, so projecting a
     // second eye from one render's cost would count the eyes twice. There the measured
@@ -1525,11 +1544,11 @@ bool renderProfileFormatHeadroom(char* out, size_t size, double seconds,
         }
 
         _snprintf_s(out, size, _TRUNCATE,
-                    "work/wait headroom: a %d Hz frame is %.2f ms. This frame already draws "
-                    "both eyes (%.2f renders a frame, mirrors included): CPU works %.2f ms "
-                    "= pre %.2f + scene %.2f + post %.2f + submission %.2f, %.0f%% of the "
-                    "budget, leaving %.2f ms%s",
-                    g_options.profileTargetHz, budget, w.renders, work, w.preWork,
+                    "work/wait headroom: a %.1f Hz headset frame is %.2f ms. This frame "
+                    "already draws both eyes (%.2f renders a frame, mirrors included): CPU "
+                    "works %.2f ms = pre %.2f + scene %.2f + post %.2f + submission %.2f, "
+                    "%.0f%% of the budget, leaving %.2f ms%s",
+                    targetHz, budget, w.renders, work, w.preWork,
                     w.sceneWork, w.post, w.presentWork, 100.0 * work / budget, budget - work,
                     gpu);
         return true;
@@ -1558,11 +1577,12 @@ bool renderProfileFormatHeadroom(char* out, size_t size, double seconds,
     }
 
     _snprintf_s(out, size, _TRUNCATE,
-                "work/wait headroom: a %d Hz frame is %.2f ms. Per render the CPU works "
+                "work/wait headroom: a %.0f Hz headset frame (a fixed reference in flat "
+                "mode) is %.2f ms. Per render the CPU works "
                 "%.2f ms (scene %.2f + submission %.2f over %.2f renders/frame); the "
                 "once-a-frame work is %.2f ms -> two eyes cost %.2f ms, %.0f%% of the "
                 "budget, leaving %.2f ms%s",
-                g_options.profileTargetHz, budget, perEye, w.sceneWork / w.renders,
+                targetHz, budget, perEye, w.sceneWork / w.renders,
                 w.presentWork / w.renders, w.renders, once, twoEyes,
                 100.0 * twoEyes / budget, budget - twoEyes, gpu);
     return true;

@@ -187,7 +187,7 @@ struct State {
     int  paneCopies = 0;
     bool reportedNoCopy = false;
     // Report 105 section 4.45: panes rendered, and panes not rendered because no eye that samples
-    // them could see their glass (mirrorSkipOutOfView), since stereoTakePaneCounts.
+    // them could see their glass (kMirrorSkipOutOfView), since stereoTakePaneCounts.
     unsigned panesRendered = 0;
     unsigned panesOutOfView = 0;
 
@@ -2019,7 +2019,7 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     for (int pass = 0; pass < 2; ++pass)
         for (int surface = 0; surface < kMaxMirrorSurfaces; ++surface)
             paneSeen[pass][surface] = true;
-    if (g_options.mirrorSkipOutOfView && tracked && panes) {
+    if (kMirrorSkipOutOfView && tracked && panes) {
         for (int pass = 0; pass < 2; ++pass) {
             float orientation[9];
             for (int row = 0; row < 3; ++row)

@@ -35,6 +35,27 @@ enum MonitorView : int {
     kMonitorBoth = 3,
 };
 
+// Two mirror fixes with no ini key, kept switchable for a hunt: rebuild with -D...=0.
+//
+// GPLVR_MIRROR_SKIP_OUT_OF_VIEW: leave out a mirror pane whose glass no eye that samples it can
+// see this frame (report 105 section 4.45, Stereo.cpp paneInView): the glass's bounding sphere
+// against a cone holding the eye's frustum plus 15 degrees. 0: every pane is rendered on every
+// mirror frame.
+//
+// GPLVR_MIRROR_COPY_REBIND: put unit 0's texture back after GPL's mirror copy-out. roglv2 binds
+// mirror.mip for the copy without telling its polygon drawer's texture cache, so the next polygon
+// whose texture the cache names is drawn with mirror.mip: a glass's background drawn right after
+// a baked pass showed the mirror images upside down (report 105 section 4.18.1). 0 leaves GPL's
+// binding. VR only: the thunk that does it is Hud.cpp's.
+#ifndef GPLVR_MIRROR_SKIP_OUT_OF_VIEW
+#define GPLVR_MIRROR_SKIP_OUT_OF_VIEW 1
+#endif
+#ifndef GPLVR_MIRROR_COPY_REBIND
+#define GPLVR_MIRROR_COPY_REBIND 1
+#endif
+constexpr bool kMirrorSkipOutOfView = GPLVR_MIRROR_SKIP_OUT_OF_VIEW != 0;
+constexpr bool kMirrorCopyRebind = GPLVR_MIRROR_COPY_REBIND != 0;
+
 struct Options {
     // STEREO IS WHAT `vr` MEANS. Each eye is rendered into one half of the frame -- two
     // cameras aimed at bitmapInstanceAlloc sub-rects, eyes half an IPD either side of the
@@ -61,17 +82,6 @@ struct Options {
     // mirror off is `mirrorUpdateInterval = 0`. Each pane after the first in a pass costs a
     // sceneRender whose main pass is skipped. VR only.
     int mirrorMode = kMirrorPerGlass;
-
-    // Leave out a mirror pane whose glass no eye that samples it can see this frame (report 105
-    // section 4.45, Stereo.cpp paneInView): the glass's bounding sphere against a cone holding
-    // the eye's frustum plus 15 degrees. 0: every pane is rendered on every mirror frame.
-    int mirrorSkipOutOfView = 1;
-
-    // Put unit 0's texture back after GPL's mirror copy-out. roglv2 binds mirror.mip for the copy
-    // without telling its polygon drawer's texture cache, so the next polygon whose texture the
-    // cache names is drawn with mirror.mip: a glass's background drawn right after a baked pass
-    // showed the mirror images upside down (report 105 section 4.18.1). 0 leaves GPL's binding.
-    bool mirrorCopyRebind = true;
 
     // Render the mirror on one frame in N, counting from the frame that latched the sim tick.
     //
@@ -269,9 +279,6 @@ struct Options {
     // submission work, on the work/wait line. 0 turns the attribution off and charges every
     // glDrawArrays to WORK.
     int profileStallUs = 50;
-
-    // The headset rate the work/wait headroom line measures the frame against.
-    int profileTargetHz = 90;
 
     // Break `post` of the flat frame line into the scene, GPL's 2D drawing entry point by entry
     // point and the present, on the CPU and with GPU timestamps, and say whether the frame is
@@ -692,12 +699,11 @@ struct Options {
     // found no view to render: a camera or driver switch, a cut). GPL draws the static over the
     // surface of the camera bound last -- on the replay screen the 3D view's, the window's size at
     // the frame's top left -- so published as a stereo pair it is noise in one eye over the
-    // previous picture.
-    //   0  published as before: as a pair, with no head pose
-    //   1  in a race, nothing is published and the headset keeps showing the last frame for the
-    //      first kNoSignalHoldMs of a spell of static, then the static fills both eyes as one
-    //      flat image filling the eye; on the replay screen it goes out that way at once
-    int vrNoSignal = 1;
+    // previous picture. Instead, in a race nothing is published and the headset keeps showing
+    // the last frame for the first vrNoSignalDelay ms of a spell of static, then the static
+    // fills both eyes as one flat image; 0 shows it that way at once. On the replay screen it
+    // always goes out at once.
+    int vrNoSignalDelay = 250;
 };
 
 extern Options g_options;
