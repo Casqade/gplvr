@@ -166,6 +166,12 @@ struct Options {
     int windowX = -1;
     int windowY = -1;
 
+    // Which monitor the window starts on. N is Windows' \\.\DISPLAYN (gplvr.log lists the
+    // monitors at startup); -1 leaves it where the game opens it. Either way it then follows
+    // the monitor it is on, so Win+Shift+Arrow moves it. A number that matches no monitor
+    // behaves as -1 and says so in the log.
+    int windowScreen = -1;
+
     // How the 640x480 front end is scaled up to the window.
     //
     //   0  whole-number scale, nearest-neighbour -- every source pixel becomes an exact

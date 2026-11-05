@@ -6,6 +6,7 @@
 #include "Pe.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -206,8 +207,69 @@ HMODULE rasterizerModule(const Binding& binding) {
     return nullptr;
 }
 
+// The N of a monitor's "\\.\DISPLAYN" device name, or 0 when it has none.
+int displayNumber(const char* device) {
+    const char prefix[] = "\\\\.\\DISPLAY";
+    size_t     length = sizeof(prefix) - 1;
+    if (std::strncmp(device, prefix, length) != 0) return 0;
+    return std::atoi(device + length);
+}
+
+struct MonitorSearch {
+    int      wanted = 0;
+    HMONITOR found = nullptr;
+    bool     list = false;
+};
+
+BOOL CALLBACK visitMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    auto&         search = *reinterpret_cast<MonitorSearch*>(data);
+    MONITORINFOEXA info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoA(monitor, &info)) return TRUE;
+    int number = displayNumber(info.szDevice);
+    if (search.list)
+        logf("window: monitor %s -- windowScreen = %d -- %ld,%ld %ldx%ld%s", info.szDevice,
+             number, info.rcMonitor.left, info.rcMonitor.top,
+             info.rcMonitor.right - info.rcMonitor.left,
+             info.rcMonitor.bottom - info.rcMonitor.top,
+             (info.dwFlags & MONITORINFOF_PRIMARY) ? ", primary" : "");
+    if (number == search.wanted && !search.found) search.found = monitor;
+    return TRUE;
+}
+
+// The monitor `windowScreen` names, or null to leave the window where it is. The list is
+// logged once, and a number that matches nothing is reported each time the answer changes.
+HMONITOR chosenMonitor() {
+    static bool listed = false;
+    static int  missing = 0;
+    MonitorSearch search;
+    search.wanted = g_options.windowScreen;
+    search.list = !listed;
+    listed = true;
+    if (search.wanted < 1 && !search.list) return nullptr;
+    EnumDisplayMonitors(nullptr, nullptr, &visitMonitor, reinterpret_cast<LPARAM>(&search));
+    if (search.wanted < 1) return nullptr;
+    if (!search.found && missing != search.wanted)
+        logf("window: windowScreen = %d matches no monitor -- the window stays on the one it "
+             "is on", search.wanted);
+    missing = search.found ? 0 : search.wanted;
+    return search.found;
+}
+
+// `windowScreen` is where the window STARTS. Until the window has reached that monitor it is
+// the target; from then on the window follows whichever monitor it is on, so Win+Shift+Arrow
+// still moves it.
+HMONITOR startMonitor(HWND window) {
+    static bool arrived = false;
+    if (arrived) return nullptr;
+    HMONITOR chosen = chosenMonitor();
+    if (!chosen || MonitorFromWindow(window, MONITOR_DEFAULTTONULL) == chosen) arrived = true;
+    return chosen;
+}
+
 bool monitorRect(HWND window, RECT& out) {
-    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR monitor = startMonitor(window);
+    if (!monitor) monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO info = {};
     info.cbSize = sizeof(info);
     if (!GetMonitorInfoA(monitor, &info)) return false;

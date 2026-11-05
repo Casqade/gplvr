@@ -2567,6 +2567,8 @@ void loadOptions(const char* fileName) {
     }
     g_options.windowX = GetPrivateProfileIntA("gplvr", "windowX", -1, path);
     g_options.windowY = GetPrivateProfileIntA("gplvr", "windowY", -1, path);
+    g_options.windowScreen = GetPrivateProfileIntA("gplvr", "windowScreen", -1, path);
+    if (g_options.windowScreen < 1) g_options.windowScreen = -1;
     g_options.renderWhenUnfocused =
         GetPrivateProfileIntA("gplvr", "renderWhenUnfocused", 0, path) != 0;
     g_options.menuFilter = GetPrivateProfileIntA("gplvr", "menuFilter", 2, path);
@@ -2825,10 +2827,11 @@ void loadOptions(const char* fileName) {
          g_options.vrMouseLook ? 1 : 0, g_options.vrMouseLookSensitivity,
          g_options.vrMouseLookInvertPitch ? 1 : 0, g_options.vrMouseLookKey);
     logf("options: vr=%d (from %s)", g_options.vr, path);
-    logf("options: window=%dx%d at %d,%d menuFilter=%d enableLetterbox=%d "
+    logf("options: window=%dx%d at %d,%d windowScreen=%d menuFilter=%d enableLetterbox=%d "
          "widescreenFix=%d renderWhenUnfocused=%d%s",
          g_options.windowWidth, g_options.windowHeight, g_options.windowX,
-         g_options.windowY, g_options.menuFilter, g_options.enableLetterbox ? 1 : 0,
+         g_options.windowY, g_options.windowScreen, g_options.menuFilter,
+         g_options.enableLetterbox ? 1 : 0,
          g_options.widescreenFix ? 1 : 0, g_options.renderWhenUnfocused ? 1 : 0,
          (!g_options.renderWhenUnfocused && g_options.vr) ? " (forced on by vr)" : "");
 
