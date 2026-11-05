@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Unload the track when a session cannot start because the replay system failed.
+
+  GPL loads the track first, then initializes replay system. If replay system fails to initialize (e.g. insufficient memory), the game shows an error and returns to the main menu without unloading the track. This patch fixes this crash-causing leak.
+
+  gpl_sessionStartLoadTrackAndReplay 0x451900 loads the track (gpl_sessionLoadTrackMarkLoaded
+  0x451230, which also sets the "a track is loaded" flag) and then sets up the replay buffer
+  (gpl_sessionReplayInitOrError 0x4512B0, message 20004 "could not initialize replay system").
+  When that fails, its error path (0x451A19) never unloads the track. Every retry loads it
+  again, and leaving to the main menu unloads it only once, because the unload in
+  gpl_bgLeaveSession 0x451390 is guarded by that one flag. The track's collision data is torn
+  down while the track itself stays cached, and the next load of it walks the torn-down data
+  and crashes at 0x467C5D.
+
+  The call at 0x45192C goes through a stub in modtext instead. When the replay setup fails, the
+  stub does what gpl_bgLeaveSession does for the track (gpl_sessionUnload 0x4A5930, the exact
+  inverse of gpl_sessionLoadTrack) and clears the flag, then returns the failure so GPL's own
+  error path runs as before.
+
+      0098C040  E8 6B52ACFF   call  gpl_sessionReplayInitOrError   ; 0x004512B0
+      0098C045  85 C0         test  eax, eax
+      0098C047  75 0F         jnz   done
+      0098C049  E8 E298B1FF   call  gpl_sessionUnload              ; 0x004A5930
+      0098C04E  A1 A1124500   mov   eax, [0x004512A1]
+      0098C053  C6 00 00      mov   byte ptr [eax], 0
+      0098C056  33 C0         xor   eax, eax
+      0098C058  C3            done: ret
+
+  The flag lives at 0x005FD4EC or 0x005FD4F4 depending on the link, inside the band GPLPatchDLL
+  shifts by 8. The stub does not name it: it reads the address out of GPL's own getter, whose
+  code (0x004512A0, `mov al, [flag]`) is the same in both links and carries that link's
+  address. Every address in this file is outside the shifted band, so one file serves both.
+
+  Stock bytes at 0x45192C, checked in gpl.exe and three gplc67.exe builds of both links:
+  E8 7F F9 FF FF. modtext 0x0098C040..0x0098C058 is untouched by the GEM+ option XMLs and by
+  gplvr-load.xml (0x0098C000..0x0098C023).
+-->
+<GPLPatch>
+
+   <ExeSection>
+      <Name>modtext</Name>
+      <MinimumFileSize>0x0000C060</MinimumFileSize>
+   </ExeSection>
+
+   <BinaryPatch>
+      <VirtualAddress>0x0098C040</VirtualAddress>
+      <Data>e86b52acff85c0750fe8e298b1ffa1a1124500c6000033c0c3</Data>
+   </BinaryPatch>
+
+   <BinaryPatch>
+      <VirtualAddress>0x0045192C</VirtualAddress>
+      <Data>e80fa75300</Data>
+   </BinaryPatch>
+
+</GPLPatch>
