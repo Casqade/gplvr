@@ -238,7 +238,7 @@ constexpr unsigned kPresenceFrames = 60;
 SampleFpsFn g_sampleFps = nullptr;
 bool        g_monitorRedirected = false;
 
-// pribludaUpdateRate counts frames, so this is the frame number the modulo is taken of.
+// pribludaUpdateInterval counts frames, so this is the frame number the modulo is taken of.
 unsigned g_panelFrame = 0;
 bool     g_reportedPanelRate = false;
 
@@ -986,7 +986,7 @@ void pribludaDrawHud() {
     int monitorHeight = *g_prib.screenHeight;
     if (monitorWidth <= 0 || monitorHeight <= 0) return;
 
-    // pribludaUpdateRate: ONE FRAME IN N, counted in frames rather than in hertz.
+    // pribludaUpdateInterval: ONE FRAME IN N, counted in frames rather than in hertz.
     //
     // It was a rate in redraws per second, which meant the panel's cadence and the frame's
     // drifted against each other and a redraw could land on any frame. Counting frames says
@@ -996,8 +996,8 @@ void pribludaDrawHud() {
     // pribluda is touched, so the headset and the monitor keep the last image and none of
     // the protections below come into play.
     ++g_panelFrame;
-    unsigned every = g_options.pribludaUpdateRate > 1
-                         ? static_cast<unsigned>(g_options.pribludaUpdateRate)
+    unsigned every = g_options.pribludaUpdateInterval > 1
+                         ? static_cast<unsigned>(g_options.pribludaUpdateInterval)
                          : 1u;
     if (every > 1 && (g_panelFrame % every) != 0) return;
 
@@ -1101,11 +1101,11 @@ void pribludaDrawHud() {
             g_reportedPanelRate = true;
             if (every > 1)
                 logf("pribluda: the HUD panel is redrawn on one frame in %u "
-                     "(pribludaUpdateRate); between redraws the last image stays up",
+                     "(pribludaUpdateInterval); between redraws the last image stays up",
                      every);
             else
                 logf("pribluda: the HUD panel is redrawn on every frame "
-                     "(pribludaUpdateRate = 1)");
+                     "(pribludaUpdateInterval = 1)");
         }
     }
 

@@ -356,150 +356,123 @@ bool g_pribludaOn = true;
 // In page order: the buttons above the strip, the tabs, then each tab's rows, top to bottom.
 MenuRow g_rows[] = {
     {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "write the settings on every tab to gplvr.ini, so they are what the game starts with next "
-     "time. The mirror aim and the pribluda layout are not here -- each tweak mode asks about "
-     "its own on the way out",
+     "save the tabs' settings to gplvr.ini (all but Pribluda HUD). Mirror aim and the Pribluda "
+     "layout and position are saved by their setup screens, which ask on the way out",
      kTabNone},
     {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "put things back to how they shipped -- it asks which. A stick click on any setting "
-     "resets that one alone",
+     "put things back to how they shipped -- choose VR settings, mirror aim, Pribluda layout "
+     "or all. To reset one setting, click the stick on it",
      kTabNone},
     {"Close", kRowAction, kCommandClose, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabNone},
 
     {"Headset", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "how it feels to sit in the car: recentre, world scale, horizon lock, gamma and the "
-     "head-tracked sound",
-     kTabHeadset},
+     "seat position, world size, horizon, brightness and sound", kTabHeadset},
     {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "what is in the car with you: the mirrors and pribluda's panel", kTabCockpit},
+     "the rear-view mirrors and the Pribluda overlay (lap times, tyres, dash readouts)",
+     kTabCockpit},
     {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "what a frame costs: the frame rate, the renderer, the render scale, and how often and "
-     "from where the mirrors and the panel are redrawn",
+     "frame rate, renderer, resolution, and how often the mirrors and the overlay are redrawn",
      kTabPerformance},
     {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "text and screens: GPL's own text, its menus in the headset, and the monitor window",
+     "the game's own messages and menus in the headset, and what the monitor shows",
      kTabDisplay},
 
     {"Recentre", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
-     "this pose becomes the seat -- also on a face button or a stick click at any time with "
-     "the menu closed, which is how to use it mid-lap",
+     "put the driver's seat where your head is now. With the menu closed, any face button or "
+     "a stick click does the same while driving",
      kTabHeadset},
     {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
-     0.5f, 2.0f, 0.02f, "metres per world unit; moves the eye separation with it", kTabHeadset},
+     0.5f, 2.0f, 0.02f,
+     "how big the world looks around you. Higher makes everything look bigger, lower "
+     "smaller",
+     kTabHeadset},
     {"Horizon lock", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrHorizonLock,
      0.0f, 1.0f, 0.05f,
-     "how much of the car's roll and pitch is taken out of the view. 0 rides with the car, "
-     "1 keeps the horizon level. Roll is the axis nobody can counteract with their own head, "
-     "so this is the comfort setting to reach for first",
+     "how much of the car's rolling and pitching is kept out of your view. 0 moves with the "
+     "car, 1 keeps the horizon level. Raise it if kerbs make you queasy",
      kTabHeadset},
     {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
-     2.0f, 0.05f, "lifts the mid-tones in the headset", kTabHeadset},
+     2.0f, 0.05f, "brightens shadows and mid-tones in the headset; 1.00 is the game's own",
+     kTabHeadset},
     {"Audio stereo width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
-     "how hard the cockpit's sound pans between your ears as you turn your head. 0 is GPL's own "
-     "gentle panning, 1 makes a car 30 degrees off to one side clearly louder in that ear, 2 is "
-     "close to hard left and right. Takes effect as you move it",
+     "how strongly sounds move between your ears as you turn your head. 0 is the game's own "
+     "gentle panning (still following your head), 2 is close to hard left and right",
      kTabHeadset, headAudioWidthAdjustable},
 
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "aim the rear-view glasses and set how wide they see", kTabCockpit},
+     "aim each rear-view mirror and set how much it shows, saved per car", kTabCockpit},
     {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
-     "off skips the HUD pass entirely -- the panel goes from the headset and the monitor, "
-     "and its cost goes with it. Runtime only: nothing is written and it is back on next "
-     "time the game starts",
+     "show or hide the Pribluda overlay, in the headset and on the monitor; hidden, it costs "
+     "nothing. Not saved: it is back on at the next start",
      kTabCockpit, pribludaRowOffered},
     {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "arrange the elements on pribluda's panel", kTabCockpit, pribludaRowOffered},
-    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "move the whole panel, and set how far away and how wide it hangs", kTabCockpit,
+     "pick single readouts on the Pribluda overlay to move, show or hide", kTabCockpit,
      pribludaRowOffered},
+    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "move the whole Pribluda overlay, and set how far away and how big it is. Edits the "
+     "placement for the current mode, head-locked or in the car",
+     kTabCockpit, pribludaRowOffered},
     // vrHudLayer 1 is head-locked and 2 is seat-locked, so ON is 1 here: `low` is the value
     // the label is true for.
     {"Head-locked Pribluda", kRowToggleInt, kCommandNone, nullptr, &g_options.vrHudLayer,
      nullptr, 1, 2, 1,
-     "on, the panel stays in front of you wherever you look; off, it is fixed to the seat "
-     "and you look down at it",
+     "on: the overlay stays in front of you wherever you look. Off: it stays put in the car, "
+     "like a dashboard",
      kTabCockpit, pribludaRowOffered},
-    {"Pribluda opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+    {"Pribluda backdrop", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
-     "how much of the world the panel's boxes hide. 0 is clear glass, 1 is solid",
+     "how dark the boxes behind the overlay's text are. 0 is invisible, 1 is solid black",
      kTabCockpit, pribludaRowOffered},
 
     {"Frame rate", kRowNamedInt, kCommandNone, nullptr, &g_options.frameRate, nullptr, 0,
      2, 1,
-     "how often the game draws a picture. Vanilla is one per physics step -- the sim's 36, "
-     "unblended, as GPL ships. Display is one per screen refresh: the headset's here, the "
-     "monitor's in flat mode. Unlimited is as fast as the machine manages. The last two "
-     "blend the world between ticks, which is what makes the extra frames new pictures "
-     "instead of copies, and costs one tick of latency. Vsync follows this and is not a "
-     "separate setting",
+     "how often a picture is drawn. vanilla: once per physics step, like the original game. "
+     "display: once per headset refresh, smoothed between steps. unlimited: as fast as possible",
      kTabPerformance},
     {"Renderer", kRowNamedInt, kCommandNone, nullptr, &g_options.vrRendererType, nullptr, 0, 2,
      1,
-     "who draws the world. Vanilla is GPL's own renderer, as it ships. GPL VR is gplvr's: the "
-     "track, the other cars, the flagmen, your cockpit and the mirrors drawn with real depth "
-     "and less CPU time, anything it cannot draw left to GPL. GPL VR (debug) is the same with a "
-     "red square in the corner of every view it drew. Takes effect on the next frame; the first "
-     "switch away from Vanilla in a session prepares the track for a few seconds while GPL "
-     "draws it",
+     "who draws the world in the headset. Vanilla: the game itself. GPL VR: this mod, using "
+     "less CPU. GPL VR (debug): the same, with a red square on every image it drew",
      kTabPerformance},
     {"Render scale", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrRenderScale, 0.5f, 2.0f, 0.05f,
-     "NOTE: NEEDS A RESTART. Multiplies the runtime's recommended per-eye size, clamped to "
-     "the maximum it reports. The presenter is given this on its command line when it "
-     "starts, so changing it here does nothing until you Save settings and restart the game",
+     "NEEDS A RESTART: Save settings, then restart the game. Multiplies the resolution the "
+     "headset asks for; lower is faster and blurrier",
      kTabPerformance},
-    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateRate,
+    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateInterval,
      nullptr, 0, 4, 1,
-     "render the mirror on one frame in N and keep the last image on the rest -- the "
-     "reflection only changes at the sim's rate anyway. Off goes further: nothing renders "
-     "it and the glasses are filled with black",
+     "redraw the mirrors on one frame in N, showing the last image in between. Off turns the "
+     "mirrors black",
      kTabPerformance},
     {"Mirrors", kRowNamedInt, kCommandNone, nullptr, &g_options.mirrorMode, nullptr,
      kMirrorSharedHeadCentre, kMirrorPerGlass, 1,
-     "how the mirror is rendered, cheapest on the left. Shared, flat renders one view astern "
-     "that every glass shows its part of, once from the head centre for both eyes: one "
-     "render, but the reflection has no depth and sits on the glass. Shared renders that view "
-     "from each eye, so it has depth like the rest of the frame: two renders whatever the car "
-     "has, each glass a little softer. Per glass renders each glass on its own from each eye: "
-     "the sharpest, two renders per glass every frame. Mirror setup aims each glass in all "
-     "three",
+     "how mirrors are drawn, cheapest first. flat: one image for all mirrors and both eyes, no "
+     "depth. shared: one per eye, with depth. per mirror: each mirror per eye, sharpest",
      kTabPerformance},
     {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
-     &g_options.pribludaUpdateRate, nullptr, 1, 4, 1,
-     "redraw the panel on one frame in N. The last image stays up in between, so a lower "
-     "rate costs nothing but the age of the numbers. No off here -- that is the Pribluda "
-     "HUD row on the Cockpit tab",
+     &g_options.pribludaUpdateInterval, nullptr, 1, 4, 1,
+     "redraw the Pribluda overlay on one frame in N, showing the last image in between. Its "
+     "numbers change only a few times a second, so 1/2 looks the same",
      kTabPerformance, pribludaRowOffered},
 
     {"GPL text size", kRowChoiceInt, kCommandNone, nullptr, &g_options.vrGplTextScale, nullptr,
      1, 4, 1,
-     "how much bigger GPL's own text is drawn -- the pause prompt, the F1 help line, \"car "
-     "must be stopped\". Not its fps counter, which GPL draws onto the window and the headset "
-     "never sees. Whole steps, because the letters are tiny bitmaps and 2 makes each dot a 2x2 "
-     "block while a half step would come out ragged",
+     "how big the game's own messages are, like the pause prompt and \"car must be stopped\". "
+     "Whole steps keep the pixel font sharp",
      kTabDisplay},
-    {"GPL text inset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrGplTextInset, 0.1f, 1.0f, 0.05f,
-     "how much of GPL's own distance from the middle survives. 1.00 keeps it at the size GPL "
-     "authored, which is already about 10% in from the edge because your eye sees more than "
-     "the monitor layout it was drawn for; 0.40 brings a corner line most of the way in. It "
-     "moves the line and not the letters in it, so the spacing stays GPL's, and a line that "
-     "would land on the one above it is moved down until it clears. Turn it down as you turn "
-     "the size up -- a line too big to fit in one eye is dropped rather than spilling into "
-     "the other",
+    {"GPL text spread", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrGplTextSpread, 0.1f, 1.0f, 0.05f,
+     "how far out toward the edges the game's messages sit. 1.00 is the game's layout; lower "
+     "is nearer the middle, where big text still fits",
      kTabDisplay},
     {"Menu size in headset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrMenuScale, 0.05f, 1.0f, 0.05f,
-     "how much of the view the game's own menus cover. They are flat images with no world "
-     "behind them, so at 1.00 they fill the whole view a few centimetres from your face. "
-     "Takes effect as you move it",
-     kTabDisplay},
+     "how much of your view the game's own menus cover; at 1.00 they fill it", kTabDisplay},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
      kMonitorOff, kMonitorBoth, 1,
-     "what the game window on the monitor shows: off, the left or the right eye, or both eyes "
-     "side by side. Off leaves the window black and saves the copy into it. The headset is "
-     "unaffected",
+     "what the monitor shows while you are in the headset: nothing, one eye, or both. Off "
+     "saves a little work",
      kTabDisplay},
 };
 
@@ -1323,8 +1296,8 @@ const char* namedValue(const MenuRow& row) {
     if (row.intValue == &g_options.mirrorMode) {
         switch (*row.intValue) {
             case kMirrorShared: return "shared";
-            case kMirrorSharedHeadCentre: return "shared, flat";
-            default: return "per glass";
+            case kMirrorSharedHeadCentre: return "flat";
+            default: return "per mirror";
         }
     }
     if (row.intValue == &g_options.vrRendererType) {
@@ -1638,16 +1611,16 @@ void saveSettings() {
     // above without a line here saves silently as nothing, which is the one way this can go
     // quietly wrong -- so they are kept in the same order to make the omission visible.
     writeInt("vrHudLayer", g_options.vrHudLayer);
-    writeInt("mirrorUpdateRate", g_options.mirrorUpdateRate);
+    writeInt("mirrorUpdateInterval", g_options.mirrorUpdateInterval);
     writeInt("mirrorMode", g_options.mirrorMode);
     writeInt("frameRate", g_options.frameRate);
     writeInt("vrRendererType", g_options.vrRendererType);
-    writeInt("pribludaUpdateRate", g_options.pribludaUpdateRate);
+    writeInt("pribludaUpdateInterval", g_options.pribludaUpdateInterval);
     writeFloat("vrRenderScale", g_options.vrRenderScale);
     writeFloat("vrMenuScale", g_options.vrMenuScale);
     writeFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
     writeInt("vrGplTextScale", g_options.vrGplTextScale);
-    writeFloat("vrGplTextInset", g_options.vrGplTextInset);
+    writeFloat("vrGplTextSpread", g_options.vrGplTextSpread);
     writeFloat("vrGamma", g_options.vrGamma);
     writeFloat("vrHorizonLock", g_options.vrHorizonLock);
     writeFloat("vrWorldScale", g_options.vrWorldScale);
@@ -1662,15 +1635,15 @@ void saveSettings() {
         return;
     }
     notice("saved to gplvr.ini");
-    logf("vr menu: saved to %s -- vrHudLayer=%d mirrorUpdateRate=%d mirrorMode=%d "
-         "frameRate=%d vrRendererType=%d pribludaUpdateRate=%d "
+    logf("vr menu: saved to %s -- vrHudLayer=%d mirrorUpdateInterval=%d mirrorMode=%d "
+         "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
-         "vrGplTextInset=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
+         "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
          "vrHeadAudioWidth=%.3f vrMonitorEye=%d",
-         path, g_options.vrHudLayer, g_options.mirrorUpdateRate, g_options.mirrorMode,
+         path, g_options.vrHudLayer, g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
-         g_options.pribludaUpdateRate, g_options.vrRenderScale, g_options.vrMenuScale,
-         g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextInset,
+         g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrMenuScale,
+         g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextSpread,
          g_options.vrGamma, g_options.vrHorizonLock, g_options.vrWorldScale,
          g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
 }
@@ -2866,7 +2839,7 @@ const char* actionEffect(int command) {
         case kCommandMirrorTweak: return "open Mirror setup";
         case kCommandHudTweak: return "open Pribluda setup";
         case kCommandPanelTweak: return "open Pribluda position";
-        case kCommandSaveSettings: return "write the settings to gplvr.ini";
+        case kCommandSaveSettings: return "save to gplvr.ini";
         case kCommandResetSettings: return "choose what to reset";
         default: return "select it";
     }
@@ -2969,42 +2942,38 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
         if (!grip[0]) grip = "Grip";
 
         // Every part is "control: effect", and the effect names what it acts on. The line sits
-        // under the row's own help, so a bare "does it" read as belonging to that text.
+        // under the row's own help, so a bare "does it" read as belonging to that text. It
+        // has to stay on one line: the footer reserves kHelpLines for the help AND this.
         const MenuRow& item = g_rows[g_state.hovered];
         char           how[kHelpLineChars * 2] = {};
         switch (item.kind) {
             case kRowAction:
-                _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s on it, or %s click: %s   |   %s: move the highlight   |   %s: "
-                            "close the menu",
-                            trigger, stick, actionEffect(item.command), stick, grip);
+                if (item.command == kCommandClose)
+                    _snprintf_s(how, sizeof(how), _TRUNCATE, "%s, %s click or %s: close the menu",
+                                trigger, stick, grip);
+                else
+                    _snprintf_s(how, sizeof(how), _TRUNCATE,
+                                "%s or %s click: %s  |  %s: close menu", trigger, stick,
+                                actionEffect(item.command), grip);
                 break;
             case kRowTab:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s on it, or %s click: open the %s tab   |   %s left/right: walk "
-                            "the tabs   |   %s: close the menu",
-                            trigger, stick, item.label, stick, grip);
+                            "%s: open tab  |  %s left/right: other tabs  |  %s: close menu",
+                            trigger, stick, grip);
                 break;
             case kRowToggleBool:
             case kRowToggleInt:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s on it, or %s left/right: turn %s on or off   |   %s click: "
-                            "back to default   |   %s: close the menu",
-                            trigger, stick, item.label, stick, grip);
+                            "%s or %s left/right: on/off  |  %s click: default", trigger, stick,
+                            stick);
                 break;
             case kRowChoiceInt:
             case kRowRateInt:
             case kRowNamedInt:
-                _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s left/right: step %s through its values   |   hold %s on the "
-                            "bar and slide: set it directly   |   %s: close the menu",
-                            stick, item.label, trigger, grip);
-                break;
             case kRowSliderFloat:
                 _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s left/right: slide %s   |   hold %s on the bar and drag: set it "
-                            "directly   |   %s: close the menu",
-                            stick, item.label, trigger, grip);
+                            "%s left/right or %s on the bar: change  |  %s click: default", stick,
+                            trigger, stick);
                 break;
             default: break;
         }
@@ -3028,13 +2997,12 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
         wrapInto(block, slot, width, text);
     }
 
-    // How to leave, and what leaving does NOT do. The grip is shared: a tap goes back, a hold
-    // is whatever this mode's table above uses it for, so the two are named apart.
+    // How to leave, and what leaving does. The grip is shared: a tap goes back, a hold is
+    // whatever this mode's table above uses it for, so the two are named apart.
     const char* grip = boundName(kInputSqueeze);
     char        back[kHelpLineChars * 2] = {};
     _snprintf_s(back, sizeof(back), _TRUNCATE,
-                "a TAP of %s goes back to the menu and saves NOTHING -- the menu's Save rows "
-                "write the file",
+                "a TAP of %s goes back to the menu; if anything changed, it asks whether to save",
                 grip[0] ? grip : "the grip");
     wrapInto(block, slot, width, back);
 }

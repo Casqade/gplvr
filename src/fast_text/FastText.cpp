@@ -1038,7 +1038,7 @@ void separateRuns() {
     if (layoutWidth <= 0 || layoutHeight <= 0) return;
 
     float scale = static_cast<float>(g_options.vrGplTextScale);
-    float inset = g_options.vrGplTextInset;
+    float inset = g_options.vrGplTextSpread;
     // A clear row between stacked lines, at the glyphs' own scale.
     float gap = scale;
 
@@ -1100,12 +1100,12 @@ void separateRuns() {
     }
 }
 
-// Horizontal disparity in pixels for `vrHudDepth` metres, or 0 for infinity. The same
+// Horizontal disparity in pixels for `vrGplTextDepth` metres, or 0 for infinity. The same
 // derivation Hud.cpp uses -- Z = f * IPD / d with f the eye's focal length in pixels -- so the
 // two paths cannot disagree about what a depth means. The separation is the runtime's, not a
 // constant: without a tracked frame there is none to use and the two copies are identical.
 int disparityPixels(int eyeWidth) {
-    if (g_options.vrHudDepth <= 0.0f || eyeWidth <= 0) return 0;
+    if (g_options.vrGplTextDepth <= 0.0f || eyeWidth <= 0) return 0;
 
     float fov = 0.0f;
     float separation = 0.0f;
@@ -1115,7 +1115,7 @@ int disparityPixels(int eyeWidth) {
     if (halfAngle <= 0.0f || halfAngle >= 1.5f) return 0;
 
     float focal = (static_cast<float>(eyeWidth) * 0.5f) / std::tan(halfAngle);
-    float pixels = focal * separation / g_options.vrHudDepth;
+    float pixels = focal * separation / g_options.vrGplTextDepth;
     float ceiling = static_cast<float>(eyeWidth) * 0.05f;
     if (pixels > ceiling) pixels = ceiling;
     return static_cast<int>(pixels + 0.5f);
@@ -1204,7 +1204,7 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
     float anchorY = static_cast<float>(baseY);
 
     float scale = static_cast<float>(g_options.vrGplTextScale);
-    float inset = g_options.vrGplTextInset;
+    float inset = g_options.vrGplTextSpread;
 
     // GPL'S OWN PIXELS, PULLED TOWARD THE MIDDLE. This was a fraction of the layout re-read as
     // the same fraction of the eye, and the two rects are not the same shape: the eye measured
@@ -1271,7 +1271,7 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
             --s.placeReports;
             logf("fast text: a glyph of set %d at GPL (%d,%d) %dx%d landed outside both eye "
                  "rects at scale %d and inset %.2f -- %u glyphs have landed outside this "
-                 "second. Lower vrGplTextScale or raise vrGplTextInset.",
+                 "second. Lower vrGplTextScale or raise vrGplTextSpread.",
                  set, ax, ay, width, height, g_options.vrGplTextScale,
                  static_cast<double>(inset), s.window.placeOutsideEye);
         }
@@ -1283,14 +1283,14 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
         --s.placeReports;
         logf("fast text: GPL's stamped text is placed in the eyes -- set %d at GPL (%d,%d) on a "
              "%dx%d layout became (%.0f,%.0f) in a %dx%d eye at scale %d, inset %.2f, %d px of "
-             "convergent disparity for vrHudDepth = %.2f. The run's anchor came from %s.",
+             "convergent disparity for vrGplTextDepth = %.2f. The run's anchor came from %s.",
              set, ax, baseY, layoutWidth, layoutHeight,
              static_cast<double>(static_cast<float>(rect[0][0]) +
                                  0.5f * static_cast<float>(rect[0][2]) + placedX),
              static_cast<double>(static_cast<float>(rect[0][1]) +
                                  0.5f * static_cast<float>(rect[0][3]) + placedY),
              rect[0][2], rect[0][3], g_options.vrGplTextScale, static_cast<double>(inset),
-             disparity, static_cast<double>(g_options.vrHudDepth),
+             disparity, static_cast<double>(g_options.vrGplTextDepth),
              run->known ? "the previous frame's extent" : "this glyph alone, for one frame");
     }
     return true;
@@ -1743,7 +1743,7 @@ bool tryInstall(bool loud) {
              "holds bitmapDraw for the mirror panes' copy offset. The batch is flushed from "
              "Hud.cpp's own thunks instead, so the ordering contract is unchanged: anything "
              "GPL draws after a run of text still lands over it. GPL's stamped glyphs are "
-             "drawn from a GPU atlas, once per eye, at vrGplTextScale and vrGplTextInset.",
+             "drawn from a GPU atlas, once per eye, at vrGplTextScale and vrGplTextSpread.",
              reinterpret_cast<void*>(s.slot[kRasterStampDraw]));
     } else {
         logf("fast text: installed on all seven 2D globals (stampDraw at %p). GPL's stamped "
@@ -1913,7 +1913,7 @@ void fastTextReport() {
          s.drawStats.uploadTicks * perFrame);
     // THE PLACEMENT'S OWN LINE, and only in VR, because in flat mode every term below is
     // structurally zero and a line of zeroes is a line nobody reads. `placed` is the number
-    // that says whether vrGplTextScale and vrGplTextInset reached anything at all: zero with a
+    // that says whether vrGplTextScale and vrGplTextSpread reached anything at all: zero with a
     // non-zero `drawn` means every glyph went where GPL put it, and one of the refusals says
     // which term decided that.
     if (s.vrPlacement) {
@@ -1924,7 +1924,7 @@ void fastTextReport() {
              "glyphs placed from their own position because the run was new, %u run sightings "
              "past the %d-entry table",
              static_cast<double>(c.placedPairs) / c.frames, g_options.vrGplTextScale,
-             static_cast<double>(g_options.vrGplTextInset), s.runCount, s.runsPushed,
+             static_cast<double>(g_options.vrGplTextSpread), s.runCount, s.runsPushed,
              c.placeFrontEnd,
              c.placeNoEyeRects, c.placeNoLayout, c.placeOffLayout, c.placeOutsideEye,
              c.placeFirstSight, c.placeRunTableFull, kMaxPlacedRuns);

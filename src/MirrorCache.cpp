@@ -40,7 +40,7 @@ void refuse(const char* why) {
     g_state.refusal = why;
     g_state.engaged = false;
     g_state.held[0] = g_state.held[1] = false;
-    logf("mirror: no per-eye copy of mirror.mip -- %s. mirrorUpdateRate does nothing while "
+    logf("mirror: no per-eye copy of mirror.mip -- %s. mirrorUpdateInterval does nothing while "
          "per-eye mirrors on, because a skipped frame would leave the left eye looking at the "
          "right eye's reflection.",
          why);
@@ -182,7 +182,7 @@ bool ensure(State& s) {
     s.refusal = nullptr;
     s.engaged = true;
     logf("mirror: each eye keeps its own copy of mirror.mip -- handle %d is %dx%d, format "
-         "0x%04X, GL texture %u, copied to %u and %u. mirrorUpdateRate now works with "
+         "0x%04X, GL texture %u, copied to %u and %u. mirrorUpdateInterval now works with "
          "per-eye mirrors on.",
          s.bitmapHandle, s.width, s.height, static_cast<unsigned>(internalFormat), name,
          s.eye[0], s.eye[1]);

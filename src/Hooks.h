@@ -58,7 +58,7 @@ struct Options {
     //
     // A pane per glass from the head centre (perEyeMirror = 0 until 2026-11-03) is not a mode: it
     // costs more renders than kMirrorSharedHeadCentre for the same flat reflection. Turning the
-    // mirror off is `mirrorUpdateRate = 0`. Each pane after the first in a pass costs a
+    // mirror off is `mirrorUpdateInterval = 0`. Each pane after the first in a pass costs a
     // sceneRender whose main pass is skipped. VR only.
     int mirrorMode = kMirrorPerGlass;
 
@@ -96,7 +96,7 @@ struct Options {
     // right eye's reflection and flickering between the two. The copies are built on the first
     // frame that renders the mirror; if anything refuses them the log says what, and every
     // frame renders as it did before.
-    int mirrorUpdateRate = 1;
+    int mirrorUpdateInterval = 1;
 
     // THE MIRROR AIM LIVES IN gplvr_mirrors.ini AND NOWHERE ELSE. vrMirrorYaw, vrMirrorPitch and
     // vrMirrorFovScale were options here until 2026-09-27, holding a fallback for cars with no
@@ -403,11 +403,10 @@ struct Options {
     // translation, and it survives every test about angles because it is about
     // distance.
     //
-    // It multiplies the eye separation and the head translation together, which is
-    // what "world scale" means in VR. Above 1.0 the world looks SMALLER (your head
-    // moves further through it, your eyes are further apart relative to it); below
-    // 1.0 it looks larger. 1.0 asserts that one GPL unit is one metre, which is an
-    // assumption nothing has yet verified.
+    // The world's size relative to the driver. The eye separation and the head translation
+    // are DIVIDED by it together, so above 1.0 the world looks BIGGER (your head moves less
+    // through it, your eyes are closer together relative to it) and below 1.0 smaller. 1.0
+    // asserts that one GPL unit is one metre, which is an assumption nothing has yet verified.
     float vrWorldScale = 1.0f;
 
     // How much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
@@ -434,11 +433,11 @@ struct Options {
     // length, so the answer is right for the person wearing the headset rather than for
     // an assumed 63 mm. Without a tracked frame there is no separation to use, and the
     // two copies stay identical.
-    float vrHudDepth = 0.0f;
+    float vrGplTextDepth = 0.0f;
 
     // `vrHudInset` was here until 2026-11-03: it pulled the per-eye re-issue's positions toward
     // the eye's centre, and since GPL's text went to the fast text path that re-issue places
-    // nothing visible in the headset. vrGplTextInset below is the inset that reaches the text.
+    // nothing visible in the headset. vrGplTextSpread below is the inset that reaches the text.
 
     // THE MIRROR GLASSES ARE NOT AN OPTION. They are read out of the car the game loaded
     // (MirrorGeometry.h), each is given a region of mirror.mip of its own by moving its UVs
@@ -489,16 +488,16 @@ struct Options {
     // How fast the arrows move an element in tweak mode, in fractions of the panel per second.
     float vrHudTweakSpeed = 0.10f;
 
-    // ONE FRAME IN N, exactly as mirrorUpdateRate above, and shown the same way in the menu:
+    // ONE FRAME IN N, exactly as mirrorUpdateInterval above, and shown the same way in the menu:
     // 1, 1/2, 1/3. Between redraws the headset and the monitor keep the last image, so a
     // lower rate costs nothing but the age of the numbers -- and pribluda's text changes a
     // few times a second at most, so 1/2 loses nothing at 90 fps and halves the panel's cost.
     //
     // No 0 here, unlike the mirror: turning the HUD off is its own thing, and it is the
     // menu's "Pribluda HUD" row, which skips the whole pass rather than freezing it.
-    int pribludaUpdateRate = 2;
+    int pribludaUpdateInterval = 2;
 
-    // GPL's OWN in-race text goes into BOTH eyes, at the disparity vrHudDepth asks for. It
+    // GPL's OWN in-race text goes into BOTH eyes, at the disparity vrGplTextDepth asks for. It
     // was `vrHudEye`, which could put it in one eye only; that is not something to configure
     // once the depth is right, and the text is being rerouted onto a layer of its own anyway.
 
@@ -511,7 +510,7 @@ struct Options {
     //
     // In VR the fast text path takes the stampDraw global, reads each glyph out of roglv2's own
     // font data and draws it from a GPU atlas as a quad of its own. A quad has a size and a
-    // position we choose, so vrGplTextScale and vrGplTextInset below are possible -- and a quad
+    // position we choose, so vrGplTextScale and vrGplTextSpread below are possible -- and a quad
     // goes through the same transform the raster position did, so at scale 1 and inset 1 it
     // lands on the pixels roglv2 would have written. In flat mode the same path installs because
     // it is faster (103 us a glyph becomes one batched draw) and GPL's layout is left alone.
@@ -554,7 +553,7 @@ struct Options {
     // centred as a line.
     //
     // VR only.
-    float vrGplTextInset = 1.0f;
+    float vrGplTextSpread = 1.0f;
 
     // `vrPredictPosition` was here and is gone as of 2026-10-05: it moved each eye to where it
     // would be when the frame was displayed, and measured `mean eye shift 0.00 mm` in 189
@@ -741,6 +740,11 @@ void mirrorTweakExit(const char* why, bool save);
 // while it does: the headset's mirror mode edits the same three numbers, and two owners of
 // one aim is how a value ends up somewhere neither of them put it.
 bool mirrorTweakActive();
+
+// True while a keyboard tweak mode is on and steers with `virtualKey` (mirror: arrows, Page
+// Up/Down, Home; HUD: arrows, Page Up/Down). The mode owns that key: no hotkey bound to it
+// fires until the mode is left.
+bool hotkeyOwnedByMode(unsigned virtualKey);
 
 // Replaces the screenDisplay function pointer. That pointer is a plain writable
 // global, so this is a single store -- no code patching involved.

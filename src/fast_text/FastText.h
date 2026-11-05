@@ -36,11 +36,11 @@
 //
 // The unit that moves is a RUN, not the surface and not a glyph. Scaling the surface would drive
 // a corner-anchored notice further out; scaling a run about its own centre and then moving that
-// centre keeps the spacing GPL authored inside the line. vrGplTextScale and vrGplTextInset are
+// centre keeps the spacing GPL authored inside the line. vrGplTextScale and vrGplTextSpread are
 // the two knobs.
 //
 // NEITHER KNOB AT ITS DEFAULT MAKES THIS A NO-OP. Placement alone is already the whole fix:
-// the same glyph is drawn into BOTH eye rects at vrHudDepth's disparity, where roglv2 left one
+// the same glyph is drawn into BOTH eye rects at vrGplTextDepth's disparity, where roglv2 left one
 // copy in the left eye's periphery at infinity. Scale 1 keeps the glyph the size GPL authored
 // and inset 1.0 keeps its distance from the middle at the size GPL authored, so the defaults
 // change neither -- but the eye it lands in, and the depth, do change.

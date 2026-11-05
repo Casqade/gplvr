@@ -264,7 +264,7 @@ int remapAnchor(int x, int fullWidth) {
     return x;
 }
 
-// Horizontal disparity in pixels for `vrHudDepth` metres, or 0 for infinity.
+// Horizontal disparity in pixels for `vrGplTextDepth` metres, or 0 for infinity.
 //
 // The left eye's copy goes RIGHT of centre and the right eye's LEFT of centre, which is
 // convergent and pulls the HUD towards the viewer. With f the eye's focal length in
@@ -275,7 +275,7 @@ int remapAnchor(int x, int fullWidth) {
 // there is no separation to use and no headset to be uncomfortable in, so the disparity
 // is zero and the two copies are identical.
 int disparityPixels(int eyeWidth) {
-    if (g_options.vrHudDepth <= 0.0f) return 0;
+    if (g_options.vrGplTextDepth <= 0.0f) return 0;
 
     float fov = 0.0f;
     float separation = 0.0f;
@@ -285,7 +285,7 @@ int disparityPixels(int eyeWidth) {
     if (halfAngle <= 0.0f || halfAngle >= 1.5f) return 0;
 
     float focal = (static_cast<float>(eyeWidth) * 0.5f) / std::tan(halfAngle);
-    float pixels = focal * separation / g_options.vrHudDepth;
+    float pixels = focal * separation / g_options.vrGplTextDepth;
 
     // A disparity wider than the item it separates is not a depth, it is two HUDs. The
     // ceiling is a twentieth of the eye, which at any sane depth is never reached.
@@ -355,9 +355,9 @@ void emit(const Call& call) {
     if (disparity != g_lastDisparity && g_reports > 0) {
         --g_reports;
         g_lastDisparity = disparity;
-        logf("hud: drawn once per eye -- %d px of convergent disparity for vrHudDepth = "
+        logf("hud: drawn once per eye -- %d px of convergent disparity for vrGplTextDepth = "
              "%.2f, eye %dx%d out of a %d-wide surface%s",
-             disparity, g_options.vrHudDepth, rect[0][2], rect[0][3], fullWidth,
+             disparity, g_options.vrGplTextDepth, rect[0][2], rect[0][3], fullWidth,
              disparity ? "" : " (at infinity)");
     }
 
@@ -794,7 +794,7 @@ void hudBind(const Binding& binding) {
 
     logf("hud: stampDraw is NOT thunked here -- the fast text path owns that global and draws "
          "GPL's glyphs from its own atlas, once per eye, where vrGplTextScale and "
-         "vrGplTextInset put them; the `fast text:` lines carry its census. The other thunks "
+         "vrGplTextSpread put them; the `fast text:` lines carry its census. The other thunks "
          "here flush that path's pending batch before they draw, which is the ordering the six "
          "globals it gives up were holding.");
 

@@ -17,7 +17,7 @@
 // the back buffer's corner in flat mode, MirrorTarget's framebuffer in VR -- through the private
 // target and its own depth, which the residual program tests GPL's leftovers against in the flush
 // bitmapDraw makes. mirror.mip is never touched: the copy-out reads the rectangle as before, so
-// the per-glass regions, the per-eye copies and mirrorUpdateRate work as they did.
+// the per-glass regions, the per-eye copies and mirrorUpdateInterval work as they did.
 //
 // Mirror detail 0 has no walk (a sorted loop calls the cars, 0x487BC2): nothing of it is baked.
 

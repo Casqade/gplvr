@@ -571,22 +571,22 @@ const TweakBinding kMirrorBindings[] = {
     // stick away to magnify is the direction every other zoom control in the world uses.
     {TweakTarget::Mirror, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Trigger, TweakAxis::Fov, TweakAction::None, TweakMode::Rate, -1.0f,
-     "trigger held: stick forward zooms the glasses in, back zooms them out"},
+     "trigger held: stick forward zooms the mirror in, back zooms it out"},
     {TweakTarget::Mirror, TweakInputAxis::StickX, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Yaw, TweakAction::None, TweakMode::Rate, 1.0f,
-     "stick left and right turns the glasses"},
+     "stick left and right turns the mirror"},
     {TweakTarget::Mirror, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Pitch, TweakAction::None, TweakMode::Rate, 1.0f,
-     "stick forward and back tilts the glasses"},
+     "stick forward and back tilts the mirror"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::StickClick,
      TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
-     "stick click puts the selected glass -- or all of them -- back to straight and 1x"},
+     "stick click: the selected mirror (or all of them) back to straight and unzoomed"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Primary,
      TweakInputButton::None, TweakAxis::None, TweakAction::SelectNext, TweakMode::Absolute,
-     1.0f, "the primary face button steps to the next glass: all, then each one in turn"},
+     1.0f, "A or X: next mirror -- all of them together, then each one in turn"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Secondary,
      TweakInputButton::None, TweakAxis::None, TweakAction::SelectPrevious, TweakMode::Absolute,
-     1.0f, "the secondary face button steps back a glass"},
+     1.0f, "B or Y: previous mirror"},
 };
 
 const TweakBinding kHudElementBindings[] = {
@@ -594,59 +594,63 @@ const TweakBinding kHudElementBindings[] = {
     // unmodified pointer rows below never fire while it is down.
     {TweakTarget::HudElement, TweakInputAxis::PointerU, TweakInputButton::None,
      TweakInputButton::Squeeze, TweakAxis::X, TweakAction::None, TweakMode::Absolute, 1.0f,
-     "HOLD the grip and the pointer drags the selected element (a tap goes back instead)"},
+     "HOLD the grip: the controller's pointer drags the selected readout (a tap goes back "
+     "instead)"},
     {TweakTarget::HudElement, TweakInputAxis::PointerV, TweakInputButton::None,
      TweakInputButton::Squeeze, TweakAxis::Y, TweakAction::None, TweakMode::Absolute, 1.0f,
-     "HOLD the grip and the pointer drags the selected element (a tap goes back instead)"},
+     "HOLD the grip: the controller's pointer drags the selected readout (a tap goes back "
+     "instead)"},
     // The dash's size, and this is one of the two bindings left open. It shares the
     // trigger with Select below, so pressing the trigger to start sizing also selects
     // whatever the pointer happened to be over -- harmless, because selecting changes
     // nothing, but it is the reason this row is marked undecided rather than settled.
     {TweakTarget::HudElement, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Trigger, TweakAxis::Size, TweakAction::None, TweakMode::Rate, 1.0f,
-     "UNDECIDED -- trigger held: stick forward and back sizes the dash"},
+     "UNDECIDED -- trigger held: stick forward and back widens and narrows the dash readout "
+     "(the only one that resizes)"},
     {TweakTarget::HudElement, TweakInputAxis::StickX, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::X, TweakAction::None, TweakMode::Rate, 1.0f,
-     "stick left and right moves the selected element"},
+     "stick left and right moves the selected readout"},
+    // Scale is negative because the panel's y counts down from its top edge.
     {TweakTarget::HudElement, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Y, TweakAction::None, TweakMode::Rate, -1.0f,
-     "stick forward and back moves the selected element -- inverted, because the panel's "
-     "y counts DOWN from its top edge"},
+     "stick forward moves the selected readout up, back moves it down"},
     {TweakTarget::HudElement, TweakInputAxis::None, TweakInputButton::Trigger,
      TweakInputButton::None, TweakAxis::None, TweakAction::Select, TweakMode::Absolute,
-     1.0f, "the trigger picks up whatever the pointer is over"},
+     1.0f, "trigger: select the readout under the pointer"},
     {TweakTarget::HudElement, TweakInputAxis::None, TweakInputButton::StickClick,
      TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
-     "stick click puts the element back where the file has it"},
+     "stick click: the readout back to where gplvr_pribluda.ini has it"},
     {TweakTarget::HudElement, TweakInputAxis::None, TweakInputButton::Primary,
      TweakInputButton::None, TweakAxis::None, TweakAction::SelectNext, TweakMode::Absolute,
-     1.0f, "the primary face button steps to the next element, as Page Down does"},
+     1.0f, "A or X: select the next readout"},
     {TweakTarget::HudElement, TweakInputAxis::None, TweakInputButton::Secondary,
      TweakInputButton::None, TweakAxis::Show, TweakAction::Toggle, TweakMode::Absolute,
-     1.0f, "UNDECIDED -- the secondary face button shows and hides the element"},
+     1.0f, "UNDECIDED -- B or Y: hide or show the selected readout (a hidden one is crossed "
+           "out and can still be selected)"},
 };
 
 const TweakBinding kHudPanelBindings[] = {
     {TweakTarget::HudPanel, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Trigger, TweakAxis::Depth, TweakAction::None, TweakMode::Rate, 1.0f,
-     "trigger held: stick forward and back pushes the panel away and pulls it in"},
+     "trigger held: stick forward pushes the panel away, back pulls it in"},
     // Both modified rows are the VERTICAL stick, so the two hold-and-push gestures differ
     // only in which button is held and both read "more" as away from you: forward pushes
     // the panel out, forward makes it bigger.
     {TweakTarget::HudPanel, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Squeeze, TweakAxis::Size, TweakAction::None, TweakMode::Rate, 1.0f,
-     "HOLD the grip and stick forward makes the panel bigger, back smaller (a tap goes "
-     "back instead)"},
+     "HOLD the grip: stick forward makes the panel bigger, back smaller (a tap goes back "
+     "instead)"},
     {TweakTarget::HudPanel, TweakInputAxis::StickX, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::X, TweakAction::None, TweakMode::Rate, 1.0f,
      "stick left and right swings the panel around you, keeping its distance"},
+    // Scale is negative because the placement's Down counts downward.
     {TweakTarget::HudPanel, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Y, TweakAction::None, TweakMode::Rate, -1.0f,
-     "stick forward and back raises and lowers the panel -- inverted, because the "
-     "placement counts DOWN"},
+     "stick forward raises the panel, back lowers it"},
     {TweakTarget::HudPanel, TweakInputAxis::None, TweakInputButton::StickClick,
      TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
-     "stick click puts the panel back where gplvr.ini's defaults have it"},
+     "stick click: the panel back to its built-in default place and size"},
 };
 
 }  // namespace

@@ -1,7 +1,7 @@
 #pragma once
 
 // A copy of mirror.mip per eye, so each eye keeps its own reflection on the frames where the
-// mirror is not rendered at all (`mirrorUpdateRate`).
+// mirror is not rendered at all (`mirrorUpdateInterval`).
 //
 // THERE IS EXACTLY ONE mirror.mip -- one texture for the whole carset (report 37 section 1.4)
 // -- and both glasses live in it as its two halves. With the mirror from each eye (mirrorMode),
@@ -48,7 +48,7 @@ bool mirrorCacheRestore(int eye);
 
 // Fill mirror.mip with black, and forget both saved copies.
 //
-// For `mirrorUpdateRate = 0`. Nothing renders the mirror then, but the CAR STILL SAMPLES THE
+// For `mirrorUpdateInterval = 0`. Nothing renders the mirror then, but the CAR STILL SAMPLES THE
 // TEXTURE, so the glasses keep showing whatever reflection was last written -- a frozen image
 // that looks like a fault rather than an off switch. This is called when the setting is turned
 // off, from wherever holds the GL context.

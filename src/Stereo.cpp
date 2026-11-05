@@ -887,7 +887,7 @@ int __cdecl walkLookupMainThunk(int hint, int* out, int x, int y, int z) {
 // from the head and is NOT head-centred (the thunk above substitutes the centre; this one passes
 // the caller's own position through), so on a frame where the mirror asked first both eyes were
 // centred on the mirror's answer, and on every other frame on the head's. With
-// mirrorUpdateRate = 4 that alternates one frame in four, which is a submission order that
+// mirrorUpdateInterval = 4 that alternates one frame in four, which is a submission order that
 // alternates, which is a seam artifact that flips -- measured 2026-10-07: mode 3 flipped every
 // frame where mode 1 was steady, with `0 of GPL's answers disagreed` proving the consistency
 // test was contributing nothing and the cache was the only difference left.
@@ -1704,7 +1704,7 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
 
 }  // namespace
 
-// Whether the glasses show anything at all. One switch: mirrorUpdateRate = 0 is off, and it
+// Whether the glasses show anything at all. One switch: mirrorUpdateInterval = 0 is off, and it
 // comes out as a dark glass rather than a frozen one, because the car keeps sampling whatever
 // was last written.
 //
@@ -1719,7 +1719,7 @@ void reportPaneAim(const PaneFrame& frame, const float eye[3], const PaneAim aim
 // its own reflection and the right's, which is a visible flicker and was reported as one.
 // MirrorCache gives each eye a copy and puts it back on the frames that do not render; until both
 // copies exist there is nothing to put back, so the frame renders.
-bool stereoMirrorOn() { return g_options.mirrorUpdateRate > 0; }
+bool stereoMirrorOn() { return g_options.mirrorUpdateInterval > 0; }
 
 void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView) {
     rendered = g_state.panesRendered;
@@ -1733,9 +1733,9 @@ void stereoTakePaneCounts(unsigned& rendered, unsigned& outOfView) {
 // put the other eye's reflection back on the region that had just been drawn.
 bool stereoMirrorDueThisFrame() {
     if (!stereoMirrorOn()) return false;
-    if (g_options.mirrorUpdateRate <= 1) return true;
+    if (g_options.mirrorUpdateInterval <= 1) return true;
     if (mirrorFromEachEye() && !mirrorCacheReady()) return true;
-    return (flatFramesTickFrameIndex() % g_options.mirrorUpdateRate) == 0;
+    return (flatFramesTickFrameIndex() % g_options.mirrorUpdateInterval) == 0;
 }
 
 bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
@@ -1764,14 +1764,14 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     void* const mirrorWanted = stereoMirrorDueThisFrame() ? savedMirror : nullptr;
 
     // Whether each eye's reflection is worth keeping. Only mode 2 gives the two eyes different
-    // images, and only a mirrorUpdateRate above 1 ever skips a render -- with neither, the
+    // images, and only a mirrorUpdateInterval above 1 ever skips a render -- with neither, the
     // copy would be made every frame and never read.
     //
     // Deliberately not conditional on there being a mirror camera this frame. A frame with no
     // camera is one that will not render the mirror and still draws a car that samples it --
     // an extra render through the present hook is exactly that -- so it wants the restore for
     // the same reason a skipped frame does. With nothing saved yet the restore costs a compare.
-    bool cacheEyes = mirrorFromEachEye() && g_options.mirrorUpdateRate > 1;
+    bool cacheEyes = mirrorFromEachEye() && g_options.mirrorUpdateInterval > 1;
     // The params block is the GAME'S live memory, not a copy of it -- gpl_simFrameRender
     // reuses it and zeroes p[43] the moment sceneRender returns. So anything we adjust in
     // it has to be put back before we hand control away. The mirror aim is the frame

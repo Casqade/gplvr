@@ -26,6 +26,13 @@ void rotate(const Quat& q, const float v[3], float out[3]) {
     out[2] = v[2] + q.w * tz + (q.x * ty - q.y * tx);
 }
 
+// GPL units per tracked metre. vrWorldScale is the world's size relative to the driver, so a
+// bigger world means the head and the eyes move LESS through it: the reciprocal.
+float trackedToWorld() {
+    float scale = g_options.vrWorldScale;
+    return (scale > 0.05f && scale < 20.0f) ? 1.0f / scale : 1.0f;
+}
+
 // The two frame conversions. Written as functions rather than a matrix because the
 // matrix form is where sign errors hide.
 void xrToGpl(const float xr[3], float gpl[3]) {
@@ -182,10 +189,7 @@ bool vrSeatRelative(const SharedPose& pose, float position[3], float forward[3])
 
         // The same world scale the eye offsets get. Scaling a hand differently from an eye
         // would put the controller somewhere the driver is not reaching.
-        const float scaleWorld =
-            (g_options.vrWorldScale > 0.05f && g_options.vrWorldScale < 20.0f)
-                ? g_options.vrWorldScale
-                : 1.0f;
+        float scaleWorld = trackedToWorld();
         position[0] *= scaleWorld;
         position[1] *= scaleWorld;
         position[2] *= scaleWorld;
@@ -406,10 +410,7 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
         // the same factor -- they are the same quantity as far as the world's apparent
         // size is concerned, and scaling only one of them would make the stereo and the
         // parallax disagree, which is worse than either being wrong.
-        const float scaleWorld =
-            (g_options.vrWorldScale > 0.05f && g_options.vrWorldScale < 20.0f)
-                ? g_options.vrWorldScale
-                : 1.0f;
+        float scaleWorld = trackedToWorld();
         out[eye].offset[0] *= scaleWorld;
         out[eye].offset[1] *= scaleWorld;
         out[eye].offset[2] *= scaleWorld;
