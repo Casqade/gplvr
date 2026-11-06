@@ -2513,7 +2513,7 @@ void loadOptions(const char* fileName) {
     if (!(g_options.vrMirrorTweakFovSpeed >= 0.05f)) g_options.vrMirrorTweakFovSpeed = 0.05f;
     if (g_options.vrMirrorTweakFovSpeed > 4.0f) g_options.vrMirrorTweakFovSpeed = 4.0f;
     g_options.profileFrame =
-        GetPrivateProfileIntA("gplvr", "profileFrame", 1, path) != 0;
+        GetPrivateProfileIntA("gplvr", "profileFrame", 0, path) != 0;
     g_options.profileGpuWait =
         GetPrivateProfileIntA("gplvr", "profileGpuWait", 0, path) != 0;
     g_options.profilePolys =
@@ -2527,7 +2527,7 @@ void loadOptions(const char* fileName) {
     g_options.profileStallUs = GetPrivateProfileIntA("gplvr", "profileStallUs", 50, path);
     if (g_options.profileStallUs < 0) g_options.profileStallUs = 0;
     if (g_options.profileStallUs > 10000) g_options.profileStallUs = 10000;
-    g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 0, path) != 0;
+    g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 1, path) != 0;
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
         GetPrivateProfileIntA("gplvr", "vrMouseLook", 0, path) != 0;
@@ -2570,12 +2570,12 @@ void loadOptions(const char* fileName) {
     g_options.enableLetterbox =
         GetPrivateProfileIntA("gplvr", "enableLetterbox", 0, path) != 0;
     g_options.widescreenFix =
-        GetPrivateProfileIntA("gplvr", "widescreenFix", 0, path) != 0;
+        GetPrivateProfileIntA("gplvr", "widescreenFix", 1, path) != 0;
     g_options.skipCredits = GetPrivateProfileIntA("gplvr", "skipCredits", 1, path) != 0;
     g_options.mirrorDriverArms =
         GetPrivateProfileIntA("gplvr", "mirrorDriverArms", 1, path) != 0;
-    g_options.vrGplMenuMode = GetPrivateProfileIntA("gplvr", "vrGplMenuMode", 0, path);
-    if (g_options.vrGplMenuMode < 0 || g_options.vrGplMenuMode > 1) g_options.vrGplMenuMode = 0;
+    g_options.vrGplMenuMode = GetPrivateProfileIntA("gplvr", "vrGplMenuMode", 1, path);
+    if (g_options.vrGplMenuMode < 0 || g_options.vrGplMenuMode > 1) g_options.vrGplMenuMode = 1;
     GetPrivateProfileStringA("gplvr", "vrGplMenuScale", "0.5", text, sizeof(text), path);
     g_options.vrGplMenuScale = static_cast<float>(atof(text));
     if (!(g_options.vrGplMenuScale >= 0.05f)) g_options.vrGplMenuScale = 0.05f;
@@ -2584,18 +2584,18 @@ void loadOptions(const char* fileName) {
     g_options.vrGplMenuDistance = static_cast<float>(atof(text));
     if (!(g_options.vrGplMenuDistance >= 0.75f)) g_options.vrGplMenuDistance = 0.75f;
     if (g_options.vrGplMenuDistance > 5.0f) g_options.vrGplMenuDistance = 5.0f;
-    GetPrivateProfileStringA("gplvr", "vrGamma", "1.0", text, sizeof(text), path);
+    GetPrivateProfileStringA("gplvr", "vrGamma", "1.2", text, sizeof(text), path);
     g_options.vrGamma = static_cast<float>(atof(text));
     if (g_options.vrGamma < 0.5f) g_options.vrGamma = 0.5f;
     if (g_options.vrGamma > 3.0f) g_options.vrGamma = 3.0f;
-    GetPrivateProfileStringA("gplvr", "vrGplTextDepth", "0.0", text, sizeof(text), path);
+    GetPrivateProfileStringA("gplvr", "vrGplTextDepth", "2.0", text, sizeof(text), path);
     g_options.vrGplTextDepth = static_cast<float>(atof(text));
     g_options.vrHudMode = GetPrivateProfileIntA("gplvr", "vrHudMode", 1, path);
     if (g_options.vrHudMode < 0 || g_options.vrHudMode > 2) g_options.vrHudMode = 1;
-    g_options.vrGplTextScale = GetPrivateProfileIntA("gplvr", "vrGplTextScale", 1, path);
+    g_options.vrGplTextScale = GetPrivateProfileIntA("gplvr", "vrGplTextScale", 2, path);
     if (g_options.vrGplTextScale < 1) g_options.vrGplTextScale = 1;
     if (g_options.vrGplTextScale > 4) g_options.vrGplTextScale = 4;
-    GetPrivateProfileStringA("gplvr", "vrGplTextSpread", "1.0", text, sizeof(text), path);
+    GetPrivateProfileStringA("gplvr", "vrGplTextSpread", "0.25", text, sizeof(text), path);
     g_options.vrGplTextSpread = static_cast<float>(atof(text));
     // 0 is every run on one point at the eye's centre, which reads as the text being gone
     // rather than as a setting being wrong.
@@ -2687,9 +2687,9 @@ void loadOptions(const char* fileName) {
     }
     g_options.vrRendererType = GetPrivateProfileIntA("gplvr", "vrRendererType", 1, path);
     if (g_options.vrRendererType < 0 || g_options.vrRendererType > 2) g_options.vrRendererType = 1;
-    g_options.flatRendererType = GetPrivateProfileIntA("gplvr", "flatRendererType", 1, path);
+    g_options.flatRendererType = GetPrivateProfileIntA("gplvr", "flatRendererType", 0, path);
     if (g_options.flatRendererType < 0 || g_options.flatRendererType > 2)
-        g_options.flatRendererType = 1;
+        g_options.flatRendererType = 0;
     g_options.flatOffscreenFrame =
         GetPrivateProfileIntA("gplvr", "flatOffscreenFrame", 0, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrRenderScale", "1.0", text, sizeof(text), path);
@@ -2751,13 +2751,13 @@ void loadOptions(const char* fileName) {
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
          g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
     mirrorConfigReset();
-    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", kMonitorBoth, path);
+    g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", kMonitorRight, path);
     if (g_options.vrMonitorEye < kMonitorOff || g_options.vrMonitorEye > kMonitorBoth)
-        g_options.vrMonitorEye = kMonitorBoth;
+        g_options.vrMonitorEye = kMonitorRight;
     g_options.vrTransferFinish =
         GetPrivateProfileIntA("gplvr", "vrTransferFinish", 1, path) != 0;
     g_options.vrDirectToShared =
-        GetPrivateProfileIntA("gplvr", "vrDirectToShared", 1, path) != 0;
+        GetPrivateProfileIntA("gplvr", "vrDirectToShared", 0, path) != 0;
     logf("options: vrDirectToShared=%d (%s)", g_options.vrDirectToShared ? 1 : 0,
          g_options.vrDirectToShared
              ? "the frame is rendered straight into the shared texture, and the render target "

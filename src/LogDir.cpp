@@ -15,7 +15,7 @@ namespace gplvr {
 namespace {
 
 constexpr char kEnvironment[] = "GPLVR_LOG_DIR";
-constexpr int  kDefaultKeep = 20;
+constexpr int  kDefaultKeep = 5;
 
 bool isDirectory(const std::string& path) {
     DWORD attributes = GetFileAttributesA(path.c_str());

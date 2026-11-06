@@ -229,15 +229,14 @@ struct Options {
     // far less than either. On widens the horizontal angle so the vertical field is the
     // one the cockpit art and the mirrors were drawn for; off leaves the game's own,
     // which on a wide window is the vanilla 4:3 view with less of it visible.
-    bool widescreenFix = false;
+    bool widescreenFix = true;
 
     // Break the frame budget into scene / present / gplvr / other, once a second.
     //
-    // On by default while the frame cost is still being chased. It exists because the
-    // render timing stopped explaining the frame rate the moment vsync came off, and
-    // `other` -- the part the hooks cannot see, which is GPL's own per-frame work
-    // outside the world pass -- turned out to be four to six milliseconds.
-    bool profileFrame = true;
+    // Off by default. It exists because the render timing stopped explaining the frame rate
+    // the moment vsync came off, and `other` -- the part the hooks cannot see, which is GPL's
+    // own per-frame work outside the world pass -- turned out to be four to six milliseconds.
+    bool profileFrame = false;
 
     // Drain the GPU with a glFinish at the end of the scene render, and time it.
     //
@@ -327,10 +326,9 @@ struct Options {
     // Present in a headset. Launches gplvr-xr.exe, hands it the back buffer through a
     // shared D3D11 texture, and lets it own the OpenXR session.
     //
-    // Off by default. It starts a second process and brings the runtime up, which is a
-    // lot to do to someone who only wanted the flat stereo mod. Everything it needs is
-    // logged, and any failure leaves the game running exactly as it would without it.
-    bool vr = false;
+    // On by default. Everything it needs is logged, and any failure leaves the game running
+    // exactly as it would without it.
+    bool vr = true;
 
     // Take the current head pose as the seat. '3' by default; 0 disables.
     //
@@ -430,7 +428,7 @@ struct Options {
     // How GPL's own menus (the front end, and any other one-image frame) are shown in the
     // headset. 0: head-locked in the eye images, vrGplMenuScale of the view. 1: on a panel
     // fixed in front of the seat, vrGplMenuDistance metres ahead (kGplMenuPanelWidth wide).
-    int vrGplMenuMode = 0;
+    int vrGplMenuMode = 1;
 
     // Mode 0: how much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
     // world render behind them, so at 1.0 they fill the whole 104-degree view a few
@@ -445,7 +443,7 @@ struct Options {
     // Gamma the presenter applies to everything it draws in the headset: the eyes, the menus
     // and the HUD panel. 1.0 leaves the game's colours exactly as the monitor shows them;
     // above 1.0 lifts mid-tones and shadows, with black and white staying put. 0.5 to 3.0.
-    float vrGamma = 1.0f;
+    float vrGamma = 1.2f;
 
     // How far in front of the driver GPL's own in-race HUD appears, in metres. 0 puts it
     // at infinity.
@@ -460,7 +458,7 @@ struct Options {
     // length, so the answer is right for the person wearing the headset rather than for
     // an assumed 63 mm. Without a tracked frame there is no separation to use, and the
     // two copies stay identical.
-    float vrGplTextDepth = 0.0f;
+    float vrGplTextDepth = 2.0f;
 
     // `vrHudInset` was here until 2026-11-03: it pulled the per-eye re-issue's positions toward
     // the eye's centre, and since GPL's text went to the fast text path that re-issue places
@@ -561,7 +559,7 @@ struct Options {
     // means; a fractional multiple would drop and double rows unevenly along a line of text.
     //
     // VR only. 1 is the size GPL authored.
-    int vrGplTextScale = 1;
+    int vrGplTextScale = 2;
 
     // HOW FAR IN FROM THE EYE'S EDGES GPL'S STAMPED TEXT IS PULLED, about the eye's centre,
     // as a fraction of the half extent.
@@ -584,7 +582,7 @@ struct Options {
     // centred as a line.
     //
     // VR only.
-    float vrGplTextSpread = 1.0f;
+    float vrGplTextSpread = 0.25f;
 
     // `vrPredictPosition` was here and is gone as of 2026-10-05: it moved each eye to where it
     // would be when the frame was displayed, and measured `mean eye shift 0.00 mm` in 189
@@ -652,7 +650,7 @@ struct Options {
     // bakedMarkFrameEnd). Read live: the menu switches it at any time; the first switch away
     // from 0 installs it.
     int vrRendererType = 1;
-    int flatRendererType = 1;
+    int flatRendererType = 0;
 
     // Flat mode: draw each world frame into a framebuffer and copy it into the window at the
     // swap (FlatTarget.h), so the window's back buffer only ever holds finished frames, and a
@@ -696,7 +694,7 @@ struct Options {
     //
     // Only meaningful with vrOffscreen on, because without an off-screen frame the window
     // IS the render and there is nothing to choose. Flat mode (vr = 0) never reads it.
-    int vrMonitorEye = kMonitorBoth;
+    int vrMonitorEye = kMonitorRight;
 
     // Drain GL with glFinish after the frame transfer's wglDXUnlockObjectsNV, before the frame
     // is published. 1 (default) keeps it. 0 skips it and relies on the unlock, which hands the
@@ -705,7 +703,7 @@ struct Options {
     bool vrTransferFinish = true;
 
     // Render the frame straight into the presenter's shared texture (report 80) rather than
-    // into a colour texture of our own that is copied across at publish. 1 (default) or 0.
+    // into a colour texture of our own that is copied across at publish. 1 or 0 (default).
     //
     // Removed on 2026-11-04 for buying no frame time -- the transfer's CPU cost is the
     // WGL_NV_DX_interop lock, not the bytes -- and back on 2026-11-06 for MEMORY: registering
@@ -715,7 +713,7 @@ struct Options {
     //
     // A lock or an attachment that fails gives the target a colour texture of its own for the
     // rest of the session and says so.
-    bool vrDirectToShared = true;
+    bool vrDirectToShared = false;
 
     // GPL'S STAMPED TEXT IS NEVER DROPPED. `vrSkipStampText` threw away stamps that could
     // not reach the headset -- a few thousand glyphs a frame into a surface the eyes never
