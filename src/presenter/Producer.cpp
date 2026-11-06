@@ -145,9 +145,9 @@ struct State {
     bool loggedFirstFrame = false;
     bool loggedFirstViews = false;
 
-    // The window's picture, taken early -- by presenterEndFrame on the direct path, where the
-    // frame is still GL's only until the publish, and by presenterDrawVrRay so the ray stays out
-    // of it. Cleared by presenterBlitToWindow, which would otherwise take it again.
+    // The window's picture, taken early by presenterEndFrame on the direct path, where the frame
+    // is still GL's only until the publish. Cleared by presenterBlitToWindow, which would
+    // otherwise take it again.
     bool windowBlitDone = false;
 
     // THE HEADSET'S MEMORY, settled at race entry (settleForRace) and released when the race is
@@ -1766,8 +1766,14 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     block->gplMenuPose = gplMenu.pose;
     block->gplMenuWidthMetres = gplMenu.width;
     block->gplMenuHeightMetres = gplMenu.height;
-    block->gplMenuBeamHand = gplMenu.beamHand;
-    block->gplMenuBeamLength = gplMenu.beamLength;
+    // The beam, asked after the panel above so the front end's pointer sees this frame's panel.
+    int  beamHand = -1;
+    float beamLength = 0.0f;
+    bool beamMark = false;
+    if (!vrMenuBeam(beamHand, beamLength, beamMark)) beamHand = -1;
+    block->beamHand = beamHand;
+    block->beamLength = beamLength;
+    block->beamMark = beamMark ? 1 : 0;
     for (int i = 0; i < 4; ++i)
         block->gplMenuRect[i] =
             static_cast<uint32_t>(gplMenu.rect[i] + (i == 1 && block->gplMenuMode ? frameTop : 0));
@@ -2021,49 +2027,6 @@ void presenterUpdateVrMenu() {
     // texture later, by drawMonitorHud, and it has nothing to show until this has run.
     if (state.stage != Stage::Publishing || !state.gl.module) return;
     vrMenuUpdate(state.gl);
-}
-
-void presenterDrawVrRay(bool takeWindowPicture) {
-    State& state = g_state;
-    if (state.stage != Stage::Publishing || !state.gl.module) return;
-    if (!vrMenuRayWanted()) return;
-
-    // THE RAY GOES IN AFTER THE WINDOW'S PICTURE HAS BEEN TAKEN. That ordering is the
-    // whole reason this is a function of its own rather than a line beside the cursor.
-    //
-    // The monitor shows the off-screen frame, so anything drawn into it before the blit
-    // is on the monitor too -- which is right for the cursor and wrong for the ray: the
-    // ray is a pointing aid for the person in the headset and means nothing to somebody
-    // watching the flat window. Taking the blit first costs nothing (the frame is
-    // finished either way) and windowBlitDone already exists to stop it happening twice.
-    //
-    // Nothing moves unless the menu is open, so a session that never opens it sees
-    // exactly the ordering it always had.
-    //
-    // An EXTRA render does not take it: that path publishes a frame of its own and never
-    // blits to the window, and the main frame that follows redraws the whole target
-    // before taking its own picture -- so the extra frame's ray cannot reach the monitor
-    // through it, and forcing a blit here would put an intermediate frame on the screen.
-    if (takeWindowPicture && !state.windowBlitDone && renderTargetActive()) {
-        frameBudgetSwitch(kSpanWindowBlit);
-        renderTargetBlitToWindow(state.gl, g_options.vrMonitorEye);
-        state.windowBlitDone = true;
-    }
-
-    // Into the off-screen target, which is the frame the headset gets. Without it the
-    // frame IS the window's back buffer and there is nowhere to put the ray that the
-    // monitor would not also show.
-    const GLuint framebuffer = renderTargetFramebuffer();
-    if (!renderTargetActive() || !framebuffer) {
-        vrMenuNoteRayNeedsOffscreen();
-        return;
-    }
-
-    GLint previous = 0;
-    state.gl.getIntegerv(kGlFramebufferBinding, &previous);
-    state.gl.bindFramebuffer(kGlFramebuffer, framebuffer);
-    vrMenuDrawRay(state.gl);
-    state.gl.bindFramebuffer(kGlFramebuffer, static_cast<GLuint>(previous));
 }
 
 bool presenterLatestInputNames(SharedInputNames& names, int32_t& generation) {

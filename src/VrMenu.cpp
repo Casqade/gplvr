@@ -348,15 +348,16 @@ bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 // One of the GPL menu's two sliders is on the page at a time: size for the head-locked mode,
 // distance for the fixed panel, each the only setting its mode has.
 bool gplMenuHeadLocked() { return g_options.vrGplMenuMode != 1; }
+
+// The setup modes aim at things only a session has -- a car's glasses, and a Pribluda panel
+// that is drawn only while one is being driven -- so their rows are not on the page in the
+// front end.
+bool inSession() { return !windowInFrontEnd(); }
+bool pribludaSetupOffered() { return pribludaRowOffered() && inSession(); }
 bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 
 // The root page. Every row here changes a live value and nothing else; Save settings is what
 // writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
-//
-// NOT AN OPTION, and deliberately not one: turning the HUD off is something a driver does for
-// a lap to see the road, or to find out what the panel costs. It is therefore not one of the
-// values Save writes, and every session starts with the HUD on.
-bool g_pribludaOn = true;
 
 // A row's help says WHAT THE ROW IS, and never which button to press. How to work the
 // highlighted widget is the same answer for every row of its kind and is built from the
@@ -367,8 +368,8 @@ bool g_pribludaOn = true;
 // In page order: the buttons above the strip, the tabs, then each tab's rows, top to bottom.
 MenuRow g_rows[] = {
     {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "save the tabs' settings to gplvr.ini (all but Pribluda HUD). Mirror aim and the Pribluda "
-     "layout and position are saved by their setup screens, which ask on the way out",
+     "save the tabs' settings to gplvr.ini. Mirror aim and the Pribluda layout and position "
+     "are saved by their setup screens, which ask on the way out",
      kTabNone},
     {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
      "put things back to how they shipped -- choose VR settings, mirror aim, Pribluda layout "
@@ -412,17 +413,12 @@ MenuRow g_rows[] = {
      kTabHeadset, headAudioWidthAdjustable},
 
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "aim each rear-view mirror and set how much it shows, saved per car", kTabCockpit},
-    {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_pribludaOn, nullptr, nullptr, 0, 1, 1,
+     "aim each rear-view mirror and set how much it shows, saved per car", kTabCockpit,
+     inSession},
+    {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_options.vrHud, nullptr, nullptr, 0,
+     1, 1,
      "show or hide the Pribluda overlay, in the headset and on the monitor; hidden, it costs "
-     "nothing. Not saved: it is back on at the next start",
-     kTabCockpit, pribludaRowOffered},
-    {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "pick single readouts on the Pribluda overlay to move, show or hide", kTabCockpit,
-     pribludaRowOffered},
-    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "move the whole Pribluda overlay, and set how far away and how big it is. Edits the "
-     "placement for the current mode, head-locked or in the car",
+     "nothing",
      kTabCockpit, pribludaRowOffered},
     // vrHudLayer 1 is head-locked and 2 is seat-locked, so ON is 1 here: `low` is the value
     // the label is true for.
@@ -431,6 +427,13 @@ MenuRow g_rows[] = {
      "on: the overlay stays in front of you wherever you look. Off: it stays put in the car, "
      "like a dashboard",
      kTabCockpit, pribludaRowOffered},
+    {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "pick single readouts on the Pribluda overlay to move, show or hide", kTabCockpit,
+     pribludaSetupOffered},
+    {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "move the whole Pribluda overlay, and set how far away and how big it is. Edits the "
+     "placement for the current mode, head-locked or in the car",
+     kTabCockpit, pribludaSetupOffered},
     {"Pribluda backdrop", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
      "how dark the boxes behind the overlay's text are. 0 is invisible, 1 is solid black",
@@ -451,15 +454,15 @@ MenuRow g_rows[] = {
      "NEEDS A RESTART: Save settings, then restart the game. Multiplies the resolution the "
      "headset asks for; lower is faster and blurrier",
      kTabPerformance},
-    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateInterval,
-     nullptr, 0, 4, 1,
-     "redraw the mirrors on one frame in N, showing the last image in between. Off turns the "
-     "mirrors black",
-     kTabPerformance},
     {"Mirrors", kRowNamedInt, kCommandNone, nullptr, &g_options.mirrorMode, nullptr,
      kMirrorSharedHeadCentre, kMirrorPerGlass, 1,
      "how mirrors are drawn, cheapest first. flat: one image for all mirrors and both eyes, no "
      "depth. shared: one per eye, with depth. per mirror: each mirror per eye, sharpest",
+     kTabPerformance},
+    {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateInterval,
+     nullptr, 0, 4, 1,
+     "redraw the mirrors on one frame in N, showing the last image in between. Off turns the "
+     "mirrors black",
      kTabPerformance},
     {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
      &g_options.pribludaUpdateInterval, nullptr, 1, 4, 1,
@@ -738,48 +741,11 @@ const char* drawRefusalName(int refusal) {
     }
 }
 
-// -- the aiming ray ----------------------------------------------------------------------
+// -- the aiming beam ---------------------------------------------------------------------
 //
-// Drawn as geometry in the eye images, because there is no composition layer type that
-// can carry a line through depth. Its own refusals, because it can fail for reasons the
-// panel cannot -- the panel is a layer and needs no eye rects, no frustum and no render
-// target, and the ray needs all three.
-constexpr float kRayStartOffset = 0.10f;    // metres ahead of the grip
-constexpr float kRayMissLength = 1.30f;     // metres, when it is pointing at nothing
-constexpr float kRayNearHalfWidth = 0.0035f;  // metres
-constexpr float kRayFarHalfWidth = 0.0009f;
-constexpr float kRayNearAlpha = 0.80f;
-constexpr float kRayFarAlpha = 0.06f;
-constexpr int   kRaySegments = 10;
-
-enum RayRefusal {
-    kRayNone = 0,
-    kRayNoFrustum,
-    kRayNoViews,
-    kRayNoEyeRect,
-    kRayNoSeat,
-    kRayNoAim,
-    kRayNoTarget,
-    kRayNoOffscreen,
-    kRayRefusalCount,
-};
-
-const char* rayRefusalName(int refusal) {
-    switch (refusal) {
-        case kRayNoFrustum: return "the eyes did not carry the runtime's frustum";
-        case kRayNoViews: return "no tracked frame has been rendered";
-        case kRayNoEyeRect: return "the eye sub-rects are not built";
-        case kRayNoSeat: return "there is no seat yet -- recentre (vrRecentreKey)";
-        case kRayNoAim: return "the aim pose has no direction";
-        case kRayNoTarget: return "there is no render target to draw into";
-        case kRayNoOffscreen:
-            // Unreachable since off-screen rendering stopped being an option, but the target
-            // can still fail to build, and then this is what it looks like from here.
-            return "the off-screen frame did not build, so there is nowhere to put a ray "
-                   "that the monitor would not also show -- the target: lines say why";
-        default: return "none";
-    }
-}
+// Drawn by the presenter on a layer of its own over every panel (openxr/Beam.cpp); this side
+// says which hand and how far (vrMenuBeam).
+constexpr float kRayMissLength = 1.30f;  // metres, when it is pointing at nothing
 
 // The canvas is rebuilt at most this often. The cursor is part of the picture, so a hand
 // in motion would otherwise rebuild four hundred glyphs on every game frame; 45 a second
@@ -866,6 +832,7 @@ struct State {
     // and how far along that ray it reaches, for the presenter's beam.
     int      fixedBeamHand = -1;
     float    fixedBeamLength = 0.0f;
+    bool     fixedBeamOn = false;  // ending on the panel, where the beam marks the spot
     Vec3     pointerLastDirection;
     bool     pointerHaveLast = false;
     LONGLONG pointerMovedAt = 0;
@@ -930,8 +897,6 @@ struct State {
     unsigned rayHits = 0;
     unsigned rayMisses = 0;
     unsigned rayDraws = 0;
-    unsigned rayRefusals[kRayRefusalCount] = {};
-    int      lastLoggedRayRefusal = -1;
 };
 
 State g_state;
@@ -952,14 +917,6 @@ double menuNow() {
     LONGLONG ticks = qpcNow();
     if (!g_state.frequency) return 0.0;
     return static_cast<double>(ticks) / static_cast<double>(g_state.frequency);
-}
-
-void noteRayRefusal(int refusal) {
-    ++g_state.rayRefusals[refusal];
-    if (refusal != g_state.lastLoggedRayRefusal) {
-        g_state.lastLoggedRayRefusal = refusal;
-        if (refusal != kRayNone) logf("vr menu: no aiming ray -- %s", rayRefusalName(refusal));
-    }
 }
 
 void noteDrawRefusal(int refusal) {
@@ -1539,14 +1496,6 @@ void resetRow(int row) {
     if (row < 0 || row >= kRowCount) return;
     MenuRow& item = g_rows[row];
 
-    // The one row whose value is not an option at all. Its default is "the HUD is on",
-    // which is also what every session starts with.
-    if (item.boolValue == &g_pribludaOn) {
-        setRowBool(item, true);
-        notice("Pribluda HUD back on");
-        return;
-    }
-
     if (item.boolValue) {
         bool value = false;
         if (defaultOf(item.boolValue, value)) setRowBool(item, value);
@@ -1675,9 +1624,10 @@ void saveSettings() {
     // One line per row of the page that has an ini key, in the page's own order. A row added
     // above without a line here saves silently as nothing, which is the one way this can go
     // quietly wrong -- so they are kept in the same order to make the omission visible.
+    writeInt("vrHud", g_options.vrHud ? 1 : 0);
     writeInt("vrHudLayer", g_options.vrHudLayer);
-    writeInt("mirrorUpdateInterval", g_options.mirrorUpdateInterval);
     writeInt("mirrorMode", g_options.mirrorMode);
+    writeInt("mirrorUpdateInterval", g_options.mirrorUpdateInterval);
     writeInt("frameRate", g_options.frameRate);
     writeInt("vrRendererType", g_options.vrRendererType);
     writeInt("pribludaUpdateInterval", g_options.pribludaUpdateInterval);
@@ -1697,18 +1647,20 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 18 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 19 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
     notice("saved to gplvr.ini");
-    logf("vr menu: saved to %s -- vrHudLayer=%d mirrorUpdateInterval=%d mirrorMode=%d "
+    logf("vr menu: saved to %s -- vrHud=%d vrHudLayer=%d mirrorUpdateInterval=%d "
+         "mirrorMode=%d "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
          "vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
          "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
          "vrHeadAudioWidth=%.3f vrMonitorEye=%d",
-         path, g_options.vrHudLayer, g_options.mirrorUpdateInterval, g_options.mirrorMode,
+         path, g_options.vrHud ? 1 : 0, g_options.vrHudLayer,
+         g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
          g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
          g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
@@ -2745,6 +2697,7 @@ void pollFrontEndPointer() {
             if (onFixed) {
                 g_state.fixedBeamHand = order[i];
                 g_state.fixedBeamLength = kRayMissLength;
+                g_state.fixedBeamOn = hit;
             }
             if (onPanel) g_state.replayHitOn = hit;
             if (!hit) {
@@ -4053,9 +4006,7 @@ void vrMenuUpdate(const GlFunctions& gl) {
     noteDrawRefusal(kDrawNone);
 }
 
-void vrMenuNoteRayNeedsOffscreen() { noteRayRefusal(kRayNoOffscreen); }
-
-bool vrMenuPribludaHidden() { return !g_pribludaOn; }
+bool vrMenuPribludaHidden() { return !g_options.vrHud; }
 
 // The hand the ray comes from: the menu's owner, or over the replay panel the hand driving the
 // pointer while it is awake. -1 when there is no ray to draw.
@@ -4070,32 +4021,6 @@ int rayHand() {
     return vrInputHand(hand).present ? hand : -1;
 }
 
-bool vrMenuRayWanted() { return rayHand() >= 0; }
-
-bool vrMenuGplMenuBeam(int& hand, float& length) {
-    const State& state = g_state;
-    if (state.mode == Mode::Closed) {
-        // Asked by the panel itself while it is being placed, so no panel check here.
-        if (state.fixedBeamHand < 0) return false;
-        hand = state.fixedBeamHand;
-        length = state.fixedBeamLength;
-        return true;
-    }
-    // The VR menu is open over the panel: the menu owner's ray, to the hit the pointer poll
-    // worked out on the menu's own panel, or the miss length.
-    hand = rayHand();
-    if (hand < 0) return false;
-    SharedPose aim = {};
-    if (!poseInSeat(vrInputHand(hand).aimPose, aim)) return false;
-    length = kRayMissLength;
-    Surface drawn = drawnSurface();
-    if (state.pointerOn && drawn.valid) {
-        Vec3 reach = sub(surfacePoint(drawn, state.pointerU, state.pointerV), positionOf(aim));
-        length = std::sqrt(dot(reach, reach));
-    }
-    return true;
-}
-
 bool vrMenuBeamOnGplMenu() {
     // The panel check too: the hand is only cleared by the front end's own poll, which a race
     // does not run.
@@ -4103,227 +4028,41 @@ bool vrMenuBeamOnGplMenu() {
     return g_state.mode == Mode::Closed && g_state.fixedBeamHand >= 0 && gplMenuPanelShown(panel);
 }
 
-void vrMenuDrawRay(const GlFunctions& gl) {
+bool vrMenuBeam(int& hand, float& length, bool& mark) {
     State& state = g_state;
-    int    handIndex = rayHand();
-    if (handIndex < 0) return;
+    mark = false;
 
-    // WHY THIS ONE IS NOT A COMPOSITION LAYER, when the panel is.
-    //
-    // A quad layer is a flat image at a pose, and the compositor has no way to express
-    // anything else. The panel is exactly that shape of thing, so it became a layer and
-    // every fault that came with projecting it ourselves went away. A ray is the
-    // opposite: it runs through DEPTH, from the hand to wherever it lands, and there is
-    // no layer type -- the headers define projection, quad, cube, cylinder and equirect
-    // and nothing else -- that can carry it. So it is real 3D geometry in the projection
-    // layer, drawn per eye, and the per-eye projection lives here for its sake alone.
-    if (!gl.begin || !gl.end || !gl.vertex2f || !gl.color4f || !gl.loadIdentity ||
-        !gl.ortho || !gl.matrixMode || !gl.pushMatrix || !gl.popMatrix || !gl.pushAttrib ||
-        !gl.popAttrib || !gl.getIntegerv || !gl.viewport || !gl.disable || !gl.enable ||
-        !gl.blendFunc || !gl.colorMask || !gl.polygonMode || !gl.scissor)
-        return;
-
-    // The eye images only carry the world when the eye cameras were re-aimed at the
-    // runtime's own frustum; without that the mapping below is not the one the world was
-    // drawn with and the ray would point somewhere the geometry is not.
-    if (!vrFrustumInjected()) {
-        noteRayRefusal(kRayNoFrustum);
-        return;
-    }
-    SharedView rendered[2] = {};
-    if (!vrLastRenderedViews(rendered)) {
-        noteRayRefusal(kRayNoViews);
-        return;
-    }
-    int rects[2][4] = {};
-    if (!stereoEyeRect(0, rects[0]) || !stereoEyeRect(1, rects[1])) {
-        noteRayRefusal(kRayNoEyeRect);
-        return;
+    // GPL's fixed menu panel with the menu closed: the front end's pointer. Its picture has no
+    // cross of its own, so the beam marks the spot while it is on the panel.
+    if (state.mode == Mode::Closed && windowInFrontEnd()) {
+        if (!vrMenuBeamOnGplMenu()) return false;
+        hand = state.fixedBeamHand;
+        length = state.fixedBeamLength;
+        mark = state.fixedBeamOn;
+        ++state.rayDraws;
+        return true;
     }
 
-    const VrHandInput& hand = vrInputHand(handIndex);
-    SharedPose         aim = {};
-    if (!poseInSeat(hand.aimPose, aim)) {
-        noteRayRefusal(kRayNoSeat);
-        return;
-    }
-
-    const Vec3 origin = positionOf(aim);
-    const Vec3 direction = normalise(rotate(quatOf(aim), {0.0f, 0.0f, -1.0f}));
-    if (direction.x == 0.0f && direction.y == 0.0f && direction.z == 0.0f) {
-        noteRayRefusal(kRayNoAim);
-        return;
-    }
-
-    // Where it ends. On the panel when it is pointing at it -- the hit the poll already
-    // worked out, so the ray and the crosshair cannot disagree -- and at a fixed length
-    // otherwise, which reads as pointing at nothing rather than as the ray vanishing.
-    // With the menu closed the ray is the replay panel's, and ends where the pointer poll last
-    // found it on that panel.
-    const bool    replay = state.mode == Mode::Closed;
-    const Surface drawn = replay ? replayPanelSurface() : drawnSurface();
-    const bool    on = replay ? state.replayHitOn : state.pointerOn;
-    const float   onU = replay ? state.replayHitU : state.pointerU;
-    const float   onV = replay ? state.replayHitV : state.pointerV;
-    Vec3          farPoint;
+    // A mode open, on its own panel wherever it is; or, with the menu closed, the replay
+    // panel's ray. Both panels draw their own cross. The beam ends on the hit the pointer poll
+    // worked out, so the two cannot disagree, and at a fixed length otherwise, which reads as
+    // pointing at nothing rather than as the beam vanishing.
+    hand = rayHand();
+    if (hand < 0) return false;
+    SharedPose aim = {};
+    if (!poseInSeat(vrInputHand(hand).aimPose, aim)) return false;
+    bool    replay = state.mode == Mode::Closed;
+    Surface drawn = replay ? replayPanelSurface() : drawnSurface();
+    bool    on = replay ? state.replayHitOn : state.pointerOn;
+    float   onU = replay ? state.replayHitU : state.pointerU;
+    float   onV = replay ? state.replayHitV : state.pointerV;
+    length = kRayMissLength;
     if (on && drawn.valid) {
-        farPoint = surfacePoint(drawn, onU, onV);
-    } else {
-        farPoint = add(origin, scale(direction, kRayMissLength));
+        Vec3 reach = sub(surfacePoint(drawn, onU, onV), positionOf(aim));
+        length = std::sqrt(dot(reach, reach));
     }
-    // Started a little ahead of the grip so it does not appear to come out of the
-    // driver's own hand or through the wheel rim it is resting on.
-    const Vec3 nearPoint = add(origin, scale(direction, kRayStartOffset));
-
-    GLint surface[4] = {0, 0, 0, 0};
-    int   targetWidth = 0;
-    int   targetHeight = 0;
-    if (renderTargetActive() && renderTargetSize(targetWidth, targetHeight) &&
-        targetWidth > 0 && targetHeight > 0) {
-        surface[2] = targetWidth;
-        surface[3] = targetHeight;
-    } else {
-        gl.getIntegerv(GL_VIEWPORT, surface);
-    }
-    if (surface[2] <= 0 || surface[3] <= 0) {
-        noteRayRefusal(kRayNoTarget);
-        return;
-    }
-
-    GLint savedMatrixMode = GL_PROJECTION;
-    gl.getIntegerv(GL_MATRIX_MODE, &savedMatrixMode);
-    gl.pushAttrib(static_cast<GLbitfield>(GL_ENABLE_BIT | GL_CURRENT_BIT |
-                                          GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT |
-                                          GL_POLYGON_BIT | GL_SCISSOR_BIT | GL_TEXTURE_BIT |
-                                          GL_VIEWPORT_BIT));
-    gl.viewport(surface[0], surface[1], surface[2], surface[3]);
-    gl.matrixMode(GL_PROJECTION);
-    gl.pushMatrix();
-    gl.loadIdentity();
-    gl.ortho(0.0, static_cast<double>(surface[2]), static_cast<double>(surface[3]), 0.0,
-             -1.0, 1.0);
-    gl.matrixMode(GL_MODELVIEW);
-    gl.pushMatrix();
-    gl.loadIdentity();
-
-    gl.disable(GL_TEXTURE_2D);
-    gl.disable(GL_TEXTURE_1D);
-    gl.disable(GL_ALPHA_TEST);
-    gl.disable(GL_STENCIL_TEST);
-    gl.disable(GL_CULL_FACE);
-    gl.disable(GL_LIGHTING);
-    gl.disable(GL_FOG);
-    gl.disable(GL_COLOR_LOGIC_OP);
-    gl.polygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    // DEPTH: NEITHER TESTED NOR WRITTEN, and that is a decision rather than an oversight.
-    //
-    // Testing it would need the ray's vertices to carry depths comparable with the ones
-    // GPL wrote, which means reconstructing the engine's projection and its depth range
-    // -- unverifiable from here and exactly the kind of guess that costs a test run. And
-    // being occluded by the cockpit would be INCONSISTENT with what the ray points at:
-    // the menu is a composition layer, drawn by the runtime over everything, so a ray
-    // that stopped at the wheel while the panel it aims at floated in front of the wheel
-    // would look more wrong, not less. Both ends of the pointer are therefore on top.
-    //
-    // What keeps it from reading as a solid rod through the bodywork is the shape: it
-    // starts ahead of the hand, it is a couple of millimetres thick, it tapers, and its
-    // alpha falls away along its length so the far end is nearly gone.
-    gl.disable(GL_DEPTH_TEST);
-    if (gl.depthMask) gl.depthMask(GL_FALSE);
-
-    const int surfaceHeight = surface[3];
-    for (int eye = 0; eye < 2; ++eye) {
-        const SharedView& view = rendered[eye];
-        SharedPose        eyeSeat = {};
-        if (!poseInSeat(view.pose, eyeSeat)) continue;
-
-        const Vec3  eyePosition = positionOf(eyeSeat);
-        const Quat  inverseEye = conjugate(quatOf(eyeSeat));
-        const float tanLeft = std::tan(view.fov.angleLeft);
-        const float tanRight = std::tan(view.fov.angleRight);
-        const float tanUp = std::tan(view.fov.angleUp);
-        const float tanDown = std::tan(view.fov.angleDown);
-        if (!(tanRight > tanLeft) || !(tanUp > tanDown)) continue;
-
-        const float rx = static_cast<float>(rects[eye][0]);
-        const float ry = static_cast<float>(rects[eye][1]);
-        const float rw = static_cast<float>(rects[eye][2]);
-        const float rh = static_cast<float>(rects[eye][3]);
-        if (!(rw > 0.0f) || !(rh > 0.0f)) continue;
-
-        // Clipped to its own eye, so a segment whose projection runs away near the eye
-        // plane cannot reach the other eye's half of the buffer.
-        gl.enable(GL_SCISSOR_TEST);
-        gl.scissor(static_cast<GLint>(rx),
-                   surfaceHeight - static_cast<GLint>(ry) - static_cast<GLint>(rh),
-                   static_cast<GLint>(rw), static_cast<GLint>(rh));
-
-        auto project = [&](const Vec3& point, float& px, float& py) -> bool {
-            const Vec3 local = rotate(inverseEye, sub(point, eyePosition));
-            if (local.z > -0.05f) return false;
-            px = rx + (local.x / -local.z - tanLeft) / (tanRight - tanLeft) * rw;
-            py = ry + (tanUp - local.y / -local.z) / (tanUp - tanDown) * rh;
-            return true;
-        };
-
-        // A ribbon that turns to face this eye, one quad per segment. Facing the eye is
-        // what makes a flat strip read as a round beam from any angle; the alternative,
-        // a fixed-up ribbon, disappears edge-on.
-        float previousPixels[2][2] = {};
-        bool  havePrevious = false;
-        for (int step = 0; step <= kRaySegments; ++step) {
-            const float t = static_cast<float>(step) / static_cast<float>(kRaySegments);
-            const Vec3  point = add(nearPoint, scale(sub(farPoint, nearPoint), t));
-            const Vec3  toEye = normalise(sub(eyePosition, point));
-            const Vec3  side = normalise(cross(normalise(sub(farPoint, nearPoint)), toEye));
-            const float half = kRayNearHalfWidth +
-                               (kRayFarHalfWidth - kRayNearHalfWidth) * t;
-
-            float pixels[2][2] = {};
-            const bool ok = project(add(point, scale(side, half)), pixels[0][0],
-                                    pixels[0][1]) &&
-                            project(sub(point, scale(side, half)), pixels[1][0],
-                                    pixels[1][1]);
-
-            if (ok && havePrevious) {
-                const float previousT =
-                    static_cast<float>(step - 1) / static_cast<float>(kRaySegments);
-                const float alphaA =
-                    kRayNearAlpha + (kRayFarAlpha - kRayNearAlpha) * previousT;
-                const float alphaB = kRayNearAlpha + (kRayFarAlpha - kRayNearAlpha) * t;
-                gl.begin(GL_QUADS);
-                gl.color4f(1.0f, 0.88f, 0.20f, alphaA);
-                gl.vertex2f(previousPixels[0][0], previousPixels[0][1]);
-                gl.vertex2f(previousPixels[1][0], previousPixels[1][1]);
-                gl.color4f(1.0f, 0.88f, 0.20f, alphaB);
-                gl.vertex2f(pixels[1][0], pixels[1][1]);
-                gl.vertex2f(pixels[0][0], pixels[0][1]);
-                gl.end();
-            }
-
-            havePrevious = ok;
-            previousPixels[0][0] = pixels[0][0];
-            previousPixels[0][1] = pixels[0][1];
-            previousPixels[1][0] = pixels[1][0];
-            previousPixels[1][1] = pixels[1][1];
-        }
-
-        gl.disable(GL_SCISSOR_TEST);
-    }
-
     ++state.rayDraws;
-    noteRayRefusal(kRayNone);
-
-    gl.matrixMode(GL_MODELVIEW);
-    gl.popMatrix();
-    gl.matrixMode(GL_PROJECTION);
-    gl.popMatrix();
-    gl.popAttrib();
-    gl.matrixMode(static_cast<GLenum>(savedMatrixMode));
+    return true;
 }
 
 bool vrMenuActive() { return g_state.mode != Mode::Closed; }
@@ -4395,21 +4134,12 @@ bool vrMenuFormatStatus(char* out, size_t size) {
     // The ray counts are the ones to read when the menu is open and nothing responds:
     // all misses means the ray never reaches the panel, and that is a different fault
     // from the panel not being drawn.
-    unsigned rayRefused = 0;
-    int      rayWorst = 1;
-    for (int i = 1; i < kRayRefusalCount; ++i) {
-        rayRefused += state.rayRefusals[i];
-        if (state.rayRefusals[i] > state.rayRefusals[rayWorst]) rayWorst = i;
-    }
-
     _snprintf_s(out, size, _TRUNCATE,
                 "vr menu: %s, %u opened, %u commands, %u layers built, %u refused%s%s | "
-                "ray %u on the panel, %u missed | beam drawn %u, refused %u%s%s | %s tab, row %d "
-                "(%s)",
+                "ray %u on the panel, %u missed | beam published %u | %s tab, row %d (%s)",
                 modeName, state.opens, state.commands, state.draws, refused,
                 refused ? " -- mostly " : "", refused ? drawRefusalName(worst) : "",
-                state.rayHits, state.rayMisses, state.rayDraws, rayRefused,
-                rayRefused ? " -- mostly " : "", rayRefused ? rayRefusalName(rayWorst) : "",
+                state.rayHits, state.rayMisses, state.rayDraws,
                 g_rows[tabRow(g_openTab)].label, state.hovered,
                 state.stickOwnsHighlight ? "stick" : "pointer");
 
@@ -4420,7 +4150,6 @@ bool vrMenuFormatStatus(char* out, size_t size) {
     state.rayMisses = 0;
     state.rayDraws = 0;
     for (unsigned& count : state.refusals) count = 0;
-    for (unsigned& count : state.rayRefusals) count = 0;
     return true;
 }
 

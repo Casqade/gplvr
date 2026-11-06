@@ -1175,9 +1175,6 @@ void renderExtraFrames() {
             // no such repeat: it is a composition layer, not part of this picture, and
             // the runtime draws it on every display frame regardless.
             presenterDrawCursor(true);
-            // The extra render painted the world over the ray as well, and an extra
-            // frame is published straight from here with no window blit of its own.
-            presenterDrawVrRay(false);
             presenterFrame(true, vrFrustumInjected());
             // Same pairing as the main frame, and for the same reason: a save must be
             // put back in the block that made it, immediately after the transfer that
@@ -1293,12 +1290,6 @@ int __cdecl screenDisplayHook(void* surface) {
     // framebuffer, and SwapBuffers only ever shows the window's own.
     frameBudgetSwitch(kSpanUnbind);
     presenterEndFrame();
-
-    // The aiming ray goes in HERE, between the window's picture and the transfer: it
-    // belongs in the headset's image and not in the monitor's. presenterDrawVrRay takes
-    // the picture before it draws, and does nothing at all while the menu is closed --
-    // except over the replay panel, while a hand is pointing.
-    presenterDrawVrRay(true);
 
     frameBudgetSwitch(kSpanPublish);
     // Set by a race frame that had GPL's static in the target; acted on once the target is
@@ -2770,10 +2761,11 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "pribludaUpdateInterval", 2, path);
     if (g_options.pribludaUpdateInterval < 1) g_options.pribludaUpdateInterval = 1;
     if (g_options.pribludaUpdateInterval > 8) g_options.pribludaUpdateInterval = 8;
+    g_options.vrHud = GetPrivateProfileIntA("gplvr", "vrHud", 1, path) != 0;
     logf("options: vrTransferFinish=%d pribludaUpdateInterval=%d (the HUD panel is redrawn on one "
-         "frame in %d)",
+         "frame in %d) vrHud=%d",
          g_options.vrTransferFinish ? 1 : 0, g_options.pribludaUpdateInterval,
-         g_options.pribludaUpdateInterval);
+         g_options.pribludaUpdateInterval, g_options.vrHud ? 1 : 0);
     g_options.vrNoSignalDelay = GetPrivateProfileIntA("gplvr", "vrNoSignalDelay", 250, path);
     if (g_options.vrNoSignalDelay < 0) g_options.vrNoSignalDelay = 0;
     if (g_options.vrNoSignalDelay > 10000) g_options.vrNoSignalDelay = 10000;

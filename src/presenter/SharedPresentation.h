@@ -45,7 +45,7 @@ inline constexpr uint32_t kControlMagic = 0x52565047;  // 'GPVR'
 // 16: the VR menu panel is one fixed size and each slot names the part its image fills;
 // 15: the VR menu's own quad layer and the runtime's input-source names;
 // 14: controller input added; 13: eyeSubImageScale removed (rebuild both)
-inline constexpr uint32_t kControlVersion = 18;
+inline constexpr uint32_t kControlVersion = 19;
 
 // Two frame slots, written alternately. The producer never writes the slot the presenter
 // is reading, so no lock is needed and a torn frame is impossible; the cost is one
@@ -417,12 +417,15 @@ struct ControlBlock {
     float      gplMenuWidthMetres = 0.0f;
     float      gplMenuHeightMetres = 0.0f;
     uint32_t   gplMenuRect[4] = {};
-    // While that panel is up, the controller beam the presenter draws into the eyes: the hand
-    // (kHandLeft or kHandRight, -1 for none) and how far along its aim ray it reaches, in metres
-    // -- to the panel it points at (GPL's, or the VR menu's while that is open), or a fixed
-    // length when it points at nothing.
-    int32_t    gplMenuBeamHand = -1;
-    float      gplMenuBeamLength = 0.0f;
+
+    // The controller beam, drawn by the presenter on a layer of its own over every panel, from
+    // its own aim sample: the hand (kHandLeft or kHandRight, -1 for none), how far along its aim
+    // ray it reaches in metres (to the spot the pointer is on, or a fixed length), and whether a
+    // cross marks that spot (1 for GPL's fixed menu panel, whose picture has none). Written with
+    // the frame.
+    int32_t    beamHand = -1;
+    float      beamLength = 0.0f;
+    int32_t    beamMark = 0;
 
     // vrGamma, applied by the presenter to everything it draws: the eyes and the HUD panel.
     // 1 leaves the game's colours as they are; above 1 lifts the mid-tones.

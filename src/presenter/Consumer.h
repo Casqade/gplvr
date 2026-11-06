@@ -64,12 +64,18 @@ public:
         float      heightMetres = 0.0f;
         uint32_t   imageWidth = 0;
         uint32_t   imageHeight = 0;
-        // The controller beam to draw into the eyes: kHandLeft/kHandRight, or -1 for none, and
-        // its reach in metres along that hand's aim ray.
-        int32_t    beamHand = -1;
-        float      beamLength = 0.0f;
     };
     bool gplMenuPanel(GplMenuPanel& out) const;
+
+    // The controller beam the current frame asks for: the hand (kHandLeft or kHandRight), its
+    // reach in metres along that hand's aim ray, and whether a cross marks the end. False when
+    // no hand is pointing.
+    struct BeamRequest {
+        int32_t hand = -1;
+        float   length = 0.0f;
+        bool    mark = false;
+    };
+    bool beam(BeamRequest& out) const;
 
     // Only after gplMenuPanel returned true for the current frame.
     bool drawGplMenu(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
@@ -201,8 +207,9 @@ private:
         float      gplMenuWidthMetres = 0.0f;
         float      gplMenuHeightMetres = 0.0f;
         uint32_t   gplMenuRect[4] = {};
-        int32_t    gplMenuBeamHand = -1;
-        float      gplMenuBeamLength = 0.0f;
+        int32_t    beamHand = -1;
+        float      beamLength = 0.0f;
+        bool       beamMark = false;
     };
 
     // The blit both drawEye and drawGplMenu end in: `rect` of the current frame (fractions of

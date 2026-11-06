@@ -1178,7 +1178,8 @@ int wmain(int argc, wchar_t** argv) {
         consumer.setError(2);
         swapchainsOk = false;
     }
-    // The controller beam over GPL's menu panel. Optional: the panel works without it.
+    // The controller beam, on a layer over every panel. Without it there is no beam and
+    // everything else works.
     Beam beam;
     if (presenting) beam.initialise(device, context);
 
@@ -1189,6 +1190,9 @@ int wmain(int argc, wchar_t** argv) {
     HudLayer menu;
     // GPL's own menu on a panel fixed to the seat (vrGplMenuMode 1), the same way.
     HudLayer gplMenu;
+    // The controller beam's own eye images, transparent but for the beam, made the first time
+    // a beam is asked for.
+    HudLayer beamEyes[2];
 
     // -- frame loop --------------------------------------------------------------
     XrSessionState state = XR_SESSION_STATE_IDLE;
@@ -1364,9 +1368,12 @@ int wmain(int argc, wchar_t** argv) {
             XrCompositionLayerQuad              hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
             XrCompositionLayerQuad              menuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
             XrCompositionLayerQuad              gplMenuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-            // Four: the projection, GPL's menu panel, pribluda's panel and the VR menu. Layers
-            // are painted in submission order, so the VR menu goes last and sits over all.
-            const XrCompositionLayerBaseHeader* layers[4] = {};
+            XrCompositionLayerProjectionView    beamViews[2] = {};
+            XrCompositionLayerProjection        beamLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            // Five: the projection, GPL's menu panel, pribluda's panel, the VR menu and the
+            // controller beam. Layers are painted in submission order, so the beam goes last and
+            // no panel can hide it.
+            const XrCompositionLayerBaseHeader* layers[5] = {};
             uint32_t layerCount = 0;
 
             if (frameState.shouldRender) {
@@ -1679,23 +1686,6 @@ int wmain(int argc, wchar_t** argv) {
                             const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                             context->ClearRenderTargetView(target, black);
                             drawn = true;
-                            // The beam, from this display's own aim pose, as seen from the
-                            // view this eye is submitted with.
-                            const int32_t beamFlags = kHandAimPositionValid |
-                                                      kHandAimOrientationValid;
-                            if (haveInput && gplPanel.beamHand >= 0 &&
-                                (sampledInput.hands[gplPanel.beamHand].flags & beamFlags) ==
-                                    beamFlags) {
-                                const SharedPose& aim =
-                                    sampledInput.hands[gplPanel.beamHand].aimPose;
-                                XrPosef aimPose;
-                                aimPose.orientation = {aim.orientationX, aim.orientationY,
-                                                       aim.orientationZ, aim.orientationW};
-                                aimPose.position = {aim.positionX, aim.positionY,
-                                                    aim.positionZ};
-                                beam.draw(target, eyes[i].width, eyes[i].height, views[i],
-                                          aimPose, gplPanel.beamLength, eyes[i].decodeSrgb);
-                            }
                         } else if (presenting) {
                             drawn = consumer.drawEye(target, eyes[i].width,
                                                      eyes[i].height,
@@ -1777,8 +1767,8 @@ int wmain(int argc, wchar_t** argv) {
                         // ends up pinned to the head on every fast turn. Handing it the
                         // rendered pose is what lets it reproject, which is the whole
                         // reason 36 Hz into a 90 Hz compositor is survivable.
-                        // Behind GPL's menu panel the eyes carry only the beam, drawn from the
-                        // views located for this display, so they are submitted with those.
+                        // Behind GPL's menu panel the eyes are black, and are submitted with the
+                        // views located for this display.
                         SharedView rendered[2] = {};
                         if (presenting && !gplPanelOn && consumer.renderedViews(rendered)) {
                             const SharedView& source = rendered[i];
@@ -2032,6 +2022,80 @@ int wmain(int argc, wchar_t** argv) {
                         reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuQuad);
                 }
 
+                // -- the controller beam, over everything ------------------------------
+                //
+                // A projection layer of its own, transparent but for the beam, drawn from this
+                // display's aim sample and views. Last in the list, so no panel hides it.
+                Consumer::BeamRequest beamRequest;
+                const int32_t         aimFlags = kHandAimPositionValid | kHandAimOrientationValid;
+                bool beamOn = valid && presenting && beam.ready() && haveInput &&
+                              consumer.beam(beamRequest) &&
+                              (sampledInput.hands[beamRequest.hand].flags & aimFlags) == aimFlags;
+                for (int e = 0; e < 2 && beamOn; ++e) {
+                    HudLayer& image = beamEyes[e];
+                    if (image.image.width == eyes[e].width && image.image.height == eyes[e].height)
+                        continue;
+                    bool failedBefore = image.failedWidth == eyes[e].width &&
+                                        image.failedHeight == eyes[e].height;
+                    if (failedBefore ||
+                        !createHudSwapchain(session, device, chosenFormat, eyes[e].width,
+                                            eyes[e].height, image,
+                                            e ? "beam (right eye)" : "beam (left eye)"))
+                        beamOn = false;
+                }
+                if (beamOn) {
+                    const SharedPose& aim = sampledInput.hands[beamRequest.hand].aimPose;
+                    XrPosef           aimPose;
+                    aimPose.orientation = {aim.orientationX, aim.orientationY, aim.orientationZ,
+                                           aim.orientationW};
+                    aimPose.position = {aim.positionX, aim.positionY, aim.positionZ};
+                    for (int e = 0; e < 2 && beamOn; ++e) {
+                        Eye&     image = beamEyes[e].image;
+                        uint32_t index = 0;
+                        XrSwapchainImageAcquireInfo acquireInfo{
+                            XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        if (!XR_CHECK(g_api.xrAcquireSwapchainImage(image.swapchain,
+                                                                    &acquireInfo, &index))) {
+                            beamOn = false;
+                            break;
+                        }
+                        XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                        waitInfo.timeout = XR_INFINITE_DURATION;
+                        XR_CHECK(g_api.xrWaitSwapchainImage(image.swapchain, &waitInfo));
+                        if (index < image.targets.size()) {
+                            const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                            context->ClearRenderTargetView(image.targets[index], clear);
+                            beam.draw(image.targets[index], image.width, image.height, views[e],
+                                      aimPose, beamRequest.length, beamRequest.mark,
+                                      image.decodeSrgb);
+                        }
+                        context->Flush();
+                        XrSwapchainImageReleaseInfo releaseInfo{
+                            XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        XR_CHECK(g_api.xrReleaseSwapchainImage(image.swapchain, &releaseInfo));
+
+                        beamViews[e].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                        beamViews[e].pose = views[e].pose;
+                        beamViews[e].fov = views[e].fov;
+                        beamViews[e].subImage.swapchain = image.swapchain;
+                        beamViews[e].subImage.imageRect.offset = {0, 0};
+                        beamViews[e].subImage.imageRect.extent = {
+                            static_cast<int32_t>(image.width), static_cast<int32_t>(image.height)};
+                        beamViews[e].subImage.imageArrayIndex = 0;
+                    }
+                }
+                if (beamOn) {
+                    beamLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    beamLayer.space = appSpace;
+                    beamLayer.viewCount = 2;
+                    beamLayer.views = beamViews;
+                    layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&beamLayer);
+                }
+                if (beamOn != (beamEyes[0].loggedLayer == 1)) {
+                    beamEyes[0].loggedLayer = beamOn ? 1 : 0;
+                    logf("xr: controller beam %s", beamOn ? "on, over every panel" : "off");
+                }
+
                 ++framesThisSecond;
                 const DWORD now = GetTickCount();
                 if (now - lastReport >= 1000) {
@@ -2131,6 +2195,8 @@ int wmain(int argc, wchar_t** argv) {
     releaseHud(hud);
     releaseHud(menu);
     releaseHud(gplMenu);
+    releaseHud(beamEyes[0]);
+    releaseHud(beamEyes[1]);
     beam.release();
     // Before the session: the action spaces and the action set belong to it.
     controllers.destroy(g_api);

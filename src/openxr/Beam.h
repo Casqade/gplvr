@@ -1,11 +1,11 @@
 #pragma once
 
-// The controller's beam, drawn by the presenter into the eye images while GPL's menu is on its
-// fixed panel (vrGplMenuMode 1). The eyes are black behind the panel then, so the beam is the
-// only thing in them, and it is drawn from the aim pose and the eye views of this very display
-// frame. The game says which hand points and how far the beam reaches (to the panel it hits, or
-// a fixed length); the look -- start offset, taper, fade, colour -- is the in-race beam's
-// (VrMenu.cpp, vrMenuDrawRay).
+// The controller beam, drawn by the presenter into a projection layer of its own that is
+// submitted after every panel, so no panel can hide it: GPL's fixed menu panel is opaque, and a
+// beam inside the eye images vanished behind it. Drawn from the aim pose and the eye views of
+// this very display frame. The game says which hand points, how far the beam reaches (to the
+// spot the pointer is on, or a fixed length) and whether a cross marks that spot; the look --
+// start offset, taper, fade, colour -- is the one the game used to draw itself.
 
 #include <d3d11.h>
 #include <openxr/openxr.h>
@@ -18,12 +18,15 @@ class Beam {
 public:
     bool initialise(ID3D11Device* device, ID3D11DeviceContext* context);
     void release();
+    bool ready() const { return vertexShader_ != nullptr; }
 
-    // One eye: from `aim` (app space) for `length` metres along its -Z, seen from `view`.
-    // `linearTarget` is true when the target view encodes sRGB on write, so the colour goes
-    // in linear.
+    // One eye, into a target cleared to transparent: from `aim` (app space) for `length` metres
+    // along its -Z, seen from `view`, with a cross at the end when `mark`. Written premultiplied,
+    // for a layer composited with its source alpha. `linearTarget` is true when the target view
+    // encodes sRGB on write, so the colour goes in linear.
     void draw(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-              const XrView& view, const XrPosef& aim, float length, bool linearTarget);
+              const XrView& view, const XrPosef& aim, float length, bool mark,
+              bool linearTarget);
 
 private:
     ID3D11Device*          device_ = nullptr;

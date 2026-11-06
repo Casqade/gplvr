@@ -4,7 +4,6 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "VrCamera.h"
-#include "VrMenu.h"
 
 #include <windows.h>
 
@@ -80,10 +79,6 @@ bool gplMenuPanelForFrame(int frameWidth, int frameHeight, bool sideBySide, bool
     out.pose.orientationW = 1.0f;
     out.width = kGplMenuPanelWidth;
     out.height = kGplMenuPanelWidth / aspect;
-    if (!vrMenuGplMenuBeam(out.beamHand, out.beamLength)) {
-        out.beamHand = -1;
-        out.beamLength = 0.0f;
-    }
 
     g_shown = out;
     g_shownOn = true;

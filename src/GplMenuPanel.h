@@ -22,9 +22,6 @@ struct GplMenuPanel {
     SharedPose pose;
     float      width = 0.0f;
     float      height = 0.0f;
-    // The beam the presenter draws while the panel is up (vrMenuGplMenuBeam): hand -1 for none.
-    int        beamHand = -1;
-    float      beamLength = 0.0f;
 };
 
 // This frame's panel. True when vrGplMenuMode is 1, the frame is one image the eyes would show

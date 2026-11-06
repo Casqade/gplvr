@@ -519,6 +519,10 @@ struct Options {
     // menu's "Pribluda HUD" row, which skips the whole pass rather than freezing it.
     int pribludaUpdateInterval = 2;
 
+    // Whether the Pribluda overlay is drawn at all, in the headset and on the monitor. Off
+    // skips the whole pass, so a hidden overlay costs nothing. Also "Pribluda HUD" in the VR menu.
+    bool vrHud = true;
+
     // GPL's OWN in-race text goes into BOTH eyes, at the disparity vrGplTextDepth asks for. It
     // was `vrHudEye`, which could put it in one eye only; that is not something to configure
     // once the depth is right, and the text is being rerouted onto a layer of its own anyway.

@@ -61,46 +61,24 @@ void vrMenuPoll();
 // never opened.
 void vrMenuUpdate(const GlFunctions& gl);
 
-// THE AIMING RAY, and it is the one thing here that cannot be a composition layer.
-//
-// A quad layer is a flat image at a pose; a ray runs through depth from the hand to
-// whatever it is pointing at, and the headers define no layer type that can carry one.
-// So it is real geometry in the projection layer, drawn per eye into the eye images with
-// the projection this file keeps for its sake alone.
-//
-// HEADSET ONLY. The caller draws it after the window's picture has been taken, so it
-// never reaches the monitor -- it is a pointing aid for the person wearing the headset
-// and means nothing to somebody watching the flat window, which keeps the panel and the
-// hit marker it already has.
-//
-// True from vrMenuRayWanted when a mode is open and the owning hand is tracked -- or, with the
-// menu closed, while the replay panel is up and a hand is pointing, so the driver can see where
-// it points off the panel as well as on it -- so the caller can decide whether the reordering
-// the draw needs is worth doing this frame.
-bool vrMenuRayWanted();
-
-// The beam the presenter draws while GPL's menu is on its fixed panel (vrGplMenuMode 1): the
-// hand pointing -- the one driving the front end's pointer, or the VR menu's owner while it is
-// open -- and how many metres along its aim ray it reaches. False when no hand is pointing.
-bool vrMenuGplMenuBeam(int& hand, float& length);
+// The controller beam the presenter draws, on a layer of its own over every panel, from its own
+// aim sample: the hand pointing and how many metres along its aim ray the beam reaches -- to the
+// spot the pointer is on, or a fixed length when it points at nothing. One beam for every
+// pointer: a mode's (the menu, a tweak mode, a dialog) wherever it is open, the replay panel's
+// with the menu closed, and the front end's on GPL's fixed menu panel (vrGplMenuMode 1). `mark`
+// asks for a cross at the end, for that last one only: the other panels draw their own. False
+// when no hand is pointing. Headset only; the monitor never shows it.
+bool vrMenuBeam(int& hand, float& length, bool& mark);
 
 // A controller is driving the front end's pointer onto GPL's fixed menu panel. The beam marks
 // where it points, so the Windows pointer is not drawn into the picture meanwhile.
 bool vrMenuBeamOnGplMenu();
 
-// True while the menu's "Hide pribluda HUD" row is on: skip the HUD pass entirely.
-//
-// A RUNTIME SWITCH AND NOTHING ELSE -- no ini key, off at every start. The quad layer needs no
-// separate handling: the presenter already drops it when the game stops drawing the panel, so
-// not calling pribludaDrawHud takes the layer down with the monitor's overlay.
+// True while vrHud (the menu's "Pribluda HUD" row) is off: skip the HUD pass entirely.
+// The quad layer needs no separate handling: the presenter already drops it when the game stops
+// drawing the panel, so not calling pribludaDrawHud takes the layer down with the monitor's
+// overlay.
 bool vrMenuPribludaHidden();
-void vrMenuDrawRay(const GlFunctions& gl);
-
-// The caller found no off-screen target to draw the ray into, which means the frame goes
-// straight to the window and there is nowhere to put a ray the monitor would not also
-// show. Counted and named here with the ray's other refusals rather than logged at the
-// call site, so one line accounts for every reason the ray is missing.
-void vrMenuNoteRayNeedsOffscreen();
 
 // True while the menu or a tweak mode is open, so the key poll can keep the game from
 // also acting on whatever the driver is doing.

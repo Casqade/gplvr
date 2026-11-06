@@ -62,15 +62,6 @@ void presenterDrawCursor(bool sideBySide);
 // menu is open and its content has changed.
 void presenterUpdateVrMenu();
 
-// Draw the controller's aiming ray into the off-screen frame, for the headset only.
-//
-// Call it AFTER presenterEndFrame and BEFORE presenterFrame: it takes the window's
-// picture first if that has not happened yet, so the ray is in the image the headset
-// gets and not in the one the monitor shows. Inert unless a mode is open and the owning
-// hand is tracked, or the replay panel is up and a hand is pointing, and it moves nothing
-// about the frame's ordering when it is inert.
-void presenterDrawVrRay(bool takeWindowPicture);
-
 // The names the runtime gives the controls each action is bound to, for the menu's help
 // lines. False until the presenter has asked at least once.
 bool presenterLatestInputNames(SharedInputNames& names, int32_t& generation);

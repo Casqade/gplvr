@@ -18,6 +18,10 @@ constexpr float kNearAlpha = 0.80f;
 constexpr float kFarAlpha = 0.06f;
 constexpr int   kSegments = 10;
 constexpr float kColour[3] = {1.0f, 0.88f, 0.20f};
+// The cross at the end, in metres per metre of reach, so it covers the same angle at any
+// distance: about 0.9 degrees across, arms 0.14 degrees thick.
+constexpr float kMarkHalfLength = 0.008f;
+constexpr float kMarkHalfThickness = 0.0012f;
 
 const char kShaderSource[] = R"(
 cbuffer Constants : register(b0) {
@@ -48,7 +52,7 @@ struct Vertex {
     float y;
     float alpha;
 };
-constexpr int kVertexCount = kSegments * 6;
+constexpr int kVertexCount = kSegments * 6 + 2 * 6;
 
 struct V3 {
     float x, y, z;
@@ -139,12 +143,12 @@ bool Beam::initialise(ID3D11Device* device, ID3D11DeviceContext* context) {
     blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
     blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    // Over a transparent clear this leaves colour times alpha and the alpha itself: the
+    // premultiplied image the layer is composited as.
     blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED |
-                                                      D3D11_COLOR_WRITE_ENABLE_GREEN |
-                                                      D3D11_COLOR_WRITE_ENABLE_BLUE;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     ok = ok && SUCCEEDED(device_->CreateBlendState(&blendDesc, &blend_));
 
     // The ribbon turns to face each eye, so its winding is either way round.
@@ -174,7 +178,8 @@ void Beam::release() {
 }
 
 void Beam::draw(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                const XrView& view, const XrPosef& aim, float length, bool linearTarget) {
+                const XrView& view, const XrPosef& aim, float length, bool mark,
+                bool linearTarget) {
     if (!vertexShader_ || !target || !width || !height || !(length > kStartOffset)) return;
 
     float tanLeft = std::tan(view.fov.angleLeft);
@@ -232,6 +237,27 @@ void Beam::draw(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
         havePrevious = ok;
         std::memcpy(previous, edge, sizeof(previous));
         previousAlpha = alpha;
+    }
+
+    // The cross: two bars square to this eye, opaque, centred on the end.
+    if (mark) {
+        V3    right = rotate(view.pose.orientation, {1.0f, 0.0f, 0.0f});
+        V3    up = rotate(view.pose.orientation, {0.0f, 1.0f, 0.0f});
+        float along = kMarkHalfLength * length;
+        float across = kMarkHalfThickness * length;
+        const V3 bars[2][2] = {{scale(right, along), scale(up, across)},
+                               {scale(up, along), scale(right, across)}};
+        for (const auto& bar : bars) {
+            V3    corner[4] = {add(add(farPoint, bar[0]), bar[1]), add(sub(farPoint, bar[0]), bar[1]),
+                               sub(sub(farPoint, bar[0]), bar[1]), sub(add(farPoint, bar[0]), bar[1])};
+            float x[4];
+            float y[4];
+            bool  ok = true;
+            for (int k = 0; k < 4 && ok; ++k) ok = project(corner[k], x[k], y[k]);
+            if (!ok || count + 6 > kVertexCount) continue;
+            const int order[6] = {0, 1, 2, 0, 2, 3};
+            for (int k : order) vertices[count++] = {x[k], y[k], 1.0f};
+        }
     }
     if (!count) return;
 

@@ -307,8 +307,9 @@ bool Consumer::update() {
         latched.gplMenuWidthMetres = block_->gplMenuWidthMetres;
         latched.gplMenuHeightMetres = block_->gplMenuHeightMetres;
         for (int i = 0; i < 4; ++i) latched.gplMenuRect[i] = block_->gplMenuRect[i];
-        latched.gplMenuBeamHand = block_->gplMenuBeamHand;
-        latched.gplMenuBeamLength = block_->gplMenuBeamLength;
+        latched.beamHand = block_->beamHand;
+        latched.beamLength = block_->beamLength;
+        latched.beamMark = block_->beamMark != 0;
         // From the slot the latched sequence names, not from a shared copy the
         // producer may already have moved on to. The seqlock below cannot protect
         // these: the producer writes payload BEFORE bumping the counter, so a write
@@ -499,10 +500,16 @@ bool Consumer::gplMenuPanel(GplMenuPanel& out) const {
     out.heightMetres = current_.gplMenuHeightMetres;
     out.imageWidth = rect[2];
     out.imageHeight = rect[3];
-    bool beam = (current_.gplMenuBeamHand == kHandLeft || current_.gplMenuBeamHand == kHandRight) &&
-                current_.gplMenuBeamLength > 0.0f && current_.gplMenuBeamLength < 100.0f;
-    out.beamHand = beam ? current_.gplMenuBeamHand : -1;
-    out.beamLength = beam ? current_.gplMenuBeamLength : 0.0f;
+    return true;
+}
+
+bool Consumer::beam(BeamRequest& out) const {
+    if (!current_.sequence) return false;
+    if (current_.beamHand != kHandLeft && current_.beamHand != kHandRight) return false;
+    if (!(current_.beamLength > 0.0f) || !(current_.beamLength < 100.0f)) return false;
+    out.hand = current_.beamHand;
+    out.length = current_.beamLength;
+    out.mark = current_.beamMark;
     return true;
 }
 
