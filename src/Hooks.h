@@ -395,6 +395,11 @@ struct Options {
     // this setting with that fix.
     float vrHorizonLock = 0.0f;
 
+    // The same blend while GPL's replay screen is showing (an instant replay or one loaded from
+    // the menu), in place of vrHorizonLock. Nobody is driving a replay, so the default keeps the
+    // horizon level.
+    float vrReplayHorizonLock = 1.0f;
+
     // Hear from the head instead of the driver's eye. In the cockpit, GPL's sound listener is
     // moved to the head's position and turned with it, so turning your head moves the other cars
     // between your ears; the car's own engine moves too. Pan only, as GPL computes it -- nothing

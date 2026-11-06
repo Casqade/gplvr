@@ -403,6 +403,11 @@ MenuRow g_rows[] = {
      "how much of the car's rolling and pitching is kept out of your view. 0 moves with the "
      "car, 1 keeps the horizon level. Raise it if kerbs make you queasy",
      kTabHeadset},
+    {"Horizon lock in replays", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrReplayHorizonLock, 0.0f, 1.0f, 0.05f,
+     "Horizon lock for replays, used in place of the one above while a replay is shown. 0 "
+     "moves with the car, 1 keeps the horizon level",
+     kTabHeadset},
     {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
      2.0f, 0.05f, "brightens shadows and mid-tones in the headset; 1.00 is the game's own",
      kTabHeadset},
@@ -1640,6 +1645,7 @@ void saveSettings() {
     writeFloat("vrGplTextSpread", g_options.vrGplTextSpread);
     writeFloat("vrGamma", g_options.vrGamma);
     writeFloat("vrHorizonLock", g_options.vrHorizonLock);
+    writeFloat("vrReplayHorizonLock", g_options.vrReplayHorizonLock);
     writeFloat("vrWorldScale", g_options.vrWorldScale);
     writeFloat("vrHeadAudioWidth", g_options.vrHeadAudioWidth);
     writeInt("vrMonitorEye", g_options.vrMonitorEye);
@@ -1647,7 +1653,7 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 19 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 20 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
@@ -1657,16 +1663,16 @@ void saveSettings() {
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
          "vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
-         "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
-         "vrHeadAudioWidth=%.3f vrMonitorEye=%d",
+         "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrReplayHorizonLock=%.3f "
+         "vrWorldScale=%.3f vrHeadAudioWidth=%.3f vrMonitorEye=%d",
          path, g_options.vrHud ? 1 : 0, g_options.vrHudLayer,
          g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
          g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
          g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
          g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextSpread,
-         g_options.vrGamma, g_options.vrHorizonLock, g_options.vrWorldScale,
-         g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
+         g_options.vrGamma, g_options.vrHorizonLock, g_options.vrReplayHorizonLock,
+         g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
 }
 
 // Every write to a row's option goes through one of these two, so a rule about what a setting

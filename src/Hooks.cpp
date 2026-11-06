@@ -2535,6 +2535,8 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "vrMouseLookKey", '6', path);
     GetPrivateProfileStringA("gplvr", "vrHorizonLock", "0.0", text, sizeof(text), path);
     g_options.vrHorizonLock = static_cast<float>(atof(text));
+    GetPrivateProfileStringA("gplvr", "vrReplayHorizonLock", "1.0", text, sizeof(text), path);
+    g_options.vrReplayHorizonLock = static_cast<float>(atof(text));
     g_options.vrHeadAudio = GetPrivateProfileIntA("gplvr", "vrHeadAudio", 1, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrHeadAudioWidth", "1.0", text, sizeof(text), path);
     g_options.vrHeadAudioWidth = static_cast<float>(atof(text));
@@ -2783,9 +2785,10 @@ void loadOptions(const char* fileName) {
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
          g_options.vrGamma, g_options.vrGplTextDepth,
          g_options.vrRenderScale, g_options.vrRecentreKey, g_options.vrMonitorEye);
-    logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d vrHeadAudioWidth=%.2f",
-         g_options.vrHorizonLock, g_options.vrWorldScale, g_options.vrHeadAudio ? 1 : 0,
-         g_options.vrHeadAudioWidth);
+    logf("options: vrHorizonLock=%.2f vrReplayHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d "
+         "vrHeadAudioWidth=%.2f",
+         g_options.vrHorizonLock, g_options.vrReplayHorizonLock, g_options.vrWorldScale,
+         g_options.vrHeadAudio ? 1 : 0, g_options.vrHeadAudioWidth);
     logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f", g_options.vrHudLayer,
          g_options.vrHudBackdropOpacity);
     logf("options: vrGplTextScale=%d vrGplTextSpread=%.2f -- in VR gplvr draws GPL's stamped "

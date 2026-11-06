@@ -18,6 +18,7 @@
 #include "MirrorUv.h"
 #include "Pe.h"
 #include "RenderTarget.h"
+#include "ReplayPanel.h"
 #include "SegmentSearch.h"
 #include "StereoEuler.h"
 #include "VrCamera.h"
@@ -1932,11 +1933,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         forwardZ < -1.0f ? -1.0f : (forwardZ > 1.0f ? 1.0f : forwardZ));
     const float seatRoll = std::atan2(leftZ, upZ);
 
-    // Blended, not switched. See Options::vrHorizonLock.
-    const float lock = (g_options.vrHorizonLock < 0.0f)
-                           ? 0.0f
-                           : (g_options.vrHorizonLock > 1.0f ? 1.0f
-                                                             : g_options.vrHorizonLock);
+    // Blended, not switched. See Options::vrHorizonLock and vrReplayHorizonLock.
+    float lockOption =
+        gplReplayScreenShown() ? g_options.vrReplayHorizonLock : g_options.vrHorizonLock;
+    float lock = lockOption < 0.0f ? 0.0f : (lockOption > 1.0f ? 1.0f : lockOption);
 
     // Rotation about +X by a maps local Y to (0, cos a, sin a) and local Z to
     // (0, -sin a, cos a). Taking a = -seatRoll drives the left axis's world-Z
