@@ -1,5 +1,6 @@
 #include "VrMenu.h"
 
+#include "BuildStamp.h"
 #include "DataRebase.h"
 #include "HeadAudio.h"
 #include "Hooks.h"
@@ -263,13 +264,13 @@ enum class Mode {
     Help,
 };
 
-// The Help popup's layout, in bands of the menu canvas: the title, kHelpPopupLines of text,
-// and the Close button in the last band, centred between these fractions of the width. The
-// draw and the pointer test both read them.
+// The Help popup's layout, in bands of the menu canvas: the title with the Close button at its
+// right, between these fractions of the width, then kHelpPopupLines of text. The draw and the
+// pointer test both read them.
 constexpr int   kHelpPopupLines = 7;
-constexpr int   kHelpPopupBands = kHelpPopupLines + 2;
-constexpr float kHelpCloseLeft = 0.38f;
-constexpr float kHelpCloseRight = 0.62f;
+constexpr int   kHelpPopupBands = kHelpPopupLines + 1;
+constexpr float kHelpCloseLeft = 0.80f;
+constexpr float kHelpCloseRight = 0.98f;
 
 // What Reset offers, in the order it is drawn. Cancel LAST and the destructive one next to
 // it, so the stick has to travel past everything to reach "all" and a driver who opened this
@@ -2425,8 +2426,7 @@ void leaveHelp() {
 // The Close button, in fractions of the menu canvas; the draw puts it at the same place.
 bool helpCloseHit(float u, float v) {
     float band = 1.0f / static_cast<float>(kHelpPopupBands);
-    return u >= kHelpCloseLeft && u <= kHelpCloseRight &&
-           v >= band * static_cast<float>(kHelpPopupBands - 1) && v <= 1.0f;
+    return u >= kHelpCloseLeft && u <= kHelpCloseRight && v >= 0.0f && v <= band;
 }
 
 // Close is the only answer, so it is always the highlighted one: the trigger on it or the
@@ -3254,7 +3254,7 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
         return;
     }
 
-    // "HELP" -- the title, the controls one per band, and Close in the last band.
+    // "HELP" -- the title with Close at its right, then the controls one per band.
     if (g_state.mode == Mode::Help) {
         float band = h / static_cast<float>(kHelpPopupBands);
         gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
@@ -3273,8 +3273,8 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
             canvasText(gl, slot, w * 0.05f, band * (static_cast<float>(line) + 1.5f),
                        lines[line]);
 
-        float top = band * static_cast<float>(kHelpPopupBands - 1) + band * 0.10f;
-        float bottom = h - band * 0.10f;
+        float top = band * 0.12f;
+        float bottom = band * 0.88f;
         float x0 = w * kHelpCloseLeft;
         float x1 = w * kHelpCloseRight;
         gl.color4f(0.22f, 0.45f, 0.78f, 0.95f);
@@ -3322,6 +3322,13 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
 
     gl.color4f(0.88f, 0.91f, 0.97f, 1.0f);
     canvasText(gl, kVrTextBody, 20.0f, band * 0.5f, "GPLVR");
+    // The release version after it, smaller and dimmer, from project(gplvr VERSION ...).
+    char version[32] = {};
+    _snprintf_s(version, sizeof(version), _TRUNCATE, "v%s", buildVersion());
+    gl.color4f(0.62f, 0.70f, 0.82f, 1.0f);
+    canvasText(gl, kVrTextSmall,
+               20.0f + static_cast<float>(vrTextWidth(kVrTextBody, "GPLVR")) + 10.0f, band * 0.5f,
+               version);
 
     // THE BUTTONS AND THE STRIP: boxes side by side, each with its label centred. The open tab
     // is filled and underlined so it reads as the page below it; the highlight is the same
