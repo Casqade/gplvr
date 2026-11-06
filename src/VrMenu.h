@@ -79,6 +79,15 @@ void vrMenuUpdate(const GlFunctions& gl);
 // the draw needs is worth doing this frame.
 bool vrMenuRayWanted();
 
+// The beam the presenter draws while GPL's menu is on its fixed panel (vrGplMenuMode 1): the
+// hand pointing -- the one driving the front end's pointer, or the VR menu's owner while it is
+// open -- and how many metres along its aim ray it reaches. False when no hand is pointing.
+bool vrMenuGplMenuBeam(int& hand, float& length);
+
+// A controller is driving the front end's pointer onto GPL's fixed menu panel. The beam marks
+// where it points, so the Windows pointer is not drawn into the picture meanwhile.
+bool vrMenuBeamOnGplMenu();
+
 // True while the menu's "Hide pribluda HUD" row is on: skip the HUD pass entirely.
 //
 // A RUNTIME SWITCH AND NOTHING ELSE -- no ini key, off at every start. The quad layer needs no

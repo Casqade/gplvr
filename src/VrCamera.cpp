@@ -248,6 +248,15 @@ bool vrPublishSeat() {
     return true;
 }
 
+bool vrSettleSeat() {
+    if (g_state.haveOrigin && !g_state.recentreRequested) return true;
+    SharedView views[2] = {};
+    SharedPose head = {};
+    if (!presenterLatestViews(views, head)) return g_state.haveOrigin;
+    captureOrigin(head);
+    return true;
+}
+
 bool vrLookOverrideActive() { return g_options.vrMouseLook; }
 
 // yaw   about +Z (up),   positive turns left
@@ -323,7 +332,7 @@ void vrClearRendered() {
     // It is normally cleared at the top of vrAcquireEyes -- but a menu frame never
     // reaches vrAcquireEyes, because the viewport guard in ensureEyes returns first.
     // So after the first stereo frame it stayed true for the rest of the session, the
-    // presenter was told stretchToFill, and vrMenuScale was skipped from then on.
+    // presenter was told stretchToFill, and vrGplMenuScale was skipped from then on.
     // Exactly "works the first time you enter the lobby, never again once you have
     // raced": before racing it had never been set.
     g_state.injected = false;

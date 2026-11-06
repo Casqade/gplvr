@@ -55,6 +55,26 @@ public:
     // the picture will be head-locked, but there is nothing better to submit.
     bool renderedViews(SharedView out[2]) const;
 
+    // vrGplMenuMode 1: the current frame belongs on a panel fixed in the seat's space rather
+    // than in the eyes. On true the eyes get no picture, the quad goes at `pose` (seat space)
+    // and drawGplMenu fills an image of `imageWidth` x `imageHeight` with the frame's picture.
+    struct GplMenuPanel {
+        SharedPose pose;
+        float      widthMetres = 0.0f;
+        float      heightMetres = 0.0f;
+        uint32_t   imageWidth = 0;
+        uint32_t   imageHeight = 0;
+        // The controller beam to draw into the eyes: kHandLeft/kHandRight, or -1 for none, and
+        // its reach in metres along that hand's aim ray.
+        int32_t    beamHand = -1;
+        float      beamLength = 0.0f;
+    };
+    bool gplMenuPanel(GplMenuPanel& out) const;
+
+    // Only after gplMenuPanel returned true for the current frame.
+    bool drawGplMenu(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                     bool decodeSrgb);
+
     // The game frame the last update() latched, for telling a new image from a repeat.
     int32_t latchedSequence() const { return current_.sequence; }
 
@@ -176,7 +196,19 @@ private:
         float      monoScale = 0.5f;
         bool       renderedValid = false;
         SharedView rendered[2] = {};
+        bool       gplMenuOn = false;
+        SharedPose gplMenuPose;
+        float      gplMenuWidthMetres = 0.0f;
+        float      gplMenuHeightMetres = 0.0f;
+        uint32_t   gplMenuRect[4] = {};
+        int32_t    gplMenuBeamHand = -1;
+        float      gplMenuBeamLength = 0.0f;
     };
+
+    // The blit both drawEye and drawGplMenu end in: `rect` of the current frame (fractions of
+    // the texture, image space) into the target, covering coverX x coverY of it.
+    bool blitFrame(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                   const float rect[4], float coverX, float coverY, bool decodeSrgb);
 
     Slot     slots_[kFrameSlots] = {};
     Slot     hudSlots_[kFrameSlots] = {};

@@ -302,6 +302,13 @@ bool Consumer::update() {
                 latched.eyeRect[eye][i] = block_->eyeRect[eye][i];
         latched.stretchToFill = block_->stretchToFill != 0;
         latched.monoScale = block_->monoScale;
+        latched.gplMenuOn = block_->gplMenuMode == 1;
+        latched.gplMenuPose = block_->gplMenuPose;
+        latched.gplMenuWidthMetres = block_->gplMenuWidthMetres;
+        latched.gplMenuHeightMetres = block_->gplMenuHeightMetres;
+        for (int i = 0; i < 4; ++i) latched.gplMenuRect[i] = block_->gplMenuRect[i];
+        latched.gplMenuBeamHand = block_->gplMenuBeamHand;
+        latched.gplMenuBeamLength = block_->gplMenuBeamLength;
         // From the slot the latched sequence names, not from a shared copy the
         // producer may already have moved on to. The seqlock below cannot protect
         // these: the producer writes payload BEFORE bumping the counter, so a write
@@ -411,10 +418,6 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     if (!target || !context_ || !block_ || !sourceWidth_ || !sourceHeight_)
         return false;
 
-    const uint32_t slot = static_cast<uint32_t>(current_.sequence) % kFrameSlots;
-    ID3D11ShaderResourceView* source = slots_[slot].view;
-    if (!source) return false;
-
     // The eye's sub-rect in the source, in texture coordinates.
     // Sample exactly the rect the game rendered, which is not necessarily half the
     // texture. An odd render width -- 2559, say -- makes the buffer 2559 wide; the game then renders
@@ -476,6 +479,52 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     // already covers the eye's field of view and its pixel shape is anamorphic on
     // purpose. Fitting it here would letterbox a picture that is already correct.
 
+    const float rect[4] = {rectLeft, rectTop, rectWidth, rectHeight};
+    if (!blitFrame(target, width, height, rect, coverX, coverY, decodeSrgb)) return false;
+    if (eye == 1)
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block_->presentedFrames));
+    return true;
+}
+
+bool Consumer::gplMenuPanel(GplMenuPanel& out) const {
+    if (!current_.sequence || !current_.gplMenuOn || current_.sideBySide) return false;
+    const uint32_t* rect = current_.gplMenuRect;
+    if (!rect[2] || !rect[3] || !sourceWidth_ || !sourceHeight_ ||
+        rect[0] + rect[2] > sourceWidth_ || rect[1] + rect[3] > sourceHeight_)
+        return false;
+    if (!(current_.gplMenuWidthMetres > 0.0f) || !(current_.gplMenuHeightMetres > 0.0f))
+        return false;
+    out.pose = current_.gplMenuPose;
+    out.widthMetres = current_.gplMenuWidthMetres;
+    out.heightMetres = current_.gplMenuHeightMetres;
+    out.imageWidth = rect[2];
+    out.imageHeight = rect[3];
+    bool beam = (current_.gplMenuBeamHand == kHandLeft || current_.gplMenuBeamHand == kHandRight) &&
+                current_.gplMenuBeamLength > 0.0f && current_.gplMenuBeamLength < 100.0f;
+    out.beamHand = beam ? current_.gplMenuBeamHand : -1;
+    out.beamLength = beam ? current_.gplMenuBeamLength : 0.0f;
+    return true;
+}
+
+bool Consumer::drawGplMenu(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                           bool decodeSrgb) {
+    if (!target || !context_ || !block_ || !sourceWidth_ || !sourceHeight_) return false;
+    const uint32_t* published = current_.gplMenuRect;
+    const float rect[4] = {static_cast<float>(published[0]) / static_cast<float>(sourceWidth_),
+                           static_cast<float>(published[1]) / static_cast<float>(sourceHeight_),
+                           static_cast<float>(published[2]) / static_cast<float>(sourceWidth_),
+                           static_cast<float>(published[3]) / static_cast<float>(sourceHeight_)};
+    if (!blitFrame(target, width, height, rect, 1.0f, 1.0f, decodeSrgb)) return false;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block_->presentedFrames));
+    return true;
+}
+
+bool Consumer::blitFrame(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
+                         const float rect[4], float coverX, float coverY, bool decodeSrgb) {
+    const uint32_t slot = static_cast<uint32_t>(current_.sequence) % kFrameSlots;
+    ID3D11ShaderResourceView* source = slots_[slot].view;
+    if (!source) return false;
+
     BlitConstants constants = {};
     constants.fit[0] = 1.0f / coverX;
     constants.fit[1] = 1.0f / coverY;
@@ -486,10 +535,10 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     // [t, t+h) comes back as texture rows [1-t-h, 1-t) -- the same band, correctly
     // ordered. That is why the rect is expressed the way the game sees the surface
     // rather than the way the texture stores it.
-    constants.rect[0] = rectLeft;
-    constants.rect[1] = rectTop;
-    constants.rect[2] = rectWidth;
-    constants.rect[3] = rectHeight;
+    constants.rect[0] = rect[0];
+    constants.rect[1] = rect[1];
+    constants.rect[2] = rect[2];
+    constants.rect[3] = rect[3];
     constants.colour[0] = decodeSrgb ? 1.0f : 0.0f;
     constants.colour[1] = block_->gamma;
 
@@ -525,9 +574,6 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
 
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->consumedSequence),
                         current_.sequence);
-    if (eye == 1)
-        InterlockedIncrement(
-            reinterpret_cast<volatile LONG*>(&block_->presentedFrames));
     return true;
 }
 

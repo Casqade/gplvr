@@ -346,7 +346,7 @@ bool ensureEyes(void* mainCamera) {
     //
     // The racing lobby draws a TV feed into a 373x280 surface inside a 640x480 window,
     // and we were splitting that into two 186x280 eyes -- so the headset went stereo
-    // while the driver was still in the menu, and vrMenuScale stopped applying because
+    // while the driver was still in the menu, and vrGplMenuScale stopped applying because
     // the presenter was told the frame was a side-by-side world. Quitting to the menu
     // from a race does the same thing.
     //
@@ -377,7 +377,7 @@ bool ensureEyes(void* mainCamera) {
                 g_state.loggedBackH = fullHeight;
                 logf("stereo: %dx%d render into a %dx%d back buffer -> treated as %s",
                      width, height, fullWidth, fullHeight,
-                     viewport ? "a MENU viewport (mono, vrMenuScale applies)"
+                     viewport ? "a MENU viewport (mono, vrGplMenuScale applies)"
                               : "a WORLD view (split into two eyes)");
             }
             if (viewport) {

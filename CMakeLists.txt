@@ -48,6 +48,7 @@ function(gplvr_add_survey target output)
         src/LogDir.cpp
         src/Paths.cpp
         src/Version.rc
+        src/openxr/Beam.cpp
         src/openxr/Xr.cpp
         src/openxr/GplvrXr.cpp
         src/openxr/XrInput.cpp
@@ -102,6 +103,7 @@ else()
         src/FrameBudget.cpp
         src/GlApi.cpp
         src/GlInterop.cpp
+        src/GplMenuPanel.cpp
         src/GpuTimer.cpp
         src/Hooks.cpp
         src/Hud.cpp

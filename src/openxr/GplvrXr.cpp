@@ -29,6 +29,7 @@
 #include "BuildStamp.h"
 #include "Log.h"
 #include "LogDir.h"
+#include "openxr/Beam.h"
 #include "openxr/Xr.h"
 #include "openxr/XrInput.h"
 #include "presenter/Consumer.h"
@@ -446,6 +447,36 @@ bool updateHudImage(Consumer& consumer, ID3D11DeviceContext* context,
         hud.haveImage = true;
     }
     return hud.haveImage;
+}
+
+// The GPL menu panel's image: the current frame's picture, drawn once per new game frame.
+bool updateGplMenuImage(Consumer& consumer, ID3D11DeviceContext* context, HudLayer& layer) {
+    int32_t sequence = consumer.latchedSequence();
+    if (!sequence || sequence == layer.drawnSequence) return layer.haveImage;
+
+    uint32_t imageIndex = 0;
+    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!XR_CHECK(
+            g_api.xrAcquireSwapchainImage(layer.image.swapchain, &acquireInfo, &imageIndex)))
+        return layer.haveImage;
+
+    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    XR_CHECK(g_api.xrWaitSwapchainImage(layer.image.swapchain, &waitInfo));
+
+    bool drawn = imageIndex < layer.image.targets.size() &&
+                 consumer.drawGplMenu(layer.image.targets[imageIndex], layer.image.width,
+                                      layer.image.height, layer.image.decodeSrgb);
+    context->Flush();
+
+    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    XR_CHECK(g_api.xrReleaseSwapchainImage(layer.image.swapchain, &releaseInfo));
+
+    if (drawn) {
+        layer.drawnSequence = sequence;
+        layer.haveImage = true;
+    }
+    return layer.haveImage;
 }
 
 // The seat space follows the game's recentre: rebuilt from the published seat pose
@@ -1147,12 +1178,17 @@ int wmain(int argc, wchar_t** argv) {
         consumer.setError(2);
         swapchainsOk = false;
     }
+    // The controller beam over GPL's menu panel. Optional: the panel works without it.
+    Beam beam;
+    if (presenting) beam.initialise(device, context);
 
     HudLayer hud;
     // The VR menu's layer. Its own swapchain and its own seat space, because the seat
     // space is rebuilt on a recentre and the two layers must not share one object whose
     // lifetime either of them can end.
     HudLayer menu;
+    // GPL's own menu on a panel fixed to the seat (vrGplMenuMode 1), the same way.
+    HudLayer gplMenu;
 
     // -- frame loop --------------------------------------------------------------
     XrSessionState state = XR_SESSION_STATE_IDLE;
@@ -1303,12 +1339,17 @@ int wmain(int argc, wchar_t** argv) {
             // Published every frame, including the frames the runtime says not to render:
             // a menu open over the game is exactly such a frame, and it is a frame where
             // the driver is most likely to be pressing something.
+            // Kept for the beam on GPL's menu panel, which is drawn from this same sample.
+            SharedInput sampledInput;
+            bool        haveInput = false;
             if (controllers.attached()) {
                 SharedInput input;
                 controllers.sample(g_api, g_instance, session, appSpace,
                                    frameState.predictedDisplayTime,
                                    state == XR_SESSION_STATE_FOCUSED, input);
                 consumer.publishInput(input);
+                sampledInput = input;
+                haveInput = true;
 
                 // What the runtime calls each bound control, asked only when a hand's
                 // interaction profile has changed -- which the sample above detects.
@@ -1322,9 +1363,10 @@ int wmain(int argc, wchar_t** argv) {
                 XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             XrCompositionLayerQuad              hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
             XrCompositionLayerQuad              menuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-            // Three: the projection, pribluda's panel and the VR menu. Layers are painted
-            // in submission order, so the menu goes last and sits over both.
-            const XrCompositionLayerBaseHeader* layers[3] = {};
+            XrCompositionLayerQuad              gplMenuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+            // Four: the projection, GPL's menu panel, pribluda's panel and the VR menu. Layers
+            // are painted in submission order, so the VR menu goes last and sits over all.
+            const XrCompositionLayerBaseHeader* layers[4] = {};
             uint32_t layerCount = 0;
 
             if (frameState.shouldRender) {
@@ -1570,6 +1612,38 @@ int wmain(int argc, wchar_t** argv) {
                             : 0.0f;
                 }
 
+                // vrGplMenuMode 1: the game's one-image frame goes on a quad fixed in the
+                // seat's space and the eyes are black behind it. Anything that stops the quad
+                // -- no swapchain, no seat space -- puts the frame back in the eyes instead.
+                Consumer::GplMenuPanel gplPanel;
+                bool gplPanelOn = valid && presenting && consumer.gplMenuPanel(gplPanel);
+                if (gplPanelOn && (gplMenu.image.width != gplPanel.imageWidth ||
+                                   gplMenu.image.height != gplPanel.imageHeight)) {
+                    bool failedBefore = gplMenu.failedWidth == gplPanel.imageWidth &&
+                                        gplMenu.failedHeight == gplPanel.imageHeight;
+                    if (failedBefore ||
+                        !createHudSwapchain(session, device, chosenFormat, gplPanel.imageWidth,
+                                            gplPanel.imageHeight, gplMenu, "GPL menu panel"))
+                        gplPanelOn = false;
+                }
+                if (gplPanelOn) {
+                    updateSeatSpace(session, consumer, gplMenu, "GPL menu panel");
+                    if (!gplMenu.seatSpace) gplPanelOn = false;
+                }
+                if (gplPanelOn && !updateGplMenuImage(consumer, context, gplMenu))
+                    gplPanelOn = false;
+                if (gplPanelOn != (gplMenu.loggedLayer == 1)) {
+                    gplMenu.loggedLayer = gplPanelOn ? 1 : 0;
+                    if (gplPanelOn)
+                        logf("xr: GPL's menu is on a %.2f x %.2f m panel %.2f m ahead of the "
+                             "seat, from a %ux%u image; the eyes are black behind it",
+                             gplPanel.widthMetres, gplPanel.heightMetres,
+                             -gplPanel.pose.positionZ, gplPanel.imageWidth,
+                             gplPanel.imageHeight);
+                    else
+                        logf("xr: GPL's menu panel is off");
+                }
+
                 if (valid) {
                     const float seconds =
                         (GetTickCount() - startTick) / 1000.0f;
@@ -1601,11 +1675,33 @@ int wmain(int argc, wchar_t** argv) {
                         // eye stays, because a blue left eye and a red right eye say
                         // "waiting for the game" far more clearly than black does.
                         bool drawn = false;
-                        if (presenting)
+                        if (presenting && gplPanelOn) {
+                            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                            context->ClearRenderTargetView(target, black);
+                            drawn = true;
+                            // The beam, from this display's own aim pose, as seen from the
+                            // view this eye is submitted with.
+                            const int32_t beamFlags = kHandAimPositionValid |
+                                                      kHandAimOrientationValid;
+                            if (haveInput && gplPanel.beamHand >= 0 &&
+                                (sampledInput.hands[gplPanel.beamHand].flags & beamFlags) ==
+                                    beamFlags) {
+                                const SharedPose& aim =
+                                    sampledInput.hands[gplPanel.beamHand].aimPose;
+                                XrPosef aimPose;
+                                aimPose.orientation = {aim.orientationX, aim.orientationY,
+                                                       aim.orientationZ, aim.orientationW};
+                                aimPose.position = {aim.positionX, aim.positionY,
+                                                    aim.positionZ};
+                                beam.draw(target, eyes[i].width, eyes[i].height, views[i],
+                                          aimPose, gplPanel.beamLength, eyes[i].decodeSrgb);
+                            }
+                        } else if (presenting) {
                             drawn = consumer.drawEye(target, eyes[i].width,
                                                      eyes[i].height,
                                                      static_cast<int>(i),
                                                      eyes[i].decodeSrgb);
+                        }
                         if (!drawn) context->ClearRenderTargetView(target, base[i]);
 
                         if (!presenting && context1) {
@@ -1681,8 +1777,10 @@ int wmain(int argc, wchar_t** argv) {
                         // ends up pinned to the head on every fast turn. Handing it the
                         // rendered pose is what lets it reproject, which is the whole
                         // reason 36 Hz into a 90 Hz compositor is survivable.
+                        // Behind GPL's menu panel the eyes carry only the beam, drawn from the
+                        // views located for this display, so they are submitted with those.
                         SharedView rendered[2] = {};
-                        if (presenting && consumer.renderedViews(rendered)) {
+                        if (presenting && !gplPanelOn && consumer.renderedViews(rendered)) {
                             const SharedView& source = rendered[i];
                             projectionViews[i].pose.orientation = {
                                 source.pose.orientationX, source.pose.orientationY,
@@ -1759,6 +1857,27 @@ int wmain(int argc, wchar_t** argv) {
                         layers[layerCount++] =
                             reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
                     }
+                }
+
+                if (gplPanelOn) {
+                    gplMenuQuad.layerFlags = 0;
+                    gplMenuQuad.space = gplMenu.seatSpace;
+                    gplMenuQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                    gplMenuQuad.subImage.swapchain = gplMenu.image.swapchain;
+                    gplMenuQuad.subImage.imageRect.offset = {0, 0};
+                    gplMenuQuad.subImage.imageRect.extent = {
+                        static_cast<int32_t>(gplMenu.image.width),
+                        static_cast<int32_t>(gplMenu.image.height)};
+                    gplMenuQuad.subImage.imageArrayIndex = 0;
+                    gplMenuQuad.pose.orientation = {
+                        gplPanel.pose.orientationX, gplPanel.pose.orientationY,
+                        gplPanel.pose.orientationZ, gplPanel.pose.orientationW};
+                    gplMenuQuad.pose.position = {gplPanel.pose.positionX,
+                                                 gplPanel.pose.positionY,
+                                                 gplPanel.pose.positionZ};
+                    gplMenuQuad.size = {gplPanel.widthMetres, gplPanel.heightMetres};
+                    layers[layerCount++] =
+                        reinterpret_cast<XrCompositionLayerBaseHeader*>(&gplMenuQuad);
                 }
 
                 // Pribluda's overlay, composited over the game's image on a quad. Layers
@@ -2011,6 +2130,8 @@ int wmain(int argc, wchar_t** argv) {
     for (Eye& eye : eyes) releaseEye(eye);
     releaseHud(hud);
     releaseHud(menu);
+    releaseHud(gplMenu);
+    beam.release();
     // Before the session: the action spaces and the action set belong to it.
     controllers.destroy(g_api);
     if (viewSpace) g_api.xrDestroySpace(viewSpace);

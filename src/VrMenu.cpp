@@ -4,6 +4,7 @@
 #include "HeadAudio.h"
 #include "Hooks.h"
 #include "Interpolation.h"
+#include "GplMenuPanel.h"
 #include "Log.h"
 #include "MenuScale.h"
 #include "MirrorConfig.h"
@@ -344,6 +345,11 @@ struct MenuRow {
 // ignored.
 bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 
+// One of the GPL menu's two sliders is on the page at a time: size for the head-locked mode,
+// distance for the fixed panel, each the only setting its mode has.
+bool gplMenuHeadLocked() { return g_options.vrGplMenuMode != 1; }
+bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
+
 // The root page. Every row here changes a live value and nothing else; Save settings is what
 // writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
 //
@@ -471,9 +477,19 @@ MenuRow g_rows[] = {
      "how far out toward the edges the game's messages sit. 1.00 is the game's layout; lower "
      "is nearer the middle, where big text still fits",
      kTabDisplay},
-    {"Menu size in headset", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrMenuScale, 0.05f, 1.0f, 0.05f,
-     "how much of your view the game's own menus cover; at 1.00 they fill it", kTabDisplay},
+    {"GPL menu", kRowNamedInt, kCommandNone, nullptr, &g_options.vrGplMenuMode, nullptr, 0, 1, 1,
+     "how the game's own menus are shown. head-locked: they turn with your head. fixed: on a "
+     "panel in front of the seat that stays put while you look around",
+     kTabDisplay},
+    {"GPL menu size", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrGplMenuScale, 0.05f, 1.0f, 0.05f,
+     "how much of your view the game's own menus cover; at 1.00 they fill it", kTabDisplay,
+     gplMenuHeadLocked},
+    {"GPL menu distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrGplMenuDistance, 0.75f, 5.0f, 0.25f,
+     "how far ahead of the seat the panel with the game's menus hangs, in metres. The panel "
+     "keeps its size, so nearer looks bigger",
+     kTabDisplay, gplMenuFixed},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
      kMonitorOff, kMonitorBoth, 1,
      "what the monitor shows while you are in the headset: nothing, one eye, or both. Off "
@@ -846,6 +862,10 @@ struct State {
 
     // The front end's pointer.
     bool     pointerHasMouse = false;
+    // On GPL's fixed menu panel: the hand whose ray drives the pointer (-1 when none is awake)
+    // and how far along that ray it reaches, for the presenter's beam.
+    int      fixedBeamHand = -1;
+    float    fixedBeamLength = 0.0f;
     Vec3     pointerLastDirection;
     bool     pointerHaveLast = false;
     LONGLONG pointerMovedAt = 0;
@@ -1344,6 +1364,7 @@ const char* namedValue(const MenuRow& row) {
             default: return "per mirror";
         }
     }
+    if (row.intValue == &g_options.vrGplMenuMode) return *row.intValue == 1 ? "fixed" : "head-locked";
     if (row.intValue == &g_options.vrRendererType) {
         switch (*row.intValue) {
             case 0: return "Vanilla";
@@ -1661,7 +1682,9 @@ void saveSettings() {
     writeInt("vrRendererType", g_options.vrRendererType);
     writeInt("pribludaUpdateInterval", g_options.pribludaUpdateInterval);
     writeFloat("vrRenderScale", g_options.vrRenderScale);
-    writeFloat("vrMenuScale", g_options.vrMenuScale);
+    writeInt("vrGplMenuMode", g_options.vrGplMenuMode);
+    writeFloat("vrGplMenuScale", g_options.vrGplMenuScale);
+    writeFloat("vrGplMenuDistance", g_options.vrGplMenuDistance);
     writeFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
     writeInt("vrGplTextScale", g_options.vrGplTextScale);
     writeFloat("vrGplTextSpread", g_options.vrGplTextSpread);
@@ -1674,19 +1697,21 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 16 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 18 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
     notice("saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudLayer=%d mirrorUpdateInterval=%d mirrorMode=%d "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
-         "vrRenderScale=%.3f vrMenuScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
+         "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
+         "vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
          "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrWorldScale=%.3f "
          "vrHeadAudioWidth=%.3f vrMonitorEye=%d",
          path, g_options.vrHudLayer, g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
-         g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrMenuScale,
+         g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
+         g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
          g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextSpread,
          g_options.vrGamma, g_options.vrHorizonLock, g_options.vrWorldScale,
          g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
@@ -2647,6 +2672,18 @@ void pollFrontEndPointer() {
     SharedPose head = {};
     if (!presenterLatestViews(views, head)) return;
 
+    // vrGplMenuMode 1: the front end is on a panel fixed in the seat's frame, and the ray goes
+    // to that panel as it does to the replay panel. Its picture is the rect above.
+    GplMenuPanel fixedPanel;
+    bool         onFixed = !onPanel && gplMenuPanelShown(fixedPanel);
+    g_state.fixedBeamHand = -1;
+    Surface      fixedSurface;
+    if (onFixed)
+        fillSurface(fixedSurface,
+                    {fixedPanel.pose.positionX, fixedPanel.pose.positionY,
+                     fixedPanel.pose.positionZ},
+                    quatOf(fixedPanel.pose), fixedPanel.width, fixedPanel.height);
+
     // Either hand, THE ONE THAT IS MOVING FIRST. Ownership is not claimed for this -- there is
     // nothing for two hands to fight over when both write the same single pointer position --
     // but which one is asked first decides who wins while both are tracked, and a fixed
@@ -2696,13 +2733,23 @@ void pollFrontEndPointer() {
             // The replay panel is a quad in the seat's frame, so the ray goes there too; the
             // front end's plane is head-locked.
             SharedPose aimSeat = {};
-            bool       hit = onPanel ? poseInSeat(hand.aimPose, aimSeat) &&
-                                     rayToSurface(replayPanelSurface(), aimSeat, rawU, rawV)
-                                     : frontEndRay(head, hand.aimPose, aspect, rawU, rawV);
+            bool       hit = false;
+            if (onPanel)
+                hit = poseInSeat(hand.aimPose, aimSeat) &&
+                      rayToSurface(replayPanelSurface(), aimSeat, rawU, rawV);
+            else if (onFixed)
+                hit = poseInSeat(hand.aimPose, aimSeat) &&
+                      rayToSurface(fixedSurface, aimSeat, rawU, rawV);
+            else
+                hit = frontEndRay(head, hand.aimPose, aspect, rawU, rawV);
+            if (onFixed) {
+                g_state.fixedBeamHand = order[i];
+                g_state.fixedBeamLength = kRayMissLength;
+            }
             if (onPanel) g_state.replayHitOn = hit;
             if (!hit) {
                 // Off the panel the filter has nothing to carry forward, as with the menu's.
-                if (onPanel) g_state.smoothValid = false;
+                if (onPanel || onFixed) g_state.smoothValid = false;
             } else {
                 float u = rawU;
                 float v = rawV;
@@ -2710,6 +2757,12 @@ void pollFrontEndPointer() {
                 if (onPanel) {
                     g_state.replayHitU = u;
                     g_state.replayHitV = v;
+                }
+                if (onFixed) {
+                    // To where the pointer is, which is the smoothed hit, so the beam ends on
+                    // the spot a press would click.
+                    Vec3 reach = sub(surfacePoint(fixedSurface, u, v), positionOf(aimSeat));
+                    g_state.fixedBeamLength = std::sqrt(dot(reach, reach));
                 }
 
                 POINT point;
@@ -2742,6 +2795,14 @@ void pollFrontEndPointer() {
                             logf("vr menu: the %s controller now drives the pointer over the "
                                  "replay panel",
                                  order[i] == kHandLeft ? "left" : "right");
+                        else if (onFixed)
+                            logf("vr menu: the %s controller now drives the front end's "
+                                 "pointer -- an aim ray onto its %.2f x %.2f m panel %.2f m "
+                                 "ahead of the seat",
+                                 order[i] == kHandLeft ? "left" : "right",
+                                 static_cast<double>(fixedPanel.width),
+                                 static_cast<double>(fixedPanel.height),
+                                 static_cast<double>(-fixedPanel.pose.positionZ));
                         else
                             logf("vr menu: the %s controller now drives the front end's "
                                  "pointer -- an aim ray onto a %.2f x %.2f m plane %.1f m "
@@ -2763,10 +2824,11 @@ void pollFrontEndPointer() {
         // the menu opening on the other hand, the race starting, the controller going to
         // sleep -- frontEndPointerRelease finds the button still down and lets it go.
         //
-        // Over the replay panel a press counts only when the ray is on the panel: the pointer
+        // Over the replay panel and the fixed GPL menu panel a press counts only when the ray is
+        // on the panel: the pointer
         // stays where it last was when the ray leaves, and a press aimed at the world would
         // click whichever button that is. The release always goes.
-        bool press = hand.triggerHeld.pressed && (!onPanel || onTarget);
+        bool press = hand.triggerHeld.pressed && (!(onPanel || onFixed) || onTarget);
         bool release = hand.triggerHeld.released && g_state.frontEndButtonDown;
         if (press || release) {
             INPUT click = {};
@@ -4009,6 +4071,37 @@ int rayHand() {
 }
 
 bool vrMenuRayWanted() { return rayHand() >= 0; }
+
+bool vrMenuGplMenuBeam(int& hand, float& length) {
+    const State& state = g_state;
+    if (state.mode == Mode::Closed) {
+        // Asked by the panel itself while it is being placed, so no panel check here.
+        if (state.fixedBeamHand < 0) return false;
+        hand = state.fixedBeamHand;
+        length = state.fixedBeamLength;
+        return true;
+    }
+    // The VR menu is open over the panel: the menu owner's ray, to the hit the pointer poll
+    // worked out on the menu's own panel, or the miss length.
+    hand = rayHand();
+    if (hand < 0) return false;
+    SharedPose aim = {};
+    if (!poseInSeat(vrInputHand(hand).aimPose, aim)) return false;
+    length = kRayMissLength;
+    Surface drawn = drawnSurface();
+    if (state.pointerOn && drawn.valid) {
+        Vec3 reach = sub(surfacePoint(drawn, state.pointerU, state.pointerV), positionOf(aim));
+        length = std::sqrt(dot(reach, reach));
+    }
+    return true;
+}
+
+bool vrMenuBeamOnGplMenu() {
+    // The panel check too: the hand is only cleared by the front end's own poll, which a race
+    // does not run.
+    GplMenuPanel panel;
+    return g_state.mode == Mode::Closed && g_state.fixedBeamHand >= 0 && gplMenuPanelShown(panel);
+}
 
 void vrMenuDrawRay(const GlFunctions& gl) {
     State& state = g_state;

@@ -422,11 +422,20 @@ struct Options {
     // asserts that one GPL unit is one metre, which is an assumption nothing has yet verified.
     float vrWorldScale = 1.0f;
 
-    // How much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
+    // How GPL's own menus (the front end, and any other one-image frame) are shown in the
+    // headset. 0: head-locked in the eye images, vrGplMenuScale of the view. 1: on a panel
+    // fixed in front of the seat, vrGplMenuDistance metres ahead (kGplMenuPanelWidth wide).
+    int vrGplMenuMode = 0;
+
+    // Mode 0: how much of the eye a menu covers, 0.05 to 1.0. Menus are flat 2D images with no
     // world render behind them, so at 1.0 they fill the whole 104-degree view a few
     // centimetres from your face. The layer sits at infinity either way -- angular size
     // is the only "distance" a projection layer has.
-    float vrMenuScale = 0.5f;
+    float vrGplMenuScale = 0.5f;
+
+    // Mode 1: metres from the seat to the panel, 0.75 to 5.0. The panel's size is fixed, so
+    // nearer is bigger.
+    float vrGplMenuDistance = 2.0f;
 
     // Gamma the presenter applies to everything it draws in the headset: the eyes, the menus
     // and the HUD panel. 1.0 leaves the game's colours exactly as the monitor shows them;

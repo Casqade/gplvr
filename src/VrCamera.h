@@ -86,6 +86,11 @@ bool vrSeatPose(SharedPose& out);
 // when there is neither.
 bool vrPublishSeat();
 
+// For a layer fixed to the seat outside a race (GPL's menu panel): vrPublishSeat, and a recentre
+// requested since the seat was taken is applied now from the newest head pose rather than at the
+// next race frame. False while there is no seat and no head pose to take one from.
+bool vrSettleSeat();
+
 // The runtime views the last successful vrAcquireEyes rendered from, still in the
 // presenter's own reference space: orientation and fov as published, eye positions moved
 // forward by the position prediction when it is on. The producer echoes these back with the frame

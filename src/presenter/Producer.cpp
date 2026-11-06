@@ -9,6 +9,7 @@
 #include "FrameBudget.h"
 #include "FrameTrace.h"
 #include "GlInterop.h"
+#include "GplMenuPanel.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "Paths.h"
@@ -1712,7 +1713,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     }
 
     block->sideBySide = sideBySide ? 1 : 0;
-    block->monoScale = g_options.vrMenuScale;
+    block->monoScale = g_options.vrGplMenuScale;
     block->gamma = g_options.vrGamma;
     const HudPlacement& placement =
         g_options.vrHudLayer == 1 ? g_options.vrHudHead : g_options.vrHudSeat;
@@ -1759,6 +1760,17 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
         for (int i = 0; i < 4; ++i)
             block->eyeRect[eye][i] = have ? static_cast<uint32_t>(rect[i]) : 0u;
     }
+    GplMenuPanel gplMenu;
+    block->gplMenuMode = gplMenuPanelForFrame(width, height, sideBySide, stretchToFill,
+                                              haveMonoRect ? monoRect : nullptr, gplMenu);
+    block->gplMenuPose = gplMenu.pose;
+    block->gplMenuWidthMetres = gplMenu.width;
+    block->gplMenuHeightMetres = gplMenu.height;
+    block->gplMenuBeamHand = gplMenu.beamHand;
+    block->gplMenuBeamLength = gplMenu.beamLength;
+    for (int i = 0; i < 4; ++i)
+        block->gplMenuRect[i] =
+            static_cast<uint32_t>(gplMenu.rect[i] + (i == 1 && block->gplMenuMode ? frameTop : 0));
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->stretchToFill),
                         stretchToFill ? 1 : 0);
 

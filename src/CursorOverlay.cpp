@@ -5,6 +5,7 @@
 #include "ReplayPanel.h"
 #include "ReplayQuickMenu.h"
 #include "Stereo.h"
+#include "VrMenu.h"
 
 #include <windows.h>
 
@@ -117,6 +118,7 @@ enum class Refusal {
     ShapeUnreadable,
     ReplayPanel,
     NoContext,
+    BeamOnGplMenu,
 };
 
 struct State {
@@ -190,6 +192,9 @@ const char* refusalText(Refusal reason, char* scratch, size_t scratchSize) {
         case Refusal::NoContext:
             return "no GL context is current (the game unbinds it before tearing the "
                    "window down), so a GL call here would do nothing";
+        case Refusal::BeamOnGplMenu:
+            return "a controller's beam points at GPL's menu panel and marks the spot itself; "
+                   "the pointer comes back when the mouse has it again";
     }
     return "unknown";
 }
@@ -794,6 +799,10 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     }
     if (gl.wglGetCurrentContext && !gl.wglGetCurrentContext()) {
         noteRefusal(Refusal::NoContext);
+        return;
+    }
+    if (vrMenuBeamOnGplMenu()) {
+        noteRefusal(Refusal::BeamOnGplMenu);
         return;
     }
 

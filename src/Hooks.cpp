@@ -2576,8 +2576,16 @@ void loadOptions(const char* fileName) {
     g_options.skipCredits = GetPrivateProfileIntA("gplvr", "skipCredits", 1, path) != 0;
     g_options.mirrorDriverArms =
         GetPrivateProfileIntA("gplvr", "mirrorDriverArms", 1, path) != 0;
-    GetPrivateProfileStringA("gplvr", "vrMenuScale", "0.5", text, sizeof(text), path);
-    g_options.vrMenuScale = static_cast<float>(atof(text));
+    g_options.vrGplMenuMode = GetPrivateProfileIntA("gplvr", "vrGplMenuMode", 0, path);
+    if (g_options.vrGplMenuMode < 0 || g_options.vrGplMenuMode > 1) g_options.vrGplMenuMode = 0;
+    GetPrivateProfileStringA("gplvr", "vrGplMenuScale", "0.5", text, sizeof(text), path);
+    g_options.vrGplMenuScale = static_cast<float>(atof(text));
+    if (!(g_options.vrGplMenuScale >= 0.05f)) g_options.vrGplMenuScale = 0.05f;
+    if (g_options.vrGplMenuScale > 1.0f) g_options.vrGplMenuScale = 1.0f;
+    GetPrivateProfileStringA("gplvr", "vrGplMenuDistance", "2.0", text, sizeof(text), path);
+    g_options.vrGplMenuDistance = static_cast<float>(atof(text));
+    if (!(g_options.vrGplMenuDistance >= 0.75f)) g_options.vrGplMenuDistance = 0.75f;
+    if (g_options.vrGplMenuDistance > 5.0f) g_options.vrGplMenuDistance = 5.0f;
     GetPrivateProfileStringA("gplvr", "vrGamma", "1.0", text, sizeof(text), path);
     g_options.vrGamma = static_cast<float>(atof(text));
     if (g_options.vrGamma < 0.5f) g_options.vrGamma = 0.5f;
@@ -2774,9 +2782,14 @@ void loadOptions(const char* fileName) {
          "-- watch the `vr: no signal` lines)",
          g_options.vrNoSignalDelay);
 
-    logf("options: vrMenuScale=%.2f vrGamma=%.2f vrGplTextDepth=%.2f vrRenderScale=%.2f "
+    logf("options: vrGplMenuMode=%d (%s) vrGplMenuScale=%.2f vrGplMenuDistance=%.2f",
+         g_options.vrGplMenuMode,
+         g_options.vrGplMenuMode == 1 ? "a panel fixed in front of the seat"
+                                      : "head-locked in the eye images",
+         g_options.vrGplMenuScale, g_options.vrGplMenuDistance);
+    logf("options: vrGamma=%.2f vrGplTextDepth=%.2f vrRenderScale=%.2f "
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
-         g_options.vrMenuScale, g_options.vrGamma, g_options.vrGplTextDepth,
+         g_options.vrGamma, g_options.vrGplTextDepth,
          g_options.vrRenderScale, g_options.vrRecentreKey, g_options.vrMonitorEye);
     logf("options: vrHorizonLock=%.2f vrWorldScale=%.2f vrHeadAudio=%d vrHeadAudioWidth=%.2f",
          g_options.vrHorizonLock, g_options.vrWorldScale, g_options.vrHeadAudio ? 1 : 0,
