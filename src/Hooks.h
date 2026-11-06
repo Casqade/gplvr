@@ -472,15 +472,19 @@ struct Options {
     // halves. That was mirrorGeometry and mirrorUvSplit until 2026-10-12; mirrorTextures, a
     // texture per glass, could never work and went with them.
 
-    // Where pribluda's overlay hangs in the headset: 0 not at all, 1 a panel that follows
-    // the head, 2 a panel fixed to the seat -- still while you look around, so it is read
-    // by looking at it, in the sharp middle of the lens.
+    // Where gplvr draws pribluda's overlay in the headset ("Pribluda mode" in the VR menu):
+    //   0  off: no panel in the headset
+    //   1  fixed: on a panel fixed to the seat -- still while you look around, so it is read
+    //      by looking at it, in the sharp middle of the lens
+    //   2  head-locked: on a panel that follows the head
+    // pribluda's own monitor HUD is pribluda's in every mode. hudLayer() below is the question
+    // the code asks of it.
     //
-    // The panel is an OpenXR quad layer the runtime draws itself on every display frame and
-    // samples once, straight to the display, so it holds still and stays sharp however the
-    // game's own frames are paced. Its layout is gplvr_pribluda.ini. The seat is the pose
-    // at the last recentre, so a seat panel appears after the first one.
-    int vrHudLayer = 2;
+    // The headset panel is an OpenXR quad layer the runtime draws itself on every display frame
+    // and samples once, straight to the display, so it holds still and stays sharp however the
+    // game's own frames are paced. Its layout is gplvr_pribluda.ini. The seat is the pose at
+    // the last recentre, so a fixed panel appears after the first one.
+    int vrHudMode = 1;
 
     // Where the panel hangs, one set per mode: its centre this many metres ahead, below and
     // to the right, and its width in metres (the height follows the monitor's shape). It
@@ -501,9 +505,9 @@ struct Options {
     // because the panel's own size already decides how big the text looks: making the panel
     // wider makes everything on it bigger together, which is the control a driver wants.
 
-    // Switch the panel between following the head (vrHudLayer 1) and fixed to the seat (2)
-    // while the game runs. Home by default; 0 disables. With the panel off it turns it on,
-    // following the head, which needs no seat.
+    // Switch the panel between fixed (vrHudMode 1) and head-locked (2) while the game runs.
+    // Home by default; 0 disables. From vrHudMode 0 it goes to head-locked, which needs no
+    // seat.
     int vrHudLayerKey = VK_HOME;
 
     // HUD tweak mode, for placing pribluda's elements on the panel from the headset. End by
@@ -520,13 +524,9 @@ struct Options {
     // lower rate costs nothing but the age of the numbers -- and pribluda's text changes a
     // few times a second at most, so 1/2 loses nothing at 90 fps and halves the panel's cost.
     //
-    // No 0 here, unlike the mirror: turning the HUD off is its own thing, and it is the
-    // menu's "Pribluda HUD" row, which skips the whole pass rather than freezing it.
+    // No 0 here, unlike the mirror: turning the HUD off is its own thing, vrHudMode 0, which
+    // skips the whole pass rather than freezing it.
     int pribludaUpdateInterval = 2;
-
-    // Whether the Pribluda overlay is drawn at all, in the headset and on the monitor. Off
-    // skips the whole pass, so a hidden overlay costs nothing. Also "Pribluda HUD" in the VR menu.
-    bool vrHud = true;
 
     // GPL's OWN in-race text goes into BOTH eyes, at the disparity vrGplTextDepth asks for. It
     // was `vrHudEye`, which could put it in one eye only; that is not something to configure
@@ -747,6 +747,12 @@ inline bool mirrorSharedPane() { return g_options.mirrorMode != kMirrorPerGlass;
 // The renderer type of the mode running now (Options::vrRendererType, flatRendererType).
 inline int rendererType() {
     return g_options.vr ? g_options.vrRendererType : g_options.flatRendererType;
+}
+
+// vrHudMode's headset panel in the presenter's numbering: 1 following the head, 2 fixed to the
+// seat, 0 none.
+inline int hudLayer() {
+    return g_options.vrHudMode == 2 ? 1 : (g_options.vrHudMode == 1 ? 2 : 0);
 }
 
 void loadOptions(const char* fileName);

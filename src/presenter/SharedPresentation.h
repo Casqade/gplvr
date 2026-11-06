@@ -519,7 +519,7 @@ struct ControlBlock {
     // Usually the seat's -- the same space the seat-locked HUD panel uses, which the
     // presenter already builds from the published seat pose, and the frame the game
     // places its panel in. The exception is HUD tweak mode with a HEAD-LOCKED HUD panel
-    // (vrHudLayer 1): the menu's quad is put exactly over that panel to annotate it, and
+    // (hudLayer 1, vrHudMode 2): the menu's quad is put exactly over that panel to annotate it, and
     // a panel the runtime re-places against the head every display frame cannot be
     // followed by a layer nailed to the seat from a pose computed a frame earlier. It
     // has to be in the same space as the thing it is drawn on.

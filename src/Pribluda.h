@@ -23,7 +23,7 @@
 //
 // HOW IT REACHES THE HEADSET. Once a frame the overlay is drawn into a shared texture that
 // the presenter composites as an OpenXR quad layer, head-locked or fixed to the seat, placed
-// from gplvr.ini (vrHudLayer, vrHudHead* and vrHudSeat*). The runtime
+// from gplvr.ini (vrHudMode, vrHudHead* and vrHudSeat*). The runtime
 // places the quad itself on every display frame, so it holds still however the game's own
 // frames are paced, and its text is sampled once, straight to the display. Pribluda's own
 // call still draws the monitor.
@@ -56,7 +56,7 @@ enum PribludaPresence {
 PribludaPresence pribludaPresence();
 
 // Draw the overlay into the HUD panel texture. Call it from the present hook, where the
-// game's GL context is current. Inert unless vr and vrHudLayer are on, the game is in a
+// game's GL context is current. Inert unless vr is on and vrHudMode is not 0, the game is in a
 // race, and pribluda is loaded with its font lists built. Resolution is lazy: pribluda is
 // loaded by gpl_rasterBegin long after gplvr attaches, and is absent entirely if the player
 // has not installed it.

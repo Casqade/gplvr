@@ -317,7 +317,7 @@ const int   kSliceAction[kSliceCount] = {kActPlay,         kActToEnd,      kActC
                                          kActCameraPrev,   kActToStart};
 
 // Eight sectors of 45 degrees; 6 degrees of hysteresis is the in-car ring's 10 scaled to the
-// narrower sector. A label wider than 170 px -- "Back to garage", "Next camera" -- is broken.
+// narrower sector. A label wider than 170 px -- "Back to pits", "Next camera" -- is broken.
 const RadialLayout kLayout = {kSliceCount, kSliceAngle, 22.5f, 6.0f, 170.0f};
 
 // -- the stick ------------------------------------------------------------------------------
@@ -381,8 +381,8 @@ const char* const kGateName[kGateCount] = {
 enum Origin { kOriginMenu = 0, kOriginCar, kOriginGarage };
 const char* const kOriginName[] = {"a replay loaded from the menu",
                                    "an instant replay from the car",
-                                   "the garage monitor's replay"};
-const char* const kBackLabel[] = {"Back to menu", "Back to car", "Back to garage"};
+                                   "the lobby monitor's replay"};
+const char* const kBackLabel[] = {"Back to menu", "Back to car", "Back to lobby"};
 
 constexpr double kBackWatchSeconds = 3.0;
 constexpr int    kViewLinesPerVisit = 40;

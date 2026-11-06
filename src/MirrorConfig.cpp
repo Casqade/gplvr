@@ -514,7 +514,7 @@ int mirrorConfigSelectStep(int direction) {
 }
 
 const char* mirrorConfigSelectedName() {
-    return g_config.selected < 0 ? "all glasses" : mirrorConfigGlassName(g_config.selected);
+    return g_config.selected < 0 ? "all mirrors" : mirrorConfigGlassName(g_config.selected);
 }
 
 void mirrorConfigFormatAims(char* out, size_t size) {

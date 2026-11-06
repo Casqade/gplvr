@@ -794,16 +794,16 @@ void pollToggle() {
     if (g_options.vr && g_options.vrHudLayerKey) {
         bool down = (GetAsyncKeyState(g_options.vrHudLayerKey) & 0x8000) != 0;
         if (down && !g_vrHudLayerKeyLast && !hotkeyOwnedByMode(g_options.vrHudLayerKey)) {
-            g_options.vrHudLayer = g_options.vrHudLayer == 1 ? 2 : 1;
+            g_options.vrHudMode = hudLayer() == 1 ? 1 : 2;
             const char* seat = "";
-            if (g_options.vrHudLayer == 2 && !presenterSeatPublished()) {
+            if (hudLayer() == 2 && !presenterSeatPublished()) {
                 seat = vrPublishSeat()
                            ? " -- no seat had been published, so the head pose now is the seat"
                            : " -- no seat yet and no head pose to take one from; it appears "
                              "after the first recentre";
             }
             logf("vr: HUD panel switched to %s%s",
-                 g_options.vrHudLayer == 1 ? "follow the head" : "the seat", seat);
+                 hudLayer() == 1 ? "follow the head" : "the seat", seat);
         }
         g_vrHudLayerKeyLast = down;
     }
@@ -1247,11 +1247,10 @@ int __cdecl screenDisplayHook(void* surface) {
     // monitor. A second copy goes into the panel texture the headset shows as a quad
     // layer; it needs the game's GL context, which is current here.
     //
-    // The menu's "Hide pribluda HUD" row skips the whole pass rather than drawing something
-    // invisible: the monitor's overlay goes with it, and so does the headset's quad, because
-    // the presenter drops that layer when the game stops drawing the panel.
+    // vrHudMode 0 draws no panel (pribludaDrawHud returns first), so the presenter drops
+    // the headset's quad. pribluda's own monitor HUD is pribluda's, in every mode.
     frameBudgetSwitch(kSpanPanel);
-    if (!vrMenuPribludaHidden()) pribludaDrawHud();
+    pribludaDrawHud();
 
     // The VR menu's layer is built here, with the GL context current and before the frame
     // transfer: it publishes under a lock of its own, and its texture is what the
@@ -2591,8 +2590,8 @@ void loadOptions(const char* fileName) {
     if (g_options.vrGamma > 3.0f) g_options.vrGamma = 3.0f;
     GetPrivateProfileStringA("gplvr", "vrGplTextDepth", "0.0", text, sizeof(text), path);
     g_options.vrGplTextDepth = static_cast<float>(atof(text));
-    g_options.vrHudLayer = GetPrivateProfileIntA("gplvr", "vrHudLayer", 2, path);
-    if (g_options.vrHudLayer < 0 || g_options.vrHudLayer > 2) g_options.vrHudLayer = 2;
+    g_options.vrHudMode = GetPrivateProfileIntA("gplvr", "vrHudMode", 1, path);
+    if (g_options.vrHudMode < 0 || g_options.vrHudMode > 2) g_options.vrHudMode = 1;
     g_options.vrGplTextScale = GetPrivateProfileIntA("gplvr", "vrGplTextScale", 1, path);
     if (g_options.vrGplTextScale < 1) g_options.vrGplTextScale = 1;
     if (g_options.vrGplTextScale > 4) g_options.vrGplTextScale = 4;
@@ -2769,11 +2768,10 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "pribludaUpdateInterval", 2, path);
     if (g_options.pribludaUpdateInterval < 1) g_options.pribludaUpdateInterval = 1;
     if (g_options.pribludaUpdateInterval > 8) g_options.pribludaUpdateInterval = 8;
-    g_options.vrHud = GetPrivateProfileIntA("gplvr", "vrHud", 1, path) != 0;
     logf("options: vrTransferFinish=%d pribludaUpdateInterval=%d (the HUD panel is redrawn on one "
-         "frame in %d) vrHud=%d",
+         "frame in %d)",
          g_options.vrTransferFinish ? 1 : 0, g_options.pribludaUpdateInterval,
-         g_options.pribludaUpdateInterval, g_options.vrHud ? 1 : 0);
+         g_options.pribludaUpdateInterval);
     g_options.vrNoSignalDelay = GetPrivateProfileIntA("gplvr", "vrNoSignalDelay", 250, path);
     if (g_options.vrNoSignalDelay < 0) g_options.vrNoSignalDelay = 0;
     if (g_options.vrNoSignalDelay > 10000) g_options.vrNoSignalDelay = 10000;
@@ -2795,7 +2793,10 @@ void loadOptions(const char* fileName) {
          "vrHeadAudioWidth=%.2f",
          g_options.vrHorizonLock, g_options.vrReplayHorizonLock, g_options.vrWorldScale,
          g_options.vrHeadAudio ? 1 : 0, g_options.vrHeadAudioWidth);
-    logf("options: vrHudLayer=%d vrHudBackdropOpacity=%.2f", g_options.vrHudLayer,
+    logf("options: vrHudMode=%d (%s) vrHudBackdropOpacity=%.2f", g_options.vrHudMode,
+         g_options.vrHudMode == 0   ? "off"
+         : g_options.vrHudMode == 1 ? "fixed"
+                                    : "head-locked",
          g_options.vrHudBackdropOpacity);
     logf("options: vrGplTextScale=%d vrGplTextSpread=%.2f -- in VR gplvr draws GPL's stamped "
          "glyphs from its own atlas, once per eye, scaled and pulled in -- watch the `fast "
@@ -2864,7 +2865,7 @@ void loadOptions(const char* fileName) {
 }
 
 // The eight keys loadOptions reads just above, written back where the panel tweak mode
-// leaves them. Both layers go every time: vrHudLayer decides which one is live, and the
+// leaves them. Both layers go every time: vrHudMode decides which one is live, and the
 // other one's numbers are still the driver's own from an earlier session.
 //
 // The leading space in the format is the value's: WritePrivateProfileString keeps the text

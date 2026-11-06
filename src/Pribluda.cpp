@@ -144,7 +144,7 @@ constexpr const char* kDefaultLayout =
     "; TOP-LEFT corner. The defaults are PRIBLUDA.INI's monitor layout, so the panel starts\r\n"
     "; out as a copy of your monitor HUD; pull things together to make it more compact.\r\n"
     ";\r\n"
-    "; Where the panel hangs and how big it is lives in gplvr.ini: vrHudLayer, and\r\n"
+    "; Where the panel hangs and how big it is lives in gplvr.ini: vrHudMode, and\r\n"
     "; vrHudHead*/vrHudSeat* for each mode; the panel's own width sets how big text is.\r\n"
     ";\r\n"
     "; Same section and key names as PRIBLUDA.INI. Only positions and `show` are read;\r\n"
@@ -546,7 +546,7 @@ bool bind() {
 }
 
 // Settle whether pribluda exists, called once a frame from the present hook ahead of every
-// option gate -- including vrHudLayer, because the menu's own row for it has to stay
+// option gate -- including vrHudMode, because the menu's own row for it has to stay
 // reachable on an install that has pribluda and has the panel switched off.
 void settlePresence() {
     if (g_presence == kPribludaPresent) return;
@@ -973,7 +973,7 @@ void drawTweakOutline(const GlFunctions& gl, int width, int height) {
 
 void pribludaDrawHud() {
     settlePresence();
-    if (!g_options.vr || g_options.vrHudLayer == 0) return;
+    if (!g_options.vr || hudLayer() == 0) return;
     if (!bind()) return;
     if (*g_prib.rasterizerKind != kRasterizerRoglv2) return;
 

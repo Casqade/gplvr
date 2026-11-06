@@ -1250,7 +1250,7 @@ void noteMonitorHud(State& state, const char* reason, int monitorEye) {
     if (!reason) {
         logf("vr: monitor HUD engaged -- the headset panel (%s) is drawn over %s of the "
              "monitor picture and pribluda's own monitor HUD is skipped",
-             g_options.vrHudLayer == 1 ? "following the head" : "fixed to the seat",
+             hudLayer() == 1 ? "following the head" : "fixed to the seat",
              monitorEye == kMonitorBoth
                  ? "each eye"
                  : (monitorEye == kMonitorLeft ? "the left eye" : "the right eye"));
@@ -1272,7 +1272,7 @@ void drawMonitorHud(State& state, int monitorEye) {
     bool live = state.hudTexture && state.hudDrawnQpc && state.qpcFrequency &&
                 now.QuadPart - state.hudDrawnQpc <
                     static_cast<LONGLONG>(state.qpcFrequency * kHudGraceSeconds);
-    int  layer = g_options.vrHudLayer;
+    int  layer = hudLayer();
 
     // WHY THIS FUNCTION EXISTS AT ALL, and why the VR menu now rides it too.
     //
@@ -1305,9 +1305,9 @@ void drawMonitorHud(State& state, int monitorEye) {
         if (!pribludaMonitorDrawRedirected())
             reason = "pribluda's monitor draw is not redirected (see the pribluda: lines)";
         else if (!live)
-            reason = "no HUD panel drawn in the last 0.25 s (not in a race, or vrHudLayer 0)";
+            reason = "no HUD panel drawn in the last 0.25 s (not in a race, or vrHudMode 0)";
         else if (layer != 1 && layer != 2)
-            reason = "vrHudLayer is not 1 or 2";
+            reason = "vrHudMode is not 1 or 2";
         else if (layer == 2 && !state.block->seatGeneration)
             reason = "no seat has been published yet";
     }
@@ -1716,7 +1716,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
     block->monoScale = g_options.vrGplMenuScale;
     block->gamma = g_options.vrGamma;
     const HudPlacement& placement =
-        g_options.vrHudLayer == 1 ? g_options.vrHudHead : g_options.vrHudSeat;
+        hudLayer() == 1 ? g_options.vrHudHead : g_options.vrHudSeat;
     block->hudRight = placement.right;
     block->hudUp = -placement.down;
     block->hudAhead = placement.ahead;
@@ -1923,7 +1923,7 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
                    transferEnd.QuadPart - state.hudPublishedQpc <
                        static_cast<LONGLONG>(state.qpcFrequency * kHudGraceSeconds);
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block->hudLayer),
-                        hudLive ? g_options.vrHudLayer : 0);
+                        hudLive ? hudLayer() : 0);
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block->producedFrames));
 
     if (haveRendered && state.acquiredViewSequence) {

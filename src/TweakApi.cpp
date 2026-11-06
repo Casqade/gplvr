@@ -378,12 +378,12 @@ bool applyHudElement(const TweakCommand& command) {
 
 // -- the panel itself -------------------------------------------------------------------
 
-// Which placement the panel is using. vrHudLayer 1 hangs it off the head, 2 off the seat,
+// Which placement the panel is using. vrHudMode 1 hangs it off the seat, 2 off the head,
 // and each has its own set of metres -- adjusting the one that is not in force would look
 // like the tweak doing nothing at all.
 HudPlacement* panelPlacement() {
-    if (g_options.vrHudLayer == 1) return &g_options.vrHudHead;
-    if (g_options.vrHudLayer == 2) return &g_options.vrHudSeat;
+    if (hudLayer() == 1) return &g_options.vrHudHead;
+    if (hudLayer() == 2) return &g_options.vrHudSeat;
     return nullptr;
 }
 
@@ -405,7 +405,7 @@ float* panelSlot(TweakAxis axis) {
 const HudPlacement& fallbackOf() {
     static const HudPlacement kHeadDefault = {0.70f, 0.10f, 0.0f, 0.45f};
     static const HudPlacement kSeatDefault = {0.70f, 0.25f, 0.0f, 0.60f};
-    return g_options.vrHudLayer == 1 ? kHeadDefault : kSeatDefault;
+    return hudLayer() == 1 ? kHeadDefault : kSeatDefault;
 }
 
 TweakRange panelRange(TweakAxis axis) {
@@ -461,7 +461,7 @@ TweakRange panelRange(TweakAxis axis) {
 
 bool applyHudPanel(const TweakCommand& command) {
     if (!panelPlacement())
-        return refuse("the HUD panel is off (vrHudLayer 0), so there is nowhere to put it");
+        return refuse("the HUD panel is off (vrHudMode 0), so there is nowhere to put it");
 
     if (command.action == TweakAction::Commit) {
         if (!hudPlacementSave())
@@ -475,7 +475,7 @@ bool applyHudPanel(const TweakCommand& command) {
         command.action == TweakAction::SelectPrevious)
         return refuse("there is one HUD panel and nothing to select between");
     if (command.action == TweakAction::Toggle)
-        return refuse("the panel has no on/off axis -- vrHudLayer picks head or seat, and "
+        return refuse("the panel has no on/off axis -- vrHudMode picks off, head or seat, and "
                       "the menu owns that");
 
     if (command.action == TweakAction::Reset) {
@@ -509,7 +509,7 @@ bool applyHudPanel(const TweakCommand& command) {
             HudPlacement* placement = panelPlacement();
             logf("tweak: the %s HUD panel is back to ahead %.2f down %.2f right %.2f "
                  "width %.2f m",
-                 g_options.vrHudLayer == 1 ? "head" : "seat", placement->ahead,
+                 hudLayer() == 1 ? "head" : "seat", placement->ahead,
                  placement->down, placement->right, placement->width);
             clearRefusal();
         }
@@ -594,20 +594,17 @@ const TweakBinding kHudElementBindings[] = {
     // unmodified pointer rows below never fire while it is down.
     {TweakTarget::HudElement, TweakInputAxis::PointerU, TweakInputButton::None,
      TweakInputButton::Squeeze, TweakAxis::X, TweakAction::None, TweakMode::Absolute, 1.0f,
-     "HOLD the grip: the controller's pointer drags the selected readout (a tap goes back "
-     "instead)"},
+     "HOLD the grip: the pointer drags the selected readout"},
     {TweakTarget::HudElement, TweakInputAxis::PointerV, TweakInputButton::None,
      TweakInputButton::Squeeze, TweakAxis::Y, TweakAction::None, TweakMode::Absolute, 1.0f,
-     "HOLD the grip: the controller's pointer drags the selected readout (a tap goes back "
-     "instead)"},
+     "HOLD the grip: the pointer drags the selected readout"},
     // The dash's size, and this is one of the two bindings left open. It shares the
     // trigger with Select below, so pressing the trigger to start sizing also selects
     // whatever the pointer happened to be over -- harmless, because selecting changes
     // nothing, but it is the reason this row is marked undecided rather than settled.
     {TweakTarget::HudElement, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Trigger, TweakAxis::Size, TweakAction::None, TweakMode::Rate, 1.0f,
-     "UNDECIDED -- trigger held: stick forward and back widens and narrows the dash readout "
-     "(the only one that resizes)"},
+     "UNDECIDED -- trigger held: stick forward/back widens/narrows the dash readout"},
     {TweakTarget::HudElement, TweakInputAxis::StickX, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::X, TweakAction::None, TweakMode::Rate, 1.0f,
      "stick left and right moves the selected readout"},
@@ -626,8 +623,8 @@ const TweakBinding kHudElementBindings[] = {
      1.0f, "A or X: select the next readout"},
     {TweakTarget::HudElement, TweakInputAxis::None, TweakInputButton::Secondary,
      TweakInputButton::None, TweakAxis::Show, TweakAction::Toggle, TweakMode::Absolute,
-     1.0f, "UNDECIDED -- B or Y: hide or show the selected readout (a hidden one is crossed "
-           "out and can still be selected)"},
+     1.0f, "UNDECIDED -- B or Y: hide or show the selected readout (hidden ones are crossed "
+           "out)"},
 };
 
 const TweakBinding kHudPanelBindings[] = {

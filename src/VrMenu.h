@@ -74,12 +74,6 @@ bool vrMenuBeam(int& hand, float& length, bool& mark);
 // where it points, so the Windows pointer is not drawn into the picture meanwhile.
 bool vrMenuBeamOnGplMenu();
 
-// True while vrHud (the menu's "Pribluda HUD" row) is off: skip the HUD pass entirely.
-// The quad layer needs no separate handling: the presenter already drops it when the game stops
-// drawing the panel, so not calling pribludaDrawHud takes the layer down with the monitor's
-// overlay.
-bool vrMenuPribludaHidden();
-
 // True while the menu or a tweak mode is open, so the key poll can keep the game from
 // also acting on whatever the driver is doing.
 bool vrMenuActive();

@@ -27,6 +27,7 @@
 #include "presenter/Producer.h"
 
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -158,7 +159,7 @@ constexpr int kStripBodyPixels = 36;
 // space is therefore reserved: the rows are laid out in what is left, the text wraps into the
 // reservation, and a hint too long for it is cut rather than allowed to push anything.
 constexpr int   kHelpLines = 3;
-constexpr int   kHintLines = 9;  // a tweak mode's list, which is longer and has no rows to move
+constexpr int   kHintLines = 12;  // a tweak mode's list, which is longer and has no rows to move
 constexpr int   kHelpLineChars = 160;
 constexpr float kHelpLineSpacing = 1.25f;
 // One margin for every footer, so the width the text was WRAPPED to and the width it is drawn
@@ -267,7 +268,7 @@ enum class Mode {
 // The Help popup's layout, in bands of the menu canvas: the title with the Close button at its
 // right, between these fractions of the width, then kHelpPopupLines of text. The draw and the
 // pointer test both read them.
-constexpr int   kHelpPopupLines = 7;
+constexpr int   kHelpPopupLines = 8;
 constexpr int   kHelpPopupBands = kHelpPopupLines + 1;
 constexpr float kHelpCloseLeft = 0.80f;
 constexpr float kHelpCloseRight = 0.98f;
@@ -364,7 +365,10 @@ bool gplMenuHeadLocked() { return g_options.vrGplMenuMode != 1; }
 // that is drawn only while one is being driven -- so their rows are not on the page in the
 // front end.
 bool inSession() { return !windowInFrontEnd(); }
-bool pribludaSetupOffered() { return pribludaRowOffered() && inSession(); }
+// With Pribluda mode Off there is no panel to arrange or place.
+bool pribludaSetupOffered() {
+    return pribludaRowOffered() && inSession() && g_options.vrHudMode != 0;
+}
 bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 
 // The root page. Every row here changes a live value and nothing else; Save settings is what
@@ -377,141 +381,107 @@ bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 // In page order: the buttons above the strip, the tabs, then each tab's rows, top to bottom.
 MenuRow g_rows[] = {
     {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "save the tabs' settings to gplvr.ini. Mirror aim and the Pribluda layout and position "
-     "are saved by their setup screens, which ask on the way out",
+     "Save changes to gplvr.ini\n"
+     "Pribluda state and mirror presets are saved upon exiting their setup modes",
      kTabNone},
     {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
-     "put things back to how they shipped -- choose VR settings, mirror aim, Pribluda layout "
-     "or all",
-     kTabNone},
+     "Reset GPLVR settings to default values", kTabNone},
     // Its help is built in buildHelpBlock, in the runtime's name for the trigger.
     {"Help", kRowAction, kCommandHelp, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabNone},
 
-    {"Headset", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "seat position, world size, horizon, brightness and sound", kTabHeadset},
-    {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "the rear-view mirrors and the Pribluda overlay (lap times, tyres, dash readouts)",
-     kTabCockpit},
-    {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "frame rate, renderer, resolution, and how often the mirrors and the overlay are redrawn",
+    {"Headset", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabHeadset},
+    {"Cockpit", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabCockpit},
+    {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "",
      kTabPerformance},
-    {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
-     "the game's own messages and menus in the headset, and what the monitor shows",
-     kTabDisplay},
+    {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabDisplay},
 
-    {"Recentre", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
-     "put the driver's seat where your head is now",
+    {"Recenter view", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
+     "When VR menu is closed, use any unbound controller button to recenter your view",
      kTabHeadset},
     {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
-     0.5f, 2.0f, 0.02f,
-     "how big the world looks around you. Higher makes everything look bigger, lower "
-     "smaller",
-     kTabHeadset},
+     0.5f, 2.0f, 0.02f, "", kTabHeadset},
     {"Horizon lock", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrHorizonLock,
      0.0f, 1.0f, 0.05f,
-     "how much of the car's rolling and pitching is kept out of your view. 0 moves with the "
-     "car, 1 keeps the horizon level. Raise it if kerbs make you queasy",
+     "Cancels out roll & pitch camera rotation.\n"
+     "Increase it if you have motion sickness",
      kTabHeadset},
     {"Horizon lock in replays", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrReplayHorizonLock, 0.0f, 1.0f, 0.05f,
-     "Horizon lock for replays, used in place of the one above while a replay is shown. 0 "
-     "moves with the car, 1 keeps the horizon level",
-     kTabHeadset},
+     "Overrides Horizon lock value in replay mode", kTabHeadset},
     {"Gamma", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrGamma, 0.6f,
-     2.0f, 0.05f, "brightens shadows and mid-tones in the headset; 1.00 is the game's own",
+     2.0f, 0.05f,
+     "Brightness of the headset picture\n"
+     "1.0 is true GPL brightness which might appear dark",
      kTabHeadset},
     {"Audio stereo width", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
-     "how strongly sounds move between your ears as you turn your head. 0 is the game's own "
-     "gentle panning (still following your head), 2 is close to hard left and right",
-     kTabHeadset, headAudioWidthAdjustable},
+     "Positional audio panning effect intensity", kTabHeadset, headAudioWidthAdjustable},
 
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "aim each rear-view mirror and set how much it shows, saved per car", kTabCockpit,
-     inSession},
-    {"Pribluda HUD", kRowToggleBool, kCommandNone, &g_options.vrHud, nullptr, nullptr, 0,
-     1, 1,
-     "show or hide the Pribluda overlay, in the headset and on the monitor; hidden, it costs "
-     "nothing",
+     "Enter mirror tweaking mode to tune car mirrors", kTabCockpit, inSession},
+    // vrHudMode: 0 off, 1 fixed in the car, 2 head-locked.
+    {"Pribluda mode", kRowNamedInt, kCommandNone, nullptr, &g_options.vrHudMode, nullptr, 0,
+     2, 1,
+     "Fixed: Pribluda is drawn on a static dashboard\n"
+     "Head-locked: Pribluda is drawn in front of your eyes",
      kTabCockpit, pribludaRowOffered},
-    // vrHudLayer 1 is head-locked and 2 is seat-locked, so ON is 1 here: `low` is the value
-    // the label is true for.
-    {"Head-locked Pribluda", kRowToggleInt, kCommandNone, nullptr, &g_options.vrHudLayer,
-     nullptr, 1, 2, 1,
-     "on: the overlay stays in front of you wherever you look. Off: it stays put in the car, "
-     "like a dashboard",
-     kTabCockpit, pribludaRowOffered},
-    {"Pribluda setup", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "pick single readouts on the Pribluda overlay to move, show or hide", kTabCockpit,
-     pribludaSetupOffered},
+    {"Pribluda layout", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "Enter Pribluda widget layout editing mode", kTabCockpit, pribludaSetupOffered},
     {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "move the whole Pribluda overlay, and set how far away and how big it is. Edits the "
-     "placement for the current mode, head-locked or in the car",
-     kTabCockpit, pribludaSetupOffered},
-    {"Pribluda backdrop", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f,
-     "how dark the boxes behind the overlay's text are. 0 is invisible, 1 is solid black",
+     "Enter Pribluda HUD position editing mode", kTabCockpit, pribludaSetupOffered},
+    {"Pribluda bg opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f, "Pribluda text background opacity",
      kTabCockpit, pribludaRowOffered},
 
-    {"Frame rate", kRowNamedInt, kCommandNone, nullptr, &g_options.frameRate, nullptr, 0,
+    {"Frame rate lock", kRowNamedInt, kCommandNone, nullptr, &g_options.frameRate, nullptr, 0,
      2, 1,
-     "how often a picture is drawn. vanilla: once per physics step, like the original game. "
-     "display: once per headset refresh, smoothed between steps. unlimited: as fast as possible",
+     "GPL: lock to GPL frame rate\n"
+     "Display: lock to your VR headset refresh rate\n"
+     "Unlocked: movement may feel stuttery or choppy",
      kTabPerformance},
     {"Renderer", kRowNamedInt, kCommandNone, nullptr, &g_options.vrRendererType, nullptr, 0, 2,
      1,
-     "who draws the world in the headset. Vanilla: the game itself. GPL VR: this mod, using "
-     "less CPU. GPL VR (debug): the same, with a red square on every image it drew",
+     "Vanilla: Use GPL renderer\n"
+     "GPLVR: Use faster GPLVR renderer\n"
+     "GPLVR (debug): draw red square in top right corner for comparison",
      kTabPerformance},
     {"Render scale", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrRenderScale, 0.5f, 2.0f, 0.05f,
-     "NEEDS A RESTART: Save settings, then restart the game. Multiplies the resolution the "
-     "headset asks for; lower is faster and blurrier",
+     "Scales output resolution for a clearer picture.\n"
+     "May eat up GPL 2GB memory limit.\n"
+     "REQUIRES GPLVR RESTART! Save settings and restart GPLVR",
      kTabPerformance},
-    {"Mirrors", kRowNamedInt, kCommandNone, nullptr, &g_options.mirrorMode, nullptr,
+    {"Mirrors mode", kRowNamedInt, kCommandNone, nullptr, &g_options.mirrorMode, nullptr,
      kMirrorSharedHeadCentre, kMirrorPerGlass, 1,
-     "how mirrors are drawn, cheapest first. flat: one image for all mirrors and both eyes, no "
-     "depth. shared: one per eye, with depth. per mirror: each mirror per eye, sharpest",
+     "2D: without depth, fastest\n"
+     "2.5D: with depth, all mirrors share one rear view\n"
+     "3D: with depth, each mirror gets its own view",
      kTabPerformance},
     {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateInterval,
-     nullptr, 0, 4, 1,
-     "redraw the mirrors on one frame in N, showing the last image in between. Off turns the "
-     "mirrors black",
-     kTabPerformance},
+     nullptr, 0, 4, 1, "Render mirrors every Nth frame", kTabPerformance},
     {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
-     &g_options.pribludaUpdateInterval, nullptr, 1, 4, 1,
-     "redraw the Pribluda overlay on one frame in N, showing the last image in between. Its "
-     "numbers change only a few times a second, so 1/2 looks the same",
+     &g_options.pribludaUpdateInterval, nullptr, 1, 4, 1, "Render Pribluda every Nth frame",
      kTabPerformance, pribludaRowOffered},
 
-    {"GPL text size", kRowChoiceInt, kCommandNone, nullptr, &g_options.vrGplTextScale, nullptr,
-     1, 4, 1,
-     "how big the game's own messages are, like the pause prompt and \"car must be stopped\". "
-     "Whole steps keep the pixel font sharp",
-     kTabDisplay},
+    {"GPL text scale", kRowChoiceInt, kCommandNone, nullptr, &g_options.vrGplTextScale,
+     nullptr, 1, 4, 1, "Size of GPL in-race text popups", kTabDisplay},
     {"GPL text spread", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrGplTextSpread, 0.1f, 1.0f, 0.05f,
-     "how far out toward the edges the game's messages sit. 1.00 is the game's layout; lower "
-     "is nearer the middle, where big text still fits",
-     kTabDisplay},
-    {"GPL menu", kRowNamedInt, kCommandNone, nullptr, &g_options.vrGplMenuMode, nullptr, 0, 1, 1,
-     "how the game's own menus are shown. head-locked: they turn with your head. fixed: on a "
-     "panel in front of the seat that stays put while you look around",
+     "Spread out GPL in-race text popups towards screen edges", kTabDisplay},
+    {"GPL menu mode", kRowNamedInt, kCommandNone, nullptr, &g_options.vrGplMenuMode, nullptr, 0,
+     1, 1,
+     "Fixed: menu is drawn on a static panel\n"
+     "Head-locked: menu is drawn in front of your eyes",
      kTabDisplay},
     {"GPL menu size", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrGplMenuScale, 0.05f, 1.0f, 0.05f,
-     "how much of your view the game's own menus cover; at 1.00 they fill it", kTabDisplay,
-     gplMenuHeadLocked},
+     "How large to draw the head-locked GPL menu", kTabDisplay, gplMenuHeadLocked},
     {"GPL menu distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
-     &g_options.vrGplMenuDistance, 0.75f, 5.0f, 0.25f,
-     "how far ahead of the seat the panel with the game's menus hangs, in metres. The panel "
-     "keeps its size, so nearer looks bigger",
+     &g_options.vrGplMenuDistance, 0.75f, 5.0f, 0.25f, "How far to draw the fixed GPL menu",
      kTabDisplay, gplMenuFixed},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
      kMonitorOff, kMonitorBoth, 1,
-     "what the monitor shows while you are in the headset: nothing, one eye, or both. Off "
-     "saves a little work",
-     kTabDisplay},
+     "Which eye view to show on your PC screen while you're in VR", kTabDisplay},
 };
 
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
@@ -1108,12 +1078,17 @@ bool capturePanel() {
 // below it, so the strip is not in front of the thing being adjusted.
 Surface hudPanelSurface();
 
+bool tweakMode() {
+    return g_state.mode == Mode::MirrorTweak || g_state.mode == Mode::HudTweak ||
+           g_state.mode == Mode::PanelTweak;
+}
+
 Surface drawnSurface() {
     Surface surface;
-    // HUD tweak puts the quad ON the HUD panel and annotates it. Everything the driver
-    // needs is then in one place and the ray, the outlines and the cursor are all in the
-    // panel's own fractions.
-    if (g_state.mode == Mode::HudTweak) {
+    // A tweak mode's quad hangs where the Pribluda panel does (tweakPanelPlacement). HUD tweak
+    // puts it ON the HUD panel and annotates it: everything the driver needs is then in one
+    // place and the ray, the outlines and the cursor are all in the panel's own fractions.
+    if (tweakMode()) {
         Surface panel = hudPanelSurface();
         if (panel.valid) return panel;
     }
@@ -1137,30 +1112,56 @@ Surface drawnSurface() {
 // quad layer from (GplvrXr.cpp, the hudQuad block). Not an approximation of it: the
 // position {right, up, -ahead}, the yaw-then-pitch turn toward the eye and the
 // width x width*h/w extent are the presenter's own, and the space they are stated in is
-// the head (vrHudLayer 1) or the seat (2).
+// the head (vrHudMode 2) or the seat (1).
 //
 // This is what makes "point the trigger at an element and drag it" mean the element the
 // driver can see, rather than a proxy of it.
 // The HUD quad's placement in the space the PRESENTER puts it in -- the head's for
-// vrHudLayer 1, the seat's for 2 -- with no space transform applied. This is the pose a
+// vrHudMode 2, the seat's for 1 -- with no space transform applied. This is the pose a
 // layer drawn over that panel has to be published with, in that same space.
-bool hudQuadPlacement(Vec3& offset, Quat& turn, float& widthMetres, float& heightMetres,
-                      int32_t& space) {
-    int texelWidth = 0;
-    int texelHeight = 0;
-    if (!pribludaPanelSize(texelWidth, texelHeight)) return false;
-    if (texelWidth <= 0 || texelHeight <= 0) return false;
+const Options& optionDefaults();
 
-    const HudPlacement* placement = nullptr;
-    if (g_options.vrHudLayer == 1) {
+// WHERE A TWEAK MODE'S QUAD HANGS. Pribluda layout and Pribluda position put it ON the HUD
+// panel, wherever it is and however big; mirror setup hangs it where the fixed panel hangs by
+// default (vrHudSeat as shipped, whatever the driver has moved theirs to), so all three read the
+// same way: big, below the eyes and turned up toward them, clear of the glasses. The texel size
+// is the panel's, or the strip canvas's when Pribluda has drawn no panel. False when there is
+// no such place -- a Pribluda mode with the panel out of the headset -- and the mode falls back
+// to the strip under the menu's place.
+bool tweakPanelPlacement(const HudPlacement*& placement, int32_t& space, int& texelWidth,
+                         int& texelHeight) {
+    bool sized =
+        pribludaPanelSize(texelWidth, texelHeight) && texelWidth > 0 && texelHeight > 0;
+    if (g_state.mode == Mode::MirrorTweak) {
+        if (!sized) {
+            texelWidth = kStripCanvasWidth;
+            texelHeight = kStripCanvasHeight;
+        }
+        placement = &optionDefaults().vrHudSeat;
+        space = kMenuSpaceSeat;
+        return true;
+    }
+    if ((g_state.mode != Mode::HudTweak && g_state.mode != Mode::PanelTweak) || !sized)
+        return false;
+    if (hudLayer() == 1) {
         placement = &g_options.vrHudHead;
         space = kMenuSpaceView;
-    } else if (g_options.vrHudLayer == 2) {
+        return true;
+    }
+    if (hudLayer() == 2) {
         placement = &g_options.vrHudSeat;
         space = kMenuSpaceSeat;
-    } else {
-        return false;
+        return true;
     }
+    return false;
+}
+
+bool hudQuadPlacement(Vec3& offset, Quat& turn, float& widthMetres, float& heightMetres,
+                      int32_t& space) {
+    int                 texelWidth = 0;
+    int                 texelHeight = 0;
+    const HudPlacement* placement = nullptr;
+    if (!tweakPanelPlacement(placement, space, texelWidth, texelHeight)) return false;
 
     // The producer publishes hudUp as MINUS the placement's `down`, so the sign is taken
     // from there rather than from the option's name.
@@ -1187,16 +1188,16 @@ bool hudQuadPlacement(Vec3& offset, Quat& turn, float& widthMetres, float& heigh
 Surface hudPanelSurface() {
     Surface surface;
 
-    int texelWidth = 0;
-    int texelHeight = 0;
-    if (!pribludaPanelSize(texelWidth, texelHeight)) return surface;
-    if (texelWidth <= 0 || texelHeight <= 0) return surface;
-
+    int                 texelWidth = 0;
+    int                 texelHeight = 0;
+    int32_t             space = kMenuSpaceSeat;
     const HudPlacement* placement = nullptr;
-    Vec3                spacePosition;
-    Quat                spaceOrientation;
+    if (!tweakPanelPlacement(placement, space, texelWidth, texelHeight)) return surface;
 
-    if (g_options.vrHudLayer == 1) {
+    Vec3 spacePosition;
+    Quat spaceOrientation;
+
+    if (space == kMenuSpaceView) {
         // Head-locked: the presenter hangs it in VIEW space, so its frame is the head's
         // own pose, tilt and all -- restated here in the seat's frame, because that is
         // the frame this file works in.
@@ -1207,15 +1208,11 @@ Surface hudPanelSurface() {
         if (!poseInSeat(headLocal, head)) return surface;
         spacePosition = positionOf(head);
         spaceOrientation = quatOf(head);
-        placement = &g_options.vrHudHead;
-    } else if (g_options.vrHudLayer == 2) {
+    } else {
         // Seat-locked, and the seat IS this file's frame -- so the placement's metres are
         // already the coordinates wanted and the space is the identity.
         spacePosition = {0.0f, 0.0f, 0.0f};
         spaceOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
-        placement = &g_options.vrHudSeat;
-    } else {
-        return surface;
     }
 
     // The producer publishes hudUp as MINUS the placement's `down`, so the sign is taken
@@ -1266,17 +1263,16 @@ void canvasSizeFor(int& width, int& height) {
         height = kMenuCanvasHeight;
         return;
     }
-    if (g_state.mode == Mode::HudTweak) {
-        int panelWidth = 0;
-        int panelHeight = 0;
-        if (pribludaPanelSize(panelWidth, panelHeight) && panelWidth > 0 &&
-            panelHeight > 0) {
-            width = kMenuCanvasWidth;
-            height = kMenuCanvasWidth * panelHeight / panelWidth;
-            if (height < 64) height = 64;
-            if (height > 1024) height = 1024;
-            return;
-        }
+    int                 panelWidth = 0;
+    int                 panelHeight = 0;
+    int32_t             space = kMenuSpaceSeat;
+    const HudPlacement* placement = nullptr;
+    if (tweakPanelPlacement(placement, space, panelWidth, panelHeight)) {
+        width = kMenuCanvasWidth;
+        height = kMenuCanvasWidth * panelHeight / panelWidth;
+        if (height < 64) height = 64;
+        if (height > 1024) height = 1024;
+        return;
     }
     width = kStripCanvasWidth;
     height = kStripCanvasHeight;
@@ -1313,34 +1309,41 @@ int rowAt(float u, float v) {
 const char* namedValue(const MenuRow& row) {
     if (row.intValue == &g_options.vrMonitorEye) {
         switch (*row.intValue) {
-            case kMonitorOff: return "off";
-            case kMonitorLeft: return "left eye";
-            case kMonitorRight: return "right eye";
-            default: return "both eyes";
+            case kMonitorOff: return "Off";
+            case kMonitorLeft: return "Left eye";
+            case kMonitorRight: return "Right eye";
+            default: return "Both eyes";
         }
     }
     if (row.intValue == &g_options.frameRate) {
         switch (*row.intValue) {
-            case 0: return "vanilla";
+            case 0: return "GPL";
             // Not "headset": in flat mode it is the monitor, and the value has to mean the
             // same thing in both modes or it is two settings wearing one name.
-            case 1: return "display";
-            default: return "unlimited";
+            case 1: return "Display";
+            default: return "Unlocked";
         }
     }
     if (row.intValue == &g_options.mirrorMode) {
         switch (*row.intValue) {
-            case kMirrorShared: return "shared";
-            case kMirrorSharedHeadCentre: return "flat";
-            default: return "per mirror";
+            case kMirrorShared: return "2.5D";
+            case kMirrorSharedHeadCentre: return "2D";
+            default: return "3D";
         }
     }
-    if (row.intValue == &g_options.vrGplMenuMode) return *row.intValue == 1 ? "fixed" : "head-locked";
+    if (row.intValue == &g_options.vrGplMenuMode) return *row.intValue == 1 ? "Fixed" : "Head-locked";
+    if (row.intValue == &g_options.vrHudMode) {
+        switch (*row.intValue) {
+            case 0: return "Off";
+            case 1: return "Fixed";
+            default: return "Head-locked";
+        }
+    }
     if (row.intValue == &g_options.vrRendererType) {
         switch (*row.intValue) {
             case 0: return "Vanilla";
-            case 1: return "GPL VR";
-            default: return "GPL VR (debug)";
+            case 1: return "GPLVR";
+            default: return "GPLVR (debug)";
         }
     }
     return "";
@@ -1638,8 +1641,7 @@ void saveSettings() {
     // One line per row of the page that has an ini key, in the page's own order. A row added
     // above without a line here saves silently as nothing, which is the one way this can go
     // quietly wrong -- so they are kept in the same order to make the omission visible.
-    writeInt("vrHud", g_options.vrHud ? 1 : 0);
-    writeInt("vrHudLayer", g_options.vrHudLayer);
+    writeInt("vrHudMode", g_options.vrHudMode);
     writeInt("mirrorMode", g_options.mirrorMode);
     writeInt("mirrorUpdateInterval", g_options.mirrorUpdateInterval);
     writeInt("frameRate", g_options.frameRate);
@@ -1662,20 +1664,19 @@ void saveSettings() {
     if (failed) {
         notice("some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 20 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 19 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return;
     }
     notice("saved to gplvr.ini");
-    logf("vr menu: saved to %s -- vrHud=%d vrHudLayer=%d mirrorUpdateInterval=%d "
+    logf("vr menu: saved to %s -- vrHudMode=%d mirrorUpdateInterval=%d "
          "mirrorMode=%d "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
          "vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
          "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrReplayHorizonLock=%.3f "
          "vrWorldScale=%.3f vrHeadAudioWidth=%.3f vrMonitorEye=%d",
-         path, g_options.vrHud ? 1 : 0, g_options.vrHudLayer,
-         g_options.mirrorUpdateInterval, g_options.mirrorMode,
+         path, g_options.vrHudMode, g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
          g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
          g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
@@ -2314,13 +2315,13 @@ void pollQuickRecentre(bool stickClick) {
 
 // -- "save changes?" -----------------------------------------------------------------------
 
-const char* const kConfirmLabel[kConfirmCount] = {"Save", "Discard", "Keep tweaking"};
+const char* const kConfirmLabel[kConfirmCount] = {"Yes", "No", "Cancel"};
 
 const char* modeName(Mode mode) {
     switch (mode) {
-        case Mode::MirrorTweak: return "mirror aim";
-        case Mode::HudTweak: return "HUD layout";
-        case Mode::PanelTweak: return "HUD panel";
+        case Mode::MirrorTweak: return "mirror preset";
+        case Mode::HudTweak: return "Pribluda layout";
+        case Mode::PanelTweak: return "Pribluda position";
         default: return "the menu";
     }
 }
@@ -2930,6 +2931,22 @@ const char* boundName(int action) {
     return names.text[hand][action];
 }
 
+// A control's name for help text: the runtime's, for the menu's hand, or the word the help was
+// written with.
+const char* controlName(int action) {
+    const char* name = boundName(action);
+    if (name[0]) return name;
+    bool left = g_state.hand == kHandLeft;
+    switch (action) {
+        case kInputTrigger: return "Trigger";
+        case kInputStick: return "Joystick";
+        case kInputSqueeze: return "Grip";
+        case kInputPrimary: return left ? "X" : "A";
+        case kInputSecondary: return left ? "Y" : "B";
+        default: return "";
+    }
+}
+
 // The Help popup's lines, the controls in this runtime's names where it gives them.
 void helpPopupLines(char lines[kHelpPopupLines][kHelpLineChars]) {
     const char* trigger = boundName(kInputTrigger);
@@ -2950,6 +2967,7 @@ void helpPopupLines(char lines[kHelpPopupLines][kHelpLineChars]) {
     _snprintf_s(lines[5], kHelpLineChars, _TRUNCATE,
                 "%s click: reset option to its default value", stick);
     _snprintf_s(lines[6], kHelpLineChars, _TRUNCATE, "%s: go back or close VR menu", grip);
+    _snprintf_s(lines[7], kHelpLineChars, _TRUNCATE, "Any button when not in VR menu: recenter your view");
 }
 
 // -- the footer's text --------------------------------------------------------------------
@@ -2974,8 +2992,20 @@ void wrapInto(HelpBlock& block, int slot, float width, const char* text) {
     while (*word && block.count < kHintLines) {
         while (*word == ' ') ++word;
         if (!*word) break;
+        // A '\n' in the text starts a new line: a description that lists choices gives each
+        // its own.
+        if (*word == '\n') {
+            if (used) {
+                _snprintf_s(block.lines[block.count], kHelpLineChars, _TRUNCATE, "%s", line);
+                ++block.count;
+                used = 0;
+                line[0] = '\0';
+            }
+            ++word;
+            continue;
+        }
         const char* end = word;
-        while (*end && *end != ' ') ++end;
+        while (*end && *end != ' ' && *end != '\n') ++end;
         int length = static_cast<int>(end - word);
         if (length >= kHelpLineChars) length = kHelpLineChars - 1;
 
@@ -3006,18 +3036,8 @@ void wrapInto(HelpBlock& block, int slot, float width, const char* text) {
     }
 }
 
-// A binding's words, as the driver should read them. The "UNDECIDED" prefix is a note to
-// whoever retunes the table and means nothing in a headset.
-const char* bindingText(const char* description) {
-    const char* undecided = "UNDECIDED -- ";
-    size_t      length = std::strlen(undecided);
-    if (std::strncmp(description, undecided, length) == 0) return description + length;
-    return description;
-}
-
 // What the footer says: a refusal if one is outstanding, the hovered row's help in the menu,
-// and in a tweak mode the mode's WHOLE control list -- built from the binding table itself, so
-// the hints and the mapping cannot drift apart.
+// and in a tweak mode the mode's whole control list.
 void buildHelpBlock(HelpBlock& block, int slot, float width) {
     block.count = 0;
     block.warning = false;
@@ -3052,33 +3072,62 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
         return;
     }
 
-    TweakTarget target = targetOf(g_state.mode);
-    if (target == TweakTarget::None) return;
-    int32_t             count = 0;
-    const TweakBinding* bindings = tweakDefaultBindings(target, count);
-    if (!bindings) return;
+    // The mode's control list, one line per gesture, in the runtime's control names. Written
+    // per mode rather than taken from the binding table's descriptions, so the lines can read
+    // in the order a driver uses them and pair gestures the table keeps apart; a binding added
+    // to TweakApi.cpp's tables needs its line here too.
+    const char* trigger = controlName(kInputTrigger);
+    const char* stick = controlName(kInputStick);
+    const char* grip = controlName(kInputSqueeze);
+    char        line[kHelpLineChars] = {};
+    auto        add = [&](const char* format, ...) {
+        va_list args;
+        va_start(args, format);
+        _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
+        va_end(args);
+        wrapInto(block, slot, width, line);
+    };
 
-    // Consecutive rows often describe one gesture twice -- the pointer drag is a U row and a
-    // V row with the same words -- and printing it twice would waste a line of a short strip.
-    const char* previous = "";
-    for (int32_t i = 0; i < count && block.count < kHintLines - 1; ++i) {
-        const char* text = bindingText(bindings[i].description);
-        if (std::strcmp(text, previous) == 0) continue;
-        previous = text;
-        wrapInto(block, slot, width, text);
+    switch (g_state.mode) {
+        case Mode::PanelTweak:
+            add("%s: move the panel", stick);
+            add("%s click: reset panel position", stick);
+            add("%s + %s: change panel distance", trigger, stick);
+            add("%s + %s: change panel size", grip, stick);
+            add("%s: go back to VR menu", grip);
+            break;
+        case Mode::HudTweak:
+            add("%s: select the widget under your cursor", trigger);
+            add("%s + %s: change dashboard widget size", trigger, stick);
+            add("%s (Held): move the selected widget", grip);
+            add("%s: move the selected widget", stick);
+            add("%s click: reset selected widget state", stick);
+            add("%s: cycle between widgets", controlName(kInputPrimary));
+            add("%s: hide/show the selected widget", controlName(kInputSecondary));
+            add("%s: go back to VR menu (aim your controller outside the panel first)", grip);
+            break;
+        case Mode::MirrorTweak: {
+            int  selected = mirrorConfigSelected();
+            char which[64] = {};
+            if (selected < 0)
+                _snprintf_s(which, sizeof(which), _TRUNCATE, "all mirrors");
+            else
+                _snprintf_s(which, sizeof(which), _TRUNCATE, "the %s mirror",
+                            mirrorConfigGlassName(selected));
+            add("%s: rotate the mirror", stick);
+            add("%s + %s: change mirror magnification", trigger, stick);
+            add("%s click: reset state for %s", stick, which);
+            add("%s / %s: cycle mirrors", controlName(kInputPrimary),
+                controlName(kInputSecondary));
+            add("%s: go back to VR menu", grip);
+            break;
+        }
+        default:
+            break;
     }
-
-    // How to leave, and what leaving does. The grip is shared: a tap goes back, a hold is
-    // whatever this mode's table above uses it for, so the two are named apart.
-    const char* grip = boundName(kInputSqueeze);
-    char        back[kHelpLineChars * 2] = {};
-    _snprintf_s(back, sizeof(back), _TRUNCATE,
-                "a TAP of %s goes back to the menu; if anything changed, it asks whether to save",
-                grip[0] ? grip : "the grip");
-    wrapInto(block, slot, width, back);
 }
 
-// A digest of the footer, for the rebuild test. The block itself is up to nine lines and the
+// A digest of the footer, for the rebuild test. The block itself is up to twelve lines and the
 // signature has a thousand bytes for the whole canvas, so what goes in is a hash.
 unsigned helpBlockHash(const HelpBlock& block) {
     unsigned hash = 2166136261u;
@@ -3133,12 +3182,19 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     const float w = static_cast<float>(width);
     const float h = static_cast<float>(height);
 
-    // HUD TWEAK: the quad sits ON the HUD panel, so the background stays transparent --
-    // the panel underneath is the thing being arranged and must stay visible. What goes
-    // on top is the element boxes, the cursor, and one readout line in a box of its own.
-    if (g_state.mode == Mode::HudTweak) {
+    // A TWEAK MODE ON THE PANEL'S PLACE (tweakPanelPlacement): the background stays
+    // transparent -- in the Pribluda modes the panel underneath is the thing being arranged and
+    // must stay visible. What goes on top is the readout and the control list in a band along
+    // the bottom, the cursor, and in HUD tweak the element boxes.
+    int                 placedWidth = 0;
+    int                 placedHeight = 0;
+    int32_t             placedSpace = kMenuSpaceSeat;
+    const HudPlacement* placed = nullptr;
+    if (tweakMode() && tweakPanelPlacement(placed, placedSpace, placedWidth, placedHeight)) {
         const int selected = pribludaElementSelected();
-        for (int element = 0; element < pribludaElementCount(); ++element) {
+        for (int element = 0; g_state.mode == Mode::HudTweak &&
+                              element < pribludaElementCount();
+             ++element) {
             float x = 0.0f;
             float y = 0.0f;
             float bw = 0.0f;
@@ -3178,9 +3234,11 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
         buildHelpBlock(block, kVrTextSmall, w - kHelpMargin * 2.0f);
         float readout = static_cast<float>(vrTextHeight(kVrTextBody)) * 1.6f;
         float hints = helpFooterHeight(kVrTextSmall, block.count);
-        // The band is the panel's own bottom edge and the panel is what is being arranged,
-        // so the list gives way rather than covering the thing it is about.
-        if (readout + hints > h * 0.55f) hints = h * 0.55f - readout;
+        // The band is the panel's own bottom edge and in the Pribluda modes the panel is what
+        // is being arranged, so the list gives way rather than covering the thing it is about.
+        // Mirror setup has nothing under it and takes the whole canvas.
+        float most = g_state.mode == Mode::MirrorTweak ? h : h * 0.55f;
+        if (readout + hints > most) hints = most - readout;
         if (hints < 0.0f) hints = 0.0f;
         float bandHeight = readout + hints;
 
@@ -4027,11 +4085,11 @@ void vrMenuUpdate(const GlFunctions& gl) {
 
     // THE POSE, AND THE SPACE IT IS STATED IN.
     //
-    // Everything but HUD tweak is the seat's: the surface was built there and its own
-    // orientation is the quad's. HUD tweak publishes the HUD quad's own placement in the
-    // HUD quad's own space instead -- head-locked when vrHudLayer is 1 -- because the
-    // menu's quad is being put ON that panel, and a layer nailed to the seat cannot
-    // follow a panel the runtime re-places against the head every display frame.
+    // Everything but a tweak mode is the seat's: the surface was built there and its own
+    // orientation is the quad's. A tweak mode publishes its placement (tweakPanelPlacement) in
+    // that placement's own space instead -- head-locked when the Pribluda panel is -- because
+    // in the Pribluda modes the menu's quad is being put ON that panel, and a layer nailed to
+    // the seat cannot follow a panel the runtime re-places against the head every display frame.
     SharedPose pose;
     int32_t    space = kMenuSpaceSeat;
     float      publishWidth = drawn.width;
@@ -4041,8 +4099,7 @@ void vrMenuUpdate(const GlFunctions& gl) {
     Quat  turn;
     float hudWidth = 0.0f;
     float hudHeight = 0.0f;
-    if (state.mode == Mode::HudTweak &&
-        hudQuadPlacement(offset, turn, hudWidth, hudHeight, space)) {
+    if (tweakMode() && hudQuadPlacement(offset, turn, hudWidth, hudHeight, space)) {
         pose.positionX = offset.x;
         pose.positionY = offset.y;
         pose.positionZ = offset.z;
@@ -4076,8 +4133,6 @@ void vrMenuUpdate(const GlFunctions& gl) {
     ++state.draws;
     noteDrawRefusal(kDrawNone);
 }
-
-bool vrMenuPribludaHidden() { return !g_options.vrHud; }
 
 // The hand the ray comes from: the menu's owner, or over the replay panel the hand driving the
 // pointer while it is awake. -1 when there is no ray to draw.
