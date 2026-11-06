@@ -16,11 +16,15 @@
 // threshold, and the sector of the selected slice is widened by the layout's hysteresis, so a
 // hand resting on a boundary does not flicker between two slices.
 //
-// DRAWING. A 640 px square canvas, head-locked 0.62 m ahead and 6 cm below the line of sight,
-// 0.30 m across: annular slices round a centre disc ("release here to cancel"), each slice's
-// label, a greyed slice's reason under its label in a smaller size, and a yellow dot where the
-// hand or stick is pushing. The image is rebuilt only when what it shows changes, at most 45
-// times a second.
+// PLACEMENT. Like the VR menu's panel: put where the head faces at the press, heading only,
+// 0.62 m ahead and 6 cm below the eyes, and stated in the seat's frame, so it then stays still in
+// the cockpit while the head moves. Before the first recentre there is no seat, and that press's
+// ring follows the head instead (logged).
+//
+// DRAWING. A 640 px square canvas, 0.30 m across: annular slices round an empty centre disc
+// (letting go there cancels), each slice's label, a greyed slice's reason under its label in a
+// smaller size, and a yellow dot where the hand or stick is pushing. The image is rebuilt only
+// when what it shows changes, at most 45 times a second.
 
 #include "GlInterop.h"
 #include "VrInput.h"
@@ -66,6 +70,11 @@ struct Radial {
     float    level = 0.0f;      // the winning deflection, 1 at the selection threshold
     float    direction = 0.0f;  // its angle, degrees anticlockwise from the right
     bool     usedStick = false;
+
+    // Where the panel sits, captured at the press: in kMenuSpaceSeat, or kMenuSpaceView when
+    // there was no seat to state it in.
+    SharedPose panelPose = {};
+    int32_t    panelSpace = 0;
 
     bool     layerVisible = false;
     bool     signatureValid = false;

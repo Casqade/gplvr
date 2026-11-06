@@ -1,5 +1,7 @@
 #include "Radial.h"
 
+#include "Log.h"
+#include "VrCamera.h"
 #include "VrText.h"
 #include "presenter/Producer.h"
 
@@ -19,7 +21,7 @@ constexpr float kRadialStickSelect = 0.5f;
 // threshold.
 constexpr float kReleaseLevel = 0.75f;
 
-// The panel: head-locked, a little below the line of sight, square.
+// The panel: ahead of the eyes at the press, a little below them, square.
 constexpr int   kCanvasSize = 640;
 constexpr float kPanelMetres = 0.30f;
 constexpr float kPanelAhead = 0.62f;
@@ -95,6 +97,47 @@ int sliceAt(const RadialLayout& layout, float degrees, int current) {
         }
     }
     return best;
+}
+
+// -- placement ------------------------------------------------------------------------------
+
+SharedPose inverseOf(const SharedPose& pose) {
+    SharedPose inverse = pose;
+    inverse.orientationX = -pose.orientationX;
+    inverse.orientationY = -pose.orientationY;
+    inverse.orientationZ = -pose.orientationZ;
+    return inverse;
+}
+
+// The panel where the head faces now, heading only, stated in the seat's frame -- the VR menu's
+// capturePanel, at the radial's distance and drop. False when there is no seat or no head yet.
+bool capturePanel(SharedPose& out) {
+    SharedPose seat;
+    if (!vrSeatPose(seat)) return false;
+    SharedView views[2] = {};
+    SharedPose head = {};
+    if (!presenterLatestViews(views, head)) return false;
+
+    SharedPose toSeat = inverseOf(seat);
+    float offset[3] = {head.positionX - seat.positionX, head.positionY - seat.positionY,
+                       head.positionZ - seat.positionZ};
+    float eye[3];
+    rotate(toSeat, offset, eye);
+    float forward[3] = {0.0f, 0.0f, -1.0f};
+    float headForward[3];
+    rotate(head, forward, headForward);
+    float seatForward[3];
+    rotate(toSeat, headForward, seatForward);
+    float yaw = std::atan2(-seatForward[0], -seatForward[2]);
+
+    out.positionX = eye[0] - std::sin(yaw) * kPanelAhead;
+    out.positionY = eye[1] - kPanelDrop;
+    out.positionZ = eye[2] - std::cos(yaw) * kPanelAhead;
+    out.orientationX = 0.0f;
+    out.orientationY = std::sin(yaw * 0.5f);
+    out.orientationZ = 0.0f;
+    out.orientationW = std::cos(yaw * 0.5f);
+    return true;
 }
 
 // -- drawing --------------------------------------------------------------------------------
@@ -268,20 +311,6 @@ void drawRadial(const Radial& radial, const RadialLayout& layout, const RadialSl
         }
     }
 
-    // What letting go now would do.
-    const char* hint = "cancel";
-    if (radial.selected != kRadialNone) {
-        const RadialSlice& slice = slices[radial.selected];
-        if (!slice.enabled)
-            hint = "can't";
-        else if (dwell >= 0.0f && dwell < 1.0f)
-            hint = "hold...";
-        else
-            hint = "release";
-    }
-    gl.color4f(0.70f, 0.74f, 0.82f, 1.0f);
-    centredText(gl, kVrTextSmall, kCentre, kCentre, hint);
-
     // Where the hand or the stick is pushing.
     float mx = 0.0f;
     float my = 0.0f;
@@ -319,6 +348,18 @@ void radialBegin(Radial& radial, const VrHandInput& hand, LONGLONG now) {
     radial.level = 0.0f;
     radial.usedStick = false;
     radial.signatureValid = false;
+
+    if (capturePanel(radial.panelPose)) {
+        radial.panelSpace = kMenuSpaceSeat;
+    } else {
+        // In the view's space the quad's +Z faces the viewer with an identity orientation.
+        radial.panelPose = {};
+        radial.panelPose.positionY = -kPanelDrop;
+        radial.panelPose.positionZ = -kPanelAhead;
+        radial.panelPose.orientationW = 1.0f;
+        radial.panelSpace = kMenuSpaceView;
+        logf("radial: no seat or head pose yet, so this ring follows the head\n");
+    }
 }
 
 void radialSteer(Radial& radial, const RadialLayout& layout, const VrHandInput& hand,
@@ -439,18 +480,7 @@ bool radialUpdate(Radial& radial, const RadialLayout& layout, const RadialSlice*
     gl.popAttrib();
     gl.matrixMode(static_cast<GLenum>(savedMatrixMode));
 
-    // Head-locked, in the view's space: it is up only while the trigger is held, it is chosen
-    // from by the hand's turn rather than by pointing, and it must be in view wherever the head
-    // happens to be. The quad's +Z faces the viewer with an identity orientation.
-    SharedPose pose;
-    pose.positionX = 0.0f;
-    pose.positionY = -kPanelDrop;
-    pose.positionZ = -kPanelAhead;
-    pose.orientationX = 0.0f;
-    pose.orientationY = 0.0f;
-    pose.orientationZ = 0.0f;
-    pose.orientationW = 1.0f;
-    if (!presenterMenuPublish(pose, kMenuSpaceView, kPanelMetres, kPanelMetres)) {
+    if (!presenterMenuPublish(radial.panelPose, radial.panelSpace, kPanelMetres, kPanelMetres)) {
         ++radial.drawRefused;
         return true;
     }
