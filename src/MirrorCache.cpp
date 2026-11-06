@@ -189,10 +189,12 @@ bool ensure(State& s) {
     return true;
 }
 
-// One whole-texture blit. On this path neither texture is bound, only attached, so roglv2's own
-// idea of which texture is bound is left alone -- the reason MirrorTarget.cpp gives for using a
-// renderbuffer applies here too. Only the setup above binds, and it puts the binding back.
-bool copyTexture(State& s, GLuint fromName, GLuint toName) {
+// One blit, of `fromRect` (x0, y0, x1, y1 in GL texels) onto the whole of the other texture; the
+// whole texture when `fromRect` is null. On this path neither texture is bound, only attached, so
+// roglv2's own idea of which texture is bound is left alone -- the reason MirrorTarget.cpp gives
+// for using a renderbuffer applies here too. Only the setup above binds, and it puts the binding
+// back.
+bool copyTexture(State& s, GLuint fromName, GLuint toName, const int* fromRect = nullptr) {
     const GlFunctions& gl = s.gl;
 
     GLint previousDraw = 0;
@@ -230,8 +232,12 @@ bool copyTexture(State& s, GLuint fromName, GLuint toName) {
         // rest of the pass write channels it had masked off, which is worse than a blit that
         // arrives masked.
         if (saved && gl.colorMask) gl.colorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        gl.blitFramebuffer(0, 0, s.width, s.height, 0, 0, s.width, s.height,
-                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (fromRect)
+            gl.blitFramebuffer(fromRect[0], fromRect[1], fromRect[2], fromRect[3], 0, 0, s.width,
+                               s.height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        else
+            gl.blitFramebuffer(0, 0, s.width, s.height, 0, 0, s.width, s.height,
+                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
         if (saved)
             gl.popAttrib();
@@ -330,6 +336,34 @@ bool mirrorCacheBlackout() {
     // turned off, and a later restore would put it back on the glass.
     s.held[0] = s.held[1] = false;
     return complete;
+}
+
+bool mirrorCacheStretchCorner(int width, int height) {
+    State& s = g_state;
+    if (width < 1 || height < 1 || (width >= s.width && height >= s.height)) return false;
+    if (!ensure(s)) return false;
+    if (width > s.width) width = s.width;
+    if (height > s.height) height = s.height;
+
+    // rogl_blit_GLtoGL_copyTexSubImage (roglv2 0x200087D0) flips only the rows it reads from the
+    // framebuffer; it writes at yoffset = y + the destination's origin, so the block at (0, 0) is
+    // GL rows 0..height-1. The left eye's copy is the scratch: it is stale after this anyway.
+    int corner[4] = {0, 0, width, height};
+    bool stretched = copyTexture(s, s.mirror, s.eye[0], corner) &&
+                     copyTexture(s, s.eye[0], s.mirror);
+    s.held[0] = s.held[1] = false;
+
+    static int said[3] = {0, 0, -1};
+    if (width != said[0] || height != said[1] || (stretched ? 1 : 0) != said[2]) {
+        said[0] = width;
+        said[1] = height;
+        said[2] = stretched ? 1 : 0;
+        logf("mirror: the lobby's copy-out is a %dx%d block of the %dx%d mirror.mip -- %s",
+             width, height, s.width, s.height,
+             stretched ? "stretched over the whole texture"
+                       : "NOT stretched, so the rest of the texture keeps its old image");
+    }
+    return stretched;
 }
 
 unsigned mirrorCacheTakeRestores() {

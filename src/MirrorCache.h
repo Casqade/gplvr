@@ -54,6 +54,11 @@ bool mirrorCacheRestore(int eye);
 // off, from wherever holds the GL context.
 bool mirrorCacheBlackout();
 
+// After a copy-out of a `width` x `height` block at (0, 0), smaller than mirror.mip: stretches
+// that block over the whole texture, and forgets both saved copies. For the race lobby's TV feed
+// (MirrorTarget.h). False when the block already covers it or the blit cannot be made.
+bool mirrorCacheStretchCorner(int width, int height);
+
 // How many restores happened since the last call, for the once-a-second line.
 unsigned mirrorCacheTakeRestores();
 

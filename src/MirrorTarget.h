@@ -29,4 +29,16 @@ void mirrorTargetAfterBind(void* camera, const SceneParams* params);
 // never followed by a main camera bind.
 void mirrorTargetEndScene();
 
+// THE RACE LOBBY'S TV FEED. gpl_simFrameRender makes the mirror instance at mirror.mip's size on
+// the main camera's surface (report 109 section 1), and in the lobby that surface is the 373x280
+// TV picture, so the instance is clipped to it and the copy-out fills only that block of
+// mirror.mip; the rest keeps whatever the car or a replay last left there. In the front end, in
+// VR, the block is stretched over the whole texture after the copy. The view needs no
+// correction: GPL gives the mirror camera a 90 degree horizontal field and sets its aspect to
+// width / (2 * height) of the instance (0x4C7D40), so the vertical field is the same at any
+// instance size and the stretch shows GPL's view at a lower resolution.
+//
+// Whether a bitmapDraw reading `readSurface` (a handle) is that copy-out.
+bool mirrorTargetLobbyCopy(int readSurface);
+
 }  // namespace gplvr

@@ -17,6 +17,7 @@
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
+#include "Window.h"
 
 #include "baked/CarRenderer.h"
 #include "baked/Renderer.h"
@@ -810,11 +811,17 @@ namespace {
 // The live rendererType() (the VR menu switches it between frames), and a switch logged. Back on
 // after passes GPL drew alone, the kept car programs are dropped: no pass followed the cars
 // meanwhile, so each is built again from its first call rather than trusted to a replay.
+//
+// The front end's only world render is the race lobby's TV feed, a small flat picture on the menu
+// where frame rate does not matter, so GPL draws it whatever the setting: its passes count as
+// mode 0's. The track bake still starts from the lobby (trackBakeMainWalk reads rendererType()).
 int liveMode(State& s) {
-    int mode = rendererType();
+    bool frontEnd = windowInFrontEnd();
+    int  mode = frontEnd ? 0 : rendererType();
     if (mode != s.modeSeen) {
         if (s.modeSeen >= 0)
-            logf("baked: renderer now %s", mode == 0   ? "GPL's own (vanilla)"
+            logf("baked: renderer now %s", frontEnd    ? "GPL's own for the front end's TV feed"
+                                           : mode == 0 ? "GPL's own (vanilla)"
                                            : mode == 1 ? "gplvr's"
                                                        : "gplvr's, its rectangles marked red");
         if (s.modeSeen == 0 && mode != 0) carProgramDropAll();

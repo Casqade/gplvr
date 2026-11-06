@@ -264,10 +264,14 @@ void restore() {
     State& s = g_state;
     if (!s.applied) return;
 
+    // A model reloaded since the apply holds its authored UVs again, and the saved nodes may be
+    // freed memory by now, so nothing is written to them.
+    bool reloaded = s.set.cockpit && mirrorGeometryCockpit(s.team) != s.set.cockpit;
+
     // Only polygons that still hold what was WRITTEN are put back. A node holding anything else
     // has been reloaded or taken over, and writing the authored values into it would be the same
     // mistake in the other direction.
-    for (int g = 0; g < s.count; ++g) {
+    for (int g = 0; g < s.count && !reloaded; ++g) {
         Glass& glass = s.glass[g];
         for (int p = 0; p < glass.polys; ++p) {
             SavedPoly& saved = glass.saved[p];

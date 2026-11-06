@@ -16,6 +16,7 @@
 #include "MirrorCache.h"
 #include "MirrorConfig.h"
 #include "MirrorTarget.h"
+#include "MirrorUv.h"
 #include "MouseLook.h"
 #include "MirrorDriverArms.h"
 #include "NoSignal.h"
@@ -1762,6 +1763,11 @@ void __cdecl sceneRenderHook(void* params) {
     // own code. Asking where it lands separates "the framebuffer flickers" from "this
     // particular draw misses the framebuffer", which the four scaling gates could not.
     if (windowInFrontEnd()) menuScaleReportBinding("sceneRender in the front end");
+
+    // The TV feed is drawn as flat GPL draws it, and GPL renders one rear view over the whole of
+    // mirror.mip, so the glasses go back to the UVs their model was authored with. The headset's
+    // regions are applied again on the first frame in the car.
+    if (windowInFrontEnd()) mirrorUvRelease();
 
     // The look override, on the flat path.
     //

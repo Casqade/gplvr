@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "MirrorCache.h"
+#include "MirrorTarget.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "ReplayPanel.h"
@@ -501,6 +502,24 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
     bool mirrorCopy = stereoMirrorCopy(source, dest, x, y);
 
     if (!g_bitmapDrawOriginal) return 0;
+
+    // The race lobby's TV feed copies a block smaller than mirror.mip, which is then stretched
+    // over all of it (MirrorTarget.h).
+    if (mirrorTargetLobbyCopy(dest)) {
+        void* read = reinterpret_cast<void*>(static_cast<intptr_t>(dest));
+        void* write = reinterpret_cast<void*>(static_cast<intptr_t>(source));
+        int   blockWidth = bitmapWidth(read);
+        int   blockHeight = bitmapHeight(read);
+        mirrorCacheNoteTexture(source, bitmapWidth(write), bitmapHeight(write));
+        if (kMirrorCopyRebind) {
+            rasterFlushPending();
+            mirrorCacheCopyBegin();
+        }
+        int result = g_bitmapDrawOriginal(source, x, y, dest);
+        if (kMirrorCopyRebind) mirrorCacheCopyEnd();
+        mirrorCacheStretchCorner(blockWidth, blockHeight);
+        return result;
+    }
 
     // The copy binds mirror.mip behind roglv2's texture cache; the binding goes back after it.
     // The flush comes first so the binding noted is the one the cache last saw.

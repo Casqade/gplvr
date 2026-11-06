@@ -4,6 +4,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "Stereo.h"
+#include "Window.h"
 
 #include <cmath>
 #include <cstring>
@@ -112,7 +113,9 @@ void mirrorTargetAfterBind(void* camera, const SceneParams* params) {
         if (!isMirror) restore();
         return;
     }
-    if (!isMirror || !g_options.vr || s.gaveUp) return;
+    // The lobby's TV feed draws its mirror in the frame's corner as flat GPL does; the menu
+    // picture is painted over it.
+    if (!isMirror || !g_options.vr || s.gaveUp || windowInFrontEnd()) return;
 
     // Only the copy-out path renders into the frame. The direct path renders into the mip.
     if (!(params->mirrorFlags & 1u)) {
@@ -196,6 +199,16 @@ void mirrorTargetAfterBind(void* camera, const SceneParams* params) {
 
 void mirrorTargetEndScene() {
     if (g_state.active) restore();
+}
+
+bool mirrorTargetLobbyCopy(int readSurface) {
+    if (!g_options.vr || readSurface <= 0 || !windowInFrontEnd()) return false;
+    auto* params = static_cast<const SceneParams*>(hooksLastSceneParams());
+    if (!params || !params->mirrorCamera) return false;
+    void* surface = nullptr;
+    std::memcpy(&surface, static_cast<const unsigned char*>(params->mirrorCamera) + kCameraSurface,
+                sizeof(surface));
+    return surface && static_cast<int>(reinterpret_cast<intptr_t>(surface)) == readSurface;
 }
 
 }  // namespace gplvr
