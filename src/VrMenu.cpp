@@ -259,7 +259,17 @@ enum class Mode {
     // "Reset what?" -- five answers rather than three, and its own mode for the same reason
     // Confirm is: while a question about the settings is up, nothing else may write them.
     Reset,
+    // The Help button's popup: how the controllers work the menu, and a Close button.
+    Help,
 };
+
+// The Help popup's layout, in bands of the menu canvas: the title, kHelpPopupLines of text,
+// and the Close button in the last band, centred between these fractions of the width. The
+// draw and the pointer test both read them.
+constexpr int   kHelpPopupLines = 7;
+constexpr int   kHelpPopupBands = kHelpPopupLines + 2;
+constexpr float kHelpCloseLeft = 0.38f;
+constexpr float kHelpCloseRight = 0.62f;
 
 // What Reset offers, in the order it is drawn. Cancel LAST and the destructive one next to
 // it, so the stick has to travel past everything to reach "all" and a driver who opened this
@@ -303,13 +313,13 @@ enum RowKind {
 // THE TABS. Each setting lives on one, filed where somebody chasing the symptom would look:
 // the update rates are on Performance rather than beside the mirror and the panel, because a
 // driver reaches for them when the frame rate drops. The page's own buttons -- Save settings,
-// Reset, Close -- are on no tab and sit above the strip, so they are there whichever tab is open.
+// Reset, Help -- are on no tab and sit above the strip, so they are there whichever tab is open.
 enum MenuTab { kTabHeadset = 0, kTabCockpit, kTabPerformance, kTabDisplay, kTabCount };
 constexpr int kTabNone = -1;
 
 enum RowCommand {
     kCommandNone = 0,
-    kCommandClose,
+    kCommandHelp,
     kCommandRecentre,
     kCommandMirrorTweak,
     kCommandHudTweak,
@@ -359,11 +369,9 @@ bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 // The root page. Every row here changes a live value and nothing else; Save settings is what
 // writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
 
-// A row's help says WHAT THE ROW IS, and never which button to press. How to work the
-// highlighted widget is the same answer for every row of its kind and is built from the
-// runtime's own control names in canvasControlLine; how to work a TWEAK MODE is the mode's
-// whole binding table, listed in the mode itself where it is needed. Putting the scheme in
-// each row's words repeated it thirteen times and still left it invisible from inside a mode.
+// A row's help says WHAT THE ROW IS, and never which button to press. How the controllers
+// work the page is the Help button's popup, in the runtime's own control names; how to work a
+// TWEAK MODE is the mode's whole binding table, listed in the mode itself where it is needed.
 //
 // In page order: the buttons above the strip, the tabs, then each tab's rows, top to bottom.
 MenuRow g_rows[] = {
@@ -373,9 +381,10 @@ MenuRow g_rows[] = {
      kTabNone},
     {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
      "put things back to how they shipped -- choose VR settings, mirror aim, Pribluda layout "
-     "or all. To reset one setting, click the stick on it",
+     "or all",
      kTabNone},
-    {"Close", kRowAction, kCommandClose, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabNone},
+    // Its help is built in buildHelpBlock, in the runtime's name for the trigger.
+    {"Help", kRowAction, kCommandHelp, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabNone},
 
     {"Headset", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0,
      "seat position, world size, horizon, brightness and sound", kTabHeadset},
@@ -390,8 +399,7 @@ MenuRow g_rows[] = {
      kTabDisplay},
 
     {"Recentre", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
-     "put the driver's seat where your head is now. With the menu closed, any face button or "
-     "a stick click does the same while driving",
+     "put the driver's seat where your head is now",
      kTabHeadset},
     {"World scale", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrWorldScale,
      0.5f, 2.0f, 0.02f,
@@ -1113,7 +1121,7 @@ Surface drawnSurface() {
     // the whole mode, it is what the driver is looking at, and a question tucked under the
     // panel at strip size would be easy to miss and hard to read.
     if (g_state.mode == Mode::Menu || g_state.mode == Mode::Confirm ||
-        g_state.mode == Mode::Reset) {
+        g_state.mode == Mode::Reset || g_state.mode == Mode::Help) {
         fillSurface(surface, g_state.panelPosition, g_state.panelOrientation, kPanelWidth,
                     kPanelHeight);
         return surface;
@@ -1252,7 +1260,7 @@ Surface pointerSurface() { return drawnSurface(); }
 // would stretch the readout across it.
 void canvasSizeFor(int& width, int& height) {
     if (g_state.mode == Mode::Menu || g_state.mode == Mode::Confirm ||
-        g_state.mode == Mode::Reset) {
+        g_state.mode == Mode::Reset || g_state.mode == Mode::Help) {
         width = kMenuCanvasWidth;
         height = kMenuCanvasHeight;
         return;
@@ -1530,8 +1538,8 @@ void saveSettings();
 void runCommand(int command) {
     ++g_state.commands;
     switch (command) {
-        case kCommandClose:
-            closeMenu(" -- Close");
+        case kCommandHelp:
+            enterMode(Mode::Help, g_state.hand);
             break;
         case kCommandRecentre:
             vrRequestRecentre();
@@ -2194,7 +2202,7 @@ void enterMode(Mode mode, int hand) {
     // would find nothing changed. Returning to the menu is what ends a session.
     if (mode == Mode::Menu) {
         g_snapshot = TweakSnapshot();
-    } else if (mode != Mode::Confirm && mode != Mode::Reset) {
+    } else if (mode != Mode::Confirm && mode != Mode::Reset && mode != Mode::Help) {
         TweakTarget target = targetOf(mode);
         if (!g_snapshot.valid || g_snapshot.target != target) snapshotTake(target);
     }
@@ -2218,6 +2226,9 @@ void enterMode(Mode mode, int hand) {
                                  "highlight can only be aimed at");
             break;
         }
+        case Mode::Help:
+            logf("vr menu: help shown");
+            break;
         case Mode::MirrorTweak:
             logf("vr menu: mirror aim from the %s hand -- %s",
                  hand == kHandLeft ? "left" : "right",
@@ -2399,6 +2410,31 @@ void pollReset(const VrHandInput& hand) {
         answerReset(state.resetChoice);
     else if (hand.stick.pressed)
         answerReset(state.resetChoice);
+}
+
+// -- "help" --------------------------------------------------------------------------------
+
+// Back to the page, with the highlight on the Help button that opened the popup.
+void leaveHelp() {
+    State& state = g_state;
+    enterMode(Mode::Menu, state.hand);
+    for (int row = 0; row < kRowCount; ++row)
+        if (g_rows[row].command == kCommandHelp) state.hovered = row;
+}
+
+// The Close button, in fractions of the menu canvas; the draw puts it at the same place.
+bool helpCloseHit(float u, float v) {
+    float band = 1.0f / static_cast<float>(kHelpPopupBands);
+    return u >= kHelpCloseLeft && u <= kHelpCloseRight &&
+           v >= band * static_cast<float>(kHelpPopupBands - 1) && v <= 1.0f;
+}
+
+// Close is the only answer, so it is always the highlighted one: the trigger on it or the
+// stick click closes the popup. The grip tap does the same (vrMenuPoll's "back").
+void pollHelp(const VrHandInput& hand) {
+    State& state = g_state;
+    bool   onClose = state.pointerOn && helpCloseHit(state.pointerU, state.pointerV);
+    if ((hand.triggerHeld.released && onClose) || hand.stick.pressed) leaveHelp();
 }
 
 void pollConfirm(const VrHandInput& hand) {
@@ -2894,21 +2930,29 @@ const char* boundName(int action) {
     return names.text[hand][action];
 }
 
-// -- the footer's text --------------------------------------------------------------------
-
-// What the trigger does on an action row, for the footer's control line.
-const char* actionEffect(int command) {
-    switch (command) {
-        case kCommandClose: return "close the menu";
-        case kCommandRecentre: return "recentre now";
-        case kCommandMirrorTweak: return "open Mirror setup";
-        case kCommandHudTweak: return "open Pribluda setup";
-        case kCommandPanelTweak: return "open Pribluda position";
-        case kCommandSaveSettings: return "save to gplvr.ini";
-        case kCommandResetSettings: return "choose what to reset";
-        default: return "select it";
-    }
+// The Help popup's lines, the controls in this runtime's names where it gives them.
+void helpPopupLines(char lines[kHelpPopupLines][kHelpLineChars]) {
+    const char* trigger = boundName(kInputTrigger);
+    const char* stick = boundName(kInputStick);
+    const char* grip = boundName(kInputSqueeze);
+    if (!trigger[0]) trigger = "Trigger";
+    if (!stick[0]) stick = "Joystick";
+    if (!grip[0]) grip = "Grip";
+    _snprintf_s(lines[0], kHelpLineChars, _TRUNCATE, "%s or %s: activate VR menu item", trigger,
+                stick);
+    _snprintf_s(lines[1], kHelpLineChars, _TRUNCATE, "Held %s: move slider value under cursor",
+                trigger);
+    _snprintf_s(lines[2], kHelpLineChars, _TRUNCATE, "Held %s (in a race or replay): open quick action menu",
+                trigger);
+    _snprintf_s(lines[3], kHelpLineChars, _TRUNCATE, "%s up/down: navigate VR menu items", stick);
+    _snprintf_s(lines[4], kHelpLineChars, _TRUNCATE,
+                "%s left/right: decrease/increase slider value", stick);
+    _snprintf_s(lines[5], kHelpLineChars, _TRUNCATE,
+                "%s click: reset option to its default value", stick);
+    _snprintf_s(lines[6], kHelpLineChars, _TRUNCATE, "%s: go back or close VR menu", grip);
 }
+
+// -- the footer's text --------------------------------------------------------------------
 
 struct HelpBlock {
     char lines[kHintLines][kHelpLineChars];
@@ -2993,56 +3037,18 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
         }
         if (g_state.hovered < 0 || g_state.hovered >= kRowCount) return;
 
-        // WHAT THE ROW IS, then HOW TO WORK IT, as two lines rather than one sentence with
-        // the scheme stapled on. The first is the row's own words and says nothing about
-        // buttons; the second is the same answer for every row of that kind, in the names
-        // this runtime gave the controls.
-        wrapInto(block, slot, width, g_rows[g_state.hovered].help);
-
-        const char* trigger = boundName(kInputTrigger);
-        const char* stick = boundName(kInputStick);
-        const char* grip = boundName(kInputSqueeze);
-        if (!trigger[0]) trigger = "Trigger";
-        if (!stick[0]) stick = "Stick";
-        if (!grip[0]) grip = "Grip";
-
-        // Every part is "control: effect", and the effect names what it acts on. The line sits
-        // under the row's own help, so a bare "does it" read as belonging to that text. It
-        // has to stay on one line: the footer reserves kHelpLines for the help AND this.
+        // What the row is, in its own words. The Help button's is the one line that names a
+        // control: the way to the popup that names the rest.
         const MenuRow& item = g_rows[g_state.hovered];
-        char           how[kHelpLineChars * 2] = {};
-        switch (item.kind) {
-            case kRowAction:
-                if (item.command == kCommandClose)
-                    _snprintf_s(how, sizeof(how), _TRUNCATE, "%s, %s click or %s: close the menu",
-                                trigger, stick, grip);
-                else
-                    _snprintf_s(how, sizeof(how), _TRUNCATE,
-                                "%s or %s click: %s  |  %s: close menu", trigger, stick,
-                                actionEffect(item.command), grip);
-                break;
-            case kRowTab:
-                _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s: open tab  |  %s left/right: other tabs  |  %s: close menu",
-                            trigger, stick, grip);
-                break;
-            case kRowToggleBool:
-            case kRowToggleInt:
-                _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s or %s left/right: on/off  |  %s click: default", trigger, stick,
-                            stick);
-                break;
-            case kRowChoiceInt:
-            case kRowRateInt:
-            case kRowNamedInt:
-            case kRowSliderFloat:
-                _snprintf_s(how, sizeof(how), _TRUNCATE,
-                            "%s left/right or %s on the bar: change  |  %s click: default", stick,
-                            trigger, stick);
-                break;
-            default: break;
+        if (item.command == kCommandHelp) {
+            const char* trigger = boundName(kInputTrigger);
+            char        open[kHelpLineChars] = {};
+            _snprintf_s(open, sizeof(open), _TRUNCATE, "Press %s to open Help",
+                        trigger[0] ? trigger : "Trigger");
+            wrapInto(block, slot, width, open);
+            return;
         }
-        if (how[0]) wrapInto(block, slot, width, how);
+        wrapInto(block, slot, width, item.help);
         return;
     }
 
@@ -3244,6 +3250,41 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                 gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
             canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f, kResetLabel[choice]);
         }
+        drawCanvasCursor(gl, w, h);
+        return;
+    }
+
+    // "HELP" -- the title, the controls one per band, and Close in the last band.
+    if (g_state.mode == Mode::Help) {
+        float band = h / static_cast<float>(kHelpPopupBands);
+        gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
+        canvasText(gl, kVrTextBody, kHelpMargin, band * 0.5f, "Help");
+
+        char lines[kHelpPopupLines][kHelpLineChars] = {};
+        helpPopupLines(lines);
+        // A runtime's long control names drop the whole list to the small size, so its lines
+        // stay alike.
+        int slot = kVrTextBody;
+        for (const char* line : lines)
+            if (static_cast<float>(vrTextWidth(kVrTextBody, line)) > w * 0.90f)
+                slot = kVrTextSmall;
+        gl.color4f(0.80f, 0.85f, 0.93f, 1.0f);
+        for (int line = 0; line < kHelpPopupLines; ++line)
+            canvasText(gl, slot, w * 0.05f, band * (static_cast<float>(line) + 1.5f),
+                       lines[line]);
+
+        float top = band * static_cast<float>(kHelpPopupBands - 1) + band * 0.10f;
+        float bottom = h - band * 0.10f;
+        float x0 = w * kHelpCloseLeft;
+        float x1 = w * kHelpCloseRight;
+        gl.color4f(0.22f, 0.45f, 0.78f, 0.95f);
+        canvasQuad(gl, x0, top, x1, bottom);
+        gl.color4f(1.0f, 0.85f, 0.25f, 1.0f);
+        canvasOutline(gl, x0, top, x1, bottom);
+        float labelWidth = static_cast<float>(vrTextWidth(kVrTextBody, "Close"));
+        gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
+        canvasText(gl, kVrTextBody, (x0 + x1 - labelWidth) * 0.5f, (top + bottom) * 0.5f,
+                   "Close");
         drawCanvasCursor(gl, w, h);
         return;
     }
@@ -3455,6 +3496,17 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
                     g_state.resetChoice);
         return;
     }
+    // The popup's text changes only when the runtime renames a control.
+    if (g_state.mode == Mode::Help) {
+        char lines[kHelpPopupLines][kHelpLineChars] = {};
+        helpPopupLines(lines);
+        unsigned hash = 2166136261u;
+        for (const char* line : lines)
+            for (const char* c = line; *c; ++c)
+                hash = (hash ^ static_cast<unsigned char>(*c)) * 16777619u;
+        _snprintf_s(out + written, size - static_cast<size_t>(written), _TRUNCATE, "%08X", hash);
+        return;
+    }
 
     // The footer goes in as a hash. It is up to nine wrapped lines and the whole signature
     // has a thousand bytes; what matters is that it changes when the text does, which a hash
@@ -3630,6 +3682,8 @@ void vrMenuPoll() {
             enterMode(state.confirmFrom, state.hand);
         } else if (state.mode == Mode::Reset) {
             enterMode(Mode::Menu, state.hand);
+        } else if (state.mode == Mode::Help) {
+            leaveHelp();
         } else {
             // LEAVING A TWEAK MODE DOES NOT WRITE ANYTHING BY ITSELF. It used to commit, which
             // made the menu's two Save rows meaningless and left no way out of a mode that did
@@ -3694,6 +3748,10 @@ void vrMenuPoll() {
     }
     if (state.mode == Mode::Reset) {
         pollReset(hand);
+        return;
+    }
+    if (state.mode == Mode::Help) {
+        pollHelp(hand);
         return;
     }
 
@@ -3883,7 +3941,7 @@ void vrMenuUpdate(const GlFunctions& gl) {
     canvasSizeFor(canvasWidth, canvasHeight);
     // The dialog is drawn on the menu's canvas at the menu's size, so it takes the menu's font.
     const bool menuMode = state.mode == Mode::Menu || state.mode == Mode::Confirm ||
-                          state.mode == Mode::Reset;
+                          state.mode == Mode::Reset || state.mode == Mode::Help;
     if (!vrTextEnsure(gl, kVrTextBody, menuMode ? kMenuBodyPixels : kStripBodyPixels) ||
         !vrTextEnsure(gl, kVrTextSmall, kMenuSmallPixels)) {
         noteDrawRefusal(kDrawNoText);
@@ -4134,6 +4192,7 @@ bool vrMenuFormatStatus(char* out, size_t size) {
         case Mode::PanelTweak: modeName = "panel tweak"; break;
         case Mode::Confirm: modeName = "save changes?"; break;
         case Mode::Reset: modeName = "reset what?"; break;
+        case Mode::Help: modeName = "help"; break;
         default: break;
     }
 
