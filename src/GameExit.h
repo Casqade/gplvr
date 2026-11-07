@@ -15,9 +15,13 @@
 // exit; below 2 it leaves them to the game. The fg thread then walks GPL's own
 // way out, one step a frame, by the screen it finds (gpl_fgCurrentState's vtable):
 //   1. The driving screen: Back to pits, exactly as the quick menu's slice fires it (GPL's Esc
-//      table and predicates; in a race that retires the car). When GPL's Esc would refuse --
-//      moving, chat open -- straight to step 3.
-//   2. The weekend screen: its own Exit button (sub_43EFF0), with GPL's dialogs answered for the
+//      table and predicates; in a race that retires the car). When GPL refuses the leave --
+//      moving, chat open -- GPL's own Esc is pressed, which puts up GPL's own prompt, and the
+//      request is dropped.
+//   R. The replay screen, entered from the car or from the weekend: Esc posted to the game window,
+//      exactly the key the player leaves it with; the walk goes on from the screen GPL returns to.
+//   2. The weekend screen: its own Exit button (sub_43EFF0), pressed once the screen is ready
+//      (the button does nothing until then), with GPL's dialogs answered for the
 //      player: Yes to "Abandon the Race?", "End Training?" and "Disconnect from the server?",
 //      Yes to saving the practice results where the weekend asks, Yes to going on when the
 //      championship season could not be written. It writes the championship after a finished
@@ -27,13 +31,19 @@
 //      credits being skipped by exitMode -- ends the fg loop; the bg and sv tasks stop on
 //      fgIsRunning(), and gpl_main shuts sound and the rasterizer down and writes app.ini, as on
 //      a normal exit.
-// A step that should change the screen and has not after 5 s, or a screen met after a step that
-// is none of the three (results, standings), moves on to step 3.
+// Each step moves on only when GPL changes the screen; nothing is timed. A screen met after the
+// weekend has been left that is none of the three (results, standings) goes to step 3.
 //
-// FALLBACKS. A second request (Alt+F4 again, a second Close) a second or more after the first,
-// or a main-menu Exit that does not match the code read at install, exits with ExitProcess(0) --
-// what GPL's own emergency key does -- after a log line. A weekend Exit that does not match is
-// skipped (step 3 runs from the weekend screen).
+// STEP 3 NEVER RUNS WITH A WEEKEND LOADED. GPL's Exit then frees the weekend's sounds while its
+// mixer thread is still playing them (dump 8624: sub_50EF10 copying from freed memory).
+//
+// A REQUEST THAT CANNOT BE CARRIED OUT IS DROPPED, and the game goes on as if it never came: the
+// car cannot be left, the weekend's Exit posted nothing (a dialog answered Cancel, GPL refused
+// the post), a check failed at install, or the request comes on a screen opened from the weekend
+// screen while the weekend is loaded. The next Alt+F4 or Close starts over.
+//
+// Two close events within a second end the process with ExitProcess(0), what GPL's own
+// emergency key does, after a log line. Nothing else does.
 
 namespace gplvr {
 

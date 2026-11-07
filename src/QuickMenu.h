@@ -68,9 +68,11 @@ bool quickMenuPostKey(UINT vk, UINT scanCode, int& down, int& up);
 void quickMenuCancel(const char* why);
 
 // The game exit's first step, on the fg thread, in either mode: Back to pits exactly as the
-// slice fires it (GPL's Esc table, GPL's predicates), when the driver is in the car. `why` says
-// what happened.
-enum class ExitLeave { NotInCar, Fired, Unavailable };
+// slice fires it (GPL's Esc table, GPL's predicates), when the driver is in the car. When GPL
+// refuses the leave (moving, chat open) its own Esc is pressed instead, which puts up GPL's own
+// prompt, and the answer is Refused. Unavailable: the checks did not install, nothing done.
+// `why` says what happened.
+enum class ExitLeave { NotInCar, Fired, Refused, Unavailable };
 ExitLeave quickMenuLeaveCarForExit(char* why, size_t size);
 
 // gpl_fgCurrentState is the driving screen. False when the checks did not install.

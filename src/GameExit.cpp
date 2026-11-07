@@ -4,6 +4,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "QuickMenu.h"
+#include "ReplayPanel.h"
 
 #include <windows.h>
 
@@ -24,7 +25,8 @@ constexpr uint32_t  kWeekendVtable = 0x005384D8;   // weekend.win
 constexpr uint32_t  kMainMenuVtable = 0x00537758;  // mainmenu.win
 
 // THE WEEKEND'S EXIT: slot 0x50 of its vtable, sub_43EFF0, the weekend screen's Exit button.
-//   - nothing unless the screen is ready (+0x1A1B, +0x1A20, +0x212B set);
+//   - nothing unless the screen is ready (+0x1A1B, +0x1A20, +0x212B set): on a weekend shown
+//     2 s earlier at least one was still clear (log of dump 8624, no dialog asked);
 //   - gpl_fgPostReplayGoLive;
 //   - single player (gpl_gameModeSelected 0 or 4): per the weekend's save setting (+0x2C24:
 //     3 asks 0x45C "Save the completed practice results?", 1 saves through sub_43EEB0), and
@@ -38,6 +40,10 @@ constexpr uint32_t  kMainMenuVtable = 0x00537758;  // mainmenu.win
 // to answerDialog instead: the player has already said "close the game".
 constexpr uintptr_t kWeekendExit = 0x0043EFF0;
 constexpr size_t    kWeekendExitSlot = 0x50 / 4;
+// The handler's own gates, at the offsets its checked bytes read: the three ready bytes, and the
+// save setting, with which 2 makes a single-player Exit do nothing.
+constexpr size_t kWeekendReady[] = {0x1A1B, 0x1A20, 0x212B};
+constexpr size_t kWeekendSaveSetting = 0x2C24;
 constexpr uintptr_t kRetailGameModeSelected = 0x00553EA0;
 constexpr uintptr_t kRetailServerFlag = 0x005F2464;
 constexpr unsigned char kWeekendExitBytes[] = {
@@ -67,6 +73,23 @@ constexpr unsigned char kWeekendExitBytes[] = {
     0xF8, 0x03, 0x75, 0x14, 0x68, 0xAE, 0x04, 0x00, 0x00, 0xE8, 0x19, 0x68, 0x0B, 0x00, 0x83,
     0xC4, 0x04, 0x3D, 0xBE, 0x0A, 0x00, 0x00, 0x75, 0x05, 0xE8, 0xFA, 0x63, 0x03, 0x00, 0x5F,
     0x5E, 0x5B, 0xC3};
+// The two posts the Exit ends in, gpl_fgPostLeaveWeekend and gpl_fgPostDisconnect, whole:
+// push msg / call gpl_fgMsgCanPost / add / test / jz / push msg / call gpl_fgMsgPost / ... A
+// posted message's +8 reads 1 until the bg task takes it, which is how the exit tells a press
+// that did something from one GPL refused.
+constexpr uintptr_t     kPostLeaveWeekend = 0x00475560;
+constexpr uintptr_t     kRetailLeaveWeekendMsg = 0x006F6468;
+constexpr unsigned char kPostLeaveWeekendBytes[] = {
+    0x68, 0x68, 0x64, 0x6F, 0x00, 0xE8, 0x96, 0x37, 0x07, 0x00, 0x83, 0xC4, 0x04,
+    0x84, 0xC0, 0x74, 0x13, 0x68, 0x68, 0x64, 0x6F, 0x00, 0xE8, 0x05, 0x38, 0x07,
+    0x00, 0x83, 0xC4, 0x04, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0, 0xC3};
+constexpr uintptr_t     kPostDisconnect = 0x00475160;
+constexpr uintptr_t     kRetailDisconnectMsg = 0x006F5EC0;
+constexpr unsigned char kPostDisconnectBytes[] = {
+    0x68, 0xC0, 0x5E, 0x6F, 0x00, 0xE8, 0x96, 0x3B, 0x07, 0x00, 0x83, 0xC4, 0x04,
+    0x84, 0xC0, 0x74, 0x13, 0x68, 0xC0, 0x5E, 0x6F, 0x00, 0xE8, 0x05, 0x3C, 0x07,
+    0x00, 0x83, 0xC4, 0x04, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0, 0xC3};
+constexpr size_t        kMsgPosted = 8;
 constexpr uintptr_t     kDialogYesNo = 0x004F5970;
 constexpr uintptr_t     kDialogYesNoCancel = 0x004F5A10;
 // mov eax, 1000h -- the start of both, the five bytes the jump replaces.
@@ -105,9 +128,8 @@ constexpr uintptr_t kRetailStateChanged = 0x0094D71C;
 
 using ScreenFn = void(__thiscall*)(void* screen);
 
-// A step that changes the screen is given this long before the exit moves on regardless.
-constexpr double kStepSeconds = 5.0;
-constexpr DWORD  kRepeatGuardMs = 1000;  // a second request sooner is the same keypress
+// Two close events this close together end the process at once.
+constexpr DWORD kForceWindowMs = 1000;
 
 struct Operand {
     uintptr_t va;
@@ -119,16 +141,23 @@ struct State {
     bool      weekendChecked = false;  // the weekend's Exit and both dialog entries match
     uintptr_t foregroundState = 0;
     uintptr_t mainMenu = 0;
-    LONGLONG  frequency = 0;
+    uintptr_t leaveWeekendMsg = 0;
+    uintptr_t disconnectMsg = 0;
 
     volatile LONG requests = 0;
-    DWORD     firstRequestAt = 0;
+    DWORD     lastRequestAt = 0;
+    bool      anyRequest = false;
     bool      started = false;
     bool      busy = false;  // inside a GPL call that might draw a frame
     bool      leftCar = false;
+    bool      leftReplay = false;  // Esc posted on this visit to the replay screen
     bool      leftWeekend = false;
     bool      quitting = false;
-    LONGLONG  stepAt = 0;
+    // The weekend screen has been up since the main menu last was: its track and sounds are
+    // loaded, and the main menu's Exit would free them under the sound mixer's thread (dump
+    // 8624). Cleared when the weekend's own Exit has taken it down.
+    bool      weekendLoaded = false;
+    bool      saidWaiting = false;
     int       answered = 0;
 };
 
@@ -171,16 +200,6 @@ bool codeMatches(const char* name, uintptr_t site, const unsigned char* bytes, s
         return false;
     }
     return true;
-}
-
-LONGLONG qpcNow() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return now.QuadPart;
-}
-
-double secondsSince(LONGLONG then) {
-    return static_cast<double>(qpcNow() - then) / static_cast<double>(g_state.frequency);
 }
 
 [[noreturn]] void hardExit(const char* why) {
@@ -240,39 +259,74 @@ bool divert(EntryPatch& patch) {
 
 void restore(const EntryPatch& patch) { writeCode(patch.site, patch.saved, sizeof(patch.saved)); }
 
-void runWeekendExit(void* weekend) {
+// Null when the weekend's Exit would act now; otherwise what makes it return doing nothing, as
+// a press of the button would.
+const char* weekendRefusal(const void* weekend) {
+    auto bytes = static_cast<const unsigned char*>(weekend);
+    for (size_t offset : kWeekendReady)
+        if (!bytes[offset]) return "the screen is still setting up";
+    int setting = 0;
+    std::memcpy(&setting, bytes + kWeekendSaveSetting, sizeof(setting));
+    int mode = *reinterpret_cast<const int*>(rebase(kRetailGameModeSelected));
+    if (setting == 2 && (mode == 0 || mode == 4)) return "its save setting is 2";
+    return nullptr;
+}
+
+bool messagePosted(uintptr_t message) {
+    return message && *reinterpret_cast<const int*>(message + kMsgPosted) == 1;
+}
+
+// True when the press posted the leave or the disconnect; false when GPL did nothing with it.
+bool runWeekendExit(void* weekend) {
     State&     s = g_state;
     EntryPatch yesNo{kDialogYesNo, {}};
     EntryPatch yesNoCancel{kDialogYesNoCancel, {}};
     bool       diverted = divert(yesNo) && divert(yesNoCancel);
     if (!diverted) {
         restore(yesNo);
-        logf("exit: the dialog entries could not be written (error %lu) -- skipping the "
-             "weekend's Exit",
-             GetLastError());
-        return;
+        logf("exit: the dialog entries could not be written (error %lu)", GetLastError());
+        return false;
     }
     s.answered = 0;
     reinterpret_cast<ScreenFn>(kWeekendExit)(weekend);
     restore(yesNoCancel);
     restore(yesNo);
-    logf("exit: the weekend's Exit ran (%d dialog%s answered)", s.answered,
-         s.answered == 1 ? "" : "s");
+    bool posted = messagePosted(s.leaveWeekendMsg) || messagePosted(s.disconnectMsg);
+    logf("exit: the weekend's Exit ran (%d dialog%s answered) -- %s", s.answered,
+         s.answered == 1 ? "" : "s",
+         posted ? "GPL posted the leave" : "GPL posted nothing");
+    return posted;
 }
 
 // -- the steps ---------------------------------------------------------------------------------
 
+// The request is dropped, as if it never came: the game goes on, and the next Alt+F4 or Close
+// starts over.
+void cancel(const char* why) {
+    State& s = g_state;
+    logf("exit: not exiting -- %s", why);
+    InterlockedExchange(&s.requests, 0);
+    s.started = false;
+    s.leftCar = false;
+    s.leftReplay = false;
+    s.leftWeekend = false;
+    s.saidWaiting = false;
+}
+
 void quit() {
     State& s = g_state;
-    s.quitting = true;
-    if (!s.quitChecked) hardExit("GPL's exit path did not check out at install (see above)");
+    if (!s.quitChecked) {
+        cancel("GPL's main-menu Exit did not check out at install (see above)");
+        return;
+    }
     auto vtable = *reinterpret_cast<const uint32_t*>(s.mainMenu);
     if (vtable != kMainMenuVtable) {
-        char text[96];
-        _snprintf_s(text, sizeof(text), _TRUNCATE, "the main menu at %08X has vtable %08X",
-                    static_cast<unsigned>(s.mainMenu), vtable);
-        hardExit(text);
+        logf("exit: the main menu at %08X has vtable %08X", static_cast<unsigned>(s.mainMenu),
+             vtable);
+        cancel("the main menu object is not GPL's");
+        return;
     }
+    s.quitting = true;
     logf("exit: GPL's main-menu Exit (gpl_quitToCreditsOrExit) -- player.ini written, the fg "
          "loop told to end; GPL shuts itself down from here");
     reinterpret_cast<ScreenFn>(kQuitToCreditsOrExit)(reinterpret_cast<void*>(s.mainMenu));
@@ -292,47 +346,70 @@ void step() {
     void*  screen = *reinterpret_cast<void* const*>(s.foregroundState);
     uint32_t vtable = screen ? *reinterpret_cast<const uint32_t*>(screen) : 0;
 
+    bool replay = gplReplayScreenShown();
     if (!s.started) {
         s.started = true;
-        s.stepAt = qpcNow();
-        logf("exit: starting on %s (vtable %08X)", screenName(vtable), vtable);
+        logf("exit: starting on %s (vtable %08X)", replay ? "the replay screen" : screenName(vtable),
+             vtable);
     }
+
+    // The replay screen, from the car or from the weekend: Esc, as the player leaves it, and the
+    // next step runs on whatever screen GPL goes back to. The replay holds a track and its sounds
+    // whichever menu it was started from, so the main menu's Exit never runs from here.
+    if (replay) {
+        if (s.leftReplay) return;
+        s.leftReplay = true;
+        constexpr UINT kEscapeScanCode = 0x01;
+        int  down = 0;
+        int  up = 0;
+        bool window = quickMenuPostKey(VK_ESCAPE, kEscapeScanCode, down, up);
+        if (!window || !down) {
+            cancel("Esc could not be posted to the game window on the replay screen");
+            return;
+        }
+        logf("exit: on the replay screen -- Esc posted, as the player leaves it");
+        return;
+    }
+    s.leftReplay = false;
 
     switch (vtable) {
         case kDrivingVtable:
             if (!s.leftCar) {
-                s.leftCar = true;
-                s.stepAt = qpcNow();
-                char why[96];
-                if (quickMenuLeaveCarForExit(why, sizeof(why)) == ExitLeave::Fired) {
+                char why[128];
+                ExitLeave leave = quickMenuLeaveCarForExit(why, sizeof(why));
+                if (leave == ExitLeave::Fired) {
+                    s.leftCar = true;
                     logf("exit: in the car -- %s", why);
                     return;
                 }
-                logf("exit: in the car, %s -- straight to the main menu's Exit", why);
-                quit();
-                return;
+                // As Esc would: GPL's own prompt is up, and the player decides from there.
+                cancel(why);
             }
-            if (secondsSince(s.stepAt) < kStepSeconds) return;
-            logf("exit: the driving screen is still up %.0f s after back to pits", kStepSeconds);
-            quit();
             return;
 
         case kWeekendVtable:
             if (!s.leftWeekend) {
-                s.leftWeekend = true;
-                s.stepAt = qpcNow();
                 if (!s.weekendChecked) {
-                    logf("exit: the weekend's Exit did not check out at install -- straight to "
-                         "the main menu's Exit");
-                    quit();
+                    cancel("the weekend's Exit did not check out at install (see above)");
                     return;
                 }
-                runWeekendExit(screen);
-                return;
+                // As a player would: the button does nothing until the screen is ready, so it
+                // is pressed once it is.
+                if (const char* why = weekendRefusal(screen)) {
+                    if (!s.saidWaiting) {
+                        s.saidWaiting = true;
+                        logf("exit: waiting on the weekend screen -- its Exit would do nothing "
+                             "yet: %s",
+                             why);
+                    }
+                    return;
+                }
+                if (runWeekendExit(screen))
+                    s.leftWeekend = true;
+                else
+                    cancel("the weekend's Exit did not leave (a dialog answered Cancel, or GPL "
+                           "refused the post)");
             }
-            if (secondsSince(s.stepAt) < kStepSeconds) return;
-            logf("exit: the weekend screen is still up %.0f s after its Exit", kStepSeconds);
-            quit();
             return;
 
         case kMainMenuVtable:
@@ -340,15 +417,38 @@ void step() {
             return;
 
         default:
-            // Before any step: a screen of the front end (options, a setup page). After one: a
-            // screen GPL shows on the way out (results, standings), given the step's time.
-            if (s.leftCar || s.leftWeekend) {
-                if (secondsSince(s.stepAt) < kStepSeconds) return;
-                logf("exit: %.0f s on another screen (vtable %08X) after leaving", kStepSeconds,
-                     vtable);
+            // A screen opened from the weekend screen, with the weekend still loaded: GPL's Exit
+            // from it would free the weekend's sounds under the mixer, and its own way back is
+            // not mapped.
+            if (s.weekendLoaded) {
+                char why[96];
+                _snprintf_s(why, sizeof(why), _TRUNCATE,
+                            "a screen opened from the weekend (vtable %08X)", vtable);
+                cancel(why);
+                return;
             }
+            // A screen of the front end (options, a setup page), or one GPL shows after the
+            // weekend has been left (results, standings).
+            if (s.leftCar || s.leftWeekend)
+                logf("exit: on another screen (vtable %08X) after leaving the weekend", vtable);
             quit();
             return;
+    }
+}
+
+// Every frame, requested or not: whether a weekend is loaded is known only from the screens seen.
+void trackWeekend() {
+    State& s = g_state;
+    void*  screen = *reinterpret_cast<void* const*>(s.foregroundState);
+    if (!screen) return;
+    uint32_t vtable = *reinterpret_cast<const uint32_t*>(screen);
+    if (vtable == kWeekendVtable) {
+        s.weekendLoaded = true;
+    } else if (vtable == kMainMenuVtable) {
+        s.weekendLoaded = false;
+    } else if (s.leftWeekend && vtable != kDrivingVtable) {
+        // The weekend's own Exit took it down.
+        s.weekendLoaded = false;
     }
 }
 
@@ -362,9 +462,6 @@ void gameExitInstall() {
              g_options.exitMode);
         return;
     }
-    LARGE_INTEGER frequency;
-    QueryPerformanceFrequency(&frequency);
-    s.frequency = frequency.QuadPart;
 
     s.foregroundState = rebase(kRetailForegroundState);
     s.mainMenu = rebase(kRetailMainMenu);
@@ -390,40 +487,56 @@ void gameExitInstall() {
                      codeMatches("the Yes/No/Cancel dialog", kDialogYesNoCancel,
                                  kDialogEntryBytes, sizeof(kDialogEntryBytes), nullptr, 0);
     auto weekendTable = reinterpret_cast<const uint32_t*>(kWeekendVtable);
+    const Operand leaveMsg[] = {{kRetailLeaveWeekendMsg, 2}};
+    const Operand disconnectMsg[] = {{kRetailDisconnectMsg, 2}};
+    bool postsOk = codeMatches("gpl_fgPostLeaveWeekend", kPostLeaveWeekend,
+                               kPostLeaveWeekendBytes, sizeof(kPostLeaveWeekendBytes), leaveMsg,
+                               1) &&
+                   codeMatches("gpl_fgPostDisconnect", kPostDisconnect, kPostDisconnectBytes,
+                               sizeof(kPostDisconnectBytes), disconnectMsg, 1);
+    s.leaveWeekendMsg = rebase(kRetailLeaveWeekendMsg);
+    s.disconnectMsg = rebase(kRetailDisconnectMsg);
     bool weekendSlotOk = weekendTable[kWeekendExitSlot] == kWeekendExit;
     if (!weekendSlotOk)
         logf("exit: the weekend's vtable %08X holds %08X at +0x50, not GPL's", kWeekendVtable,
              weekendTable[kWeekendExitSlot]);
-    s.weekendChecked = s.quitChecked && weekendOk && dialogsOk && weekendSlotOk;
+    s.weekendChecked = s.quitChecked && weekendOk && dialogsOk && postsOk && weekendSlotOk;
 
-    logf("exit: %s; the weekend's Exit %s -- Alt+F4 and the window's Close %s",
+    logf("exit: %s; the weekend's Exit %s -- Alt+F4 and the window's Close %s; twice within a "
+         "second ends the process",
          s.quitChecked ? "GPL's main-menu Exit checked" : "GPL's main-menu Exit REFUSED",
-         s.weekendChecked ? "checked" : "refused (the exit goes from the garage straight on)",
-         s.quitChecked ? "leave the car and the weekend, then run it"
-                       : "end the process with ExitProcess(0)");
+         s.weekendChecked ? "checked" : "REFUSED",
+         !s.quitChecked     ? "do nothing"
+         : s.weekendChecked ? "leave the car and the weekend, then run it"
+                            : "run it from the main menu only");
 }
 
 void gameExitRequest(const char* why) {
     State& s = g_state;
     DWORD  now = GetTickCount();
-    if (InterlockedIncrement(&s.requests) == 1) {
-        s.firstRequestAt = now;
-        logf("exit: requested -- %s", why);
-        return;
+    bool   forced = s.anyRequest && now - s.lastRequestAt < kForceWindowMs;
+    s.anyRequest = true;
+    s.lastRequestAt = now;
+    if (forced) {
+        char text[96];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "two close events within a second (%s)", why);
+        hardExit(text);
     }
-    if (now - s.firstRequestAt < kRepeatGuardMs) return;
-    char text[96];
-    _snprintf_s(text, sizeof(text), _TRUNCATE, "asked again (%s) while GPL was exiting", why);
-    hardExit(text);
+    if (InterlockedIncrement(&s.requests) == 1)
+        logf("exit: requested -- %s", why);
+    else
+        logf("exit: requested again -- %s; the exit is already under way", why);
 }
 
 void gameExitPoll() {
     State& s = g_state;
-    if (s.requests == 0 || s.quitting || s.busy) return;
     if (!s.foregroundState) {
-        quit();
+        // exitMode below 2, or GPL's foreground state could not be placed in this image.
+        if (s.requests) cancel("GPL's screens cannot be read in this image");
         return;
     }
+    if (!s.quitting) trackWeekend();
+    if (s.requests == 0 || s.quitting || s.busy) return;
     s.busy = true;
     step();
     s.busy = false;

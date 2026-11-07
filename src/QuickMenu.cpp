@@ -76,6 +76,8 @@ constexpr uintptr_t kPromptClose = 0x00417E20;         // gpl_drivePromptClose
 // in state 4 posts msg 37, in state 5 posts the unpause and sets screen+0x50, and
 // gpl_driveScreenFrame (0x416EBD) posts 37 on the first frame the latch reads 4 again.
 constexpr uintptr_t kConfirmLeave = 0x00417D70;
+// gpl_driveEscPressed: the Esc key on the driving screen, checked whole below.
+constexpr uintptr_t kEscPressed = 0x00417AB0;
 
 using PostFn = int(__cdecl*)();
 using ScreenFn = void(__thiscall*)(void* screen);
@@ -216,7 +218,7 @@ const CodeCheck kChecks[] = {
      {}, 0, kNeedReset},
     {"gpl_driveScreenOnEvent reset refusal", 0x004180DA, kResetRefusalBytes,
      sizeof(kResetRefusalBytes), {}, 0, kNeedReset},
-    {"gpl_driveEscPressed", 0x00417AB0, kEscPressedBytes, sizeof(kEscPressedBytes),
+    {"gpl_driveEscPressed", kEscPressed, kEscPressedBytes, sizeof(kEscPressedBytes),
      {{kRetailPromptBox, 1}, {kRetailGameMode, 1}, {kRetailEscTable, 1}}, 3, kNeedPits},
     {"the prompt box's text getter", kPromptBoxGetText, kPromptBoxGetTextBytes,
      sizeof(kPromptBoxGetTextBytes), {}, 0, kNeedPits},
@@ -1191,8 +1193,15 @@ ExitLeave quickMenuLeaveCarForExit(char* why, size_t size) {
     evaluate(snap, s.view, s.esc);
     const SliceView& pits = s.view[kSlicePits];
     if (!pits.enabled) {
-        _snprintf_s(why, size, _TRUNCATE, "back to pits refused: %s", pits.reason);
-        return ExitLeave::Unavailable;
+        if (s.refused & kNeedPits) {
+            _snprintf_s(why, size, _TRUNCATE, "back to pits refused: %s", pits.reason);
+            return ExitLeave::Unavailable;
+        }
+        reinterpret_cast<ScreenFn>(kEscPressed)(reinterpret_cast<void*>(s.driveScreen));
+        _snprintf_s(why, size, _TRUNCATE,
+                    "GPL refuses the leave (%s) -- its own Esc pressed, which shows its prompt",
+                    pits.reason);
+        return ExitLeave::Refused;
     }
     fire(kSlicePits, snap);
     _snprintf_s(why, size, _TRUNCATE, "back to pits fired");
