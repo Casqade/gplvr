@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace gplvr {
 namespace {
@@ -351,19 +352,75 @@ void mirrorConfigReset() {
     // The glasses are the panes', which this does not lay out, so they stay.
 }
 
-bool mirrorConfigClearAll() {
-    const char* path = ensurePath();
-    if (!DeleteFileA(path) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-        logf("mirror config: %s could not be deleted (error %lu) -- the presets are unchanged",
-             path, GetLastError());
+bool mirrorConfigCarSetName(char* carSet, size_t carSetSize) {
+    if (carSetSize) carSet[0] = '\0';
+    // The same car-set name buildKey puts in front of every section it writes.
+    uintptr_t at = rebase(kRetailCarsetDirName);
+    if (!at) return false;
+    char dir[kCarsetDirBytes + 1] = {};
+    std::memcpy(dir, reinterpret_cast<const void*>(at), kCarsetDirBytes);
+    if (!validName(dir, kCarsetDirBytes - 1)) return false;
+    lowerCase(dir);
+    _snprintf_s(carSet, carSetSize, _TRUNCATE, "%s", dir);
+    return true;
+}
+
+bool mirrorConfigClearCarSet(char* carSet, size_t carSetSize, int& cleared) {
+    cleared = 0;
+    char dir[kCarsetDirBytes + 1] = {};
+    if (!mirrorConfigCarSetName(dir, sizeof(dir))) {
+        if (carSetSize) carSet[0] = '\0';
+        logf("mirror config: no car set is loaded, so there are no presets to clear -- "
+             "gplvr_mirrors.ini is unchanged");
         return false;
     }
-    // The cache holds a copy of every car's aim that was read before the file went, so it
-    // has to go too or the cars already seen this session would keep theirs.
+    _snprintf_s(carSet, carSetSize, _TRUNCATE, "%s", dir);
+
+    const char* path = ensurePath();
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        logf("mirror config: %s does not exist, so %s has no presets to clear", path, dir);
+        return true;
+    }
+
+    // GetPrivateProfileSectionNames returns size - 2 when the names did not fit.
+    std::vector<char> names(16384);
+    for (;;) {
+        DWORD length = GetPrivateProfileSectionNamesA(names.data(),
+                                                      static_cast<DWORD>(names.size()), path);
+        if (length + 2 < names.size()) break;
+        names.resize(names.size() * 2);
+    }
+
+    char prefix[kCarsetDirBytes + 2] = {};
+    _snprintf_s(prefix, sizeof(prefix), _TRUNCATE, "%s/", dir);
+    size_t prefixLength = std::strlen(prefix);
+    int    failed = 0;
+    DWORD  error = 0;
+    for (const char* name = names.data(); *name; name += std::strlen(name) + 1) {
+        char lower[kKeyBytes] = {};
+        _snprintf_s(lower, sizeof(lower), _TRUNCATE, "%s", name);
+        lowerCase(lower);
+        if (std::strncmp(lower, prefix, prefixLength) != 0) continue;
+        if (WritePrivateProfileStringA(name, nullptr, nullptr, path)) {
+            ++cleared;
+        } else {
+            ++failed;
+            error = GetLastError();
+        }
+    }
+
+    // The cache holds a copy of every car's aim that was read before, so it has to go too or
+    // the cars already seen this session would keep theirs. Other car sets read theirs again.
     mirrorConfigReset();
-    logf("mirror config: every per-car preset has been cleared and %s deleted -- every car "
-         "is back to the glasses where GPL points them",
-         path);
+    if (failed) {
+        logf("mirror config: cleared %d %s preset(s) from %s, %d could not be removed (error "
+             "%lu)",
+             cleared, dir, path, failed, error);
+        return false;
+    }
+    logf("mirror config: cleared %d %s preset(s) from %s -- those cars are back to the glasses "
+         "where GPL points them; other car sets keep theirs",
+         cleared, dir, path);
     return true;
 }
 

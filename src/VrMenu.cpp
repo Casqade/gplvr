@@ -349,6 +349,10 @@ struct MenuRow {
     // refuses takes no band, cannot be highlighted and is not drawn -- the rows below it on
     // its tab move up.
     bool (*offered)();
+    // Whether an offered row can be used right now. Null is yes. A row this refuses keeps its
+    // band and can be highlighted, so its help still reads, but is drawn greyed out; its
+    // command says why when pressed.
+    bool (*available)();
 };
 
 // pribluda's rows. The overlay is a separate mod and a GEM+ patch, so an install can
@@ -362,13 +366,10 @@ bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 bool gplMenuHeadLocked() { return g_options.vrGplMenuMode != 1; }
 
 // The setup modes aim at things only a session has -- a car's glasses, and a Pribluda panel
-// that is drawn only while one is being driven -- so their rows are not on the page in the
-// front end.
+// that is drawn only while one is being driven -- so their rows are greyed out in the front end.
 bool inSession() { return !windowInFrontEnd(); }
-// With Pribluda mode Off there is no panel to arrange or place.
-bool pribludaSetupOffered() {
-    return pribludaRowOffered() && inSession() && g_options.vrHudMode != 0;
-}
+// With Pribluda mode Off there is no panel to arrange or place, so the rows leave the page.
+bool pribludaSetupOffered() { return pribludaRowOffered() && g_options.vrHudMode != 0; }
 bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 
 // The root page. Every row here changes a live value and nothing else; Save settings is what
@@ -418,7 +419,7 @@ MenuRow g_rows[] = {
      "Positional audio panning effect intensity", kTabHeadset, headAudioWidthAdjustable},
 
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "Enter mirror tweaking mode to tune car mirrors", kTabCockpit, inSession},
+     "Enter mirror tweaking mode to tune car mirrors", kTabCockpit, nullptr, inSession},
     // vrHudMode: 0 off, 1 fixed in the car, 2 head-locked.
     {"Pribluda mode", kRowNamedInt, kCommandNone, nullptr, &g_options.vrHudMode, nullptr, 0,
      2, 1,
@@ -426,9 +427,10 @@ MenuRow g_rows[] = {
      "Head-locked: Pribluda is drawn in front of your eyes",
      kTabCockpit, pribludaRowOffered},
     {"Pribluda layout", kRowAction, kCommandHudTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "Enter Pribluda widget layout editing mode", kTabCockpit, pribludaSetupOffered},
+     "Enter Pribluda widget layout editing mode", kTabCockpit, pribludaSetupOffered, inSession},
     {"Pribluda position", kRowAction, kCommandPanelTweak, nullptr, nullptr, nullptr, 0, 0, 0,
-     "Enter Pribluda HUD position editing mode", kTabCockpit, pribludaSetupOffered},
+     "Enter Pribluda HUD position editing mode", kTabCockpit, pribludaSetupOffered,
+     inSession},
     {"Pribluda bg opacity", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrHudBackdropOpacity, 0.0f, 1.0f, 0.05f, "Pribluda text background opacity",
      kTabCockpit, pribludaRowOffered},
@@ -508,6 +510,11 @@ constexpr int kFirstRowLine = 2;
 bool rowOffered(int row) {
     if (row < 0 || row >= kRowCount) return false;
     return !g_rows[row].offered || g_rows[row].offered();
+}
+
+bool rowAvailable(int row) {
+    if (row < 0 || row >= kRowCount) return false;
+    return !g_rows[row].available || g_rows[row].available();
 }
 
 // A setting on `tab` that is on the page, as opposed to a button or a tab of the strip.
@@ -623,7 +630,7 @@ bool rendererWarning(char* out, size_t size) {
     const char* brief = bakedPassUploadStopped();
     if (const char* why = trackBakeFailure()) {
         if (std::strstr(why, "out of memory"))
-            brief = "not enough memory for this track";
+            brief = "not enough memory";
         else if (std::strncmp(why, "no tracks", 9) == 0)
             brief = "its track file was not found";
         else
@@ -631,8 +638,7 @@ bool rendererWarning(char* out, size_t size) {
     }
     if (!brief) return false;
     _snprintf_s(out, size, _TRUNCATE,
-                "GPL VR renderer is off on this track: %s. The game's own renderer draws it, so "
-                "performance may be lower.",
+                "GPL VR renderer is off on this track: %s. Performance will be worse",
                 brief);
     return true;
 }
@@ -648,13 +654,13 @@ bool renderScaleWarning(char* out, size_t size) {
     const char* where = sizing.inRace ? "on this track" : "on the last track";
     if (sizing.windowPicture)
         _snprintf_s(out, size, _TRUNCATE,
-                    "Not enough memory for the headset's images %s: it shows the game "
-                    "window's picture. Lower Render scale and restart.",
+                    "Not enough memory for Render scale %.2f %s, running at GPL window size. Lower Render scale and apply 4 GB patch to gpl.exe",
+                    g_options.vrRenderScale,
                     where);
     else
         _snprintf_s(out, size, _TRUNCATE,
-                    "Not enough memory for Render scale %.2f %s: running at an effective "
-                    "%.2f. Lower it, or make gplc67.exe large-address-aware.",
+                    "Not enough memory for Render scale %.2f %s, running at "
+                    "%.2f. Lower Render scale and apply 4 GB patch to gpl.exe",
                     g_options.vrRenderScale, where, g_options.vrRenderScale * sizing.fraction);
     return true;
 }
@@ -689,8 +695,8 @@ int footerLines() {
 void enforceRowRules(const MenuRow& changed) {
     if (changed.intValue == &g_options.frameRate && g_options.frameRate > 0 &&
         !interpolationActive())
-        notice("the blend did not install this session, so a rate above the sim's cannot be "
-               "drawn -- the interp: line in gplvr.log says why");
+        notice("Can't set frame rate higher than GPL's vanilla: "
+               "frame interpoplation failed to arm - see gplvr.log for the reason");
 }
 
 // Why a draw produced nothing. Counted rather than logged per frame.
@@ -1537,7 +1543,7 @@ void resetRow(int row) {
     notice(text);
 }
 
-void saveSettings();
+bool saveSettings();
 
 void runCommand(int command) {
     ++g_state.commands;
@@ -1555,7 +1561,7 @@ void runCommand(int command) {
             // driven. The menu itself is open out here, which is the point, but these
             // rows say why they are not rather than opening onto nothing.
             if (windowInFrontEnd()) {
-                notice("the mirrors belong to a car -- start a session first");
+                notice("Mirrors can only be tweaked in a car");
                 break;
             }
             // The keyboard modes edit the same numbers. One owner at a time, decided
@@ -1570,7 +1576,7 @@ void runCommand(int command) {
             break;
         case kCommandHudTweak:
             if (windowInFrontEnd()) {
-                notice("pribluda's panel is only drawn in a session -- start one first");
+                notice("Pribluda can only be tweaked in a car");
                 break;
             }
             if (pribludaTweakActive()) {
@@ -1582,7 +1588,7 @@ void runCommand(int command) {
             break;
         case kCommandPanelTweak:
             if (windowInFrontEnd()) {
-                notice("pribluda's panel is only drawn in a session -- start one first");
+                notice("Pribluda can only be tweaked in a car");
                 break;
             }
             enterMode(Mode::PanelTweak, g_state.hand);
@@ -1612,7 +1618,8 @@ void runCommand(int command) {
 // WHAT A TWEAK MODE CHANGES IS NOT HERE. The mirror aim and the pribluda layout live in
 // their own files, the HUD panel's placement in its own eight keys of this one, and each
 // tweak mode asks about its own on the way out -- so none of them needs this row.
-void saveSettings() {
+// True when every key was written.
+bool saveSettings() {
     // The same file loadOptions read, beside gplvr. Writing one in the game's folder instead
     // would succeed, report success, and change nothing anybody reads.
     char path[MAX_PATH] = {};
@@ -1662,13 +1669,13 @@ void saveSettings() {
     writeInt("vrMonitorEye", g_options.vrMonitorEye);
 
     if (failed) {
-        notice("some settings could not be written to gplvr.ini -- is the game folder "
+        notice("Some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
         logf("vr menu: %d of 19 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
-        return;
+        return false;
     }
-    notice("saved to gplvr.ini");
+    notice("Saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudMode=%d mirrorUpdateInterval=%d "
          "mirrorMode=%d "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
@@ -1683,6 +1690,7 @@ void saveSettings() {
          g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextSpread,
          g_options.vrGamma, g_options.vrHorizonLock, g_options.vrReplayHorizonLock,
          g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
+    return true;
 }
 
 // Every write to a row's option goes through one of these two, so a rule about what a setting
@@ -2369,15 +2377,27 @@ void answerReset(int choice) {
     int  written = 0;
 
     if (all || choice == kResetVrSettings) {
-        // The live values only. Writing gplvr.ini here would be a second, hidden save, and
-        // the page already has one row that does that and says so.
+        // Saved at once, like the mirror presets and the Pribluda layout below, so every
+        // choice in this dialog leaves its file as the notice says.
         for (int row = 0; row < kRowCount; ++row) resetRow(row);
-        written += _snprintf_s(done, sizeof(done), _TRUNCATE, "settings");
+        bool saved = saveSettings();
+        written += _snprintf_s(done, sizeof(done), _TRUNCATE, "%s",
+                               saved ? "Settings saved to gplvr.ini"
+                                     : "Failed to write settings: gplvr.ini could not be written");
     }
     if (all || choice == kResetMirrors) {
-        bool ok = mirrorConfigClearAll();
-        written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE, "%s%s",
-                               written ? ", " : "", ok ? "mirror presets" : "MIRRORS FAILED");
+        char carSet[24] = {};
+        int  cleared = 0;
+        bool ok = mirrorConfigClearCarSet(carSet, sizeof(carSet), cleared);
+        if (ok) {
+            written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE,
+                                   "%s%s mirror presets (%d)", written ? ", " : "", carSet,
+                                   cleared);
+        } else {
+            written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE, "%s%s",
+                                   written ? ", " : "",
+                                   carSet[0] ? "MIRRORS FAILED" : "no car set loaded");
+        }
     }
     if (all || choice == kResetPribluda) {
         bool ok = pribludaResetLayout();
@@ -2386,8 +2406,7 @@ void answerReset(int choice) {
     }
 
     char text[256] = {};
-    _snprintf_s(text, sizeof(text), _TRUNCATE,
-                "reset: %s. The settings are live only -- Save settings keeps them", done);
+    _snprintf_s(text, sizeof(text), _TRUNCATE, "Reset: %s", done);
     enterMode(Mode::Menu, state.hand);
     notice(text);
 }
@@ -3306,7 +3325,16 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                 setResetColour(gl);
             else
                 gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
-            canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f, kResetLabel[choice]);
+            // The mirror row names the car set it clears.
+            char        mirrorLabel[48] = {};
+            char        carSet[24] = {};
+            const char* label = kResetLabel[choice];
+            if (choice == kResetMirrors && mirrorConfigCarSetName(carSet, sizeof(carSet))) {
+                _snprintf_s(mirrorLabel, sizeof(mirrorLabel), _TRUNCATE,
+                            "Clear %s mirror presets", carSet);
+                label = mirrorLabel;
+            }
+            canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f, label);
         }
         drawCanvasCursor(gl, w, h);
         return;
@@ -3422,7 +3450,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
             }
 
             float labelWidth = static_cast<float>(vrTextWidth(kVrTextBody, g_rows[row].label));
-            if (g_rows[row].command == kCommandResetSettings)
+            if (!rowAvailable(row))
+                gl.color4f(0.50f, 0.53f, 0.58f, 1.0f);
+            else if (g_rows[row].command == kCommandResetSettings)
                 setResetColour(gl);
             else if (g_rows[row].command == kCommandSaveSettings)
                 gl.color4f(0.45f, 0.95f, 0.50f, 1.0f);
@@ -3487,7 +3517,10 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                        centre + band * 0.16f);
         }
 
-        gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
+        if (rowAvailable(row))
+            gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
+        else
+            gl.color4f(0.50f, 0.53f, 0.58f, 1.0f);
         canvasText(gl, kVrTextBody, labelX, centre, item.label);
         rowValueText(item, value, sizeof(value));
         if (value[0]) canvasText(gl, kVrTextBody, valueX, centre, value);
@@ -3611,7 +3644,8 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
         const float fraction = rowFraction(g_rows[row]);
         const int   quantised = fraction < 0.0f ? -1 : static_cast<int>(fraction * 512.0f);
         const int   added = _snprintf_s(out + used, size - static_cast<size_t>(used),
-                                        _TRUNCATE, "%s,%d;", value, quantised);
+                                        _TRUNCATE, "%s,%d,%d;", value, quantised,
+                                        rowAvailable(row) ? 1 : 0);
         if (added < 0) break;
         used += added;
     }

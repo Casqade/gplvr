@@ -46,9 +46,15 @@ constexpr int kMaxMirrorGlasses = 8;
 // Called at the end of loadOptions: every car starts neutral.
 void mirrorConfigReset();
 
-// Delete gplvr_mirrors.ini and forget every cached car, so every car is back to neutral and
-// can be aimed again. For the menu's Reset dialog.
-bool mirrorConfigClearAll();
+// The loaded car set's folder name in lower case ("cars67"), as the section names carry it.
+// False, with an empty string, when no car set is loaded.
+bool mirrorConfigCarSetName(char* carSet, size_t carSetSize);
+
+// Remove the loaded car set's sections from gplvr_mirrors.ini and forget every cached car, so
+// that car set's cars are back to neutral and can be aimed again; other car sets' presets stay.
+// carSet receives the car set's name in lower case, cleared the number of sections removed.
+// False when no car set is loaded or a section could not be removed. For the menu's Reset dialog.
+bool mirrorConfigClearCarSet(char* carSet, size_t carSetSize, int& cleared);
 
 // Once a frame from stereoRender's mirror path. True when the car-set directory string has
 // changed since the last key was built, which drops every cached car and asks the caller to
