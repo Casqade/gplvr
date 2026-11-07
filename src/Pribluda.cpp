@@ -532,6 +532,60 @@ bool bind() {
     return true;
 }
 
+// THE LETTERBOX BARS PRIBLUDA REPAINTS. prib_hudDraw opens with
+//     +0x108C8  cmp prib_repaintBars, 0
+//     +0x108CF  jz  +0x108D6
+//     +0x108D1  call prib_paintLetterboxBars (+0x97D0)
+// and prib_paintLetterboxBars fills two OPAQUE black boxes the full screen width, blackBarRatio
+// of its height tall, at the top and the bottom, for six draws, then clears the flag.
+// prib_pollHotkeys sets the flag on every widget hotkey (F4 and the rest), and the telemetry
+// tick on a client-rect change: pribluda repaints GPL's letterbox bars over whatever HUD text it
+// drew into them. With the letterbox removed (enableLetterbox = 0) the boxes land on the 3D view
+// and read as the letterbox flashing back. So the jz becomes a jmp, in either mode; the flag is
+// read nowhere else in the draw, and the VR panel already holds it down around its own call.
+constexpr DWORD         kRvaBarRepaintJump = 0x000108CF;
+constexpr DWORD         kRvaPaintLetterboxBars = 0x000097D0;
+constexpr unsigned char kBarRepaintJz = 0x74;
+constexpr unsigned char kBarRepaintJmp = 0xEB;
+
+void suppressBarRepaint() {
+    static bool settled = false;
+    if (settled || g_options.enableLetterbox) return;
+    HMODULE module = GetModuleHandleA("pribluda");
+    if (!module) return;
+    settled = true;
+
+    const char* build = at<const char>(module, kRvaBuildDate);
+    if (memcmp(build, kBuildDate, sizeof("Jul  3 2010") - 1) != 0) {
+        logf("pribluda: not the build gplvr knows -- its letterbox bar repaint after a hotkey "
+             "stays, and flashes the bars gplvr removed");
+        return;
+    }
+    unsigned char* site = at<unsigned char>(module, kRvaBarRepaintJump);
+    int32_t        displacement = 0;
+    std::memcpy(&displacement, site + 3, sizeof(displacement));
+    unsigned char* target = site + 7 + displacement;
+    if (site[0] != kBarRepaintJz || site[1] != 0x05 || site[2] != 0xE8 ||
+        target != at<unsigned char>(module, kRvaPaintLetterboxBars)) {
+        logf("pribluda: +0x%05X holds %02X %02X %02X, not the jz around prib_paintLetterboxBars "
+             "-- its letterbox bar repaint after a hotkey stays",
+             kRvaBarRepaintJump, site[0], site[1], site[2]);
+        return;
+    }
+    DWORD protection = 0;
+    if (!VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &protection)) {
+        logf("pribluda: VirtualProtect on +0x%05X failed (error %lu) -- its letterbox bar "
+             "repaint after a hotkey stays",
+             kRvaBarRepaintJump, GetLastError());
+        return;
+    }
+    *site = kBarRepaintJmp;
+    VirtualProtect(site, 1, protection, &protection);
+    FlushInstructionCache(GetCurrentProcess(), site, 1);
+    logf("pribluda: its letterbox bar repaint (after a hotkey or a window resize) is skipped -- "
+         "enableLetterbox = 0, so there are no bars to repaint");
+}
+
 // Settle whether pribluda exists, called once a frame from the present hook ahead of every
 // option gate -- including vrHudMode, because the menu's own row for it has to stay
 // reachable on an install that has pribluda and has the panel switched off.
@@ -960,6 +1014,7 @@ void drawTweakOutline(const GlFunctions& gl, int width, int height) {
 
 void pribludaDrawHud() {
     settlePresence();
+    suppressBarRepaint();
     if (!g_options.vr || hudLayer() == 0) return;
     if (!bind()) return;
     if (*g_prib.rasterizerKind != kRasterizerRoglv2) return;
