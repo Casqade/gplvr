@@ -19,6 +19,12 @@ namespace {
 //
 // gpl_fgCurrentState is the screen the fg loop runs; a screen is told apart by its vtable, which
 // sits in .rdata and does not move between links.
+// A global a template names, and how many times: placed on this image by rebase().
+struct Operand {
+    uintptr_t va;
+    unsigned  count;
+};
+
 constexpr uintptr_t kRetailForegroundState = 0x0094D718;
 constexpr uint32_t  kDrivingVtable = 0x00537410;   // driving.win
 constexpr uint32_t  kWeekendVtable = 0x005384D8;   // weekend.win
@@ -94,6 +100,69 @@ constexpr uintptr_t     kDialogYesNo = 0x004F5970;
 constexpr uintptr_t     kDialogYesNoCancel = 0x004F5A10;
 // mov eax, 1000h -- the start of both, the five bytes the jump replaces.
 constexpr unsigned char kDialogEntryBytes[] = {0xB8, 0x00, 0x10, 0x00, 0x00};
+// gpl_dialogOk, cdecl(uID): a message with an OK button. Same entry.
+constexpr uintptr_t kDialogOk = 0x004F58E0;
+// gpl_dialogText, cdecl(const wchar_t* text): the car setup's "discard?" question, shown from
+// a string it loads itself; anything but 2748 Cancel goes on.
+//     mov eax, [esp+4]; sub esp, 800h
+constexpr uintptr_t     kDialogText = 0x004F5860;
+constexpr unsigned char kDialogTextEntryBytes[] = {0x8B, 0x44, 0x24, 0x04, 0x81,
+                                                   0xEC, 0x00, 0x08, 0x00, 0x00};
+// gpl_loadStringW, stdcall(uID, buffer, count): how the car setup loads that question, called
+// to recognise it.
+using LoadStringFn = int(__stdcall*)(unsigned id, wchar_t* buffer, int count);
+constexpr uintptr_t     kLoadString = 0x004EEB70;
+constexpr unsigned char kLoadStringBytes[] = {0xB8, 0x04, 0x11, 0x00, 0x00,
+                                              0xE8, 0x46, 0x09, 0x03, 0x00};
+constexpr unsigned kDiscardSetupText = 0x30B;  // "Discard all changes made to the car's setup?"
+
+// THE SCREENS OPENED FROM THE WEEKEND, left the way the player leaves them. Every screen's
+// vtable carries its two buttons at the same slots: +0x50 the red one (Cancel; it opens with
+// the empty gpl_uiRedPressedStub, 0x422DF0) and +0x54 the green one (OK, gpl_uiGreenPressedStub,
+// 0x422DE0). Both end in gpl_screenGoToParentState, which puts the parent screen in
+// gpl_fgCurrentState at once.
+//   - Car setup, carsetup.win: RED, sub_420920. A changed setup asks 0x30B through
+//     gpl_dialogText, answered Yes; the changes not applied are dropped, as the button drops
+//     them. Its green applies the setup and, for the default file, asks 0x3EC and opens a
+//     file dialog, which nothing here can fill in.
+//   - Settings, options.win: GREEN, sub_42ACD0. Stores the options, writes player.ini and the
+//     controls; refuses with 0x4B8 when a control is unassigned.
+//   - Team info from the weekend, teamInfo.win's read-only class: GREEN, sub_435CC0, straight
+//     back (its red slot is nullsub_123: no red button).
+struct ScreenButton {
+    const char*          screen;
+    const char*          button;
+    uint32_t             vtable;
+    size_t               slot;
+    uintptr_t            handler;
+    const unsigned char* bytes;
+    size_t               length;
+    Operand              operand;  // va 0: none
+};
+constexpr size_t kRedSlot = 0x50 / 4;
+constexpr size_t kGreenSlot = 0x54 / 4;
+constexpr unsigned char kCarSetupRedBytes[] = {
+    0x81, 0xEC, 0x00, 0x08, 0x00, 0x00, 0x56, 0x8B, 0xF1, 0xE8, 0xC2, 0x24, 0x00, 0x00, 0x8A,
+    0x86, 0x6E, 0x03, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x3C, 0x8D, 0x44, 0x24, 0x04, 0x68, 0xFF,
+    0x03, 0x00, 0x00, 0x50, 0x68, 0x0B, 0x03, 0x00, 0x00, 0xB9, 0x08, 0xD7, 0x94, 0x00, 0xE8,
+    0x1F, 0xE2, 0x0C, 0x00, 0x8D, 0x4C, 0x24, 0x04, 0x51, 0xE8, 0x05, 0x4F, 0x0D, 0x00, 0x83,
+    0xC4, 0x04, 0x3D, 0xBC, 0x0A, 0x00, 0x00, 0x74, 0x16, 0x8B, 0x16, 0x8B, 0xCE, 0xFF, 0x52,
+    0x28};
+constexpr unsigned char kSettingsGreenBytes[] = {
+    0xA1, 0x30, 0x19, 0x55, 0x00, 0x56, 0x85, 0xC0, 0x8B, 0xF1, 0x74, 0x72, 0x8A, 0x88, 0xE8,
+    0x0A, 0x00, 0x00, 0x84, 0xC9, 0x75, 0x68, 0x8B, 0xCE, 0xE8, 0xF3, 0x80, 0xFF, 0xFF, 0x8B,
+    0xCE, 0xE8, 0x3C, 0xF9, 0xFF, 0xFF, 0x8B, 0xCE, 0xE8, 0x65, 0xF9, 0xFF, 0xFF, 0x8B, 0xCE};
+constexpr unsigned char kTeamInfoGreenBytes[] = {0x56, 0x8B, 0xF1, 0xE8, 0x18, 0xD1, 0xFE, 0xFF,
+                                                 0x8B, 0x06, 0x8B, 0xCE, 0xFF, 0x50, 0x28, 0x5E};
+const ScreenButton kButtons[] = {
+    {"the car setup screen", "red", 0x00537668, kRedSlot, 0x00420920, kCarSetupRedBytes,
+     sizeof(kCarSetupRedBytes), {0x0094D708, 1}},
+    {"the Settings screen", "green", 0x00537918, kGreenSlot, 0x0042ACD0, kSettingsGreenBytes,
+     sizeof(kSettingsGreenBytes), {0x00551930, 1}},
+    {"the team info screen", "green", 0x00537C48, kGreenSlot, 0x00435CC0, kTeamInfoGreenBytes,
+     sizeof(kTeamInfoGreenBytes), {0, 0}},
+};
+constexpr size_t kButtonCount = sizeof(kButtons) / sizeof(kButtons[0]);
 constexpr int kDialogYes = 2750;
 constexpr int kDialogNo = 2749;
 constexpr int kDialogCancel = 2748;
@@ -131,14 +200,11 @@ using ScreenFn = void(__thiscall*)(void* screen);
 // Two close events this close together end the process at once.
 constexpr DWORD kForceWindowMs = 1000;
 
-struct Operand {
-    uintptr_t va;
-    unsigned  count;
-};
-
 struct State {
     bool      quitChecked = false;     // the main menu's Exit matches and its object is placed
-    bool      weekendChecked = false;  // the weekend's Exit and both dialog entries match
+    bool      dialogsChecked = false;  // the four dialog entries and the string loader match
+    bool      weekendChecked = false;  // the weekend's Exit, its posts and the dialogs match
+    bool      buttonChecked[kButtonCount] = {};
     uintptr_t foregroundState = 0;
     uintptr_t mainMenu = 0;
     uintptr_t leaveWeekendMsg = 0;
@@ -225,6 +291,9 @@ int __cdecl answerDialog(unsigned id) {
             text = "\"Unable to save the updated championship season status! Discard race "
                    "results and repeat race later?\" -- Yes";
             break;
+        // gpl_dialogOk's messages: the answer is not read, the screen decides what follows.
+        case 0x4B8: answer = kDialogYes; text = "\"All controls must be assigned.\" -- OK"; break;
+        case 0x46A: answer = kDialogYes; text = "\"Unable to save player options.\" -- OK"; break;
         default: break;
     }
     ++g_state.answered;
@@ -232,8 +301,20 @@ int __cdecl answerDialog(unsigned id) {
     return answer;
 }
 
+// gpl_dialogText's question, recognised by loading the one string it is expected to be.
+int __cdecl answerTextDialog(const wchar_t* text) {
+    wchar_t discard[512] = {};
+    reinterpret_cast<LoadStringFn>(kLoadString)(kDiscardSetupText, discard, 511);
+    bool known = text && discard[0] && wcscmp(text, discard) == 0;
+    ++g_state.answered;
+    logf("exit: GPL asked \"%ls\": %s", text ? text : L"",
+         known ? "Yes" : "not one the exit expects -- Cancel");
+    return known ? kDialogYes : kDialogCancel;
+}
+
 struct EntryPatch {
     uintptr_t     site;
+    void*         answer;
     unsigned char saved[5];
 };
 
@@ -251,7 +332,7 @@ bool writeCode(uintptr_t site, const unsigned char* bytes, size_t length) {
 bool divert(EntryPatch& patch) {
     std::memcpy(patch.saved, reinterpret_cast<const void*>(patch.site), sizeof(patch.saved));
     unsigned char jump[5] = {0xE9};
-    auto rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&answerDialog) -
+    auto rel = static_cast<int32_t>(reinterpret_cast<uintptr_t>(patch.answer) -
                                     (patch.site + sizeof(jump)));
     std::memcpy(jump + 1, &rel, sizeof(rel));
     return writeCode(patch.site, jump, sizeof(jump));
@@ -276,21 +357,36 @@ bool messagePosted(uintptr_t message) {
     return message && *reinterpret_cast<const int*>(message + kMsgPosted) == 1;
 }
 
-// True when the press posted the leave or the disconnect; false when GPL did nothing with it.
-bool runWeekendExit(void* weekend) {
+// Run one of GPL's button handlers with every dialog entry jumped to the exit's answers, and
+// put the entries back. False, after a log line, when the entries could not be written.
+bool pressAnswering(uintptr_t handler, void* screen) {
     State&     s = g_state;
-    EntryPatch yesNo{kDialogYesNo, {}};
-    EntryPatch yesNoCancel{kDialogYesNoCancel, {}};
-    bool       diverted = divert(yesNo) && divert(yesNoCancel);
-    if (!diverted) {
-        restore(yesNo);
+    EntryPatch patches[] = {
+        {kDialogYesNo, reinterpret_cast<void*>(&answerDialog), {}},
+        {kDialogYesNoCancel, reinterpret_cast<void*>(&answerDialog), {}},
+        {kDialogOk, reinterpret_cast<void*>(&answerDialog), {}},
+        {kDialogText, reinterpret_cast<void*>(&answerTextDialog), {}},
+    };
+    size_t diverted = 0;
+    for (EntryPatch& patch : patches) {
+        if (!divert(patch)) break;
+        ++diverted;
+    }
+    if (diverted != sizeof(patches) / sizeof(patches[0])) {
         logf("exit: the dialog entries could not be written (error %lu)", GetLastError());
+        while (diverted) restore(patches[--diverted]);
         return false;
     }
     s.answered = 0;
-    reinterpret_cast<ScreenFn>(kWeekendExit)(weekend);
-    restore(yesNoCancel);
-    restore(yesNo);
+    reinterpret_cast<ScreenFn>(handler)(screen);
+    while (diverted) restore(patches[--diverted]);
+    return true;
+}
+
+// True when the press posted the leave or the disconnect; false when GPL did nothing with it.
+bool runWeekendExit(void* weekend) {
+    State& s = g_state;
+    if (!pressAnswering(kWeekendExit, weekend)) return false;
     bool posted = messagePosted(s.leaveWeekendMsg) || messagePosted(s.disconnectMsg);
     logf("exit: the weekend's Exit ran (%d dialog%s answered) -- %s", s.answered,
          s.answered == 1 ? "" : "s",
@@ -332,12 +428,44 @@ void quit() {
     reinterpret_cast<ScreenFn>(kQuitToCreditsOrExit)(reinterpret_cast<void*>(s.mainMenu));
 }
 
+// A screen opened from the weekend (or from the main menu): its own button, as the player leaves
+// it. The button changes gpl_fgCurrentState before it returns, so whether it left is read at
+// once; the next step runs on the screen GPL went back to.
+void pressScreenButton(size_t index, void* screen) {
+    State&              s = g_state;
+    const ScreenButton& b = kButtons[index];
+    char                why[160];
+    if (!s.buttonChecked[index]) {
+        _snprintf_s(why, sizeof(why), _TRUNCATE, "%s's %s button did not check out at install",
+                    b.screen, b.button);
+        cancel(why);
+        return;
+    }
+    if (!pressAnswering(b.handler, screen)) {
+        cancel("the dialog entries could not be written");
+        return;
+    }
+    void* now = *reinterpret_cast<void* const*>(s.foregroundState);
+    if (now == screen) {
+        _snprintf_s(why, sizeof(why), _TRUNCATE,
+                    "%s's %s button kept the screen up (%d dialog%s answered)", b.screen,
+                    b.button, s.answered, s.answered == 1 ? "" : "s");
+        cancel(why);
+        return;
+    }
+    logf("exit: %s's %s button pressed (%d dialog%s answered) -- GPL went back a screen",
+         b.screen, b.button, s.answered, s.answered == 1 ? "" : "s");
+}
+
 const char* screenName(uint32_t vtable) {
     switch (vtable) {
         case kDrivingVtable: return "the driving screen";
         case kWeekendVtable: return "the weekend screen";
         case kMainMenuVtable: return "the main menu";
-        default: return "another screen";
+        default:
+            for (const ScreenButton& b : kButtons)
+                if (vtable == b.vtable) return b.screen;
+            return "another screen";
     }
 }
 
@@ -417,6 +545,11 @@ void step() {
             return;
 
         default:
+            for (size_t i = 0; i < kButtonCount; ++i) {
+                if (vtable != kButtons[i].vtable) continue;
+                pressScreenButton(i, screen);
+                return;
+            }
             // A screen opened from the weekend screen, with the weekend still loaded: GPL's Exit
             // from it would free the weekend's sounds under the mixer, and its own way back is
             // not mapped.
@@ -485,7 +618,34 @@ void gameExitInstall() {
     bool dialogsOk = codeMatches("the Yes/No dialog", kDialogYesNo, kDialogEntryBytes,
                                  sizeof(kDialogEntryBytes), nullptr, 0) &&
                      codeMatches("the Yes/No/Cancel dialog", kDialogYesNoCancel,
-                                 kDialogEntryBytes, sizeof(kDialogEntryBytes), nullptr, 0);
+                                 kDialogEntryBytes, sizeof(kDialogEntryBytes), nullptr, 0) &&
+                     codeMatches("the OK dialog", kDialogOk, kDialogEntryBytes,
+                                 sizeof(kDialogEntryBytes), nullptr, 0) &&
+                     codeMatches("the text dialog", kDialogText, kDialogTextEntryBytes,
+                                 sizeof(kDialogTextEntryBytes), nullptr, 0) &&
+                     codeMatches("the string loader", kLoadString, kLoadStringBytes,
+                                 sizeof(kLoadStringBytes), nullptr, 0);
+    s.dialogsChecked = dialogsOk;
+
+    char buttons[160] = {};
+    size_t used = 0;
+    for (size_t i = 0; i < kButtonCount; ++i) {
+        const ScreenButton& b = kButtons[i];
+        auto table = reinterpret_cast<const uint32_t*>(b.vtable);
+        bool slotOk = table[b.slot] == b.handler;
+        if (!slotOk)
+            logf("exit: %s's vtable %08X holds %08X at +0x%02X, not GPL's %08X", b.screen,
+                 b.vtable, table[b.slot], static_cast<unsigned>(b.slot * 4),
+                 static_cast<unsigned>(b.handler));
+        bool codeOk = codeMatches(b.screen, b.handler, b.bytes, b.length, &b.operand,
+                                  b.operand.va ? 1 : 0);
+        s.buttonChecked[i] = dialogsOk && slotOk && codeOk;
+        int wrote = _snprintf_s(buttons + used, sizeof(buttons) - used, _TRUNCATE, "%s%s %s",
+                                i ? ", " : "", b.screen + 4,
+                                s.buttonChecked[i] ? "checked" : "REFUSED");
+        if (wrote > 0) used += static_cast<size_t>(wrote);
+    }
+    logf("exit: the buttons the exit leaves screens with: %s", buttons);
     auto weekendTable = reinterpret_cast<const uint32_t*>(kWeekendVtable);
     const Operand leaveMsg[] = {{kRetailLeaveWeekendMsg, 2}};
     const Operand disconnectMsg[] = {{kRetailDisconnectMsg, 2}};

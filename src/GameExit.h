@@ -20,6 +20,10 @@
 //      request is dropped.
 //   R. The replay screen, entered from the car or from the weekend: Esc posted to the game window,
 //      exactly the key the player leaves it with; the walk goes on from the screen GPL returns to.
+//   S. Car setup, Settings and the weekend's team info: the screen's own button back, with the
+//      dialogs answered -- car setup's red (its unapplied changes discarded, "Discard all
+//      changes made to the car's setup?" Yes), the other two's green (Settings stores and saves
+//      the options). A button that keeps the screen up drops the request.
 //   2. The weekend screen: its own Exit button (sub_43EFF0), pressed once the screen is ready
 //      (the button does nothing until then), with GPL's dialogs answered for the
 //      player: Yes to "Abandon the Race?", "End Training?" and "Disconnect from the server?",
