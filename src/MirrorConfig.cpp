@@ -55,12 +55,11 @@ constexpr int kTeamSlots = 50;
 
 constexpr const char kFileName[] = "gplvr_mirrors.ini";
 constexpr const char kFileHeader[] =
-    "; gplvr_mirrors.ini -- per-car, per-glass mirror aim, written by gplvr's mirror tweak mode.\r\n"
+    "; gplvr_mirrors.ini -- mirror presets, written by gplvr's mirror tweaking mode.\r\n"
     "; One section per car: [<car-set folder>/<team folder>], lower case, e.g. [cars67/lotus].\r\n"
-    "; In it <glass>Yaw, <glass>Pitch and <glass>FovScale for each glass -- left, right,\r\n"
-    "; centre. Positive yaw turns that glass's view toward the car's right, so a symmetric\r\n"
-    "; pair has opposite signs. A glass with no values gets the aim GPL gives it: 0 yaw,\r\n"
-    "; 0 pitch, 1.0 scale. Delete a section to put that car back to neutral and aim it again.\r\n"
+    "; In it <mirror>Yaw, <mirror>Pitch and <mirror>FovScale for each mirror -- left, right or centre.\r\n"
+    "; Positive yaw turns that mirror's view toward the car's right, so a symmetric pair has opposite signs.\r\n"
+    "; To reset a car preset, delete its section.\r\n"
     "\r\n";
 
 constexpr int kKeyBytes = 40;

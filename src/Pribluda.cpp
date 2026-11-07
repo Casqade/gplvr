@@ -123,46 +123,33 @@ constexpr int         kUnset = INT_MIN;
 // control someone actually wants, and two overlapping size controls is one too many.
 constexpr float kPribludaTextScale = 2.0f;
 
-// Written into gplvr's own folder when it is missing. Positions are fractions of the panel, and
-// the defaults are PRIBLUDA.INI's own monitor layout in those terms -- the three boards at
-// width-900/-600/-300, the tyre grid at 1180 and 100 up from the bottom, the fps counter
-// 120 in and 50 up -- so the panel starts out looking exactly like the monitor.
+// Written into gplvr's own folder when it is missing, and by Reset Pribluda layout. The same
+// text as the shipped config/gplvr_pribluda.ini, so a reset gives back the shipped layout; keep
+// the two identical.
 constexpr const char* kDefaultLayout =
-    "; gplvr_pribluda.ini -- pribluda's overlay, laid out on the headset's HUD PANEL.\r\n"
-    ";\r\n"
-    "; gplvr wrote this because it was missing. While it sits beside gplvr.dll the panel\r\n"
-    "; takes its layout from here, and the monitor keeps using PRIBLUDA.INI exactly as\r\n"
-    "; before. It is read once, when the game starts: restart the game to apply an edit.\r\n"
-    "; Delete it to get these defaults back.\r\n"
-    ";\r\n"
-    "; Or place things from the headset: in a race press End (vrHudTweakKey in gplvr.ini),\r\n"
-    "; move the outlined element with the arrows, pick another with Page Up/Down, and press\r\n"
-    "; End again to write the positions here.\r\n"
+    "; gplvr_pribluda.ini -- Pribluda layout in VR.\r\n"
     ";\r\n"
     "; POSITIONS ARE FRACTIONS OF THE PANEL, 0 to 1. X runs left to right, Y top to bottom:\r\n"
-    "; 0,0 is the top-left corner and 1,1 the bottom-right. A panel's X and Y place its\r\n"
-    "; TOP-LEFT corner. The defaults are PRIBLUDA.INI's monitor layout, so the panel starts\r\n"
-    "; out as a copy of your monitor HUD; pull things together to make it more compact.\r\n"
+    "; 0,0 is the panel's top-left corner and 1,1 its bottom-right. A widget's X and Y place\r\n"
+    "; its top-left corner.\r\n"
     ";\r\n"
-    "; Where the panel hangs and how big it is lives in gplvr.ini: vrHudMode, and\r\n"
-    "; vrHudHead*/vrHudSeat* for each mode; the panel's own width sets how big text is.\r\n"
-    ";\r\n"
-    "; Same section and key names as PRIBLUDA.INI. Only positions and `show` are read;\r\n"
-    "; colours, driver counts and key bindings still come from PRIBLUDA.INI. `show` here\r\n"
-    "; overrides the hotkeys for that panel in the headset -- delete the line to follow them.\r\n"
+    "; Same section and key names as PRIBLUDA.INI. Only positions, `show` and the dash's\r\n"
+    "; `width` are read; colours, driver counts and key bindings still come from PRIBLUDA.INI.\r\n"
+    "; `show` here overrides pribluda's hotkeys for that widget in VR -- delete its\r\n"
+    "; line if you want to use the hotkeys.\r\n"
     "\r\n"
-    "[times]\r\nshow = 1\r\nX = 0\r\nY = 0\r\n\r\n"
-    "[playerboard]\r\nshow = 1\r\nX = 0.648\r\nY = 0\r\n\r\n"
-    "[leaderboard]\r\nshow = 1\r\nX = 0.766\r\nY = 0\r\n\r\n"
-    "[trackpositionboard]\r\nshow = 1\r\nX = 0.883\r\nY = 0\r\n\r\n"
+    "[times]\r\nshow = 1\r\nX =0.3483\r\nY =0.2707\r\n\r\n"
+    "[playerboard]\r\nshow = 1\r\nX =0.7935\r\nY =0.2867\r\n\r\n"
+    "[leaderboard]\r\nshow = 1\r\nX =0.8225\r\nY =0.0555\r\n\r\n"
+    "[trackpositionboard]\r\nshow = 1\r\nX =0.0225\r\nY =0.0681\r\n\r\n"
     "[tyres]\r\n"
     "; pribluda's quirk: with show = 0 and showPatch = 1 the patch is drawn at X/Y.\r\n"
-    "show = 1\r\nX = 0.461\r\nY = 0.931\r\nshowPatch = 1\r\npatchX = 0.461\r\npatchY = 0.965\r\n\r\n"
-    "[fps]\r\nshow = 1\r\nX = 0.953\r\nY = 0.965\r\n\r\n"
+    "show = 1\r\nX =0.4305\r\nY =0.4582\r\nshowPatch = 1\r\npatchX =0.4296\r\npatchY =0.3817\r\n\r\n"
+    "[fps]\r\nshow = 1\r\nX =0.4837\r\nY =0.0000\r\n\r\n"
     "[dash]\r\n"
     "; One row: X and Y are its top-left corner, width how far it spreads. Speed, gear and\r\n"
     "; rpm centre themselves in that width, oil sits at its left end and fuel at its right.\r\n"
-    "show = 1\r\nX = 0\r\nY = 0.896\r\nwidth = 1\r\n";
+    "show = 1\r\nX =0.0290\r\nY =0.2270\r\nwidth = 0.95\r\n";
 
 typedef unsigned(__cdecl* HudDrawFn)(void*, void*, void*);
 typedef int(__cdecl* GameStateFn)();
