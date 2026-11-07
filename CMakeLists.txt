@@ -101,6 +101,7 @@ else()
         src/FlatFrames.cpp
         src/FlatTarget.cpp
         src/FrameBudget.cpp
+        src/GameExit.cpp
         src/GlApi.cpp
         src/GlInterop.cpp
         src/GplMenuPanel.cpp
@@ -147,6 +148,7 @@ else()
         src/VrText.cpp
         src/Version.rc
         src/Window.cpp
+        src/XrRuntimeProbe.cpp
         src/presenter/Producer.cpp
         src/presenter/HeadsetMemory.cpp
         src/fast_text/FastText.cpp

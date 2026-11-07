@@ -35,7 +35,8 @@
 // drives (gpl_tickInterrupt), so a word pushed into it from here would race GPL's own writes.
 // The F2 press therefore goes through the window's message queue instead.
 //
-// Always on in VR; there is no option.
+// Always on in VR; there is no option. The checks install in flat mode too, for the game exit's
+// back to pits (GameExit.h); the radial and the pause rule run in VR only.
 
 #include "GlInterop.h"
 
@@ -65,6 +66,15 @@ bool quickMenuPostKey(UINT vk, UINT scanCode, int& down, int& up);
 
 // Close it without firing, releasing the controller. Safe when it is closed.
 void quickMenuCancel(const char* why);
+
+// The game exit's first step, on the fg thread, in either mode: Back to pits exactly as the
+// slice fires it (GPL's Esc table, GPL's predicates), when the driver is in the car. `why` says
+// what happened.
+enum class ExitLeave { NotInCar, Fired, Unavailable };
+ExitLeave quickMenuLeaveCarForExit(char* why, size_t size);
+
+// gpl_fgCurrentState is the driving screen. False when the checks did not install.
+bool quickMenuDrivingScreenShown();
 
 // Build and publish the radial's image on the VR menu's quad layer, from vrMenuUpdate while the
 // VR menu is closed, with the game's GL context current. True while the radial holds the layer;

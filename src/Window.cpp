@@ -3,6 +3,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "FlatTarget.h"
+#include "GameExit.h"
 #include "MenuScale.h"
 #include "Pe.h"
 
@@ -1085,11 +1086,27 @@ bool windowHandleMessage(HWND window, UINT message, WPARAM wParam, LPARAM& lPara
             return true;
         }
 
+        // With exitMode 2, closing the window exits the game through GPL's own exit (GameExit.h):
+        // roglv2 swallows WM_CLOSE, and GPL's keyboard proc takes WM_SYSKEYDOWN, so Alt+F4 never
+        // becomes one. Below 2 all three go down the chain as in the stock game.
         case WM_CLOSE:
-            // roglv2 swallows this and returns 0, so alt-F4 does nothing at all. Give it
-            // back: post the quit ourselves, above the subclass that eats it.
-            logf("window: WM_CLOSE -- quitting");
-            PostQuitMessage(0);
+            if (g_options.exitMode < 2) return false;
+            gameExitRequest("WM_CLOSE");
+            result = 0;
+            return true;
+
+        case WM_SYSCOMMAND:
+            if (g_options.exitMode < 2 || (wParam & 0xFFF0) != SC_CLOSE) return false;
+            gameExitRequest("SC_CLOSE");
+            result = 0;
+            return true;
+
+        case WM_SYSKEYDOWN:
+            // Alt held (context bit 29), and the first press, not its auto-repeat (bit 30).
+            if (g_options.exitMode < 2 || wParam != VK_F4 || !(lParam & (1 << 29)) ||
+                (lParam & (1 << 30)))
+                return false;
+            gameExitRequest("Alt+F4");
             result = 0;
             return true;
 

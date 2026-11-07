@@ -1035,7 +1035,6 @@ void release(const Snapshot& snap, LONGLONG now) {
 void quickMenuInstall() {
     State& s = g_state;
     if (s.installed) return;
-    if (!g_options.vr) return;
 
     s.driveScreen = rebase(kRetailDriveScreen);
     s.foregroundState = rebase(kRetailForegroundState);
@@ -1084,8 +1083,10 @@ void quickMenuInstall() {
 
     qpcNow();
     s.installed = true;
-    logf("quick menu: installed -- hold the trigger in the car; driving screen %08X, fg state "
+    logf("quick menu: installed -- %s; driving screen %08X, fg state "
          "%08X, game mode %08X, Esc table %08X, session state %08X; %s",
+         g_options.vr ? "hold the trigger in the car"
+                      : "flat: only the game exit's back to pits uses it",
          static_cast<unsigned>(s.driveScreen), static_cast<unsigned>(s.foregroundState),
          static_cast<unsigned>(s.gameMode), static_cast<unsigned>(s.escTable),
          static_cast<unsigned>(s.sessionState),
@@ -1094,7 +1095,7 @@ void quickMenuInstall() {
 
 void quickMenuPoll() {
     State& s = g_state;
-    if (!s.installed) return;
+    if (!s.installed || !g_options.vr) return;
 
     LONGLONG now = qpcNow();
     Snapshot snap = readSnapshot();
@@ -1174,6 +1175,35 @@ bool quickMenuPostKey(UINT vk, UINT scanCode, int& down, int& up) {
 }
 
 bool quickMenuOpen() { return g_state.open; }
+
+ExitLeave quickMenuLeaveCarForExit(char* why, size_t size) {
+    State& s = g_state;
+    if (!s.installed) {
+        _snprintf_s(why, size, _TRUNCATE, "the quick menu's checks did not install");
+        return ExitLeave::Unavailable;
+    }
+    Snapshot snap = readSnapshot();
+    if (!snap.vtableOk || !snap.driveCurrent || (snap.latched != 4 && snap.latched != 5)) {
+        _snprintf_s(why, size, _TRUNCATE, "not in the car");
+        return ExitLeave::NotInCar;
+    }
+    if (s.open) closeRadial("the game is exiting");
+    evaluate(snap, s.view, s.esc);
+    const SliceView& pits = s.view[kSlicePits];
+    if (!pits.enabled) {
+        _snprintf_s(why, size, _TRUNCATE, "back to pits refused: %s", pits.reason);
+        return ExitLeave::Unavailable;
+    }
+    fire(kSlicePits, snap);
+    _snprintf_s(why, size, _TRUNCATE, "back to pits fired");
+    return ExitLeave::Fired;
+}
+
+bool quickMenuDrivingScreenShown() {
+    const State& s = g_state;
+    if (!s.installed) return false;
+    return readSnapshot().driveCurrent;
+}
 
 void quickMenuCancel(const char* why) {
     State& s = g_state;

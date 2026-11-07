@@ -38,6 +38,8 @@
 #include "VrInput.h"
 #include "VrMenu.h"
 #include "Window.h"
+#include "XrRuntimeProbe.h"
+#include "GameExit.h"
 #include "presenter/Producer.h"
 
 #include <cmath>
@@ -827,6 +829,9 @@ void pollToggle() {
     // replay pointer, which has already clicked if this press was on GPL's panel. Its posts
     // belong on the fg thread too.
     replayQuickMenuPoll();
+    // A close the window proc took (Alt+F4, the window's Close), carried out here on the fg thread
+    // in GPL's order: out of the car, then the main menu's Exit. Either mode.
+    gameExitPoll();
 
     // The next mirror mode. The pass loop reads mirrorMode every frame and the main world walk
     // redirect is installed whichever way it started, so the modes swap freely.
@@ -2528,6 +2533,19 @@ void loadOptions(const char* fileName) {
     if (g_options.profileStallUs < 0) g_options.profileStallUs = 0;
     if (g_options.profileStallUs > 10000) g_options.profileStallUs = 10000;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 1, path) != 0;
+    // Before anything reads vr: every VR-only install gate then sees the flat answer, exactly as
+    // with vr = 0 in the ini.
+    if (g_options.vr) {
+        char runtime[1200];
+        if (xrRuntimeFind(runtime, sizeof(runtime))) {
+            logf("vr: OpenXR runtime -- %s", runtime);
+        } else {
+            g_options.vr = false;
+            logf("vr: NO OpenXR runtime -- %s. Playing flat, as with vr = 0; install or select a "
+                 "runtime (SteamVR, Oculus, Pico, Virtual Desktop...) to play in the headset",
+                 runtime);
+        }
+    }
     g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
     g_options.vrMouseLook =
         GetPrivateProfileIntA("gplvr", "vrMouseLook", 0, path) != 0;
@@ -2571,7 +2589,8 @@ void loadOptions(const char* fileName) {
         GetPrivateProfileIntA("gplvr", "enableLetterbox", 0, path) != 0;
     g_options.widescreenFix =
         GetPrivateProfileIntA("gplvr", "widescreenFix", 1, path) != 0;
-    g_options.skipCredits = GetPrivateProfileIntA("gplvr", "skipCredits", 1, path) != 0;
+    g_options.exitMode = GetPrivateProfileIntA("gplvr", "exitMode", 2, path);
+    if (g_options.exitMode < 0 || g_options.exitMode > 2) g_options.exitMode = 2;
     g_options.mirrorDriverArms =
         GetPrivateProfileIntA("gplvr", "mirrorDriverArms", 1, path) != 0;
     g_options.vrGplMenuMode = GetPrivateProfileIntA("gplvr", "vrGplMenuMode", 1, path);
@@ -2825,6 +2844,10 @@ void loadOptions(const char* fileName) {
              ? "flat world frames are drawn off-screen and copied into the window at the swap; "
                "watch the `flat frame:` lines"
              : "flat world frames are drawn straight into the window");
+    logf("options: exitMode=%d (%s)", g_options.exitMode,
+         g_options.exitMode == 0   ? "vanilla: the credits roll, Alt+F4 and Close do nothing"
+         : g_options.exitMode == 1 ? "no credits; Alt+F4 and Close do nothing"
+                                   : "no credits; Alt+F4 and Close exit through GPL's own exits");
     logf("options: vrRendererType=%d flatRendererType=%d, this mode's %d (%s)",
          g_options.vrRendererType, g_options.flatRendererType, rendererType(),
          rendererType() == 0
@@ -3120,7 +3143,7 @@ void setSelfModule(HMODULE module) { g_selfModule = module; }
 constexpr uintptr_t kRetailCreditsOnExit = 0x0054C5CC;
 
 void creditsSkipInstall() {
-    if (!g_options.skipCredits) return;
+    if (g_options.exitMode < 1) return;
 
     uintptr_t flag = rebase(kRetailCreditsOnExit);
     if (!flag) {
@@ -3138,7 +3161,7 @@ void creditsSkipInstall() {
         return;
     }
     logf("credits: quitting now exits straight away -- %08X %u -> 0, so the quit path takes the "
-         "branch past credits.win. skipCredits = 0 leaves it alone.",
+         "branch past credits.win. exitMode = 0 leaves it alone.",
          static_cast<unsigned>(flag), before);
 }
 

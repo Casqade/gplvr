@@ -208,12 +208,15 @@ struct Options {
     // On installs none of it and the game keeps its 4:3 band.
     bool enableLetterbox = false;
 
-    // Quit straight out instead of sitting through the credits roll. Flat mode too: the credits
-    // are a screen like any other and nothing about them is VR-specific, they are just a much
-    // worse thing to be shown in a headset you are trying to take off.
-    //
-    // One byte, not a code patch -- see creditsSkipInstall.
-    bool skipCredits = true;
+    // How the game exits. Flat mode too.
+    //   0  vanilla: the credits roll, and Alt+F4 and the window's Close do nothing
+    //   1  quit straight out instead of sitting through the credits roll -- one byte, not a code
+    //      patch, see creditsSkipInstall. The credits are a screen like any other and nothing
+    //      about them is VR-specific, they are just a much worse thing to be shown in a headset
+    //      you are trying to take off.
+    //   2  (default) 1, and Alt+F4 and the window's Close exit the game through GPL's own exits
+    //      (GameExit.h)
+    int exitMode = 2;
 
     // Turn on GPL's mirror "driver arms" option, which has no ini key or checkbox of its own and
     // is off. Off, the mirror draws a stock car's low-detail steering wheel in its flat colour,
@@ -845,7 +848,7 @@ void patchDisplaySettingsImports(HMODULE module);
 
 void patchDisplaySettingsImportsEverywhere();
 
-// Clear GPL's "roll the credits on the way out" flag, when skipCredits asks for it. Flat mode
+// Clear GPL's "roll the credits on the way out" flag, when exitMode is 1 or 2. Flat mode
 // too. One byte; no hook, so there is nothing to survive a mode change.
 void creditsSkipInstall();
 

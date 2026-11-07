@@ -139,7 +139,8 @@ struct GlApi {
     void(BAKED_GLAPI* getQueryObjectui64v)(GLuint, GLenum, uint64_t*) = nullptr;
     void(BAKED_GLAPI* getInteger64v)(GLenum, int64_t*) = nullptr;
 
-    // GL 3.3 - 4.3, used only by the car renderer (CarRenderer.cpp), which checks them itself;
+    // GL 3.3 - 4.3, used by the car renderer (CarRenderer.cpp) and, bindBufferBase, by the merged
+    // draws (RendererMerged.cpp); each checks them itself;
     // glApiMissing does not require them.
     void(BAKED_GLAPI* vertexAttribDivisor)(GLuint, GLuint) = nullptr;
     void(BAKED_GLAPI* multiDrawElementsIndirect)(GLenum, GLenum, const void*, GLsizei,
@@ -287,6 +288,8 @@ constexpr GLenum kDrawIndirectBuffer = 0x8F3F;
 constexpr GLenum kDrawIndirectBufferBinding = 0x8F43;
 constexpr GLenum kShaderStorageBuffer = 0x90D2;
 constexpr GLenum kShaderStorageBufferBinding = 0x90D3;
+constexpr GLenum kMaxVertexShaderStorageBlocks = 0x90D6;
+constexpr GLenum kMaxShaderStorageBlockSize = 0x90DE;
 constexpr GLenum kClipDistance0 = 0x3000;
 constexpr GLenum kModelviewMatrix = 0x0BA6;
 constexpr GLenum kProjectionMatrix = 0x0BA7;

@@ -21,7 +21,17 @@ namespace {
 // kVertexShader and kSpriteVertexShader in one: the batch table says which a vertex is. A sprite
 // corner reads `flat` as two int16 offsets (attribute 7), its normal as its up axis and its gap as
 // the screen-aligned flag (Scene.h, Vertex).
-const char* const kMergedVertexShader = R"(#version 400
+constexpr GLuint kItemOrderBinding = 0;   // kMergedVertexShader's ItemOrder block
+constexpr GLuint kBatchTableBinding = 1;  // and its BatchTable block
+
+//
+// The two tables the vertex shader reads -- the item order and the batch table -- are shader
+// storage buffers (GL 4.3), bound to indexed binding points, not buffer textures on texture
+// units. AMD's driver 27.20.14044.2 (Radeon integrated) read the texture of unit -1 for this
+// shader's two usamplerBuffers in every merged draw through a program with a geometry shader,
+// whatever unit the uniforms named and however they were written (crashes\gplc67, dumps 7096,
+// 7716, 3964 and 8096, 2026-11-08); a storage block has no sampler slot to look a unit up for.
+const char* const kMergedVertexShader = R"(#version 430
 #extension GL_ARB_bindless_texture : require
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec2 a_uv;
@@ -48,10 +58,11 @@ uniform vec3 u_viewLeft;
 uniform vec3 u_viewUp;
 uniform vec2 u_faceEye;
 uniform float u_offsetStep;
-uniform usamplerBuffer u_itemOrder;
+// Per item: its order number (Renderer.cpp's orderTableBuffer_), binding kItemOrderBinding.
+layout(std430, binding = 0) readonly buffer ItemOrder { uint itemOrder[]; };
 // Per batch: the texture handle's two halves (0 untextured), surface class + 1 (0 none), and
-// pass | kind << 8 | decal << 16.
-uniform usamplerBuffer u_batches;
+// pass | kind << 8 | decal << 16; binding kBatchTableBinding.
+layout(std430, binding = 1) readonly buffer BatchTable { uvec4 batchTable[]; };
 // To the geometry shader (kMergedTriangleClip, kMergedLineClip), which hands them on as v_*.
 out vec2 g_uv;
 noperspective out vec4 g_colour;  // as Renderer.cpp's: roglv2 interpolates it across the screen
@@ -64,7 +75,7 @@ flat out uint g_level;
 // Above 0 for a face of a two-sided panel turned away from the eye: kMergedTriangleClip drops it.
 flat out float g_away;
 void main() {
-    uvec4 batch = texelFetch(u_batches, int(a_batchLevel & 0xFFFFFFu));
+    uvec4 batch = batchTable[a_batchLevel & 0xFFFFFFu];
     int surfaceClass = int(batch.z) - 1;
     uint kind = (batch.w >> 8) & 0xFFu;
     g_texture = batch.xy;
@@ -76,7 +87,7 @@ void main() {
         vec3 face = (a_batchLevel & 0x20000000u) != 0u ? -a_normal : a_normal;
         g_away = dot(face, a_position - u_eye);
     }
-    g_order = a_item < uint(textureSize(u_itemOrder)) ? texelFetch(u_itemOrder, int(a_item)).r : 0u;
+    g_order = a_item < uint(itemOrder.length()) ? itemOrder[a_item] : 0u;
     g_uv = a_uv;
     g_colour = a_colour;
     if (surfaceClass >= 0 && ((uint(u_classVisible) >> uint(surfaceClass)) & 1u) == 0u) {
@@ -354,7 +365,6 @@ void Renderer::findMergedUniforms(GLuint p, MergedUniforms& u) {
     u.viewUp = gl_.getUniformLocation(p, "u_viewUp");
     u.faceEye = gl_.getUniformLocation(p, "u_faceEye");
     u.offsetStep = gl_.getUniformLocation(p, "u_offsetStep");
-    u.batches = gl_.getUniformLocation(p, "u_batches");
     u.gouraud = gl_.getUniformLocation(p, "u_gouraud");
     u.alphaPart = gl_.getUniformLocation(p, "u_alphaPart");
     u.fog = gl_.getUniformLocation(p, "u_fog");
@@ -395,13 +405,10 @@ void Renderer::buildBatchTable(const Scene& scene) {
     gl_.bindBuffer(gl::kArrayBuffer, batchTableBuffer_);
     gl_.bufferData(gl::kArrayBuffer, static_cast<GLsizeiptr>(table.size() * sizeof(uint32_t)),
                    table.data(), gl::kStaticDraw);
-    gl_.genTextures(1, &batchTableTexture_);
-    gl_.activeTexture(kBatchTableUnit);
-    gl_.bindTexture(gl::kTextureBuffer, batchTableTexture_);
-    gl_.texBuffer(gl::kTextureBuffer, gl::kRgba32ui, batchTableBuffer_);
 
+    // The batch index has 24 bits of a_batchLevel; the block's size limit is 16 MiB or more.
     bool fits = scene.batches.size() < (1u << 24) &&
-                scene.batches.size() <= static_cast<size_t>(maxTextureBufferSize_);
+                table.size() * sizeof(uint32_t) <= static_cast<size_t>(maxStorageBlockSize_);
     mergedReady_ = fits && without == 0;
     logf("baked: merged draws -- %s: %zu textures resident through bindless handles (%u without "
          "one), %zu batches in the table%s",
@@ -413,13 +420,12 @@ void Renderer::releaseMerged(bool contextAlive) {
     if (contextAlive) {
         for (uint64_t handle : textureHandles_)
             if (handle) gl_.makeTextureHandleNonResident(handle);
-        if (batchTableTexture_) gl_.deleteTextures(1, &batchTableTexture_);
         if (batchTableBuffer_) gl_.deleteBuffers(1, &batchTableBuffer_);
         if (mergedProgram_) gl_.deleteProgram(mergedProgram_);
         if (mergedLineProgram_) gl_.deleteProgram(mergedLineProgram_);
     }
     textureHandles_.clear();
-    batchTableTexture_ = batchTableBuffer_ = 0;
+    batchTableBuffer_ = 0;
     mergedProgram_ = mergedLineProgram_ = 0;
     mergedReady_ = false;
 }
@@ -450,8 +456,6 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
                       frame.fog.density);
         gl_.uniform3f(u.fogColour, frame.fog.colour[0], frame.fog.colour[1],
                       frame.fog.colour[2]);
-        gl_.uniform1i(u.batches, static_cast<GLint>(kBatchTableUnit - gl::kTexture0));
-        gl_.uniform1i(u.order.itemOrder, static_cast<GLint>(kItemOrderUnit - gl::kTexture0));
         gl_.uniform1i(u.order.solidOrder, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
         gl_.uniform1i(u.order.solidDepth, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
         gl_.uniform1i(u.order.test, 0);
@@ -479,10 +483,10 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         orderTest = value;
         gl_.uniform1i(u.order.test, value);
     };
-    gl_.activeTexture(kBatchTableUnit);
-    gl_.bindTexture(gl::kTextureBuffer, batchTableTexture_);
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kItemOrderBinding, orderTableBuffer_);
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kBatchTableBinding, batchTableBuffer_);
 
-    auto add = [&](DrawList& list, const Range& range) {
+    auto add =[&](DrawList& list, const Range& range) {
         if (!list.counts.empty() && list.end == range.first) {
             list.counts.back() += static_cast<GLsizei>(range.count);
         } else {
@@ -638,6 +642,9 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         gl_.enable(gl::kDepthTest);
     }
     setWrites(true, true);
+    // Nothing else in the process uses storage buffers; left unbound, as found.
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kItemOrderBinding, 0);
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kBatchTableBinding, 0);
 }
 
 }  // namespace baked

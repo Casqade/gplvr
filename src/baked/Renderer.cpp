@@ -473,9 +473,19 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     if (!buildProgram(error)) return false;
     bindless_ = bindless_ && gl_.getTextureHandle && gl_.makeTextureHandleResident &&
                 gl_.makeTextureHandleNonResident;
-    const char* merged = "OFF: the driver has no ARB_bindless_texture";
+    // The merged vertex shader reads its two tables from shader storage buffers (GL 4.3).
+    GLint vertexStorageBlocks = 0;
+    if (major > 4 || (major == 4 && minor >= 3)) {
+        gl_.getIntegerv(gl::kMaxVertexShaderStorageBlocks, &vertexStorageBlocks);
+        gl_.getIntegerv(gl::kMaxShaderStorageBlockSize, &maxStorageBlockSize_);
+    }
+    for (int drained = 0; drained < 16 && gl_.getError() != 0; ++drained) {
+    }
+    bool storage = gl_.bindBufferBase && vertexStorageBlocks >= 2;
+    const char* merged = !bindless_ ? "OFF: the driver has no ARB_bindless_texture"
+                                    : "OFF: no GL 4.3 shader storage buffers in the vertex shader";
     std::string mergedError;
-    if (bindless_) {
+    if (bindless_ && storage) {
         merged = buildMergedProgram(mergedError)
                      ? "ready once the textures are up; triangles and lines clipped at GPL's near "
                        "plane before the screen-linear colour (geometry shaders)"

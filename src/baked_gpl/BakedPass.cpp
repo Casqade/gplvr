@@ -446,6 +446,7 @@ bool fillGlApi(baked::GlApi& g) {
     BAKED_EXT(getInteger64v, "glGetInteger64v");
     BAKED_EXT(vertexAttribDivisor, "glVertexAttribDivisor");
     BAKED_EXT(multiDrawElementsIndirect, "glMultiDrawElementsIndirect");
+    BAKED_EXT(bindBufferBase, "glBindBufferBase");
     BAKED_EXT(getBufferSubData, "glGetBufferSubData");
     BAKED_EXT(uniform3i, "glUniform3i");
     BAKED_EXT(copyBufferSubData, "glCopyBufferSubData");

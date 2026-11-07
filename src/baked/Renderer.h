@@ -117,8 +117,9 @@ public:
     // have their depth moved onto the road (bias); every other decal is lifted onto its road.
     void setBiasClasses(uint32_t classes) { biasClasses_ = classes; }
     // Merged draws (RendererMerged.cpp): one program and bindless textures, so a phase is one
-    // multi-draw whatever its batches. Used when the driver has ARB_bindless_texture and the
-    // merged program built; otherwise the renderer draws batch by batch.
+    // multi-draw whatever its batches. Used when the driver has ARB_bindless_texture and GL 4.3's
+    // vertex-shader storage buffers and the merged program built; otherwise the renderer draws
+    // batch by batch.
     bool mergedDraws() const { return mergedReady_; }
     // Which way GPL turns its sprites in this process (report 67b). Billboard.cpp, installed in
     // VR only, redirects both drawers to face the eye; stock GPL faces the view plane: the
@@ -204,7 +205,6 @@ private:
         GLint viewUp = -1;
         GLint faceEye = -1;
         GLint offsetStep = -1;
-        GLint batches = -1;
         GLint gouraud = -1;
         GLint alphaPart = -1;
         GLint fog = -1;
@@ -252,6 +252,7 @@ private:
     bool  clipControl_ = false;
     GLint maxTextureSize_ = 4096;
     GLint maxTextureBufferSize_ = 65536;
+    GLint maxStorageBlockSize_ = 0;  // GL_MAX_SHADER_STORAGE_BLOCK_SIZE, bytes; 0 below GL 4.3
     float maxAnisotropy_ = 0.0f;  // 0 when the driver has no anisotropic filtering
     TextureFilter filter_;
     uint32_t      biasClasses_ = 0;
@@ -295,8 +296,8 @@ private:
     OrderUniforms spriteOrder_;
 
     // Merged draws: the driver's bindless support, the programs, every texture's resident handle,
-    // and per batch (RGBA32UI): the handle's two halves, surface class + 1, and
-    // pass | kind << 8 | decal << 16. The two programs share their vertex and fragment shaders;
+    // and per batch (four uints, a shader storage buffer): the handle's two halves, surface
+    // class + 1, and pass | kind << 8 | decal << 16. The two programs share their vertex and fragment shaders;
     // their geometry shaders clip triangles and lines at GPL's near plane (report 105 section
     // 4.16), and a draw takes the one for its primitive.
     bool                  bindless_ = false;
@@ -307,7 +308,6 @@ private:
     MergedUniforms        mergedLine_;
     std::vector<uint64_t> textureHandles_;
     GLuint                batchTableBuffer_ = 0;
-    GLuint                batchTableTexture_ = 0;
     // Index-buffer runs of one merged multi-draw, contiguous ones joined (RendererMerged.cpp).
     struct DrawList {
         std::vector<GLsizei>     counts;

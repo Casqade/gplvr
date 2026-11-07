@@ -19,6 +19,7 @@
 #include "DrawnMarks.h"
 #include "FlagmanReplay.h"
 #include "FlatFrames.h"
+#include "GameExit.h"
 #include "HeadAudio.h"
 #include "Hooks.h"
 #include "Hud.h"
@@ -182,11 +183,15 @@ DWORD WINAPI installThread(LPVOID) {
         hudBind(binding);
         billboardInstall(binding);
         headAudioInstall();
-        // Patches nothing: it checks the functions and globals the radial calls and reads.
-        quickMenuInstall();
         // Likewise for the replay's stick and radial.
         replayQuickMenuInstall();
     }
+    // Flat mode too. Patches nothing: it checks the functions and globals the radial calls and
+    // reads, and the game exit's back to pits is the radial's.
+    quickMenuInstall();
+    // Flat mode too, after quickMenuInstall: checks GPL's main-menu Exit, which Alt+F4 and the
+    // window's Close end in.
+    gameExitInstall();
     // AFTER hudBind, and the order matters. In flat mode this takes all seven 2D globals, which
     // Hud.cpp has not touched. In VR it takes stampDraw alone -- Hud.cpp has already left that
     // one slot for it, so there is exactly one owner per slot and neither module can adopt the
