@@ -2,6 +2,8 @@
 
 #include "Hooks.h"
 #include "Log.h"
+#include "QuickMenu.h"
+#include "ReplayPanel.h"
 #include "presenter/Producer.h"
 
 #include <cmath>
@@ -257,7 +259,11 @@ bool vrSettleSeat() {
     return true;
 }
 
-bool vrLookOverrideActive() { return g_options.vrMouseLook; }
+// Only in the views a driver looks around in: the car and the replay. The lobby's TV feed is
+// a world render too, and there the mouse belongs to the menus.
+bool vrLookOverrideActive() {
+    return g_options.vrMouseLook && (quickMenuDrivingScreenShown() || gplReplayScreenShown());
+}
 
 // yaw   about +Z (up),   positive turns left
 // pitch about +Y (left); a positive rotation about +Y tilts forward toward -Z, which is

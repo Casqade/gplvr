@@ -878,7 +878,9 @@ void pollToggle() {
     if (g_options.vrMouseLook && mouseLookEnsureStarted()) {
         int deltaX = 0;
         int deltaY = 0;
-        if (mouseLookTake(deltaX, deltaY)) {
+        // Drained on every screen, so the mouse moved in the menus does not turn the view on
+        // the way into the car.
+        if (mouseLookTake(deltaX, deltaY) && vrLookOverrideActive()) {
             // Right turns the view right, and yaw is positive to the LEFT, so that sign
             // flips. Mouse forward is negative Y and should look UP, and pitch is
             // positive up, so that one flips as well.

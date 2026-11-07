@@ -97,8 +97,8 @@ bool vrSettleSeat();
 // so the presenter can submit the pose the image was actually drawn from.
 bool vrLastRenderedViews(SharedView out[2]);
 
-// True when the head rotation is being replaced by a look override -- the fixed debug
-// rotation, or the mouse.
+// True when the head rotation is being replaced by the mouse look: vrMouseLook is on and the
+// screen is the car or the replay.
 bool vrLookOverrideActive();
 
 // That override as a 3x3 in GPL axes, row-major. ONE definition, used both by the VR
