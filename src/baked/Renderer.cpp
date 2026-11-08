@@ -3,6 +3,7 @@
 #include "baked/BakedLog.h"
 #include "baked/RendererInternal.h"
 #include "baked/SceneMemory.h"
+#include "baked/Trace.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1721,6 +1722,7 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.drawBuffers(1, &colourOnly);
     gl_.blitFramebuffer(rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3], 0, 0, rect[2],
                         rect[3], gl::kColorBufferBit, gl::kNearest);
+    trace("pass: the frame copied into the baked target");
 
     gl_.bindFramebuffer(gl::kReadFramebuffer, framebuffer_);
     gl_.viewport(0, 0, rect[2], rect[3]);
@@ -1742,12 +1744,15 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.clearDepth(depthClear);
     gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
     gl_.depthMask(depthMask);
+    trace("pass: the baked target cleared");
 
     draw(scene, view, frame);
+    trace("pass: drawn");
 
     gl_.bindFramebuffer(gl::kDrawFramebuffer, static_cast<GLuint>(previousDraw));
     gl_.blitFramebuffer(0, 0, rect[2], rect[3], rect[0], rect[1], rect[0] + rect[2],
                         rect[1] + rect[3], gl::kColorBufferBit, gl::kNearest);
+    trace("pass: the baked target copied back");
     // The pass's commands go to the GPU now: the driver otherwise held the cars' draws and the
     // GPU idled until a later flush (report 105 section 4.25.1).
     if (gl_.flush) gl_.flush();

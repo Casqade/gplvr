@@ -144,6 +144,13 @@ public:
     bool uploadFailed() const { return !uploadError_.empty(); }
     const std::string& uploadError() const { return uploadError_; }
     size_t uploadedGeometryBytes() const { return geometryBytes_; }
+    // The track textures resident through bindless handles (the merged draws'), for diagnostics.
+    size_t residentHandles() const {
+        size_t count = 0;
+        for (uint64_t handle : textureHandles_)
+            if (handle) ++count;
+        return count;
+    }
     size_t uploadedTextureBytes() const { return textureBytes_; }
 
     // The visible set for one pass. Which surface covers which is decided at bake time from the

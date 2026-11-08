@@ -42,7 +42,8 @@ constexpr uint32_t kInitialDrawIndices = 4096;
 // Per draw in the table: x, y the texture handle, z the frame, w the colour (ARGB, a sprite's
 // live colour word); then the texture's average colour (ARGB) -- for a palette sprite instead the
 // texel of the table where its palette row starts --, the specular exponent, the specular factor's
-// bits, and textured | kWalkOnly | kPaletteDraw | kPaletteOpaque | rank << 8.
+// bits -- for a palette sprite, which is never lit, its texture's width and height --, and
+// textured | kWalkOnly | kPaletteDraw | kPaletteOpaque | rank << 8.
 constexpr uint32_t kWalkOnlyBit = 2u;
 constexpr uint32_t kPaletteDrawBit = 4u;
 constexpr uint32_t kPaletteOpaqueBit = 8u;
@@ -102,6 +103,7 @@ flat out uvec2 v_texture;
 flat out float v_rank;
 flat out int v_palette;   // the palette row's first texel in u_draws, -1 for none
 flat out uint v_drawBits;  // d1.w & 14: walk-order only, palette, palette alpha ignored
+flat out vec2 v_paletteSize;  // a palette sprite's texture size, from its row
 const uint kSprite = 1u;
 const uint kLit = 2u;
 const uint kTextured = 4u;
@@ -134,6 +136,7 @@ void main() {
     v_rank = float(d1.w >> 8);
     v_palette = (d1.w & 4u) != 0u ? int(d1.x) : -1;
     v_drawBits = d1.w & 14u;
+    v_paletteSize = v_palette >= 0 ? vec2(float(d1.y), float(d1.z)) : vec2(1.0);
     v_uv = a_uv;
     v_secondary = vec3(0.0);
     if ((a_flags & kInvisible) != 0u) {
@@ -205,6 +208,7 @@ flat in uvec2 v_texture;
 flat in float v_rank;
 flat in int v_palette;
 flat in uint v_drawBits;
+flat in vec2 v_paletteSize;
 uniform int u_phase;
 // A palette sprite (the flagmen): its texture holds palette indices, its palette row is in the
 // draw table. roglv2 expands such a mip with the current colormap and samples the result with
@@ -236,8 +240,11 @@ vec4 paletteColour(float index) {
     if ((v_drawBits & 8u) != 0u) c.a = 1.0;
     return c;
 }
+// The texture's size comes from the draw row: AMD's GL compiler (atioglxx 31.0.21924.61) crashes
+// linking a fragment shader that calls both textureSize and textureGather on one bindless sampler,
+// and also with the textureSize in the vertex shader (tools/bindlessprobe, STATUS.md).
 vec4 paletteTexel(sampler2D indices) {
-    vec2 size = vec2(textureSize(indices, 0));
+    vec2 size = v_paletteSize;
     vec4 gathered = textureGather(indices, v_uv);  // (i0,j1) (i1,j1) (i1,j0) (i0,j0)
     vec2 f = fract(v_uv * size - 0.5);
     if (u_paletteLinear == 0) f = step(0.5, f);
@@ -701,6 +708,8 @@ void CarRenderer::uploadTexture(const Texture& texture, GpuTexture& out) {
            (image.levels[first].width > maxTextureSize_ ||
             image.levels[first].height > maxTextureSize_))
         ++first;
+    out.width = static_cast<uint32_t>(image.levels[first].width);
+    out.height = static_cast<uint32_t>(image.levels[first].height);
     gl_.genTextures(1, &out.name);
     gl_.bindTexture(gl::kTexture2D, out.name);
     for (size_t level = first; level < image.levels.size(); ++level) {
@@ -807,6 +816,8 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
     uint32_t average = 0xFFFFFFFFu;
     bool     textured = false;
     uint32_t bits = list.flagman ? kWalkOnlyBit : 0u;
+    uint32_t paletteWidth = 0;
+    uint32_t paletteHeight = 0;
     if (sprite) {
         int32_t index = draw.sprite >= 0 && static_cast<size_t>(draw.sprite) < scene.sprites.size()
                             ? scene.sprites[static_cast<size_t>(draw.sprite)].texture
@@ -819,6 +830,8 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
             if (!list.flagman) return false;
             palette = true;
             bits |= kPaletteDrawBit | (gpu->opaque ? kPaletteOpaqueBit : 0u);
+            paletteWidth = gpu->width;
+            paletteHeight = gpu->height;
         }
         handle = gpu->handle;
         textured = true;
@@ -840,8 +853,8 @@ bool CarRenderer::drawRow(const CarScene& scene, const CarDrawList& list, const 
     words[2] = draw.frame;
     words[3] = colour;
     words[4] = average;
-    words[5] = static_cast<uint32_t>(material.specularExponent);
-    words[6] = floatBits(material.specular);
+    words[5] = palette ? paletteWidth : static_cast<uint32_t>(material.specularExponent);
+    words[6] = palette ? paletteHeight : floatBits(material.specular);
     words[7] = (textured ? 1u : 0u) | bits | (rank << 8);
     command.count = draw.indexCount;
     command.instanceCount = 1;
@@ -1853,7 +1866,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
     gl_.activeTexture(kRowUnit);
-    gl_.bindTexture(gl::kTextureBuffer, store_.rowTexture());
+    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
     rowSource_[0] = rowSource_[1] = rowSource_[2] = -1;
     setRowSource(nullptr);
 
@@ -1901,7 +1914,7 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
     gl_.activeTexture(kRowUnit);
-    gl_.bindTexture(gl::kTextureBuffer, store_.rowTexture());
+    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
     setRowSource(&car);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
@@ -1964,11 +1977,27 @@ int CarRenderer::setLiveMirror(GLuint texture, bool flipT) {
     gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT, gl::kClampToEdge);
     gl_.bindTexture(gl::kTexture2D, static_cast<GLuint>(previousTexture));
     gl_.activeTexture(static_cast<GLenum>(previousUnit));
-    if (mirrorCopy_) mirrorHandle_ = gl_.getTextureHandle(mirrorCopy_);
     mirrorWidth_ = width;
     mirrorHeight_ = height;
     mirrorFormat_ = format;
-    if (!mirrorHandle_ || !copyFramebuffers_[0] || !copyFramebuffers_[1] || !copyMirror(false)) {
+    // The first blit comes before the handle. AMD's driver (atioglxx 31.0.21924.61) samples a texture
+    // that was attached without a draw and given its handle before its first draw as 0 0 0 255 for
+    // good, by handle or bound, while a framebuffer read of it has the right pixels (STATUS.md). A
+    // blit obeys the scissor and the colour mask, so both open for it and go back.
+    GLboolean scissor = gl_.isEnabled(gl::kScissorTest);
+    GLboolean colourMask[4] = {1, 1, 1, 1};
+    gl_.getBooleanv(gl::kColorWritemask, colourMask);
+    gl_.disable(gl::kScissorTest);
+    gl_.colorMask(1, 1, 1, 1);
+    bool copied = copyFramebuffers_[0] && copyFramebuffers_[1] && copyMirror();
+    gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
+    if (scissor) gl_.enable(gl::kScissorTest);
+    if (!copied) {
+        releaseMirrorCopy();
+        return kLiveMirrorNoCopy;
+    }
+    mirrorHandle_ = gl_.getTextureHandle(mirrorCopy_);
+    if (!mirrorHandle_) {
         releaseMirrorCopy();
         return kLiveMirrorNoCopy;
     }
@@ -1977,10 +2006,10 @@ int CarRenderer::setLiveMirror(GLuint texture, bool flipT) {
 }
 
 // The live mirror texture into the copy, its rows reversed when roglv2 flips its t, so the glass
-// samples the copy at GPL's own UVs; with `blit` false only whether both attach completely. Neither
-// texture is bound, only attached; the caller has the scissor test off and every colour channel
-// writable, which a blit obeys.
-bool CarRenderer::copyMirror(bool blit) {
+// samples the copy at GPL's own UVs; false when the two do not attach completely. Neither texture
+// is bound, only attached; the caller has the scissor test off and every colour channel writable,
+// which a blit obeys.
+bool CarRenderer::copyMirror() {
     if (!mirrorCopy_ || !mirrorSource_) return false;
     GLint previousDraw = 0;
     GLint previousRead = 0;
@@ -1997,7 +2026,7 @@ bool CarRenderer::copyMirror(bool blit) {
     gl_.drawBuffers(1, &colourOnly);
     bool complete = gl_.checkFramebufferStatus(gl::kReadFramebuffer) == gl::kFramebufferComplete &&
                     gl_.checkFramebufferStatus(gl::kDrawFramebuffer) == gl::kFramebufferComplete;
-    if (complete && blit)
+    if (complete)
         gl_.blitFramebuffer(0, 0, mirrorWidth_, mirrorHeight_, 0, mirrorFlip_ ? mirrorHeight_ : 0,
                             mirrorWidth_, mirrorFlip_ ? 0 : mirrorHeight_, gl::kColorBufferBit,
                             gl::kNearest);
@@ -2050,7 +2079,7 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
     gl_.disable(gl::kScissorTest);
     gl_.colorMask(1, 1, 1, 1);
     // A failed copy leaves the glass showing the last copy.
-    if (overlayGlass_) copyMirror(true);
+    if (overlayGlass_) copyMirror();
 
     // GPL's painter's order: every draw over what is there, the later over the earlier, the
     // translucent ones blended in place as roglv2 blends them. Without a depth test GL writes no
@@ -2071,6 +2100,8 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
     gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
     gl_.activeTexture(kDrawUnit);
     gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
+    gl_.activeTexture(kRowUnit);
+    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
     setRowSource(nullptr);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,

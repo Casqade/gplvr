@@ -27,6 +27,7 @@
 #include "Interpolation.h"
 #include "Letterbox.h"
 #include "FlatTarget.h"
+#include "GlTrace.h"
 #include "MenuScale.h"
 #include "MirrorDriverArms.h"
 #include "NoSignal.h"
@@ -63,20 +64,24 @@ LoadLibraryExAFn g_loadLibraryExA = nullptr;
 HMODULE WINAPI loadLibraryAHook(LPCSTR name) {
     HMODULE result = g_loadLibraryA ? g_loadLibraryA(name) : LoadLibraryA(name);
     if (result) patchDisplaySettingsImports(result);
+    if (result) glTraceInstall();
     return result;
 }
 
 HMODULE WINAPI loadLibraryWHook(LPCWSTR name) {
     HMODULE result = g_loadLibraryW ? g_loadLibraryW(name) : LoadLibraryW(name);
     if (result) patchDisplaySettingsImports(result);
+    if (result) glTraceInstall();
     return result;
 }
 
 HMODULE WINAPI loadLibraryExAHook(LPCSTR name, HANDLE file, DWORD flags) {
     HMODULE result =
         g_loadLibraryExA ? g_loadLibraryExA(name, file, flags) : LoadLibraryExA(name, file, flags);
-    if (result && !(flags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)))
+    if (result && !(flags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE))) {
         patchDisplaySettingsImports(result);
+        glTraceInstall();
+    }
     return result;
 }
 
@@ -219,6 +224,7 @@ DWORD WINAPI installThread(LPVOID) {
     renderProfileInstallDriverThunks();
     // After the profiler's: its SwapBuffers timer, when it is on, becomes this one's original.
     flatTargetInstall();
+    glTraceInstall();
     renderPacingInstall();
     // Locates the latch from the tick wait pacing installed at.
     interpolationInstall();

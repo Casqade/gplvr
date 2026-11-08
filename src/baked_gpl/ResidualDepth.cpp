@@ -1,5 +1,6 @@
 #include "baked_gpl/ResidualDepth.h"
 
+#include "GlTrace.h"
 #include "Log.h"
 #include "Pe.h"
 
@@ -267,6 +268,7 @@ bool         g_installed = false;
 bool         g_armed = false;
 ResidualPass g_pass;
 bool         g_flushOpen = false;  // an armed flush is running
+bool         g_anyFlushOpen = false;  // any flush is running, armed or not (glTrace's steps)
 bool         g_bound = false;      // our program is in use for it
 bool         g_inWalk = false;
 GLint        g_previousProgram = 0;
@@ -546,6 +548,7 @@ void openProgram(void* drawer) {
 
     setFogUniforms(g_gl.isEnabled(kFog) != 0);
     g_bound = true;
+    glTraceStep("residual: program opened over roglv2's flush");
 }
 
 void closeFlush() {
@@ -553,6 +556,8 @@ void closeFlush() {
         g_gl.useProgram(static_cast<GLuint>(g_previousProgram));
         if (!g_fogArrayWasOn) g_gl.disableClientState(kFogCoordArray);
         g_bound = false;
+        glTraceStep("residual: roglv2's flush drawn under the program");
+        glTraceRoglWindow(true);
     }
     g_flushOpen = false;
 }
@@ -562,6 +567,7 @@ void WINAPI clearHook(GLbitfield mask) {
     // roglv2 clears depth only at the start of a flush (ZBufferOpenGL slot 0).
     if (!(mask & kDepthBufferBit)) return;
     if (g_inWalk) g_walkFlushed = true;
+    g_anyFlushOpen = true;
     g_flushOpen = g_armed;
     g_armed = false;
 }
@@ -576,8 +582,11 @@ void WINAPI enableHook(GLenum cap) {
 
 void WINAPI disableHook(GLenum cap) {
     // The flush ends with GL_DEPTH_TEST disabled (ZBufferOpenGL slot 4, 0x2001E438).
+    bool otherFlushEnds = cap == kDepthTest && g_anyFlushOpen && !g_flushOpen;
     if (cap == kDepthTest && g_flushOpen) closeFlush();
+    if (cap == kDepthTest) g_anyFlushOpen = false;
     g_realDisable(cap);
+    if (otherFlushEnds) glTraceStepIfStarted("roglv2: a flush drawn (no residual program)");
     if (!g_bound) return;
     if (cap == kTexture2D) g_gl.uniform1i(g_gl.uTextured, 0);
     if (cap == kColourSum) g_gl.uniform1i(g_gl.uColourSum, 0);

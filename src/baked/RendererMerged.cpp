@@ -11,6 +11,7 @@
 
 #include "baked/BakedLog.h"
 #include "baked/RendererInternal.h"
+#include "baked/Trace.h"
 
 #include <algorithm>
 #include <string>
@@ -544,7 +545,9 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
     };
 
     // Opaque surfaces and the cores of cutouts, with depth and order.
+    trace("merged: uniforms set, storage buffers bound");
     drawBase(false);
+    trace("merged: base (opaque surfaces and cutout cores)");
 
     // Decals by level, then batch: depth-tested, not written, offset towards the eye.
     if (!decals_.empty()) {
@@ -560,6 +563,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         submitOrdered();
         gl_.disable(gl::kPolygonOffsetFill);
         setWrites(true, true);
+        trace("merged: decals");
     }
 
     // Overlays level by level, as Renderer::draw: each level's depth and order first (cores,
@@ -598,15 +602,18 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         setDecalOn(0);
         gl_.disable(gl::kPolygonOffsetFill);
         setWrites(true, true);
+        trace("merged: overlays");
     }
 
     // The host's own solid content (the cars), as Renderer::draw.
     callSolidHook(clipFromView, view, frame);
+    trace("merged: the cars' solid parts (car renderer)");
 
     // The soft edges of the cutouts, blended over everything solid, without depth.
     setWrites(true, false);
     setAlphaPart(2);
     drawBase(true);
+    trace("merged: cutout fringes");
 
     // The walk-order phase, in GPL's order, under the order test (Renderer::draw). The host's
     // runs (the cars' translucent parts) go in at their places in GPL's walk, as Renderer::draw
@@ -619,7 +626,9 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         auto drawHookRuns = [&](size_t position) {
             while (hookRun < hookRuns && hookRunPosition(hookRun) <= position) {
                 submitOrdered();
+                trace("merged: walk order, the track up to a car run");
                 solidHook_->drawWalkOrderRun(hookRun, hookRunPosition(hookRun), hookAt);
+                trace("merged: walk order, a car run (car renderer)");
                 ++hookRun;
             }
         };
@@ -640,6 +649,7 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
         setOrderTest(0);
         gl_.bindFramebuffer(gl::kDrawFramebuffer, framebuffer_);
         gl_.enable(gl::kDepthTest);
+        trace("merged: walk order, the rest");
     }
     setWrites(true, true);
     // Nothing else in the process uses storage buffers; left unbound, as found.

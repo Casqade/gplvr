@@ -11,6 +11,7 @@
 
 #include "DataRebase.h"
 #include "Discovery.h"
+#include "GlTrace.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
@@ -533,6 +534,7 @@ bool ensureRenderer(State& s) {
             s.rendererFailed = true;
             return false;
         }
+        glTraceContext();
         if (s.carsBound && !s.carsFailed && !s.cars.initialised()) {
             if (!s.cars.init(s.gl, error)) {
                 logf("baked cars: the car renderer could not start (%s) -- GPL draws the cars",
@@ -1048,6 +1050,22 @@ void endPass(State& s, SceneParams* params, bool mirror) {
     if (!(view.nearPlane > 0.0f)) view.nearPlane = 0.125f;
 
     readFog(s.gl, s.frame.fog);
+    if (g_options.glTrace >= 2) {
+        // What the driver holds resident through bindless handles, each time it changes.
+        static size_t lastTrack = static_cast<size_t>(-1);
+        static size_t lastCars = static_cast<size_t>(-1);
+        size_t track = s.renderer.residentHandles();
+        size_t carHandles = s.cars.residentHandles();
+        if (track != lastTrack || carHandles != lastCars) {
+            lastTrack = track;
+            lastCars = carHandles;
+            logf("trace: resident bindless handles at this %s pass's end -- track %zu, cars and "
+                 "mirror %zu, %zu in all",
+                 mirror ? "mirror" : "main", track, carHandles, track + carHandles);
+        }
+    }
+    glTraceStep(mirror ? "pass: mirror pass end, before the cars' prepare"
+                       : "pass: main pass end, before the cars' prepare");
     if (listCount) {
         baked::CarLighting lighting;
         lighting.on = readValue<uint8_t>(s.at.lightingOn) != 0;
@@ -1063,7 +1081,9 @@ void endPass(State& s, SceneParams* params, bool mirror) {
                  lighting.on ? "on" : "OFF", lighting.specular ? "on" : "off", lighting.ambient,
                  lighting.diffuse, check.c_str());
     }
+    if (listCount) glTraceStep("pass: the cars' prepare (row uploads, row store copies)");
     bool drawn = s.renderer.drawComposited(*s.scene, view, s.frame, s.rect);
+    glTraceStep(mirror ? "pass: mirror pass composited" : "pass: main pass composited");
     if (drawn) {
         // What GPL submitted during this walk is flushed by roglv2 after this; test it against
         // the depth just drawn (report 67c).
@@ -1079,7 +1099,10 @@ void endPass(State& s, SceneParams* params, bool mirror) {
         if (!mirror && rendererType() == 2 && s.markCount < 2)
             std::memcpy(s.markRects[s.markCount++], s.rect, sizeof(s.rect));
     }
-    if (listCount) s.cars.finishPass();
+    if (listCount) {
+        s.cars.finishPass();
+        glTraceStep("pass: the cars' pass finished");
+    }
     if (mirror) return;
     // The overlay waits for the walk's end, where GPL has submitted everything of the pass; it
     // goes where the composite went.

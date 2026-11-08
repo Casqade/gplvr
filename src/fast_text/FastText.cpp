@@ -1,6 +1,7 @@
 #include "fast_text/FastText.h"
 
 #include "Discovery.h"
+#include "GlTrace.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "Pe.h"
@@ -816,6 +817,7 @@ void flushPending() {
         } else {
             s.draw.draw(screen, s.drawStats);
         }
+        glTraceStepIfStarted("fast text: a run of GPL's glyphs drawn");
     }
 }
 

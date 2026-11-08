@@ -288,6 +288,10 @@ struct Options {
     // GL_TIMESTAMP once a frame.
     bool profilePost = false;
 
+    // GlTrace.h: 1 logs the driver's GL_KHR_debug messages, 2 also finishes and logs every step
+    // of the first frames' baked passes and presents. 0 (default) installs nothing.
+    int glTrace = 0;
+
     // Draw GPL's stamped text ourselves instead of letting roglv2 blit it a glyph at a time
     // (FastText.h, docs/audit-2026-09-18/71-fast-text.md).
     //

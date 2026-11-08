@@ -9,6 +9,7 @@
 #include "FlatTarget.h"
 #include "FrameBudget.h"
 #include "FrameTrace.h"
+#include "GlTrace.h"
 #include "Hud.h"
 #include "Interpolation.h"
 #include "Letterbox.h"
@@ -1199,6 +1200,8 @@ void renderExtraFrames() {
 }
 
 int __cdecl screenDisplayHook(void* surface) {
+    glTraceRoglWindow(false);
+    glTraceStepIfStarted("present hook: entered -- everything GPL drew this frame");
     frameBudgetSwitch(kSpanHousekeeping);
 
     // We are on the game's render thread, between frames: sceneRender has already
@@ -1219,6 +1222,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // reads that buffer. The VR transfer below is one of those readers, which is what
     // lets the headset show a scaled menu as well as the monitor.
     menuScaleEndFrameAndBlit();
+    glTraceStepIfStarted("present hook: the front end's scaled blit");
 
     ++g_frames;
     taskRateReportThread("present");
@@ -1234,6 +1238,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // one, which is every menu-to-sim transition.
     swapControlApply();
     reportOncePerSecond();
+    glTraceStepIfStarted("present hook: window, letterbox, swap interval");
 
     // Before the original, not after: the back buffer still holds the finished frame
     // at this point, which is the whole reason the transport probe lives here.
@@ -1258,6 +1263,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // the headset's quad. pribluda's own monitor HUD is pribluda's, in every mode.
     frameBudgetSwitch(kSpanPanel);
     pribludaDrawHud();
+    glTraceStepIfStarted("present hook: pribluda's HUD panel");
 
     // The VR menu's layer is built here, with the GL context current and before the frame
     // transfer: it publishes under a lock of its own, and its texture is what the
@@ -1269,6 +1275,7 @@ int __cdecl screenDisplayHook(void* surface) {
     frameBudgetSwitch(kSpanCursor);
     presenterUpdateVrMenu();
     presenterDrawCursor(g_stereoRenderedFrame);
+    glTraceStepIfStarted("present hook: the VR menu and the cursor");
 
     // GPL'S OWN STAMPED TEXT HAS TO BE DRAWN WHILE THE OFF-SCREEN TARGET IS STILL BOUND.
     //
@@ -1291,12 +1298,14 @@ int __cdecl screenDisplayHook(void* surface) {
 
     // rendererType() = 2's mark, while the frame is still bound.
     bakedMarkFrameEnd();
+    glTraceStepIfStarted("present hook: fast text flush, static, renderer mark");
 
     // The off-screen frame has to stop being the draw target before the presenter
     // reads it and before the game presents: glCopyTexSubImage2D reads the READ
     // framebuffer, and SwapBuffers only ever shows the window's own.
     frameBudgetSwitch(kSpanUnbind);
     presenterEndFrame();
+    glTraceStepIfStarted("present hook: the off-screen frame unbound");
 
     frameBudgetSwitch(kSpanPublish);
     // Set by a race frame that had GPL's static in the target; acted on once the target is
@@ -1531,6 +1540,7 @@ int __cdecl screenDisplayHook(void* surface) {
     // puts the trail straight back.
     frameBudgetSwitch(kSpanCursor);
     presenterRestoreUnderCursor();
+    glTraceStepIfStarted("present hook: the window blit and the pixels under the cursor");
     frameBudgetSwitch(kSpanPublish);
 
     // A WINDOW IN THE BACKGROUND DOES NOT PRESENT.
@@ -1547,14 +1557,17 @@ int __cdecl screenDisplayHook(void* surface) {
     // Every stampDraw of the frame has been issued, so anything the fast text path still has
     // batched is drawn now -- before roglv2 presents, and after everything GPL drew over it.
     fastTextEndFrame();
+    glTraceStepIfStarted("present hook: fast text's end of frame");
 
     frameBudgetSwitch(kSpanPresent);
     postProfilePresentBegin();
     LARGE_INTEGER beforePresent, afterPresent;
     QueryPerformanceCounter(&beforePresent);
     renderProfileSetInPresent(true);
+    glTracePresent(false);
     const int presented =
         (!background && g_originalScreenDisplay) ? g_originalScreenDisplay(surface) : 0;
+    glTracePresent(true);
     renderProfileSetInPresent(false);
     QueryPerformanceCounter(&afterPresent);
     postProfilePresentEnd();
@@ -2528,6 +2541,9 @@ void loadOptions(const char* fileName) {
     g_options.profileStages =
         GetPrivateProfileIntA("gplvr", "profileStages", 0, path) != 0;
     g_options.profilePost = GetPrivateProfileIntA("gplvr", "profilePost", 0, path) != 0;
+    g_options.glTrace = GetPrivateProfileIntA("gplvr", "glTrace", 0, path);
+    if (g_options.glTrace < 0) g_options.glTrace = 0;
+    if (g_options.glTrace > 2) g_options.glTrace = 2;
     g_options.profileWorkWait =
         GetPrivateProfileIntA("gplvr", "profileWorkWait", 0, path) != 0 ||
         g_options.profileStages;
@@ -2862,6 +2878,12 @@ void loadOptions(const char* fileName) {
     logf("options: profilePost=%d (%s)", g_options.profilePost ? 1 : 0,
          g_options.profilePost ? "post is split into roglv2's flushes and the rest, CPU and GPU"
                                : "post is one number");
+    logf("options: glTrace=%d (%s)", g_options.glTrace,
+         g_options.glTrace == 0   ? "off"
+         : g_options.glTrace == 1 ? "the driver's GL debug messages are logged"
+                                  : "the driver's GL debug messages are logged, and every step of "
+                                    "the first 300 frames from the first baked pass is finished "
+                                    "on the GPU and logged -- slow");
     logf("options: profileWorkWait=%d profileStallUs=%d (%s)",
          g_options.profileWorkWait ? 1 : 0, g_options.profileStallUs,
          g_options.profileWorkWait
@@ -3181,7 +3203,20 @@ void patchDisplaySettingsImportsEverywhere() {
 
     if (!enumerate(process, modules, sizeof(modules), &needed)) return;
     const DWORD count = needed / sizeof(HMODULE);
-    for (DWORD i = 0; i < count && i < 512; ++i) patchDisplaySettingsImports(modules[i]);
+    // The game's thread loads and unloads DLLs while this runs (dump 8160: a module listed here
+    // was gone when its header was read). Each module is pinned while its imports are read, and
+    // one that is no longer loaded is skipped.
+    for (DWORD i = 0; i < count && i < 512; ++i) {
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                reinterpret_cast<LPCWSTR>(modules[i]), &pinned) ||
+            pinned != modules[i]) {
+            if (pinned) FreeLibrary(pinned);
+            continue;
+        }
+        patchDisplaySettingsImports(modules[i]);
+        FreeLibrary(pinned);
+    }
 }
 
 }  // namespace gplvr

@@ -84,6 +84,13 @@ public:
     // `contextAlive` false when the context is gone, so nothing is deleted, only forgotten.
     void release(bool contextAlive);
     bool initialised() const { return initialised_; }
+    // The car textures and the mirror copy resident through bindless handles, for diagnostics.
+    size_t residentHandles() const {
+        size_t count = mirrorHandle_ ? 1 : 0;
+        for (const GpuTexture& texture : textures_)
+            if (texture.handle) ++count;
+        return count;
+    }
 
     // As the track's textures (Renderer::setTextureFilter); takes effect for later uploads.
     void setTextureFilter(const TextureFilter& filter, int anisotropy) {
@@ -162,6 +169,9 @@ private:
         // palette alpha roglv2 ignores as Mip.cpp does.
         bool     indexed = false;
         bool     opaque = false;
+        // Level 0 as uploaded (past the levels over the size limit).
+        uint32_t width = 0;
+        uint32_t height = 0;
     };
     struct GpuObject {
         uint32_t baseVertex = 0;
@@ -387,6 +397,12 @@ private:
     // The u_rowSource the program holds; drawSolid sets it first.
     void setRowSource(const CarRange* range);
     int32_t rowSource_[3] = {-1, -1, -1};
+    // The buffer texture every car draw binds on kRowUnit for u_rows: the store's rows, or without
+    // a store the draw table (the same RGBA32UI format; with no resident list u_rows is never
+    // read). AMD's driver (atioglxx 31.0.21924.61) puts a null allocation in its list of the
+    // program's buffer textures for a unit left on the default buffer texture and faults on it at
+    // a later submission (dump 7704, the cockpit overlay's draw).
+    GLuint rowUnitTexture() const { return store_.rowTexture() ? store_.rowTexture() : drawTexture_; }
     // drawSolid ran this pass, so the walk-order runs may be drawn.
     bool runsReady_ = false;
     // Report 105 section 4.49: the overlay lists' commands, after every other list's in commands_
@@ -409,7 +425,7 @@ private:
     uint64_t mirrorHandle_ = 0;
     GLuint   copyFramebuffers_[2] = {0, 0};
     void releaseMirrorCopy();
-    bool copyMirror(bool blit);
+    bool copyMirror();
     float                 light_[3] = {0.0f, 0.0f, 1.0f};
     CarLighting           lighting_;
     bool                  framesChecked_ = false;
