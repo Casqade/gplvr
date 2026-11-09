@@ -177,8 +177,14 @@ void main() {
         vec4 shade = u_gouraud != 0 ? a_colour : vec4(1.0);
         if ((a_flags & kLit) != 0u && u_lighting.x > 0.5) {
             // gpl_normalLightCached 0x4CFA70 per corner; the shaded kind (0x22) multiplies the
-            // corner's shade by it (0x4C94F0) and keeps the specular apart.
-            vec3 normal = normalize(rotation * a_normal);
+            // corner's shade by it (0x4C94F0) and keeps the specular apart. GPL lights the NORM
+            // record as stored, in the object's frame: a zero normal (every team model of some car
+            // sets has a few) takes the ambient alone and no specular, a shorter one less diffuse.
+            // So the normal keeps its length through the frame's rotation.
+            vec3 turned = rotation * a_normal;
+            float turnedLength = length(turned);
+            vec3 normal = turnedLength > 0.0 ? turned * (length(a_normal) / turnedLength)
+                                             : vec3(0.0);
             shade = vec4(a_colour.rgb * gplDiffuse(normal, u_light, u_lighting), a_colour.a);
             v_secondary = vec3(gplSpecular(normal, halfVector, u_lighting, float(int(d1.y)),
                                            uintBitsToFloat(d1.z)));
