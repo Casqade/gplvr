@@ -44,7 +44,7 @@ GPLVR is **incompatible** with some XML patches since it partially reimplements 
 
 ### System requirements
 
-NOTE: These are for [GPLVR renderer](#performance) (non-zero `vrRendererType` or `flatRendererType` in `gplvr.ini`). If you don't use it, GPLVR should run the same way GPL does on your machine.
+NOTE: These are for [GPLVR renderer](#performance) (non-zero `vrRendererType` or `flatRendererType` in [`gplvr.ini`](config/gplvr.ini)). If you don't use it, GPLVR should run the same way GPL does on your machine.
 
 Minimum (non-VR):
 - OS: Windows 10 x64
@@ -100,7 +100,7 @@ If you're having trouble with any step or understanding its phrasing, feel free 
 3. Unblock `gplvr.exe`, `gplvr.dll` and `gplvr-xr.exe` (File -> Properties -> Unblock)
 4. Open `core.ini` in your GPL directory and in `[ Rasterizer ]` section set `fullScreen=0`. If you want clearer mirror reflections, also set `MirrorSize=512` in `[RasterV2]` section (it shouldn't affect performance in any way). Save changes
 5. Optional steps:
-  - one of GEM+ stock patches has a crash-causing [bug](#05_unbindfix.xml). To fix it, put `05_unbindfix.xml` from `gplvr/patches` dir to your GPL carset mods folder, e.g. for GPL Beta it's `Mods/GEM+/gpl67`. Make sure the original `05.xml` is in the same directory as well
+  - one of GEM+ stock patches has a crash-causing [bug](#05_unbindfixxml). To fix it, put `05_unbindfix.xml` from `gplvr/patches` dir to your GPL carset mods folder, e.g. for GPL Beta it's `Mods/GEM+/gpl67`. Make sure the original `05.xml` is in the same directory as well
   - if you want to install 144fps patch, put `78 144fps v35 US.xml` from `gplvr/patches` dir into your GEM+ patches directory (`GPLSecrets/GEM+/Options`) and apply it in GEM+. **Note**: if you use UK GPL version, use UK patch alternative instead
 6. Installation is complete, proceed to [Configuration](#configuration)
 
@@ -118,7 +118,7 @@ If you're having trouble with any step or understanding its phrasing, feel free 
 ### Performance
 
 **Important note**: GPL uses a very old and inefficient rendering technique, which even on modern hardware makes the game heavily bottlenecked by CPU. Playing GPL on flat screen is fine because there's only one rendering pass + one mirror pass, while Virtual Reality demands 3 times as that (each eye gets its own render + 2 mirrors), making it impossible to keep up stable 90+ fps on modded tracks & cars.
-For that reason GPLVR implements a custom renderer to reduce CPU load and utilize your GPU better, thus making heavily-modded GPL setups playable in VR. This renderer has some minor polygon ordering artifacts and is enabled by default. Feel free to turn it off in VR menu (or set `rendererType` option in `gplvr.ini` to `0`) if your CPU handles vanilla graphics alright or you prefer to drive without opponents.
+For that reason GPLVR implements a custom renderer to reduce CPU load and utilize your GPU better, thus making heavily-modded GPL setups playable in VR. This renderer has some minor polygon ordering artifacts and is enabled by default. Feel free to turn it off in VR menu (or set `flatRendererType` option in [`gplvr.ini`](config/gplvr.ini) to `0`) if your CPU handles vanilla graphics alright or you prefer to drive without opponents.
 
 **Caveat**: GPLVR renderer uses more memory on top of GPL's own, and since GPL is a 32-bit application, it has a 2 GB memory limit. If you load a big track (e.g. Isle of Man) and use a polygon-heavy carset, the memory usage will be at its limit and the renderer may refuse to arm, so the game will fallback to GPL's vanilla one which will run significantly slower. To reduce this risk, you'll need to apply [Large Address Aware flag](https://ntcore.com/4gb-patch) to your `gpl.exe`.
 
@@ -136,7 +136,7 @@ In my experience, default GPL 2020 Demo carset has the worst performance:
 
 ### Crashes
 
-The only AMD hardware I have is AMD Ryzen 5600U with integrated graphics (only 500MB VRAM) on my laptop. On tracks with many textures (e.g. spa67), GPLVR renderer crashes the game, presumably due to a bug/limitation in AMD OpenGL driver. If you encounter the same issue, try enabling `textureLimitFix` in `gplvr.ini`.
+The only AMD hardware I have is AMD Ryzen 5600U with integrated graphics (only 500MB VRAM) on my laptop. On tracks with many textures (e.g. spa67), GPLVR renderer crashes the game, presumably due to a bug/limitation in AMD OpenGL driver. If you encounter the same issue, try enabling `textureLimitFix` in [`gplvr.ini`](config/gplvr.ini).
 
 
 ### Artifacts
