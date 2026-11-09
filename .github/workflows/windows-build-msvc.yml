@@ -1,0 +1,106 @@
+name: Build (Windows MSVC)
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-stage:
+    name: player payload
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # GPL is a Win32 application, so the injected DLL and its loader are 32-bit.
+    - name: Configure Win32 mod and loader
+      run: >
+        cmake -S . -B build\x86
+        -T host=x86 -A Win32
+        -DGPLVR_PRESENTER_ONLY=OFF
+
+    - name: Build Win32 mod and loader
+      run: >
+        cmake --build build\x86 --config Release
+        --target gplvr gplvr_loader
+
+    # OpenXR runtimes are 64-bit, so the presenter is a separate x64 process.
+    - name: Configure x64 presenter
+      run: >
+        cmake -S . -B build\x64
+        -T host=x64 -A x64
+        -DGPLVR_PRESENTER_ONLY=ON
+
+    - name: Build x64 presenter
+      run: >
+        cmake --build build\x64 --config Release
+        --target gplvr_xr
+
+    - name: Read version and commit id
+      id: version
+      shell: pwsh
+      run: |
+        $short = "${{ github.sha }}".Substring(0, 7)
+        $match = Select-String -LiteralPath 'CMakeLists.txt' -Pattern 'project\(gplvr VERSION ([0-9.]+)'
+        if (-not $match) { throw "no project(gplvr VERSION ...) in CMakeLists.txt" }
+        $version = $match.Matches[0].Groups[1].Value
+        "short_sha=$short" >> $env:GITHUB_OUTPUT
+        "version=$version" >> $env:GITHUB_OUTPUT
+
+    - name: Stage player payload
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $x86 = 'build\x86\Release'
+        $x64 = 'build\x64\Release'
+        $dest = '${{ github.workspace }}\payload\gplvr'
+
+        $files = @(
+            "$x86\gplvr.exe",
+            "$x86\gplvr.dll",
+            "$x64\gplvr-xr.exe",
+            'config\gplvr.ini',
+            'config\gplvr_pribluda.ini',
+            'config\gplvr_mirrors.ini',
+            'README.md'
+        )
+        $missing = @($files | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+        if (-not (Test-Path -LiteralPath "$x64\runtime\openxr\win64\openxr_loader.dll" -PathType Leaf)) {
+            $missing += "$x64\runtime\openxr\win64\openxr_loader.dll"
+        }
+        if (-not (Get-ChildItem -LiteralPath 'patches' -Filter *.xml -File -ErrorAction SilentlyContinue)) {
+            $missing += 'patches\*.xml'
+        }
+        if ($missing.Count -gt 0) {
+            throw "Payload inputs are missing:`n" + ($missing -join "`n")
+        }
+
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        foreach ($file in $files) {
+            Copy-Item -LiteralPath $file -Destination $dest
+        }
+        Copy-Item -LiteralPath "$x64\runtime" -Destination "$dest\runtime" -Recurse
+        Copy-Item -LiteralPath 'licenses' -Destination "$dest\licenses" -Recurse
+        Copy-Item -LiteralPath 'patches' -Destination "$dest\patches" -Recurse
+
+        $payload = '${{ github.workspace }}\payload'
+        Get-ChildItem -LiteralPath $payload -Recurse -File |
+            ForEach-Object { $_.FullName.Substring($payload.Length + 1) } |
+            Sort-Object
+
+    - name: Upload player payload
+      uses: actions/upload-artifact@v4
+      with:
+        name: 'gplvr-${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }}'
+        path: payload
+        if-no-files-found: error
+        compression-level: 9
