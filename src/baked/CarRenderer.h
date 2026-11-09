@@ -83,6 +83,10 @@ public:
     bool init(const GlApi& gl, std::string& error);
     // `contextAlive` false when the context is gone, so nothing is deleted, only forgotten.
     void release(bool contextAlive);
+    // Deletes the car textures, their handles and the mirror copy, and keeps the buffers and the row
+    // store for the next track. For a track GPL draws itself, where no prepare comes to do it and
+    // the handles would stay resident during GPL's draws. Needs the context current.
+    void dropSceneTextures();
     bool initialised() const { return initialised_; }
     // The car textures and the mirror copy resident through bindless handles, for diagnostics.
     size_t residentHandles() const {
@@ -177,6 +181,7 @@ private:
         uint32_t baseVertex = 0;
         uint32_t firstIndex = 0;
     };
+    uint32_t refusedHandles_ = 0;  // texture handles the driver did not keep resident
     // glMultiDrawElementsIndirect's DrawElementsIndirectCommand.
     struct Command {
         uint32_t count;

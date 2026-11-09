@@ -5,6 +5,7 @@
 #include "Interpolation.h"
 #include "Log.h"
 #include "RenderProfile.h"
+#include "Window.h"
 #include "presenter/Producer.h"
 
 #include <windows.h>
@@ -48,10 +49,6 @@ constexpr uintptr_t kLastLatchedBgCount = 0x00582114;
 // The same global as this image keeps it, placed in flatFramesInstall. Zero until then.
 uintptr_t g_lastLatchedBgCountAt = 0;
 
-// The hard ceiling on extra frames per tick, whatever the option says. At 36 Hz seven extra
-// frames is 288 Hz.
-constexpr int kMaxExtra = 7;
-
 using BeginFn = void(__cdecl*)();
 using EndFn = void(__cdecl*)();
 using CountFn = int(__cdecl*)();
@@ -83,7 +80,8 @@ struct State {
     unsigned windowBlended = 0;   // extra frames that actually moved the world
     unsigned windowWaited = 0;    // extra frames that had to wait for their slice
     unsigned windowPreempted = 0; // of those, the ones that gave up to keep a tick latched
-    unsigned windowExhausted = 0; // refused because the tick's allowance was spent
+    unsigned windowOverdue = 0;   // stock frames taken because the tick was overdue
+    unsigned windowBackground = 0;  // stock frames taken because nothing will be presented
     unsigned windowTickless = 0;  // refused because no tick has been latched yet
     unsigned windowMaxExtra = 0;  // the most drawn against any one tick in the window
     unsigned windowHeld = 0;      // ends deferred so the frame survived into an extra draw
@@ -118,9 +116,18 @@ bool redirect(uintptr_t site, uintptr_t to) {
     return true;
 }
 
-// frameRate 1 and 2 both skip the loop's wait for the next tick; the ceiling is the same and
-// only the gate in front of each extra frame differs. 0 never draws one.
-int extraLimit() { return g_options.frameRate > 0 ? kMaxExtra : 0; }
+// frameRate 1 and 2 both skip the loop's wait for the next tick; only the gate in front of each
+// extra frame differs. 0 never draws one.
+bool extraFramesOn() { return g_options.frameRate > 0; }
+
+// A tick late by a whole period: the sim has stalled or stopped, so the loop goes back to GPL's
+// own wait, which ends when a tick lands or the sim is no longer running.
+bool tickOverdue(const State& s) {
+    return s.tickPeriod > 0.0 && static_cast<double>(now() - s.tickStart) > 2.0 * s.tickPeriod;
+}
+
+// Unfocused in flat mode the present hook skips the present, so nothing would pace the loop.
+bool nothingPresented() { return !keepDrawingWhileUnfocused() && !windowHasFocus(); }
 
 // Is this frame allowed to be drawn yet?
 //
@@ -167,10 +174,14 @@ void takeStockFrame(State& s) {
 
 void __cdecl snapshotBeginHook() {
     State& s = g_state;
-    int    limit = extraLimit();
     ++s.windowFrames;
 
-    if (!limit || !s.getBGCount) {
+    if (!extraFramesOn() || !s.getBGCount) {
+        takeStockFrame(s);
+        return;
+    }
+    if (nothingPresented()) {
+        ++s.windowBackground;
         takeStockFrame(s);
         return;
     }
@@ -215,9 +226,8 @@ void __cdecl snapshotBeginHook() {
         takeStockFrame(s);
         return;
     }
-    if (s.extras >= limit) {
-        // The allowance is spent; the stock path sleeps out the rest of the tick as GPL does.
-        ++s.windowExhausted;
+    if (tickOverdue(s)) {
+        ++s.windowOverdue;
         takeStockFrame(s);
         return;
     }
@@ -233,11 +243,10 @@ void __cdecl snapshotBeginHook() {
 
 void __cdecl snapshotEndHook() {
     State& s = g_state;
-    int    limit = extraLimit();
 
-    // Hold the frame open only while another draw of it is still to come. When the allowance is
-    // spent the release happens exactly where GPL puts it.
-    bool more = limit > 0 && s.haveTick && s.extras < limit && interpolationActive();
+    // Hold the frame open, as another draw of it may come. If the next frame latches instead,
+    // gpl_fgFrameSnapshotBegin's own prologue does the release.
+    bool more = extraFramesOn() && s.haveTick && interpolationActive();
 
     // A pending BG request is serviced immediately after this call, and what it services --
     // loads, frees, a car-model swap -- can free what the open frame points at. Stock GPL always
@@ -368,16 +377,16 @@ void flatFramesInstall() {
     }
 
     logf("frames: the frame loop's wait for the next sim tick is ours (frameRate = %d, %s). "
-         "Up to %d frames between any two ticks, each redrawing the last latched tick with the "
-         "blend advanced to that instant. THE SIMULATION RATE IS UNTOUCHED -- an extra frame "
-         "reads no simulation state.",
+         "Frames between two ticks redraw the last latched tick with the blend advanced to that "
+         "instant, with no limit on how many; the loop goes back to GPL's wait when a tick is a "
+         "whole period late or nothing will be presented (unfocused). THE SIMULATION RATE IS "
+         "UNTOUCHED -- an extra frame reads no simulation state.",
          g_options.frameRate,
          g_options.frameRate == 1
              ? (g_options.vr ? "one frame per view set the presenter publishes"
                              : "one frame per refresh, which swapInterval does by blocking in "
                                "SwapBuffers")
-             : "unlocked: as fast as frames can be drawn",
-         kMaxExtra);
+             : "unlocked: as fast as frames can be drawn");
 }
 
 bool flatFramesActive() { return g_state.installed; }
@@ -395,19 +404,21 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
                   "frames: %u frames in %.1f s (%.1f/s), %u of them between ticks (%u moved the "
                   "world, %u drew a repeat) | up to %u per tick against a %.1f ms tick | %u "
                   "waited for the display, %u of those gave up so a tick would not pass "
-                  "unlatched | %u past the allowance, %u before the first tick | frame held "
-                  "open %u times, released early for a BG request %u",
+                  "unlatched | %u for an overdue tick, %u unfocused, %u before the first tick | "
+                  "frame held open %u times, released early for a BG request %u",
                   s.windowFrames, seconds, seconds > 0.0 ? s.windowFrames / seconds : 0.0,
                   s.windowExtra, s.windowBlended, s.windowExtra - s.windowBlended,
                   s.windowMaxExtra, period, s.windowWaited, s.windowPreempted,
-                  s.windowExhausted, s.windowTickless, s.windowHeld, s.windowReleased);
+                  s.windowOverdue, s.windowBackground, s.windowTickless, s.windowHeld,
+                  s.windowReleased);
 
     s.windowFrames = 0;
     s.windowExtra = 0;
     s.windowBlended = 0;
     s.windowWaited = 0;
     s.windowPreempted = 0;
-    s.windowExhausted = 0;
+    s.windowOverdue = 0;
+    s.windowBackground = 0;
     s.windowTickless = 0;
     s.windowMaxExtra = 0;
     s.windowHeld = 0;

@@ -14,10 +14,16 @@
 #include "baked/Trace.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <map>
 #include <string>
+#include <tuple>
 
 namespace baked {
 namespace {
+
+// A batch's layer has the upper half of its table row's third word.
+constexpr GLint kMaxLayersInTable = 65536;
 
 // kVertexShader and kSpriteVertexShader in one: the batch table says which a vertex is. A sprite
 // corner reads `flat` as two int16 offsets (attribute 7), its normal as its up axis and its gap as
@@ -61,8 +67,8 @@ uniform vec2 u_faceEye;
 uniform float u_offsetStep;
 // Per item: its order number (Renderer.cpp's orderTableBuffer_), binding kItemOrderBinding.
 layout(std430, binding = 0) readonly buffer ItemOrder { uint itemOrder[]; };
-// Per batch: the texture handle's two halves (0 untextured), surface class + 1 (0 none), and
-// pass | kind << 8 | decal << 16; binding kBatchTableBinding.
+// Per batch: the texture handle's two halves (0 untextured), surface class + 1 (0 none) | layer
+// << 16, and pass | kind << 8 | decal << 16; binding kBatchTableBinding.
 layout(std430, binding = 1) readonly buffer BatchTable { uvec4 batchTable[]; };
 // To the geometry shader (kMergedTriangleClip, kMergedLineClip), which hands them on as v_*.
 out vec2 g_uv;
@@ -71,15 +77,17 @@ out vec4 g_flat;
 noperspective out float g_fogW;  // the view depth, before any decal bias: what GPL clips by
 flat out uint g_order;
 flat out uvec2 g_texture;
+flat out uint g_layer;
 flat out uint g_flags;  // pass | kind << 8 | (surface class + 1) << 16
 flat out uint g_level;
 // Above 0 for a face of a two-sided panel turned away from the eye: kMergedTriangleClip drops it.
 flat out float g_away;
 void main() {
     uvec4 batch = batchTable[a_batchLevel & 0xFFFFFFu];
-    int surfaceClass = int(batch.z) - 1;
+    int surfaceClass = int(batch.z & 0xFFFFu) - 1;
     uint kind = (batch.w >> 8) & 0xFFu;
     g_texture = batch.xy;
+    g_layer = batch.z >> 16;
     g_flags = (batch.w & 0xFFFFu) | (batch.z << 16);
     g_level = (a_batchLevel >> 24) & 0xFu;
     // The eye's distance behind the face's plane: every corner of the polygon gives the same.
@@ -165,6 +173,7 @@ in vec4 g_flat[];
 noperspective in float g_fogW[];
 flat in uint g_order[];
 flat in uvec2 g_texture[];
+flat in uint g_layer[];
 flat in uint g_flags[];
 flat in uint g_level[];
 uniform vec2 u_depth;  // y: the near plane, GPL's camera's
@@ -174,6 +183,7 @@ out vec4 v_flat;
 noperspective out float v_fogW;
 flat out uint v_order;
 flat out uvec2 v_texture;
+flat out uint v_layer;
 flat out uint v_flags;
 flat out uint v_level;
 // The point a fraction t of the way from corner a to corner b.
@@ -184,6 +194,7 @@ void emitAt(int a, int b, float t, int provoking) {
     v_fogW = mix(g_fogW[a], g_fogW[b], t);
     v_order = g_order[provoking];
     v_texture = g_texture[provoking];
+    v_layer = g_layer[provoking];
     v_flags = g_flags[provoking];
     v_level = g_level[provoking];
     gl_Position = mix(gl_in[a].gl_Position, gl_in[b].gl_Position, t);
@@ -265,15 +276,18 @@ void main() {
 
 // kFragmentShader with the per-batch choices made here: textured or not from the batch's handle
 // and the host's textured classes, the alpha window from the batch's pass and the phase, and the
-// overlay offset of the order test from the vertex's level.
-const char* const kMergedFragmentShader = R"(#version 400
-#extension GL_ARB_bindless_texture : require
+// overlay offset of the order test from the vertex's level. It starts with kMergedFragmentHeader,
+// which defines TEXTURE_ARRAYS when the batch's handle is a texture array.
+const char* const kMergedFragmentHeader =
+    "#version 400\n#extension GL_ARB_bindless_texture : require\n";
+const char* const kMergedFragmentShader = R"(
 in vec2 v_uv;
 noperspective in vec4 v_colour;
 in vec4 v_flat;
 noperspective in float v_fogW;
 flat in uint v_order;
 flat in uvec2 v_texture;
+flat in uint v_layer;
 flat in uint v_flags;
 flat in uint v_level;
 uniform int u_gouraud;
@@ -301,6 +315,13 @@ bool hiddenBySolid(float slope) {
     z += u_orderDepth.x * overlay * (u_orderDepth.y * slope + u_orderDepth.z * unit);
     return u_orderDepth.x * (z - texelFetch(u_solidDepth, pixel, 0).r) < 0.0;
 }
+vec4 batchTexel() {
+#ifdef TEXTURE_ARRAYS
+    return texture(sampler2DArray(v_texture), vec3(v_uv, float(v_layer)));
+#else
+    return texture(sampler2D(v_texture), v_uv);
+#endif
+}
 void main() {
     float slope = max(abs(dFdx(gl_FragCoord.z)), abs(dFdy(gl_FragCoord.z)));
     o_order = v_order;
@@ -311,7 +332,7 @@ void main() {
                     (kind == 1u || surfaceClass < 0 ||
                      ((uint(u_classTextured) >> uint(surfaceClass)) & 1u) != 0u);
     vec4 shade = u_gouraud != 0 ? v_colour : vec4(1.0);
-    vec4 colour = !textured ? v_flat * shade : texture(sampler2D(v_texture), v_uv) * shade;
+    vec4 colour = !textured ? v_flat * shade : batchTexel() * shade;
     float ref = pass == 0u ? -1.0 : u_alphaPart == 1 ? kCoreAlpha : 1.0 / 255.0;
     float ceiling = pass != 0u && u_alphaPart == 2 ? kCoreAlpha : 2.0;
     if (colour.a < ref || colour.a >= ceiling) discard;
@@ -336,11 +357,12 @@ bool Renderer::buildMergedProgram(std::string& error) {
                             kMergedClipCommon + kMergedTriangleClip;
     std::string lines = std::string(kMergedClipVersion) + kMergedLineLayout + kMergedClipCommon +
                         kMergedLineClip;
-    mergedProgram_ =
-        linkSources(kMergedVertexShader, kMergedFragmentShader, error, triangles.c_str());
+    std::string fragment = std::string(kMergedFragmentHeader) +
+                           (textureArrays_ ? "#define TEXTURE_ARRAYS\n" : "") +
+                           kMergedFragmentShader;
+    mergedProgram_ = linkSources(kMergedVertexShader, fragment.c_str(), error, triangles.c_str());
     if (!mergedProgram_) return false;
-    mergedLineProgram_ =
-        linkSources(kMergedVertexShader, kMergedFragmentShader, error, lines.c_str());
+    mergedLineProgram_ = linkSources(kMergedVertexShader, fragment.c_str(), error, lines.c_str());
     if (!mergedLineProgram_) {
         error = "lines: " + error;
         gl_.deleteProgram(mergedProgram_);
@@ -373,32 +395,147 @@ void Renderer::findMergedUniforms(GLuint p, MergedUniforms& u) {
     findOrderUniforms(p, u.order);
 }
 
-// Every texture made resident once, after the upload: a handle fixes the texture's state, and
-// uploadTexture has set all of it by then.
+void Renderer::deleteMergedPrograms() {
+    if (mergedProgram_) gl_.deleteProgram(mergedProgram_);
+    if (mergedLineProgram_) gl_.deleteProgram(mergedLineProgram_);
+    mergedProgram_ = mergedLineProgram_ = 0;
+}
+
+void Renderer::deleteTextureArrays() {
+    for (GLuint name : arrayNames_)
+        if (name) gl_.deleteTextures(1, &name);
+    arrayNames_.clear();
+    textureLayers_.clear();
+}
+
+// Textures that agree on their level sizes, format and sampling can share an array, and so one
+// bindless handle: AMD's driver 27.20.14044.2 adds every resident handle to every draw's fixed
+// list of about 1024 allocations and faults past it, and spa67 alone has 1764 textures. The batch
+// table gives each draw its handle and layer; the pixels go up layer by layer in uploadTexture.
+bool Renderer::allocateTextureArrays(const Scene& scene, std::string& error) {
+    // Top level width and height, level count, internal format, texel bytes, wrap flags.
+    using Key = std::tuple<int, int, int, GLenum, int, int>;
+    std::map<Key, std::vector<uint32_t>> groups;
+    uint32_t cut = 0;
+    for (uint32_t t = 0; t < scene.textures.size(); ++t) {
+        const MipImage& image = scene.textures[t].image;
+        size_t          first = firstLevelWithin(image, maxTextureSize_);
+        int             levels = halvingLevels(image, first);
+        if (first + levels < image.levels.size()) ++cut;
+        TextureFormat format = textureFormatFor(image);
+        groups[Key(image.levels[first].width, image.levels[first].height, levels, format.internal,
+                   format.bytesPerTexel, image.flags & 3)]
+            .push_back(t);
+    }
+
+    for (int drained = 0; drained < 16 && gl_.getError() != 0; ++drained) {
+    }
+    GLint perArray = std::min(maxArrayLayers_, kMaxLayersInTable);
+    textureLayers_.assign(scene.textures.size(), TextureLayer{});
+    size_t totalBytes = 0;
+    size_t largestBytes = 0;
+    size_t largestLayers = 0;
+    size_t singles = 0;
+    for (const auto& group : groups) {
+        int    width = std::get<0>(group.first);
+        int    height = std::get<1>(group.first);
+        int    levels = std::get<2>(group.first);
+        GLenum internal = std::get<3>(group.first);
+        int    wrap = std::get<5>(group.first);
+        size_t layerBytes = 0;
+        for (int level = 0; level < levels; ++level)
+            layerBytes += static_cast<size_t>(std::max(1, width >> level)) *
+                          std::max(1, height >> level) * std::get<4>(group.first);
+        const std::vector<uint32_t>& members = group.second;
+        for (size_t start = 0; start < members.size(); start += perArray) {
+            size_t count = std::min(members.size() - start, static_cast<size_t>(perArray));
+            GLuint name = 0;
+            gl_.genTextures(1, &name);
+            arrayNames_.push_back(name);
+            gl_.bindTexture(gl::kTexture2DArray, name);
+            gl_.texStorage3D(gl::kTexture2DArray, levels, internal, width, height,
+                             static_cast<GLsizei>(count));
+            setTextureSampling(gl::kTexture2DArray, levels, static_cast<uint8_t>(wrap));
+            GLenum failed = gl_.getError();
+            if (failed) {
+                char text[120];
+                std::snprintf(text, sizeof(text),
+                              "GL error 0x%X allocating %dx%d, %d levels, %zu layers", failed,
+                              width, height, levels, count);
+                error = text;
+                gl_.bindTexture(gl::kTexture2DArray, 0);
+                return false;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                TextureLayer& at = textureLayers_[members[start + i]];
+                at.array = static_cast<uint32_t>(arrayNames_.size() - 1);
+                at.layer = static_cast<uint32_t>(i);
+            }
+            size_t bytes = layerBytes * count;
+            totalBytes += bytes;
+            if (bytes > largestBytes) largestBytes = bytes;
+            if (count > largestLayers) largestLayers = count;
+            if (count == 1) ++singles;
+        }
+    }
+    gl_.bindTexture(gl::kTexture2DArray, 0);
+    logf("baked: texture arrays -- %zu textures in %zu arrays, %.1f MiB (%zu of one layer, at most "
+         "%zu layers, the largest %.1f MiB; the driver allows %d layers); %u textures lost levels "
+         "that do not halve",
+         scene.textures.size(), arrayNames_.size(), totalBytes / 1048576.0, singles, largestLayers,
+         largestBytes / 1048576.0, maxArrayLayers_, cut);
+    trace("upload: texture arrays allocated");
+    return true;
+}
+
+void Renderer::buildTextureArrays(const Scene& scene) {
+    std::string error;
+    if (allocateTextureArrays(scene, error)) return;
+    logf("baked: texture arrays OFF -- %s; every texture gets its own handle", error.c_str());
+    deleteTextureArrays();
+    textureArrays_ = false;
+    deleteMergedPrograms();
+    if (!buildMergedProgram(error))
+        logf("baked: merged draws OFF -- the program did not build again: %s", error.c_str());
+}
+
+// Every array or texture made resident once, after the upload: a handle fixes the texture's state,
+// and it has all been set by then.
 void Renderer::buildBatchTable(const Scene& scene) {
-    textureHandles_.assign(textures_.size(), 0);
+    const std::vector<GLuint>& names = textureArrays_ ? arrayNames_ : textures_;
+    textureHandles_.assign(names.size(), 0);
     uint32_t without = 0;
-    for (size_t t = 0; t < textures_.size(); ++t) {
-        uint64_t handle = textures_[t] ? gl_.getTextureHandle(textures_[t]) : 0;
+    uint32_t refused = 0;
+    for (size_t t = 0; t < names.size(); ++t) {
+        uint64_t handle = names[t] ? gl_.getTextureHandle(names[t]) : 0;
         if (handle) {
-            gl_.makeTextureHandleResident(handle);
-            textureHandles_[t] = handle;
+            textureHandles_[t] = makeResidentChecked(gl_, handle);
+            if (!textureHandles_[t]) ++refused;
         } else {
             ++without;
         }
     }
+    if (refused)
+        uploadError_ = "the driver did not keep " + std::to_string(refused) + " of " +
+                       std::to_string(names.size()) + " texture handles resident";
 
     std::vector<uint32_t> table(scene.batches.size() * 4, 0);
+    batchSamplers_.assign(scene.batches.size(), DrawList::kNoSampler);
     for (size_t b = 0; b < scene.batches.size(); ++b) {
         const Batch& batch = scene.batches[b];
-        uint64_t     handle = batch.texture >= 0 && static_cast<size_t>(batch.texture) <
-                                                     textureHandles_.size()
-                                  ? textureHandles_[static_cast<size_t>(batch.texture)]
-                                  : 0;
+        uint64_t     handle = 0;
+        uint32_t     layer = 0;
+        if (batch.texture >= 0 && static_cast<size_t>(batch.texture) < textures_.size()) {
+            size_t texture = static_cast<size_t>(batch.texture);
+            size_t sampler = textureArrays_ ? textureLayers_[texture].array : texture;
+            handle = textureHandles_[sampler];
+            if (textureArrays_) layer = textureLayers_[texture].layer;
+            if (handle) batchSamplers_[b] = static_cast<uint32_t>(sampler);
+        }
         uint32_t* row = table.data() + b * 4;
         row[0] = static_cast<uint32_t>(handle);
         row[1] = static_cast<uint32_t>(handle >> 32);
-        row[2] = static_cast<uint32_t>(batch.surfaceClass + 1);
+        row[2] = static_cast<uint32_t>(batch.surfaceClass + 1) | (layer << 16);
         row[3] = batch.pass | (static_cast<uint32_t>(batch.kind) << 8) |
                  (static_cast<uint32_t>(batch.decal) << 16);
     }
@@ -410,11 +547,12 @@ void Renderer::buildBatchTable(const Scene& scene) {
     // The batch index has 24 bits of a_batchLevel; the block's size limit is 16 MiB or more.
     bool fits = scene.batches.size() < (1u << 24) &&
                 table.size() * sizeof(uint32_t) <= static_cast<size_t>(maxStorageBlockSize_);
-    mergedReady_ = fits && without == 0;
-    logf("baked: merged draws -- %s: %zu textures resident through bindless handles (%u without "
-         "one), %zu batches in the table%s",
-         mergedReady_ ? "READY" : "OFF", textures_.size() - without, without,
-         scene.batches.size(), fits ? "" : " (more than the table holds)");
+    mergedReady_ = fits && without == 0 && refused == 0;
+    logf("baked: merged draws -- %s: %zu %s resident through bindless handles (%u without one, %u "
+         "refused), %zu batches in the table%s",
+         mergedReady_ ? "READY" : "OFF", names.size() - without - refused,
+         textureArrays_ ? "texture arrays" : "textures", without, refused, scene.batches.size(),
+         fits ? "" : " (more than the table holds)");
 }
 
 void Renderer::releaseMerged(bool contextAlive) {
@@ -422,12 +560,16 @@ void Renderer::releaseMerged(bool contextAlive) {
         for (uint64_t handle : textureHandles_)
             if (handle) gl_.makeTextureHandleNonResident(handle);
         if (batchTableBuffer_) gl_.deleteBuffers(1, &batchTableBuffer_);
-        if (mergedProgram_) gl_.deleteProgram(mergedProgram_);
-        if (mergedLineProgram_) gl_.deleteProgram(mergedLineProgram_);
+        deleteMergedPrograms();
+        deleteTextureArrays();
     }
     textureHandles_.clear();
+    batchSamplers_.clear();
     batchTableBuffer_ = 0;
     mergedProgram_ = mergedLineProgram_ = 0;
+    arrayNames_.clear();
+    textureLayers_.clear();
+    textureArrays_ = false;
     mergedReady_ = false;
 }
 
@@ -487,14 +629,22 @@ void Renderer::drawMergedPhases(const Scene& scene, const ViewInputs& view,
     gl_.bindBufferBase(gl::kShaderStorageBuffer, kItemOrderBinding, orderTableBuffer_);
     gl_.bindBufferBase(gl::kShaderStorageBuffer, kBatchTableBinding, batchTableBuffer_);
 
+    // Contiguous ranges join into one sub-draw while they sample one handle: without
+    // NV_gpu_shader5 a bindless sampler must be dynamically uniform, and GLSL's limit for that is
+    // one rendering command. A batch with no handle samples nothing, so it joins any sub-draw.
     auto add =[&](DrawList& list, const Range& range) {
-        if (!list.counts.empty() && list.end == range.first) {
+        uint32_t sampler = batchSamplers_[range.batch];
+        bool     sameHandle = sampler == DrawList::kNoSampler ||
+                          list.sampler == DrawList::kNoSampler || sampler == list.sampler;
+        if (!list.counts.empty() && list.end == range.first && sameHandle) {
             list.counts.back() += static_cast<GLsizei>(range.count);
         } else {
             uintptr_t offset = static_cast<uintptr_t>(range.first) * sizeof(uint32_t);
             list.counts.push_back(static_cast<GLsizei>(range.count));
             list.offsets.push_back(reinterpret_cast<const void*>(offset));
+            list.sampler = DrawList::kNoSampler;
         }
+        if (sampler != DrawList::kNoSampler) list.sampler = sampler;
         list.end = range.first + range.count;
     };
     auto submit = [&](DrawList& list, GLenum mode) {

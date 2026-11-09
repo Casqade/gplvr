@@ -292,6 +292,11 @@ struct Options {
     // of the first frames' baked passes and presents. 0 (default) installs nothing.
     int glTrace = 0;
 
+    // Keep the baked track's textures in texture arrays, one bindless handle for each array of
+    // like textures instead of one for each texture (RendererMerged.cpp). AMD's driver
+    // 27.20.14044.2 faults once about 1024 handles are resident.
+    bool textureLimitFix = false;
+
     // Draw GPL's stamped text ourselves instead of letting roglv2 blit it a glyph at a time
     // (FastText.h, docs/audit-2026-09-18/71-fast-text.md).
     //
@@ -614,7 +619,7 @@ struct Options {
     //      refresh, which the swap interval does by blocking in SwapBuffers.
     //
     //   2  UNLIMITED. The wait is skipped and nothing else paces the loop, so the rate is
-    //      1000 / the cost of one frame, to a ceiling of 7 extra frames per tick. Vsync off.
+    //      1000 / the cost of one frame. Vsync off.
     //
     // 1 and 2 are the SAME MECHANISM -- FlatFrames skips the loop's tick wait -- differing only
     // in what is allowed to gate a frame afterwards. THE SIMULATION RATE IS UNTOUCHED by both:

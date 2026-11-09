@@ -121,6 +121,9 @@ public:
     // vertex-shader storage buffers and the merged program built; otherwise the renderer draws
     // batch by batch.
     bool mergedDraws() const { return mergedReady_; }
+    // Whether merged draws keep the textures in texture arrays (RendererMerged.cpp). Set before
+    // init.
+    void setTextureArrays(bool on) { textureArraysWanted_ = on; }
     // Which way GPL turns its sprites in this process (report 67b). Billboard.cpp, installed in
     // VR only, redirects both drawers to face the eye; stock GPL faces the view plane: the
     // vertical-axis sprite spans cross(up, camera forward), the screen-aligned one the camera's
@@ -144,7 +147,7 @@ public:
     bool uploadFailed() const { return !uploadError_.empty(); }
     const std::string& uploadError() const { return uploadError_; }
     size_t uploadedGeometryBytes() const { return geometryBytes_; }
-    // The track textures resident through bindless handles (the merged draws'), for diagnostics.
+    // The bindless handles resident for the track's textures (the merged draws'), for diagnostics.
     size_t residentHandles() const {
         size_t count = 0;
         for (uint64_t handle : textureHandles_)
@@ -227,6 +230,12 @@ private:
     // RendererMerged.cpp: the merged program, the per-batch table its shaders read, and the
     // phases drawn with them.
     bool buildMergedProgram(std::string& error);
+    void deleteMergedPrograms();
+    // Groups the scene's textures and allocates their arrays. On failure there are no arrays, and
+    // the merged program is rebuilt to sample a texture per handle.
+    void buildTextureArrays(const Scene& scene);
+    bool allocateTextureArrays(const Scene& scene, std::string& error);
+    void deleteTextureArrays();
     void buildBatchTable(const Scene& scene);
     void releaseMerged(bool contextAlive);
     void drawMergedPhases(const Scene& scene, const ViewInputs& view, const FrameInputs& frame,
@@ -247,6 +256,8 @@ private:
     // the order number. A surface that writes depth writes its order too, and nothing else does.
     void setWrites(bool colour, bool solid);
     bool uploadTexture(const Scene& scene, size_t index, GLuint& name, size_t& bytes);
+    // Sampling and wrap for the texture bound to `target`, from its level count and MPHD flags.
+    void setTextureSampling(GLenum target, GLint levels, uint8_t flags);
     void evaluate(const Scene& scene, const ViewInputs& view, const FrameInputs& frame);
     // Appends the runs under order node `node` of `item` to ordered_, in GPL's order for this
     // pass: gate sides and piece results are the item's, just evaluated.
@@ -302,12 +313,24 @@ private:
     OrderUniforms order_;
     OrderUniforms spriteOrder_;
 
-    // Merged draws: the driver's bindless support, the programs, every texture's resident handle,
-    // and per batch (four uints, a shader storage buffer): the handle's two halves, surface
-    // class + 1, and pass | kind << 8 | decal << 16. The two programs share their vertex and fragment shaders;
-    // their geometry shaders clip triangles and lines at GPL's near plane (report 105 section
-    // 4.16), and a draw takes the one for its primitive.
+    // Merged draws: the driver's bindless support, the programs, the resident handles (one per
+    // array, or per texture without arrays), and per batch (four uints, a shader storage buffer):
+    // the handle's two halves, surface class + 1 | layer << 16, and pass | kind << 8 | decal << 16.
+    // The two programs share their vertex and fragment shaders; their geometry shaders clip
+    // triangles and lines at GPL's near plane (report 105 section 4.16), and a draw takes the one
+    // for its primitive.
     bool                  bindless_ = false;
+    // Texture arrays: whether the host wants them, whether the merged program samples them and the
+    // upload fills them, the arrays, and where each of the scene's textures lies in them.
+    struct TextureLayer {
+        uint32_t array = 0;
+        uint32_t layer = 0;
+    };
+    bool                      textureArraysWanted_ = false;
+    bool                      textureArrays_ = false;
+    GLint                     maxArrayLayers_ = 0;
+    std::vector<GLuint>       arrayNames_;
+    std::vector<TextureLayer> textureLayers_;
     bool                  mergedReady_ = false;
     GLuint                mergedProgram_ = 0;
     GLuint                mergedLineProgram_ = 0;
@@ -317,15 +340,20 @@ private:
     GLuint                batchTableBuffer_ = 0;
     // Index-buffer runs of one merged multi-draw, contiguous ones joined (RendererMerged.cpp).
     struct DrawList {
+        static constexpr uint32_t kNoSampler = 0xFFFFFFFFu;
         std::vector<GLsizei>     counts;
         std::vector<const void*> offsets;
         uint32_t                 end = 0;  // the index after the last run, for joining
+        uint32_t                 sampler = kNoSampler;  // the handle its last sub-draw samples
         void clear() {
             counts.clear();
             offsets.clear();
             end = 0;
+            sampler = kNoSampler;
         }
     };
+    // Per batch, which of textureHandles_ it samples, DrawList::kNoSampler for none.
+    std::vector<uint32_t> batchSamplers_;
     DrawList triangleList_;
     DrawList lineList_;
 

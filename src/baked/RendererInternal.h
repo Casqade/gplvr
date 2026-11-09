@@ -6,6 +6,8 @@
 #include "baked/GlApi.h"
 #include "baked/Mip.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 
 namespace baked {
@@ -54,6 +56,41 @@ inline TextureFormat textureFormatFor(const MipImage& image) {
     case 6: return {gl::kRgb8, gl::kBgra, gl::kUnsignedByte, 4};
     default: return {gl::kRgba8, gl::kBgra, gl::kUnsignedByte, 4};
     }
+}
+
+// Makes `handle` resident and returns it, or 0 if the driver does not hold it resident afterwards.
+// A driver can refuse without a GL error, and sampling such a handle is undefined and may end the
+// program (ARB_bindless_texture). An AMD overflow past about 1024 handles (STATUS.md) does not show
+// here: that driver reports every handle resident up to its crash at a draw.
+inline uint64_t makeResidentChecked(const GlApi& gl, uint64_t handle) {
+    gl.makeTextureHandleResident(handle);
+    if (gl.isTextureHandleResident && !gl.isTextureHandleResident(handle)) return 0;
+    return handle;
+}
+
+// The level an upload starts at: those above the driver's size limit are skipped.
+inline size_t firstLevelWithin(const MipImage& image, int maxSize) {
+    size_t first = 0;
+    while (first + 1 < image.levels.size() &&
+           (image.levels[first].width > maxSize || image.levels[first].height > maxSize))
+        ++first;
+    return first;
+}
+
+// How many levels from `first` halve from it down to at most 1x1: what a texture array, whose
+// levels are sized from the top one, can hold of this image.
+inline int halvingLevels(const MipImage& image, size_t first) {
+    int width = image.levels[first].width;
+    int height = image.levels[first].height;
+    int count = 1;
+    while (first + count < image.levels.size() && ((width | height) >> count) != 0) {
+        const MipLevel& next = image.levels[first + count];
+        if (next.width != std::max(1, width >> count) ||
+            next.height != std::max(1, height >> count))
+            break;
+        ++count;
+    }
+    return count;
 }
 
 constexpr GLenum kTextureUnit = gl::kTexture0 + 1;

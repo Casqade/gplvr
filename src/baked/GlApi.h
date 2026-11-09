@@ -130,6 +130,7 @@ struct GlApi {
     uint64_t(BAKED_GLAPI* getTextureHandle)(GLuint) = nullptr;
     void(BAKED_GLAPI* makeTextureHandleResident)(uint64_t) = nullptr;
     void(BAKED_GLAPI* makeTextureHandleNonResident)(uint64_t) = nullptr;
+    GLboolean(BAKED_GLAPI* isTextureHandleResident)(uint64_t) = nullptr;
 
     // GL 3.3 / ARB_timer_query. Optional, and nothing in the renderers uses them now.
     void(BAKED_GLAPI* genQueries)(GLsizei, GLuint*) = nullptr;
@@ -147,6 +148,10 @@ struct GlApi {
                                                  GLsizei) = nullptr;
     void(BAKED_GLAPI* bindBufferBase)(GLenum, GLuint, GLuint) = nullptr;
     void(BAKED_GLAPI* multiDrawArraysIndirect)(GLenum, const void*, GLsizei, GLsizei) = nullptr;
+    // GL 4.2 and 1.2: the merged draws' texture arrays (RendererMerged.cpp), checked in init.
+    void(BAKED_GLAPI* texStorage3D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei) = nullptr;
+    void(BAKED_GLAPI* texSubImage3D)(GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei,
+                                     GLenum, GLenum, const void*) = nullptr;
 
     // GL 2.0 - 4.4, used only by the car renderer's resident rows (CarRowStore.h, report 105
     // section 4.66), which checks them itself; glApiMissing does not require them.
@@ -213,6 +218,7 @@ constexpr GLbitfield kDepthBufferBit = 0x0100;
 constexpr GLbitfield kColorBufferBit = 0x4000;
 
 constexpr GLenum kTexture2D = 0x0DE1;
+constexpr GLenum kTexture2DArray = 0x8C1A;
 constexpr GLenum kTexture0 = 0x84C0;
 constexpr GLenum kActiveTexture = 0x84E0;
 constexpr GLenum kTextureBinding2D = 0x8069;
@@ -245,6 +251,7 @@ constexpr GLenum kPackAlignment = 0x0D05;
 constexpr GLenum kPixelPackBuffer = 0x88EB;
 constexpr GLenum kPixelPackBufferBinding = 0x88ED;
 constexpr GLenum kMaxTextureSize = 0x0D33;
+constexpr GLenum kMaxArrayTextureLayers = 0x88FF;
 
 constexpr GLenum kTextureBuffer = 0x8C2A;
 constexpr GLenum kMaxTextureBufferSize = 0x8C2B;

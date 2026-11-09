@@ -466,6 +466,8 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     gl_.getIntegerv(gl::kMaxTextureSize, &maxTextureSize_);
     if (maxTextureSize_ < 256) maxTextureSize_ = 256;
     gl_.getIntegerv(gl::kMaxTextureBufferSize, &maxTextureBufferSize_);
+    maxArrayLayers_ = 0;
+    gl_.getIntegerv(gl::kMaxArrayTextureLayers, &maxArrayLayers_);
     maxAnisotropy_ = 0.0f;
     if (anisotropic) gl_.getFloatv(gl::kMaxTextureMaxAnisotropy, &maxAnisotropy_);
     for (int drained = 0; drained < 16 && gl_.getError() != 0; ++drained) {
@@ -486,11 +488,22 @@ bool Renderer::init(const GlApi& gl, std::string& error) {
     const char* merged = !bindless_ ? "OFF: the driver has no ARB_bindless_texture"
                                     : "OFF: no GL 4.3 shader storage buffers in the vertex shader";
     std::string mergedError;
+    textureArrays_ = textureArraysWanted_ && gl_.texStorage3D && gl_.texSubImage3D &&
+                     maxArrayLayers_ > 0;
     if (bindless_ && storage) {
-        merged = buildMergedProgram(mergedError)
-                     ? "ready once the textures are up; triangles and lines clipped at GPL's near "
-                       "plane before the screen-linear colour (geometry shaders)"
-                     : "OFF: the merged program did not build";
+        bool built = buildMergedProgram(mergedError);
+        if (!built && textureArrays_) {
+            logf("baked: texture arrays OFF -- the merged program did not build with them: %s",
+                 mergedError.c_str());
+            textureArrays_ = false;
+            mergedError.clear();
+            built = buildMergedProgram(mergedError);
+        }
+        merged = built ? "ready once the textures are up; triangles and lines clipped at GPL's "
+                         "near plane before the screen-linear colour (geometry shaders)"
+                       : "OFF: the merged program did not build";
+    } else {
+        textureArrays_ = false;
     }
 
     logf("baked: GL %d.%d on \"%s\" -- %s depth, max texture %d, max anisotropy %.0f, max "
@@ -655,11 +668,21 @@ bool Renderer::uploadTexture(const Scene& scene, size_t index, GLuint& name, siz
     TextureFormat   format = textureFormatFor(image);
 
     // Skip levels above the driver's limit; the pyramid below them is complete by construction.
-    size_t first = 0;
-    while (first + 1 < image.levels.size() &&
-           (image.levels[first].width > maxTextureSize_ ||
-            image.levels[first].height > maxTextureSize_))
-        ++first;
+    size_t first = firstLevelWithin(image, maxTextureSize_);
+
+    if (textureArrays_) {
+        const TextureLayer& at = textureLayers_[index];
+        gl_.bindTexture(gl::kTexture2DArray, arrayNames_[at.array]);
+        int levels = halvingLevels(image, first);
+        for (int level = 0; level < levels; ++level) {
+            const MipLevel& data = image.levels[first + level];
+            gl_.texSubImage3D(gl::kTexture2DArray, level, 0, 0, static_cast<GLint>(at.layer),
+                              data.width, data.height, 1, format.format, format.type,
+                              data.data.data());
+            bytes += data.data.size();
+        }
+        return true;
+    }
 
     gl_.genTextures(1, &name);
     gl_.bindTexture(gl::kTexture2D, name);
@@ -670,25 +693,26 @@ bool Renderer::uploadTexture(const Scene& scene, size_t index, GLuint& name, siz
                        format.format, format.type, data.data.data());
         bytes += data.data.size();
     }
-    // Sampling as roglv2's TextureOpenGL init 0x200091C0: magnification linear; minification
-    // LINEAR_MIPMAP_LINEAR with TrilinearFiltering, else NEAREST_MIPMAP_LINEAR (9986 + the
-    // setting), and for a single level LINEAR, else NEAREST; the anisotropy of
-    // AnisotropicFiltering; wrap from MPHD flags.
-    GLint levels = static_cast<GLint>(image.levels.size() - first);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureBaseLevel, 0);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxLevel, levels - 1);
+    setTextureSampling(gl::kTexture2D, static_cast<GLint>(image.levels.size() - first),
+                       image.flags);
+    return true;
+}
+
+// Sampling as roglv2's TextureOpenGL init 0x200091C0: magnification linear; minification
+// LINEAR_MIPMAP_LINEAR with TrilinearFiltering, else NEAREST_MIPMAP_LINEAR (9986 + the setting),
+// and for a single level LINEAR, else NEAREST; the anisotropy of AnisotropicFiltering; wrap from
+// MPHD flags.
+void Renderer::setTextureSampling(GLenum target, GLint levels, uint8_t flags) {
+    gl_.texParameteri(target, gl::kTextureBaseLevel, 0);
+    gl_.texParameteri(target, gl::kTextureMaxLevel, levels - 1);
     GLenum minFilter = levels > 1 ? (filter_.trilinear ? gl::kLinearMipmapLinear
                                                        : gl::kNearestMipmapLinear)
                                   : (filter_.trilinear ? gl::kLinear : gl::kNearest);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMinFilter, static_cast<GLint>(minFilter));
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureMagFilter, gl::kLinear);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapS,
-                      (image.flags & 1) ? gl::kClampToEdge : gl::kRepeat);
-    gl_.texParameteri(gl::kTexture2D, gl::kTextureWrapT,
-                      (image.flags & 2) ? gl::kClampToEdge : gl::kRepeat);
-    if (int amount = anisotropy())
-        gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxAnisotropy, amount);
-    return true;
+    gl_.texParameteri(target, gl::kTextureMinFilter, static_cast<GLint>(minFilter));
+    gl_.texParameteri(target, gl::kTextureMagFilter, gl::kLinear);
+    gl_.texParameteri(target, gl::kTextureWrapS, (flags & 1) ? gl::kClampToEdge : gl::kRepeat);
+    gl_.texParameteri(target, gl::kTextureWrapT, (flags & 2) ? gl::kClampToEdge : gl::kRepeat);
+    if (int amount = anisotropy()) gl_.texParameteri(target, gl::kTextureMaxAnisotropy, amount);
 }
 
 int Renderer::anisotropy() const {
@@ -859,6 +883,7 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
                          scene.indices.size() * sizeof(uint32_t);
         textures_.assign(scene.textures.size(), 0);
         nextTexture_ = 0;
+        if (textureArrays_) buildTextureArrays(scene);
         geometryUploaded_ = true;
         byteBudget = byteBudget > geometryBytes_ ? byteBudget - geometryBytes_ : 0;
     }
@@ -876,6 +901,7 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
     }
     readWorstCall_ = std::max(readWorstCall_, readMilliseconds_ - readBefore);
     textureBytes_ += spent;
+    if (textureArrays_) gl_.bindTexture(gl::kTexture2DArray, 0);
     gl_.pixelStorei(gl::kUnpackSkipPixels, skipPixels);
     gl_.pixelStorei(gl::kUnpackSkipRows, skipRows);
     gl_.pixelStorei(gl::kUnpackRowLength, rowLength);
@@ -883,6 +909,10 @@ bool Renderer::upload(const Scene& scene, size_t byteBudget) {
 
     uploadComplete_ = !uploadFailed() && nextTexture_ >= scene.textures.size();
     if (uploadComplete_ && mergedProgram_) buildBatchTable(scene);
+    // The batch-by-batch path draws ordinary textures, and arrays left none.
+    if (uploadComplete_ && !uploadFailed() && textureArrays_ && !mergedReady_)
+        uploadError_ = "the merged draws could not take the texture arrays";
+    if (uploadFailed()) uploadComplete_ = false;
     restoreState(gl_, clipControl_, saved);
     if (uploadFailed())
         logf("baked: GPU upload STOPPED at texture %zu of %zu -- %s", nextTexture_,

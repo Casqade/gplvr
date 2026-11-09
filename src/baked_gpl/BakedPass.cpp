@@ -439,6 +439,7 @@ bool fillGlApi(baked::GlApi& g) {
     BAKED_EXT(getTextureHandle, "glGetTextureHandleARB");
     BAKED_EXT(makeTextureHandleResident, "glMakeTextureHandleResidentARB");
     BAKED_EXT(makeTextureHandleNonResident, "glMakeTextureHandleNonResidentARB");
+    BAKED_EXT(isTextureHandleResident, "glIsTextureHandleResidentARB");
     BAKED_EXT(genQueries, "glGenQueries");
     BAKED_EXT(deleteQueries, "glDeleteQueries");
     BAKED_EXT(queryCounter, "glQueryCounter");
@@ -455,6 +456,8 @@ bool fillGlApi(baked::GlApi& g) {
     BAKED_EXT(clientWaitSync, "glClientWaitSync");
     BAKED_EXT(deleteSync, "glDeleteSync");
     BAKED_EXT(bufferStorage, "glBufferStorage");
+    BAKED_EXT(texStorage3D, "glTexStorage3D");
+    BAKED_EXT(texSubImage3D, "glTexSubImage3D");
 #undef BAKED_CORE
 #undef BAKED_EXT
     return true;
@@ -528,6 +531,7 @@ bool ensureRenderer(State& s) {
         s.glFilled = false;  // extension entry points are per context
         if (!fillGl(s)) return false;
         std::string error;
+        s.renderer.setTextureArrays(g_options.textureLimitFix);
         if (!s.renderer.init(s.gl, error)) {
             logf("baked: the renderer could not start (%s) -- the game draws the track itself",
                  error.c_str());
@@ -739,7 +743,16 @@ void sayOverlayLost(State& s, OverlayLost why) {
 // scene restarts the renderer (as when a scene drops). GPL draws this track. `brief` is the
 // reason in a few words, for the VR menu.
 void stopUpload(State& s, const char* why, const char* brief) {
-    s.renderer.release(s.context && s.wglGetCurrentContext() == s.context);
+    bool contextAlive = s.context && s.wglGetCurrentContext() == s.context;
+    s.renderer.release(contextAlive);
+    if (contextAlive) {
+        size_t carHandles = s.cars.residentHandles();
+        s.cars.dropSceneTextures();
+        if (carHandles)
+            logf("baked cars: %zu handles of an earlier track's car textures released, as GPL draws "
+                 "this track; the buffers stay for the next one",
+                 carHandles);
+    }
     s.ready = false;
     s.context = nullptr;
     s.stoppedGeneration = trackBakeSceneGeneration();
@@ -948,8 +961,8 @@ bool beginPass(State& s, SceneParams* params, bool mirror) {
         if (s.renderer.uploadedGeometryBytes()) trackBakeDropGeometry();
         if (!uploaded) {
             if (s.renderer.uploadFailed())
-                stopUpload(s, "a texture could not be read again (the line above)",
-                           "a track texture could not be read");
+                stopUpload(s, "a texture could not be read again or used (the line above)",
+                           "a track texture could not be loaded");
             return false;
         }
         logf("baked: GPU upload done -- %.0f MiB of address space free",

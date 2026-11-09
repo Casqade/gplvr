@@ -2544,6 +2544,7 @@ void loadOptions(const char* fileName) {
     g_options.glTrace = GetPrivateProfileIntA("gplvr", "glTrace", 0, path);
     if (g_options.glTrace < 0) g_options.glTrace = 0;
     if (g_options.glTrace > 2) g_options.glTrace = 2;
+    g_options.textureLimitFix = GetPrivateProfileIntA("gplvr", "textureLimitFix", 0, path) != 0;
     g_options.profileWorkWait =
         GetPrivateProfileIntA("gplvr", "profileWorkWait", 0, path) != 0 ||
         g_options.profileStages;
@@ -2884,6 +2885,9 @@ void loadOptions(const char* fileName) {
                                   : "the driver's GL debug messages are logged, and every step of "
                                     "the first 300 frames from the first baked pass is finished "
                                     "on the GPU and logged -- slow");
+    logf("options: textureLimitFix=%d (%s)", g_options.textureLimitFix ? 1 : 0,
+         g_options.textureLimitFix ? "the baked track's textures share one handle per array"
+                                   : "every baked track texture has its own handle");
     logf("options: profileWorkWait=%d profileStallUs=%d (%s)",
          g_options.profileWorkWait ? 1 : 0, g_options.profileStallUs,
          g_options.profileWorkWait

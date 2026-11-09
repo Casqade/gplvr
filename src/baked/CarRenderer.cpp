@@ -626,6 +626,18 @@ void CarRenderer::resetScene() {
     storeOff_ = false;
 }
 
+void CarRenderer::dropSceneTextures() {
+    if (!initialised_) return;
+    resetScene();
+    releaseMirrorCopy();
+    mirrorSource_ = 0;
+    discardOverlay();
+    prepared_ = false;
+    commands_.clear();
+    // The next prepare takes its generation as new, with nothing left to reset.
+    haveGeneration_ = false;
+}
+
 void CarRenderer::ensureDrawIndices(uint32_t count) {
     if (count <= drawIndexCapacity_) return;
     uint32_t capacity = std::max(drawIndexCapacity_ * 2, std::max(count, kInitialDrawIndices));
@@ -739,7 +751,14 @@ void CarRenderer::uploadTexture(const Texture& texture, GpuTexture& out) {
     if (anisotropy_ > 1 && !out.indexed)
         gl_.texParameteri(gl::kTexture2D, gl::kTextureMaxAnisotropy, anisotropy_);
     out.handle = gl_.getTextureHandle(out.name);
-    if (out.handle) gl_.makeTextureHandleResident(out.handle);
+    if (out.handle) {
+        out.handle = makeResidentChecked(gl_, out.handle);
+        if (!out.handle && ++refusedHandles_ <= 8)
+            logf("baked cars: the driver did not keep texture %s's handle resident (%zu resident, "
+                 "%u refused so far) -- its polygons are drawn in its average colour, a sprite not "
+                 "at all",
+                 texture.name.c_str(), residentHandles(), refusedHandles_);
+    }
 }
 
 // The GPU copy of CarScene::textures[index], uploaded the first time a draw names it; null for
@@ -2001,7 +2020,12 @@ int CarRenderer::setLiveMirror(GLuint texture, bool flipT) {
         releaseMirrorCopy();
         return kLiveMirrorNoCopy;
     }
-    gl_.makeTextureHandleResident(mirrorHandle_);
+    mirrorHandle_ = makeResidentChecked(gl_, mirrorHandle_);
+    if (!mirrorHandle_) {
+        logf("baked cars: the driver did not keep the mirror copy's handle resident -- no copy");
+        releaseMirrorCopy();
+        return kLiveMirrorNoCopy;
+    }
     return kLiveMirrorReady;
 }
 
