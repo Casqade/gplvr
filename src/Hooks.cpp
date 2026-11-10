@@ -1823,12 +1823,13 @@ void __cdecl sceneRenderHook(void* params) {
     frameBudgetSceneEnd();
 }
 
-// -- ChangeDisplaySettings -------------------------------------------------
+// -- ChangeDisplaySettings, ClipCursor, SetWindowPos ------------------------
 //
-// The pass-through paths below MUST NOT call the imported ChangeDisplaySettings* /
-// ClipCursor names directly: those go through this DLL's own import table, which the
-// IAT patcher would happily redirect back into these hooks -- infinite recursion.
-// Resolve the real entry points from user32 once and call those.
+// ChangeDisplaySettings* and ClipCursor are blocked outright. SetWindowPos passes through,
+// and it, like gplvr's own ClipCursor and SetWindowPos calls elsewhere, MUST NOT call the
+// imported names directly: those go through this DLL's own import table, which the IAT
+// patcher would happily redirect back into these hooks -- infinite recursion. Resolve the
+// real entry points from user32 once and call those.
 
 HMODULE g_selfModule = nullptr;
 
@@ -1849,71 +1850,29 @@ Fn realUser32(const char* name) {
 }
 
 LONG WINAPI changeDisplaySettingsAHook(DEVMODEA* mode, DWORD flags) {
-    ApiGuard guard;
-    if (guard.reentered) {
-        logf("re-entry into changeDisplaySettingsAHook -- passing through inert");
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-
-    {
-        logf("blocked ChangeDisplaySettingsA(%s, flags=%08X)",
-             mode ? "mode" : "restore-defaults", flags);
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-    return realUser32<decltype(&ChangeDisplaySettingsA)>("ChangeDisplaySettingsA")(
-        mode, flags);
+    logf("blocked ChangeDisplaySettingsA(%s, flags=%08X)",
+         mode ? "mode" : "restore-defaults", flags);
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
-LONG WINAPI changeDisplaySettingsWHook(DEVMODEW* mode, DWORD flags) {
-    ApiGuard guard;
-    if (guard.reentered) {
-        logf("re-entry into changeDisplaySettingsWHook -- passing through inert");
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-
-    {
-        logf("blocked ChangeDisplaySettingsW(flags=%08X)", flags);
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-    return realUser32<decltype(&ChangeDisplaySettingsW)>("ChangeDisplaySettingsW")(
-        mode, flags);
+LONG WINAPI changeDisplaySettingsWHook(DEVMODEW*, DWORD flags) {
+    logf("blocked ChangeDisplaySettingsW(flags=%08X)", flags);
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
-LONG WINAPI changeDisplaySettingsExAHook(LPCSTR device, DEVMODEA* mode, HWND window,
-                                         DWORD flags, LPVOID param) {
-    ApiGuard guard;
-    if (guard.reentered) {
-        logf("re-entry into changeDisplaySettingsExAHook -- passing through inert");
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-
-    {
-        if (mode)
-            logf("blocked ChangeDisplaySettingsExA -> %ux%u @%u Hz, %u bpp, flags=%08X",
-                 mode->dmPelsWidth, mode->dmPelsHeight, mode->dmDisplayFrequency,
-                 mode->dmBitsPerPel, flags);
-        else
-            logf("blocked ChangeDisplaySettingsExA -> restore defaults, flags=%08X", flags);
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-    return realUser32<decltype(&ChangeDisplaySettingsExA)>("ChangeDisplaySettingsExA")(
-        device, mode, window, flags, param);
+LONG WINAPI changeDisplaySettingsExAHook(LPCSTR, DEVMODEA* mode, HWND, DWORD flags, LPVOID) {
+    if (mode)
+        logf("blocked ChangeDisplaySettingsExA -> %ux%u @%u Hz, %u bpp, flags=%08X",
+             mode->dmPelsWidth, mode->dmPelsHeight, mode->dmDisplayFrequency,
+             mode->dmBitsPerPel, flags);
+    else
+        logf("blocked ChangeDisplaySettingsExA -> restore defaults, flags=%08X", flags);
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
-LONG WINAPI changeDisplaySettingsExWHook(LPCWSTR device, DEVMODEW* mode, HWND window,
-                                         DWORD flags, LPVOID param) {
-    ApiGuard guard;
-    if (guard.reentered) {
-        logf("re-entry into changeDisplaySettingsExWHook -- passing through inert");
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-
-    {
-        logf("blocked ChangeDisplaySettingsExW(flags=%08X)", flags);
-        return DISP_CHANGE_SUCCESSFUL;
-    }
-    return realUser32<decltype(&ChangeDisplaySettingsExW)>("ChangeDisplaySettingsExW")(
-        device, mode, window, flags, param);
+LONG WINAPI changeDisplaySettingsExWHook(LPCWSTR, DEVMODEW*, HWND, DWORD flags, LPVOID) {
+    logf("blocked ChangeDisplaySettingsExW(flags=%08X)", flags);
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
 void applyPendingSceneRenderHook() {
@@ -2006,20 +1965,10 @@ void applyPendingSceneRenderHook() {
 }
 
 BOOL WINAPI clipCursorHook(const RECT* rect) {
-    ApiGuard guard;
-    if (guard.reentered) {
-        logf("re-entry into clipCursorHook -- passing through inert");
-        return TRUE;
-    }
-
-
-    {
-        if (rect)
-            logf("blocked ClipCursor(%d,%d..%d,%d)", rect->left, rect->top, rect->right,
-                 rect->bottom);
-        return TRUE;
-    }
-    return realUser32<decltype(&ClipCursor)>("ClipCursor")(rect);
+    if (rect)
+        logf("blocked ClipCursor(%d,%d..%d,%d)", rect->left, rect->top, rect->right,
+             rect->bottom);
+    return TRUE;
 }
 
 // roglv2's WindowManager::SetSize is the one that asks:
