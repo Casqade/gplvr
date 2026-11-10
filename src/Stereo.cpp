@@ -197,6 +197,10 @@ struct State {
 
     // The viewed car's team, asked only when the driver index changes.
     int         paneDriver = -1000;
+    // The team gpl_driverGetTeamIndex reported for paneDriver (negative when it could not be
+    // read), and that team's cockpit node when the glasses were last derived (0: not loaded).
+    int         paneReportedTeam = -1000;
+    uintptr_t   paneCockpit = 0;
     int         paneTeam = kTeamLotus;
     const char* paneTeamFallback = nullptr;
     bool        teamCodeChecked = false;
@@ -986,9 +990,10 @@ int callDriverGetTeamIndex(int driver) {
 }
 
 // The viewed car's glass geometry. Lotus when the team cannot be read, with the reason in
-// paneTeamFallback. `changed` is set when the driver index moved, which is the only time the
-// game is asked, or when the car set changed under the same driver. Each ask also selects the
-// car's mirror aim (MirrorConfig); without a viewed car the last car's aim stays.
+// paneTeamFallback. The team is asked for every frame; `changed` is set when the driver, its
+// team (the player picking another car keeps the driver index), that team's cockpit node (a
+// model loaded or reloaded) or the car set changed. Each change also selects the car's mirror
+// aim (MirrorConfig); without a viewed car the last car's aim stays.
 //
 // The derived surfaces, the two glasses the pair of panes is aimed from when they share one
 // mirror.mip, and the one glass per surface they are aimed from when each has a texture.
@@ -1117,21 +1122,6 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
         return kPaneGeometry[s.paneTeam];
     }
     int driver = *reinterpret_cast<const int*>(driverAt);
-    if (driver == s.paneDriver) {
-        // THE SAME CAR IS NOT THE SAME MODEL. mod_teamModelLoadIfNeeded can reload a team's
-        // model under a driver index that never moves, which puts a different cockpit node in
-        // the team record and leaves every material node address this derived pointing at
-        // memory that has been freed. One dword a frame says so, and the walk is redone.
-        if (!g_derivedActive || g_derivedTeam < 0 ||
-            mirrorGeometryCockpit(g_derivedTeam) == g_derivedSet.cockpit)
-            return kPaneGeometry[s.paneTeam];
-        logf("mirror: team %d's model was reloaded -- its cockpit node moved, so the glasses "
-             "and the mirror textures are derived again",
-             g_derivedTeam);
-    }
-
-    s.paneDriver = driver;
-    changed = true;
 
     if (!s.teamCodeChecked) {
         s.teamCodeChecked = true;
@@ -1159,6 +1149,28 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
                 fallback = "the team index is outside the 1967 table (another carset?)";
         }
     }
+
+    // THE SAME DRIVER IS NOT THE SAME CAR, AND THE SAME CAR IS NOT THE SAME MODEL. Picking
+    // another car in the front end changes the player's team under a driver index that stays.
+    // mod_teamModelLoadIfNeeded can load or reload a team's model, which puts a different
+    // cockpit node in the team record and leaves every material node address derived from the
+    // old one pointing at freed memory. One dword a frame says so, and the walk is redone.
+    uintptr_t cockpit = team >= 0 ? mirrorGeometryCockpit(team) : 0;
+    if (driver == s.paneDriver && team == s.paneReportedTeam && cockpit == s.paneCockpit)
+        return kPaneGeometry[s.paneTeam];
+    if (driver == s.paneDriver && team != s.paneReportedTeam)
+        logf("mirror: driver %d's team changed %d -> %d -- another car was picked, so its glasses "
+             "and aim are taken",
+             driver, s.paneReportedTeam, team);
+    else if (driver == s.paneDriver)
+        logf("mirror: team %d's cockpit node moved %08X -> %08X -- its model was loaded or "
+             "reloaded, so the glasses and the mirror textures are derived again",
+             team, static_cast<unsigned>(s.paneCockpit), static_cast<unsigned>(cockpit));
+
+    s.paneDriver = driver;
+    s.paneReportedTeam = team;
+    s.paneCockpit = cockpit;
+    changed = true;
 
     if (driver >= 0 && driver < kDriverSlots) mirrorConfigViewedTeam(team, fallback);
 
