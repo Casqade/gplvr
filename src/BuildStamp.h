@@ -6,7 +6,7 @@ namespace gplvr {
 // (tools/BuildStamp.cmake), so it names the link that produced the binary.
 const char* buildStamp();
 
-// The release version, from `project(gplvr VERSION ...)` in CMakeLists.txt -- "1.0".
+// The release version, from `project(gplvr VERSION ...)` in CMakeLists.txt, e.g. "1.1".
 const char* buildVersion();
 
 // The commit the build was made from, short form, with "+" when the working tree had changes to
