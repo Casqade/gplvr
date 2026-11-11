@@ -65,6 +65,7 @@ Recommended (VR):
 
 - Left and right VR controllers behave identically, use the one you prefer
 - Press grip button to open VR menu. Use Help button on the top right menu corner to learn VR controls
+- If you don't have a VR controller, use `CTRL+M` to open VR menu and navigate it using arrows and Enter/Esc
 
 
 ## Playtesting
@@ -96,7 +97,7 @@ If you're having trouble with any step or understanding its phrasing, feel free 
 ## Installation
 
 1. Download latest GPLVR from [Releases](https://github.com/Casqade/gplvr/releases/latest) section
-2. Unpack archive contents into your GPL directory so the full path to `gplvr.exe` resolves as `<path-to-gpl>/gplvr/gplvr.exe`
+2. Unpack archive contents into your GPL directory so the full path to `gplvr.exe` resolves as `<path-to-gpl>/gplvr/gplvr.exe`, **i.e. gplvr files should be in gplvr subdirectory**
 3. Unblock `gplvr.exe`, `gplvr.dll` and `gplvr-xr.exe` (File -> Properties -> Unblock)
 4. Open `core.ini` in your GPL directory and in `[ Rasterizer ]` section set `fullScreen=0`. If you want clearer mirror reflections, also set `MirrorSize=512` in `[RasterV2]` section (it shouldn't affect performance in any way). Save changes
 5. Optional steps:
