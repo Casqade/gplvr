@@ -47,8 +47,13 @@ public:
     // Draws eye 0 or 1 into the given render target. Safe to call only after update()
     // has returned true. `decodeSrgb` converts the game's sRGB pixels to linear first, for a
     // target view that encodes on write.
+    //
+    // `display`, the frustum the runtime located this eye with, lets a stereo frame be placed
+    // inside it by the frustum the game rendered. `placed` then says so, and the
+    // caller submits `display` as the layer's fov instead of the rendered one.
     bool drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                 int eye, bool decodeSrgb);
+                 int eye, bool decodeSrgb, const SharedFov* display = nullptr,
+                 bool* placed = nullptr);
 
     // The poses the current frame was rendered from. False means the game is not
     // tracking yet, in which case the caller should fall back to the located views --
@@ -213,10 +218,14 @@ private:
     };
 
     // The blit both drawEye and drawGplMenu end in: `rect` of the current frame (fractions of
-    // the texture, image space) into the target, covering coverX x coverY of it.
+    // the texture, image space) into the target, covering coverX x coverY of it. `place`, when
+    // given, maps the target's coordinates into the rect's afterwards (scale xy, offset zw), and
+    // what falls outside the rect is black.
     bool blitFrame(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                   const float rect[4], float coverX, float coverY, bool decodeSrgb);
+                   const float rect[4], float coverX, float coverY, bool decodeSrgb,
+                   const float* place = nullptr);
 
+    bool     loggedPlacement_ = false;
     Slot     slots_[kFrameSlots] = {};
     Slot     hudSlots_[kFrameSlots] = {};
     int32_t  hudGeneration_ = 0;

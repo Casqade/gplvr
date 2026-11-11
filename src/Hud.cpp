@@ -268,6 +268,17 @@ int remapAnchor(int x, int fullWidth) {
 // vrAcquireEyes with the poses, and it is the user's real one. Without a tracked frame
 // there is no separation to use and no headset to be uncomfortable in, so the disparity
 // is zero and the two copies are identical.
+// stereoEyeCentreShift for both eyes, rounded to the pixels the 2D calls take.
+void eyeCentreShifts(int x[2], int y[2]) {
+    for (int eye = 0; eye < 2; ++eye) {
+        float dx = 0.0f;
+        float dy = 0.0f;
+        stereoEyeCentreShift(eye, dx, dy);
+        x[eye] = static_cast<int>(std::lround(dx));
+        y[eye] = static_cast<int>(std::lround(dy));
+    }
+}
+
 int disparityPixels(int eyeWidth) {
     if (g_options.vrGplTextDepth <= 0.0f) return 0;
 
@@ -357,8 +368,14 @@ void emit(const Call& call) {
 
     // y needs no anchor remap: each eye is the full height of the buffer, and a sub-rect
     // instance already offsets into the root by its own origin.
-    g_original(left, call.colour, x + disparity / 2, y, call.text, call.background);
-    g_original(right, call.colour, x - disparity / 2, y, call.text, call.background);
+    // Each eye's copy moves with where straight ahead lands in that eye (stereoEyeCentreShift).
+    int shiftX[2] = {};
+    int shiftY[2] = {};
+    eyeCentreShifts(shiftX, shiftY);
+    g_original(left, call.colour, x + disparity / 2 + shiftX[0], y + shiftY[0], call.text,
+               call.background);
+    g_original(right, call.colour, x - disparity / 2 + shiftX[1], y + shiftY[1], call.text,
+               call.background);
 }
 
 // -- THE OTHER 2D ENTRY POINTS ---------------------------------------------------------
@@ -649,11 +666,14 @@ int __cdecl bitmapDrawThunk(int source, int x, int y, int dest) {
 
     // The EYE goes in the first argument, which is the one the pixels land in, and `dest` keeps
     // the surface being read. Swapping these drew each eye's image into the art instead of the
-    // art into each eye.
-    g_bitmapDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)), outX + half, outY,
-                         dest);
+    // art into each eye. Each copy moves with where straight ahead lands in its eye.
+    int shiftX[2] = {};
+    int shiftY[2] = {};
+    eyeCentreShifts(shiftX, shiftY);
+    g_bitmapDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(left)),
+                         outX + half + shiftX[0], outY + shiftY[0], dest);
     return g_bitmapDrawOriginal(static_cast<int>(reinterpret_cast<intptr_t>(right)),
-                                outX - half, outY, dest);
+                                outX - half + shiftX[1], outY + shiftY[1], dest);
 }
 
 void __cdecl drawDebugTextThunk(void* surface, unsigned colour, int x, int y,

@@ -8,6 +8,7 @@
 #include "FlatFrames.h"
 #include "FlatTarget.h"
 #include "FrameBudget.h"
+#include "FrameHold.h"
 #include "FrameTrace.h"
 #include "GlTrace.h"
 #include "Hud.h"
@@ -148,6 +149,12 @@ const char* mirrorModeText(int mode) {
 // presenter side-by-side anyway made it cut the menu in half and blow one half up to
 // fill the headset. What matters is whether THIS frame has two eyes in it.
 bool      g_stereoRenderedFrame = false;
+// Set by the scene hook when GPL's own single render ran instead: one image over the buffer.
+bool      g_monoSceneThisFrame = false;
+// Whether the off-screen buffer still holds the last stereo pair as it was published: set by a
+// published pair, cleared by anything mono that reaches the buffer (a mono render, GPL's static,
+// the front end). What a race frame without a world render is held on.
+bool      g_pairInBuffer = false;
 bool      g_warnedLateTick = false;
 
 // Set the instant the headset's copy of the frame is taken, cleared when the next scene
@@ -1396,6 +1403,9 @@ int __cdecl screenDisplayHook(void* surface) {
         bool staticLeftOver = !noSignal && g_noSignal.since &&
                               !g_stereoRenderedFrame && !windowInFrontEnd();
         if (noSignal || staticLeftOver) {
+            // The static is over the pair, or in a race was cleared out of the target with it.
+            g_pairInBuffer = false;
+            frameHoldNoteOutcome(FrameOutcome::Other);
             ULONGLONG nowMs = GetTickCount64();
             if (noSignal) {
                 if (!g_noSignal.since) {
@@ -1484,25 +1494,44 @@ int __cdecl screenDisplayHook(void* surface) {
                 g_noSignal = NoSignalEpisode{};
             }
 
-            int eyeRect[2][4];
-            bool pairStillInBuffer = g_lastFrameWasStereo && stereoEyeRect(0, eyeRect[0]) &&
-                                     stereoEyeRect(1, eyeRect[1]);
-            bool publishAsPair = g_stereoRenderedFrame || pairStillInBuffer;
-            if (!g_stereoRenderedFrame && pairStillInBuffer && g_heldPairReports > 0) {
-                --g_heldPairReports;
-                logf("vr: no scene render this frame, but the eye targets are intact and the "
-                     "last frame was a tracked pair -- published as side-by-side so each eye "
-                     "samples its own rect. The head pose is cleared, so this frame holds "
-                     "still. If this repeats for more than a moment the picture is frozen and "
-                     "the cause is upstream: GPL drew no world.");
+            int  eyeRect[2][4];
+            bool rectsIntact = stereoEyeRect(0, eyeRect[0]) && stereoEyeRect(1, eyeRect[1]);
+            bool inRace = !windowInFrontEnd();
+            if (!inRace) g_pairInBuffer = false;
+            // No world render, and nothing mono over the last pair: the frame IS that pair.
+            bool noRenderOverPair = !g_stereoRenderedFrame && !g_monoSceneThisFrame &&
+                                    g_pairInBuffer && rectsIntact && inRace;
+            if (noRenderOverPair) {
+                // Nothing published: the presenter keeps submitting the last frame with the pose
+                // it was rendered from, which the runtime reprojects like any dropped frame.
+                // Published, the first such frame went out as a held pair without a pose (glued
+                // to the head) and the next ones as one image, both eyes' pictures in each eye.
+                frameTracePublish("HELD, GPL rendered no world; the last pair stays in the headset",
+                                  false, false);
+                frameHoldNoteOutcome(FrameOutcome::HeldNoRender);
+            } else {
+                bool pairStillInBuffer = g_lastFrameWasStereo && rectsIntact;
+                bool publishAsPair = g_stereoRenderedFrame || pairStillInBuffer;
+                if (!g_stereoRenderedFrame && pairStillInBuffer && g_heldPairReports > 0) {
+                    --g_heldPairReports;
+                    logf("vr: no scene render this frame, but the eye targets are intact and the "
+                         "last frame was a tracked pair -- published as side-by-side so each eye "
+                         "samples its own rect. The head pose is cleared, so this frame holds "
+                         "still. If this repeats for more than a moment the picture is frozen and "
+                         "the cause is upstream: GPL drew no world.");
+                }
+                presenterFrame(publishAsPair, vrFrustumInjected());
+                g_publishedAny = true;
+                frameTracePublish(!publishAsPair         ? "published as one image"
+                                  : g_stereoRenderedFrame ? "published as a pair"
+                                                          : "published as a HELD PAIR: no world was "
+                                                            "rendered, the buffer's last pair went out",
+                                  publishAsPair, vrFrustumInjected());
+                frameHoldNoteOutcome(g_stereoRenderedFrame ? FrameOutcome::Rendered
+                                                           : FrameOutcome::Other);
+                // Anything but a rendered pair -- a mono render, a menu -- is not the pair.
+                g_pairInBuffer = g_stereoRenderedFrame;
             }
-            presenterFrame(publishAsPair, vrFrustumInjected());
-            g_publishedAny = true;
-            frameTracePublish(!publishAsPair         ? "published as one image"
-                              : g_stereoRenderedFrame ? "published as a pair"
-                                                      : "published as a HELD PAIR: no world was "
-                                                        "rendered, the buffer's last pair went out",
-                              publishAsPair, vrFrustumInjected());
         }
         noSignalEndFrame();
         // WHAT THE HEADSET HAS ALREADY BEEN GIVEN. Anything drawn after this point
@@ -1516,6 +1545,7 @@ int __cdecl screenDisplayHook(void* surface) {
         // The same answer decides whether the next frame's latch is paced.
         renderPacingEndFrame(g_lastFrameWasStereo && vrFrustumInjected());
         g_stereoRenderedFrame = false;
+        g_monoSceneThisFrame = false;
     }
 
     // The window is a monitor of the off-screen frame, not the frame itself. Between
@@ -1808,10 +1838,12 @@ void __cdecl sceneRenderHook(void* params) {
     float savedFov = scene->mainFov;
     bool  fovCorrected = !g_options.vr && windowCorrectMainFov(savedFov, scene->mainFov);
 
-    if (g_options.vr && stereoRender(scene, &callOriginalSceneRender))
+    if (g_options.vr && stereoRender(scene, &callOriginalSceneRender)) {
         g_stereoRenderedFrame = true;
-    else
+    } else {
         callOriginalSceneRender(params);
+        g_monoSceneThisFrame = true;
+    }
     mirrorTargetEndScene();
     // GPL's 3D view has been repainted, which in flat mode paints over the replay bands' area
     // too; the replay panel's next capture starts empty to match.
@@ -2715,6 +2747,7 @@ void loadOptions(const char* fileName) {
     logf("options: debugKeys=%d (%s)", g_options.debugKeys ? 1 : 0,
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
                              : "no hotkey is polled; the VR menu has every setting they toggle");
+    vrFovLoadOptions(path);
 
     logf("build: GPLVR_MIRROR_SKIP_OUT_OF_VIEW=%d (%s) GPLVR_MIRROR_COPY_REBIND=%d",
          kMirrorSkipOutOfView ? 1 : 0,

@@ -42,7 +42,21 @@ struct VrEye {
     // aspect is the engine's stretch factor, where 1 means square pixels.
     float fov = 0.0f;
     float aspect = 1.0f;
+
+    // The principal point to write into the eye camera, normalised as GPL's projection uses it
+    // (gpl_cameraRebuildProjection 0x4C7DA0: screen x = cx - cot(fov/2) * left/forward, screen y
+    // = cy - ... * up/forward, edges at +/-1, y growing down). Where straight ahead lands in the
+    // eye's picture: 0, 0 for a centred frustum and with vrAsymmetricFovFix = 0.
+    float principalX = 0.0f;
+    float principalY = 0.0f;
+
+    // The full horizontal angle of a centred cone that holds the whole frustum, for tests that
+    // ask whether something is in view. Equal to fov for a centred frustum.
+    float coverFov = 0.0f;
 };
+
+// vrAsymmetricFovFix from gplvr.ini (Hooks.h), logged.
+void vrFovLoadOptions(const char* path);
 
 // Reads the newest views the presenter published and converts them. False means VR is
 // off, the presenter has not published yet, or the sample was caught mid-write -- in

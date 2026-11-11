@@ -1682,15 +1682,24 @@ int wmain(int argc, wchar_t** argv) {
                         // eye stays, because a blue left eye and a red right eye say
                         // "waiting for the game" far more clearly than black does.
                         bool drawn = false;
+                        // Set when the eye was placed inside the display's own frustum, which
+                        // is then the fov this layer view is submitted with.
+                        bool placedInDisplay = false;
                         if (presenting && gplPanelOn) {
                             const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                             context->ClearRenderTargetView(target, black);
                             drawn = true;
                         } else if (presenting) {
+                            SharedFov display;
+                            display.angleLeft = views[i].fov.angleLeft;
+                            display.angleRight = views[i].fov.angleRight;
+                            display.angleUp = views[i].fov.angleUp;
+                            display.angleDown = views[i].fov.angleDown;
                             drawn = consumer.drawEye(target, eyes[i].width,
                                                      eyes[i].height,
                                                      static_cast<int>(i),
-                                                     eyes[i].decodeSrgb);
+                                                     eyes[i].decodeSrgb, &display,
+                                                     &placedInDisplay);
                         }
                         if (!drawn) context->ClearRenderTargetView(target, base[i]);
 
@@ -1779,9 +1788,10 @@ int wmain(int argc, wchar_t** argv) {
                                                                 source.pose.positionY,
                                                                 source.pose.positionZ};
 
-                            projectionViews[i].fov = {
-                                source.fov.angleLeft, source.fov.angleRight,
-                                source.fov.angleUp, source.fov.angleDown};
+                            if (!placedInDisplay)
+                                projectionViews[i].fov = {
+                                    source.fov.angleLeft, source.fov.angleRight,
+                                    source.fov.angleUp, source.fov.angleDown};
                         }
                         projectionViews[i].subImage.swapchain = eyes[i].swapchain;
                         projectionViews[i].subImage.imageRect.offset = {0, 0};

@@ -24,6 +24,9 @@ cbuffer Blit : register(b0)
     // x: 1 decodes the source from sRGB to linear before writing it.
     // y: gamma, applied to the game's colours first; 1 leaves them alone.
     float4 colour;
+    // xy scale, zw offset: the fitted coordinate is mapped by these afterwards. (1, 1, 0, 0)
+    // leaves it alone; a stereo eye placed inside the display's frustum uses the rest.
+    float4 place;
 };
 
 Texture2D    source : register(t0);
@@ -49,7 +52,7 @@ float4 PixelMain(Varying input) : SV_TARGET
     // Aspect fit about the centre. Anything outside the fitted image is black rather
     // than a stretched edge, so a wrong aspect looks like letterboxing and not like a
     // subtly wrong world.
-    float2 fitted = (input.uv - 0.5) * fit.xy + 0.5;
+    float2 fitted = ((input.uv - 0.5) * fit.xy + 0.5) * place.xy + place.zw;
     if (any(fitted < 0.0) || any(fitted > 1.0))
     {
         return float4(0.0, 0.0, 0.0, 1.0);
@@ -100,6 +103,9 @@ struct BlitConstants {
     float fit[4];
     float rect[4];
     float colour[4];
+    // The shader multiplies by place.xy, so a draw that leaves it zero samples one texel: the
+    // identity is the default for every draw that does not place.
+    float place[4] = {1.0f, 1.0f, 0.0f, 0.0f};
 };
 
 }  // namespace
@@ -415,7 +421,8 @@ bool Consumer::update() {
 }
 
 bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                       int eye, bool decodeSrgb) {
+                       int eye, bool decodeSrgb, const SharedFov* display, bool* placed) {
+    if (placed) *placed = false;
     if (!target || !context_ || !block_ || !sourceWidth_ || !sourceHeight_)
         return false;
 
@@ -480,8 +487,50 @@ bool Consumer::drawEye(ID3D11RenderTargetView* target, uint32_t width, uint32_t 
     // already covers the eye's field of view and its pixel shape is anamorphic on
     // purpose. Fitting it here would letterbox a picture that is already correct.
 
+    // A STEREO EYE GOES WHERE IT WAS RENDERED, INSIDE THE DISPLAY'S OWN FRUSTUM. The swapchain
+    // is then the display's frustum and is submitted as such, so a compositor that ignores a
+    // layer's fov -- SteamVR with a streaming headset showed every picture stretched over the
+    // display's frustum whatever was submitted (2026-11-11) -- shows it right as well. On tangent
+    // planes the map is affine: a target coordinate's direction, then where that direction is in
+    // the rendered picture. x grows right, y down. The same frustum maps to itself.
+    float place[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    bool  placing = false;
+    if (display && current_.sideBySide && current_.stretchToFill &&
+        current_.renderedValid && (eye == 0 || eye == 1)) {
+        const SharedFov& r = current_.rendered[eye].fov;
+        float rl = std::tan(r.angleLeft), rr = std::tan(r.angleRight);
+        float ru = std::tan(r.angleUp), rd = std::tan(r.angleDown);
+        float dl = std::tan(display->angleLeft), dr = std::tan(display->angleRight);
+        float du = std::tan(display->angleUp), dd = std::tan(display->angleDown);
+        if (rr - rl > 1e-4f && ru - rd > 1e-4f && dr - dl > 1e-4f && du - dd > 1e-4f) {
+            place[0] = (dr - dl) / (rr - rl);
+            place[1] = (du - dd) / (ru - rd);
+            place[2] = (dl - rl) / (rr - rl);
+            place[3] = (ru - du) / (ru - rd);
+            placing = true;
+        }
+    }
+
     const float rect[4] = {rectLeft, rectTop, rectWidth, rectHeight};
-    if (!blitFrame(target, width, height, rect, coverX, coverY, decodeSrgb)) return false;
+    if (!blitFrame(target, width, height, rect, coverX, coverY, decodeSrgb,
+                   placing ? place : nullptr))
+        return false;
+    if (placed) *placed = placing;
+    if (placing && eye == 0 &&
+        (std::fabs(place[0] - 1.0f) > 1e-3f || std::fabs(place[1] - 1.0f) > 1e-3f ||
+         std::fabs(place[2]) > 1e-3f || std::fabs(place[3]) > 1e-3f) &&
+        !loggedPlacement_) {
+        loggedPlacement_ = true;
+        logf("present: eye 0 is placed inside the display's frustum -- rendered tan L%.4f R%.4f "
+             "U%.4f D%.4f, display L%.4f R%.4f U%.4f D%.4f, scale %.4f %.4f offset %.4f %.4f; "
+             "the rest of the eye is black and the display's frustum is submitted",
+             std::tan(current_.rendered[0].fov.angleLeft),
+             std::tan(current_.rendered[0].fov.angleRight),
+             std::tan(current_.rendered[0].fov.angleUp),
+             std::tan(current_.rendered[0].fov.angleDown), std::tan(display->angleLeft),
+             std::tan(display->angleRight), std::tan(display->angleUp),
+             std::tan(display->angleDown), place[0], place[1], place[2], place[3]);
+    }
     if (eye == 1)
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&block_->presentedFrames));
     return true;
@@ -527,7 +576,8 @@ bool Consumer::drawGplMenu(ID3D11RenderTargetView* target, uint32_t width, uint3
 }
 
 bool Consumer::blitFrame(ID3D11RenderTargetView* target, uint32_t width, uint32_t height,
-                         const float rect[4], float coverX, float coverY, bool decodeSrgb) {
+                         const float rect[4], float coverX, float coverY, bool decodeSrgb,
+                         const float* place) {
     const uint32_t slot = static_cast<uint32_t>(current_.sequence) % kFrameSlots;
     ID3D11ShaderResourceView* source = slots_[slot].view;
     if (!source) return false;
@@ -548,6 +598,10 @@ bool Consumer::blitFrame(ID3D11RenderTargetView* target, uint32_t width, uint32_
     constants.rect[3] = rect[3];
     constants.colour[0] = decodeSrgb ? 1.0f : 0.0f;
     constants.colour[1] = block_->gamma;
+    constants.place[0] = place ? place[0] : 1.0f;
+    constants.place[1] = place ? place[1] : 1.0f;
+    constants.place[2] = place ? place[2] : 0.0f;
+    constants.place[3] = place ? place[3] : 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context_->Map(constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))

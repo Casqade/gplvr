@@ -181,6 +181,12 @@ bool stereoSourceCarvedSize(int& width, int& height);
 // drops -- so a caller that needs the runtime's real IPD cannot silently get a stale one.
 bool stereoEyeGeometry(float& fov, float& separation);
 
+// Where straight ahead lands in an eye's picture, in that eye's pixels from its centre (x right,
+// y down): the eye camera's principal point. 2D drawn into the eyes relative to the picture's
+// centre moves by it, so it keeps one direction in both eyes. 0, 0 for a centred frustum, and
+// before a tracked frame.
+void stereoEyeCentreShift(int eye, float& dx, float& dy);
+
 
 // Re-apply the eye frustum to `camera`, if it is one of ours.
 //

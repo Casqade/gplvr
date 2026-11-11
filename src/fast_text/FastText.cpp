@@ -1234,9 +1234,14 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
         // The left eye's copy goes right of centre and the right eye's left of centre, which is
         // convergent and pulls the text toward the viewer.
         float shift = static_cast<float>(eye == 0 ? disparity : -disparity) * 0.5f;
+        // Placed from where straight ahead lands in this eye, which is off the picture's centre
+        // when the eye's frustum is rendered off-centre.
+        float centreX = 0.0f;
+        float centreY = 0.0f;
+        stereoEyeCentreShift(eye, centreX, centreY);
 
-        float x0 = ex + 0.5f * ew + placedX + shift + offsetX;
-        float rasterY = ey + 0.5f * eh + placedY + offsetY;
+        float x0 = ex + 0.5f * ew + centreX + placedX + shift + offsetX;
+        float rasterY = ey + 0.5f * eh + centreY + placedY + offsetY;
 
         // A GLYPH THAT LEAVES ITS OWN EYE IS DROPPED, NOT CLAMPED. The off-screen target's two
         // eye rects are adjacent, so a quad hanging off one edge is drawn into the other eye's

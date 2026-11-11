@@ -125,7 +125,12 @@ struct State {
     // can put it back after sceneRender overwrites it.
     float pendingFov[2] = {0.0f, 0.0f};
     float pendingAspect[2] = {0.0f, 0.0f};
+    // Each eye's principal point (VrEye::principalX/Y), written with the frustum at bind.
+    float pendingPrincipal[2][2] = {};
+    // The same, from the last tracked frame, for 2D drawn into the eyes (stereoEyeCentreShift).
+    float eyePrincipal[2][2] = {};
     bool  pendingValid[2] = {false, false};
+    bool  loggedPrincipal = false;
     bool  loggedReapply = false;
     bool  loggedFlatFrustum = false;
     float loggedMainCx = 999.0f;
@@ -262,6 +267,17 @@ void cameraCentrePrincipalPoint(void* camera) {
     auto bytes = static_cast<unsigned char*>(camera);
     *reinterpret_cast<float*>(bytes + kCameraCx) = 0.0f;
     *reinterpret_cast<float*>(bytes + kCameraCy) = 0.0f;
+    bytes[kCameraDirty] = 1;
+}
+
+// A principal point in GPL's normalised units, stored the way gpl_cameraSetPrincipalPoint
+// (0x4C7D60) stores it: multiplied by the half extents.
+void cameraPlacePrincipalPoint(void* camera, float cx, float cy) {
+    auto bytes = static_cast<unsigned char*>(camera);
+    *reinterpret_cast<float*>(bytes + kCameraCx) =
+        cx * *reinterpret_cast<const float*>(bytes + kCameraHalfWExtent);
+    *reinterpret_cast<float*>(bytes + kCameraCy) =
+        cy * *reinterpret_cast<const float*>(bytes + kCameraHalfHExtent);
     bytes[kCameraDirty] = 1;
 }
 
@@ -1282,10 +1298,21 @@ void stereoOnCameraBind(void* camera) {
         // cameraBind. The fov half was put back from Phase 2 onward and the principal
         // point was left as the game set it -- which, for the cockpit view, is offset
         // vertically by about an eighth of half-height, and pitched the whole VR image
-        // down by nine degrees for nine sessions. A headset frustum is symmetric about
-        // the eye; anything but centre is simply wrong here, so there is nothing to
-        // choose between.
-        cameraCentrePrincipalPoint(camera);
+        // down by nine degrees for nine sessions. The eye's own principal point replaces
+        // GPL's: the centre for a centred frustum, and where the runtime's frustum is
+        // centred for an off-centre one with vrAsymmetricFovFix.
+        float cx = g_state.pendingPrincipal[pass][0];
+        float cy = g_state.pendingPrincipal[pass][1];
+        if (cx != 0.0f || cy != 0.0f)
+            cameraPlacePrincipalPoint(camera, cx, cy);
+        else
+            cameraCentrePrincipalPoint(camera);
+        if ((cx != 0.0f || cy != 0.0f) && !g_state.loggedPrincipal) {
+            g_state.loggedPrincipal = true;
+            logf("stereo: eye %d's principal point written at bind -- cx %.4f cy %.4f, stored "
+                 "%.2f %.2f px",
+                 pass, cx, cy, cameraFloat(camera, kCameraCx), cameraFloat(camera, kCameraCy));
+        }
 
         if (!g_state.loggedReapply) {
             g_state.loggedReapply = true;
@@ -1365,6 +1392,16 @@ bool stereoEyeGeometry(float& fov, float& separation) {
     fov = g_state.eyeFov;
     separation = g_state.eyeSeparation;
     return fov > 0.0f && separation > 0.0f;
+}
+
+void stereoEyeCentreShift(int eye, float& dx, float& dy) {
+    dx = 0.0f;
+    dy = 0.0f;
+    if (eye < 0 || eye > 1 || !g_state.geometryValid) return;
+    int rect[4];
+    if (!stereoEyeRect(eye, rect)) return;
+    dx = g_state.eyePrincipal[eye][0] * static_cast<float>(rect[2]) * 0.5f;
+    dy = g_state.eyePrincipal[eye][1] * static_cast<float>(rect[3]) * 0.5f;
 }
 
 bool stereoMirrorOnlyPass() { return g_state.mirrorOnly; }
@@ -1818,6 +1855,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
         float dz = vr[0].offset[2] - vr[1].offset[2];
         g_state.eyeFov = vr[0].fov;
         g_state.eyeSeparation = std::sqrt(dx * dx + dy * dy + dz * dz);
+        for (int eye = 0; eye < 2; ++eye) {
+            g_state.eyePrincipal[eye][0] = vr[eye].principalX;
+            g_state.eyePrincipal[eye][1] = vr[eye].principalY;
+        }
     }
 
     // No poses, no split. Returning false sends the caller to the game's own single
@@ -2049,14 +2090,15 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
                 bool any = false;
                 for (int i = 0; i < mirrorUvCount() && !any; ++i)
                     any = paneInView(paneFrame, g_surfaceGlass[i], i, eye, orientation,
-                                     vr[pass].fov);
+                                     vr[pass].coverFov);
                 paneSeen[pass][0] = any;
                 continue;
             }
             for (int surface = 0; surface < g_state.paneCount && surface < kMaxMirrorSurfaces;
                  ++surface)
                 paneSeen[pass][surface] = paneInView(paneFrame, paneGlass(*glass, surface),
-                                                     surface, eye, orientation, vr[pass].fov);
+                                                     surface, eye, orientation,
+                                                     vr[pass].coverFov);
         }
     }
 
@@ -2111,6 +2153,8 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
 
         g_state.pendingFov[pass] = useFov;
         g_state.pendingAspect[pass] = useAspect;
+        g_state.pendingPrincipal[pass][0] = vr[poseIndex].principalX;
+        g_state.pendingPrincipal[pass][1] = vr[poseIndex].principalY;
         g_state.pendingValid[pass] = true;
 
         cameraSetFrustum(g_state.half[pass].camera, useFov, useAspect);

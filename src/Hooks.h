@@ -745,6 +745,13 @@ struct Options {
     // fills both eyes as one flat image; 0 shows it that way at once. On the replay screen it
     // always goes out at once.
     int vrNoSignalDelay = 250;
+
+    // How an eye whose frustum is off-centre (wider outward than inward, as on Quest headsets)
+    // is rendered. 1: off-centre through GPL's principal point, the whole display used. 0: centred
+    // on the eye's axis, with a black band on the display's wider side. Either way the presenter
+    // places the picture inside the display's frustum by the frustum it was rendered with. A
+    // centred headset gives the same picture with both.
+    bool vrAsymmetricFovFix = true;
 };
 
 extern Options g_options;

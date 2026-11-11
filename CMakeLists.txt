@@ -101,6 +101,7 @@ else()
         src/FlatFrames.cpp
         src/FlatTarget.cpp
         src/FrameBudget.cpp
+        src/FrameHold.cpp
         src/GameExit.cpp
         src/GlApi.cpp
         src/GlInterop.cpp
