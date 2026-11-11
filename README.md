@@ -21,7 +21,7 @@ Despite its name and original intent, GPLVR offers additional features available
 - `Borderless fullscreen`: GPL won't mess with your display resolution settings or prevent ALT-tabbing. Optional widescreen & letterbox fixes come as part of it
 - `Frame interpolation`: Render GPL at any frame rate, limited only by your hardware. You won't have to experience choppy 36 fps ever again
 - [`Custom renderer`](#performance): Utilize your GPU better to allow higher frame rate
-- `Mouse look`: Look around the cockpit with your mouse
+- [`Mouse look`](config/gplvr.ini#L113): Look around the cockpit with your mouse
 - Skip credits and close the game faster with Alt+F4 or by closing its window
 - A proper 144 FPS patch with working AI
 
@@ -39,7 +39,7 @@ Only GPL Beta and GPL 2020 Demo are officially supported. GPLVR doesn't change a
 
 GPLVR is **incompatible** with some XML patches since it partially reimplements the same functionality:
 - `No-letterbox patch`: GPLVR conflicts with it, but offers a similar optional functionality as part of borderless fullscreen mode
-- `60/144 FPS patches`: those don't work with AI properly and have bugs. This repository has correct [144 FPS XML patch](patches/78 144fps v35 US.xml) which doesn't break AI, but with GPLVR's frame interpolation the only benefit it gives is faster input response (worth trying though)
+- `60/144 FPS patches`: those don't work with AI properly and have bugs. This repository has correct [144 FPS XML patch](<patches/78 144fps v35 US.xml>) which doesn't break AI, but with GPLVR's frame interpolation the only benefit it gives is faster input response (worth trying though)
 
 
 ### System requirements
