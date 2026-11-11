@@ -39,6 +39,7 @@
 #include "VrCamera.h"
 #include "VrInput.h"
 #include "VrMenu.h"
+#include "VrMenuKeys.h"
 #include "Window.h"
 #include "XrRuntimeProbe.h"
 #include "GameExit.h"
@@ -2189,6 +2190,12 @@ LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPA
         static_cast<unsigned>(wParam) == static_cast<unsigned>(g_options.vrMirrorModeKey))
         return 0;
 
+    // The VR menu's keys: Ctrl + its own key always, the arrows, Enter and Esc while it is open.
+    // Called for the releases too, which always go on to the game.
+    if ((message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR) &&
+        vrMenuKeysSwallow(message, static_cast<unsigned>(wParam)))
+        return 0;
+
     // Only the DEACTIVATION half, and only this message. Activations pass through
     // untouched so the gates still get set the first time the game is focused, and so
     // the game's own one-shot display restore keeps working exactly as it does now.
@@ -2748,6 +2755,7 @@ void loadOptions(const char* fileName) {
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
                              : "no hotkey is polled; the VR menu has every setting they toggle");
     vrFovLoadOptions(path);
+    vrMenuKeysLoadOptions(path);
 
     logf("build: GPLVR_MIRROR_SKIP_OUT_OF_VIEW=%d (%s) GPLVR_MIRROR_COPY_REBIND=%d",
          kMirrorSkipOutOfView ? 1 : 0,

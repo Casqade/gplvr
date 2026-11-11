@@ -20,6 +20,7 @@
 #include "TweakApi.h"
 #include "VrCamera.h"
 #include "VrInput.h"
+#include "VrMenuKeys.h"
 #include "VrText.h"
 #include "Window.h"
 #include "baked_gpl/BakedPass.h"
@@ -746,6 +747,9 @@ constexpr LONGLONG kMenuRebuildHz = 45;
 struct State {
     Mode mode = Mode::Closed;
     int  hand = -1;  // the hand that owns the surface while a mode is open
+    // Opened with Ctrl + vrMenuKey: it stays open without a tracked controller, and `hand` is then only
+    // where a controller's input is merged from if one wakes up.
+    bool keyboardOpened = false;
 
     // The panel, captured when a mode opens.
     Vec3 panelPosition;
@@ -2156,6 +2160,7 @@ void closeMenu(const char* why) {
     logf("vr menu: closed%s", why ? why : "");
     g_state.mode = Mode::Closed;
     g_state.hand = -1;
+    g_state.keyboardOpened = false;
     g_state.hovered = -1;
     g_state.pressed = -1;
     g_state.draggingSlider = false;
@@ -2168,7 +2173,10 @@ void closeMenu(const char* why) {
 
 void enterMode(Mode mode, int hand) {
     if (hand < 0) return;
-    if (!vrInputClaim(hand, "the VR menu")) return;
+    // The keyboard needs no controller to claim; a tracked one is still claimed, so its input
+    // goes on reaching the menu alongside the keys.
+    bool keyboardOnly = g_state.keyboardOpened && !vrInputHand(hand).present;
+    if (!keyboardOnly && !vrInputClaim(hand, "the VR menu")) return;
 
     g_state.mode = mode;
     g_state.hand = hand;
@@ -2286,6 +2294,23 @@ bool gripTapped(const VrHandInput& input, double& since, bool& consumed) {
         return tap;
     }
     return false;
+}
+
+// Ctrl + vrMenuKey: the menu opens on the right hand if it is tracked, the left if only that one is, and
+// on the right with no controller at all, which the keyboard then drives alone.
+void openFromKeyboard() {
+    int hand = vrInputHand(kHandRight).present  ? kHandRight
+               : vrInputHand(kHandLeft).present ? kHandLeft
+                                                : kHandRight;
+    g_state.keyboardOpened = true;
+    enterMode(Mode::Menu, hand);
+    if (g_state.mode == Mode::Closed) {
+        g_state.keyboardOpened = false;
+        return;
+    }
+    logf("vr menu: opened from the keyboard -- arrows move and change, Enter selects, Esc or "
+         "Ctrl + the menu key steps back%s",
+         vrInputHand(hand).present ? "; the controller works too" : "");
 }
 
 int openingHand() {
@@ -3662,6 +3687,9 @@ void vrMenuPoll() {
         return;
     }
 
+    // The keyboard stands in for a controller: read once, merged into the owning hand below.
+    const VrMenuKeys keys = vrMenuKeysPoll();
+
     // THE FRONT END IS SOMEWHERE THE MENU OPENS TOO, and it used to be the one place it did
     // not. Everything a driver would reach for outside a race -- the render scale, the
     // gamma, how much of the eye the front end itself covers -- was behind a mode that only
@@ -3701,6 +3729,11 @@ void vrMenuPoll() {
     }
 
     if (frontEnd && state.mode == Mode::Closed) {
+        if (keys.toggle) {
+            frontEndPointerRelease("the VR menu opened");
+            openFromKeyboard();
+            return;
+        }
         // The grip tap is asked about BEFORE the pointer is driven, so the poll that opens
         // the menu does not also push the front end's cursor and send it a click on the
         // way past.
@@ -3743,6 +3776,12 @@ void vrMenuPoll() {
     const float seconds = vrInputSeconds();
 
     if (state.mode == Mode::Closed) {
+        if (keys.toggle) {
+            quickMenuCancel("the VR menu opened");
+            replayQuickMenuCancel("the VR menu opened");
+            openFromKeyboard();
+            return;
+        }
         const int hand = openingHand();
         if (hand >= 0) {
             // The grip still opens the menu over an open quick menu, which closes unfired and
@@ -3763,15 +3802,25 @@ void vrMenuPoll() {
         closeMenu(" -- the owning hand went away");
         return;
     }
-    const VrHandInput& hand = vrInputHand(state.hand);
-    if (!hand.present) {
+    // A copy, because the keys are merged into it: the arrows are the stick, and Enter is the
+    // stick click in a dialog. A held arrow outweighs the stick, which is resting if nobody
+    // touches it.
+    VrHandInput hand = vrInputHand(state.hand);
+    if (!hand.present && !state.keyboardOpened) {
         closeMenu(" -- the owning hand stopped being tracked");
         return;
     }
+    if (keys.stickX != 0.0f) hand.stickX = keys.stickX;
+    if (keys.stickY != 0.0f) hand.stickY = keys.stickY;
+    if (keys.enter && (state.mode == Mode::Confirm || state.mode == Mode::Reset ||
+                       state.mode == Mode::Help))
+        hand.stick.pressed = true;
 
     // A grip TAP steps back one level, whichever mode is open -- the same control that opened
-    // the menu, so there is one button to learn and it always means "back".
+    // the menu, so there is one button to learn and it always means "back". On the keyboard
+    // that is Ctrl + the menu key, or Esc.
     bool back = gripTapped(hand, state.gripSince[state.hand], state.gripConsumed[state.hand]);
+    back = back || keys.toggle || keys.back;
     if (back) {
         if (state.mode == Mode::Menu) {
             closeMenu(" -- the grip");
@@ -3815,8 +3864,8 @@ void vrMenuPoll() {
     // The ray has to be in the panel's frame, which is the seat's. Both the hand and the
     // panel come from the presenter's LOCAL space and the conversion is the same one.
     SharedPose aimSeat = {};
-    state.pointerOn =
-        poseInSeat(hand.aimPose, aimSeat) && rayToSurface(surface, aimSeat, u, v);
+    state.pointerOn = hand.present && poseInSeat(hand.aimPose, aimSeat) &&
+                      rayToSurface(surface, aimSeat, u, v);
     if (state.pointerOn) {
         // THE SAME FILTER THE FRONT END'S POINTER USES. /input/aim/pose carries the hand's
         // real tremor at the display rate, and the throw from the hand to the panel turns
@@ -3948,6 +3997,14 @@ void vrMenuPoll() {
     // whether it is in range.
     if (rowLine(state.hovered) < 0) state.hovered = firstRow();
     if (rowLine(state.hovered) == kButtonLine) state.buttonColumn = rowColumn(state.hovered);
+
+    // ENTER PRESSES THE HIGHLIGHTED ROW, whatever it is: a toggle flips, a button fires, a tab
+    // opens. A slider or a choice has nothing to press; the arrows change it.
+    if (keys.enter && state.hovered >= 0) {
+        // It may have left the page, as the stick click below may.
+        activateRow(state.hovered);
+        return;
+    }
 
     // A STICK CLICK PUTS THE HIGHLIGHTED SETTING BACK, which is what it already means inside
     // every tweak mode. Same control, same meaning, wherever the driver happens to be. On a

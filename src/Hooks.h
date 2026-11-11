@@ -118,6 +118,12 @@ struct Options {
     // corner of the frame, where a second pass leaves a square in the left eye. That was
     // vrMirrorOffscreen and there was never a reason to turn it off.
 
+    // The VR menu from the keyboard, debugKeys or not (VrMenuKeys.h): Ctrl and this key open it
+    // and step back out like a grip tap, the arrows move the highlight and change values, Enter
+    // selects, Esc steps back. 'M' by default; 0 disables. VR only. Not in the hotkey clash table:
+    // with Ctrl it does not share a press with any plain key there.
+    int vrMenuKey = 'M';
+
     // EVERY HOTKEY BELOW (every option ending in Key) is a debug control: the VR menu has what
     // each one toggles. Off, loadOptions sets all of them to 0, so none is polled, swallowed or
     // checked for a clash; on, each reads its own line of gplvr.ini as before.
