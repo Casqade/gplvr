@@ -44,6 +44,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <cstring>
 
 namespace gplvr {
@@ -83,6 +84,60 @@ HMODULE WINAPI loadLibraryExAHook(LPCSTR name, HANDLE file, DWORD flags) {
         glTraceInstall();
     }
     return result;
+}
+
+// -- the sound's focus window -------------------------------------------------
+// GPL's Miles opens DirectSound on the first top-level window of the process in Z-order
+// (mss_dsCreateDevice 0x50F1F0, the image's only GetTopWindow call), and DirectSound plays
+// Miles' buffers only while the thread that owns that window has the foreground. Stock roglv2
+// has made the game window topmost by then, so the walk finds it first. gplvr's borderless
+// window is not topmost, and a hidden window that another thread of the process created since
+// lies above it: the sound device opens, every voice plays, and nothing is heard. This answers
+// that call with the game window, so the walk ends on it at its first step.
+
+using GetTopWindowFn = HWND(WINAPI*)(HWND);
+GetTopWindowFn g_getTopWindow = nullptr;
+
+HWND WINAPI getTopWindowHook(HWND parent) {
+    if (!parent) {
+        if (HWND window = gameWindow()) return window;
+    }
+    return g_getTopWindow ? g_getTopWindow(parent) : GetTopWindow(parent);
+}
+
+// Miles makes each voice's DirectSound buffer with the flags 0xE0 -- frequency, pan and volume
+// control (mss_dsSampleBufferAcquire 0x50FD80, `mov [esp+2Ch], 0E0h` at 0x50FEDB) -- and
+// DirectSound mutes such a buffer whenever the game does not have the foreground. In VR, and
+// with renderWhenUnfocused, the picture keeps running then, so the buffers are made with
+// DSBCAPS_GLOBALFOCUS as well and the sound runs with it. Flat mode without the option keeps
+// GPL's flags: the simulation runs on behind another window, and its engine would be heard.
+//
+// A buffer keeps the flags it was made with, so this is written before the game's entry point,
+// ahead of the first voice.
+constexpr uintptr_t     kSampleBufferFlagsSite = 0x0050FEDB;
+constexpr unsigned char kSampleBufferFlagsStock[8] = {0xC7, 0x44, 0x24, 0x2C, 0xE0, 0x00, 0x00, 0x00};
+constexpr uint32_t      kGlobalFocus = 0x00008000;  // DSBCAPS_GLOBALFOCUS
+
+void soundGlobalFocusInstall() {
+    if (!keepDrawingWhileUnfocused()) return;
+
+    auto site = reinterpret_cast<unsigned char*>(kSampleBufferFlagsSite);
+    if (std::memcmp(site, kSampleBufferFlagsStock, sizeof(kSampleBufferFlagsStock)) != 0) {
+        logf("sound: %08X does not hold Miles' stock buffer flags (%02X %02X %02X %02X %02X %02X "
+             "%02X %02X) -- the sound still stops while the game is not in the foreground",
+             static_cast<unsigned>(kSampleBufferFlagsSite), site[0], site[1], site[2], site[3],
+             site[4], site[5], site[6], site[7]);
+        return;
+    }
+    uint32_t flags = 0xE0 | kGlobalFocus;
+    if (!patchBytes(site + 4, &flags, sizeof(flags))) {
+        logf("sound: could not write Miles' buffer flags at %08X -- the sound still stops while "
+             "the game is not in the foreground",
+             static_cast<unsigned>(kSampleBufferFlagsSite));
+        return;
+    }
+    logf("sound: Miles' buffers are made with DSBCAPS_GLOBALFOCUS -- the sound keeps playing "
+         "while the game is not in the foreground, as the picture does");
 }
 
 // Redirect one named import of the main module to `replacement`, remembering the
@@ -315,6 +370,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         hookMainModuleImport("LoadLibraryA", reinterpret_cast<void*>(&loadLibraryAHook), &g_loadLibraryA);
         hookMainModuleImport("LoadLibraryW", reinterpret_cast<void*>(&loadLibraryWHook), &g_loadLibraryW);
         hookMainModuleImport("LoadLibraryExA", reinterpret_cast<void*>(&loadLibraryExAHook), &g_loadLibraryExA);
+        // Before the game's entry point too: the sound device is opened in gpl_main, ahead of
+        // the first frame and of everything the install thread does.
+        hookMainModuleImport("GetTopWindow", reinterpret_cast<void*>(&getTopWindowHook), &g_getTopWindow);
+        soundGlobalFocusInstall();
         patchDisplaySettingsImports(GetModuleHandleA(nullptr));
 
         if (HANDLE thread = CreateThread(nullptr, 0, &installThread, nullptr, 0, nullptr))
