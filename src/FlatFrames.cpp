@@ -86,6 +86,14 @@ struct State {
     unsigned windowMaxExtra = 0;  // the most drawn against any one tick in the window
     unsigned windowHeld = 0;      // ends deferred so the frame survived into an extra draw
     unsigned windowReleased = 0;  // ends let through because a BG request was waiting
+    unsigned windowCapped = 0;    // frames that waited for the frame cap's slot
+
+    // The frame cap (`frameLimit`): when the next frame may start, in QPC ticks, and the timer
+    // that sleeps towards it.
+    double limitDue = 0.0;
+    HANDLE limitTimer = nullptr;
+    bool   limitTimerTried = false;
+    bool   limitTimerPrecise = false;
 };
 
 State g_state;
@@ -120,6 +128,64 @@ bool redirect(uintptr_t site, uintptr_t to) {
 // extra frame differs. 0 never draws one.
 bool extraFramesOn() { return g_options.frameRate > 0; }
 
+// Windows 10 1803 and later; older SDK headers do not name it.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// Wait until `due`, a QPC instant. A waitable timer takes the thread to within a margin of it
+// and the rest is spun, because no timer wakes a thread to a tenth of a millisecond. The
+// high-resolution timer is good to about half a millisecond; where the system does not have one
+// the ordinary timer follows the system timer resolution, which gplvr raises to 1 ms at start-up.
+void waitUntil(State& s, long long due) {
+    if (!s.limitTimerTried) {
+        s.limitTimerTried = true;
+        s.limitTimer = CreateWaitableTimerExW(nullptr, nullptr,
+                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_ALL_ACCESS);
+        s.limitTimerPrecise = s.limitTimer != nullptr;
+        if (!s.limitTimer) s.limitTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+        logf("frames: the frame cap sleeps on %s",
+             s.limitTimerPrecise ? "a high-resolution waitable timer and spins the last "
+                                   "millisecond"
+             : s.limitTimer      ? "an ordinary waitable timer and spins the last two "
+                                   "milliseconds (no high-resolution timer on this system)"
+                                 : "nothing -- no waitable timer could be created, so it spins "
+                                   "the whole wait");
+    }
+
+    long long margin = s.frequency * (s.limitTimerPrecise ? 1 : 2) / 1000;
+    long long remaining = due - now();
+    if (s.limitTimer && remaining > margin) {
+        // Relative due times are negative and count 100 ns units.
+        LARGE_INTEGER relative;
+        relative.QuadPart = -((remaining - margin) * 10000000LL / s.frequency);
+        if (SetWaitableTimer(s.limitTimer, &relative, 0, nullptr, nullptr, FALSE))
+            WaitForSingleObject(s.limitTimer, 1000);
+    }
+    while (now() < due) YieldProcessor();
+}
+
+// The frame cap. Each frame has a slot one period after the previous slot and waits for it before
+// it starts, ahead of the latch, so the frame that follows is drawn from the newest tick there is
+// at that moment. Spacing slots from the previous slot keeps one late wake-up from shifting every
+// frame after it. A frame more than a period late starts a new run of slots from itself.
+void waitForFrameSlot(State& s) {
+    if (g_options.vr || g_options.frameLimit <= 0 || s.frequency <= 0) return;
+
+    double period = static_cast<double>(s.frequency) / g_options.frameLimit;
+    double at = static_cast<double>(now());
+    if (s.limitDue <= 0.0 || at - s.limitDue > period) {
+        s.limitDue = at + period;
+        return;
+    }
+    if (at < s.limitDue) {
+        waitUntil(s, static_cast<long long>(s.limitDue));
+        ++s.windowCapped;
+    }
+    s.limitDue += period;
+}
+
 // A tick late by a whole period: the sim has stalled or stopped, so the loop goes back to GPL's
 // own wait, which ends when a tick lands or the sim is no longer running.
 bool tickOverdue(const State& s) {
@@ -143,6 +209,26 @@ bool displayIsReady(const State& s) {
     int32_t published = presenterViewSequence();
     if (!published) return true;  // not publishing yet; do not stall on a clock that is absent
     return published != s.lastViewSequence;
+}
+
+// One step of the wait for the next view set, between two looks at the view counter.
+//
+// The presenter signals an event as it publishes a set, which wakes this thread within the
+// scheduler's own latency instead of at the next millisecond boundary. The step is capped at a
+// millisecond all the same: with a presenter that never signals -- one built before the event
+// existed -- or with no event at all, the wait is then the one-millisecond poll, and no state of
+// the event can hold a frame longer than that poll would.
+//
+// A signal can be left over from a set that was published while the last frame was being drawn.
+// It ends one step early and the counter says there is nothing new, so the loop comes back here
+// with the event spent.
+void waitForViews(State& s) {
+    HANDLE event = presenterViewEvent();
+    if (!event) {
+        Sleep(1);
+        return;
+    }
+    WaitForSingleObject(event, 1);
 }
 
 bool tickWaiting(const State& s) {
@@ -186,6 +272,8 @@ void __cdecl snapshotBeginHook() {
         return;
     }
 
+    waitForFrameSlot(s);
+
     // EVERY ITERATION WAITS FOR THE DISPLAY, INCLUDING THE ONE THAT LATCHES.
     //
     // This is the whole of the decoupling, and having it the other way round is what kept the
@@ -213,7 +301,7 @@ void __cdecl snapshotBeginHook() {
                 ++s.windowPreempted;
                 break;
             }
-            Sleep(1);
+            waitForViews(s);
         }
     }
     s.lastViewSequence = presenterViewSequence();
@@ -405,12 +493,13 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
                   "world, %u drew a repeat) | up to %u per tick against a %.1f ms tick | %u "
                   "waited for the display, %u of those gave up so a tick would not pass "
                   "unlatched | %u for an overdue tick, %u unfocused, %u before the first tick | "
-                  "frame held open %u times, released early for a BG request %u",
+                  "frame held open %u times, released early for a BG request %u | %u waited for "
+                  "the frame cap",
                   s.windowFrames, seconds, seconds > 0.0 ? s.windowFrames / seconds : 0.0,
                   s.windowExtra, s.windowBlended, s.windowExtra - s.windowBlended,
                   s.windowMaxExtra, period, s.windowWaited, s.windowPreempted,
                   s.windowOverdue, s.windowBackground, s.windowTickless, s.windowHeld,
-                  s.windowReleased);
+                  s.windowReleased, s.windowCapped);
 
     s.windowFrames = 0;
     s.windowExtra = 0;
@@ -423,6 +512,7 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
     s.windowMaxExtra = 0;
     s.windowHeld = 0;
     s.windowReleased = 0;
+    s.windowCapped = 0;
     return true;
 }
 

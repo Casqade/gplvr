@@ -145,7 +145,15 @@ bool Consumer::open(const wchar_t* instance) {
     producerProcess_ =
         OpenProcess(SYNCHRONIZE, FALSE, block_->producerProcessId);
 
-    logf("present: attached to the game, pid %u", block_->producerProcessId);
+    // The game sleeps on this between view sets when it draws one frame per set. A game
+    // without it polls the view counter, so its absence is only worth a line.
+    wchar_t eventName[128] = {};
+    makeViewEventName(eventName, instance);
+    viewEvent_ = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName);
+
+    logf("present: attached to the game, pid %u; view-set signal %s",
+         block_->producerProcessId,
+         viewEvent_ ? "on" : "off (the game did not create the event, so it polls)");
     return true;
 }
 
@@ -929,6 +937,9 @@ void Consumer::publishViews(const SharedView views[2], const SharedPose& head,
     // copy can tell whether it caught us mid-write.
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&block_->viewSequence),
                         ++viewSequence_);
+
+    // After the sequence, so the game it wakes finds the new set when it looks.
+    if (viewEvent_) SetEvent(viewEvent_);
 }
 
 void Consumer::publishInput(const SharedInput& input) {
@@ -993,6 +1004,8 @@ void Consumer::close() {
     mapping_ = nullptr;
     if (producerProcess_) CloseHandle(producerProcess_);
     producerProcess_ = nullptr;
+    if (viewEvent_) CloseHandle(viewEvent_);
+    viewEvent_ = nullptr;
 }
 
 }  // namespace gplvr

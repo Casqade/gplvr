@@ -160,6 +160,11 @@ bool presenterMonitorHudTaken();
 // each rendered frame correspond to one display frame.
 int32_t presenterViewSequence();
 
+// The event the presenter signals as it publishes each view set, for a wait that wants to wake
+// when the counter above moves. Null while the presenter is not publishing or the event could
+// not be created; the counter is still what says whether a new set is there.
+HANDLE presenterViewEvent();
+
 // The view set the LAST RENDER actually took its eye cameras from, which is what an extra
 // frame has to be newer than.
 //

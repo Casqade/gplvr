@@ -1,6 +1,7 @@
 #include "TaskRate.h"
 
 #include "Log.h"
+#include "TickClock.h"
 
 #include <windows.h>
 
@@ -91,10 +92,15 @@ void __cdecl bgSleepHook() {
         }
     }
 
+    // The tick counter belongs to this thread's loop, so this is the earliest it can be dated:
+    // on the way into the sleep, and again on the way out for a tick counted while it slept.
+    if (g_api.getBGCount) tickClockNote(g_api.getBGCount(), now.QuadPart);
+
     if (g_api.bgSleep) g_api.bgSleep();
 
     QueryPerformanceCounter(&now);
     g_api.lastReturn = now.QuadPart;
+    if (g_api.getBGCount) tickClockNote(g_api.getBGCount(), now.QuadPart);
 }
 
 }  // namespace

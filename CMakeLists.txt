@@ -144,6 +144,7 @@ else()
         src/StereoEuler.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
+        src/TickClock.cpp
         src/TweakApi.cpp
         src/VrCamera.cpp
         src/VrInput.cpp

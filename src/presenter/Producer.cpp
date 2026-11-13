@@ -55,6 +55,9 @@ struct State {
     HANDLE        mapping = nullptr;
     ControlBlock* block = nullptr;
     HANDLE        presenterProcess = nullptr;
+    // Signalled by the presenter as it publishes each view set (makeViewEventName). Null when
+    // it could not be created, which leaves the frame gate polling.
+    HANDLE        viewEvent = nullptr;
 
     GlFunctions gl;
     HANDLE      interopDevice = nullptr;
@@ -236,6 +239,17 @@ bool createControlBlock(State& state, wchar_t (&instance)[32]) {
     state.block->producerProcessId = GetCurrentProcessId();
     InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->producerState),
                         static_cast<LONG>(ProcessState::Starting));
+
+    // Before the presenter is launched, so the event is there when it looks for it. Auto-reset:
+    // one signal wakes the one waiter and is then spent. Not having it is not a failure of the
+    // channel.
+    wchar_t eventName[128] = {};
+    makeViewEventName(eventName, instance);
+    state.viewEvent = CreateEventW(nullptr, FALSE, FALSE, eventName);
+    if (!state.viewEvent)
+        logf("vr: CreateEvent for the view-set signal failed (error %lu) -- the frame gate "
+             "polls for new views once a millisecond instead",
+             GetLastError());
     return true;
 }
 
@@ -2156,6 +2170,11 @@ int32_t presenterViewSequence() {
 
 int32_t presenterAcquiredViewSequence() { return g_state.acquiredViewSequence; }
 
+HANDLE presenterViewEvent() {
+    const State& state = g_state;
+    return state.stage == Stage::Publishing ? state.viewEvent : nullptr;
+}
+
 bool presenterLatestViews(SharedView views[2], SharedPose& head, SharedMotion* motion) {
     State& state = g_state;
     if (state.stage != Stage::Publishing || !state.block) return false;
@@ -2456,6 +2475,8 @@ void presenterStop() {
     state.block = nullptr;
     if (state.mapping) CloseHandle(state.mapping);
     state.mapping = nullptr;
+    if (state.viewEvent) CloseHandle(state.viewEvent);
+    state.viewEvent = nullptr;
 
     state.stage = Stage::Off;
     state.width = 0;

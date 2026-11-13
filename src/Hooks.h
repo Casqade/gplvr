@@ -341,6 +341,18 @@ struct Options {
     // rate steps straight from 144 to 72 with nothing between. See SwapControl.h.
     int swapInterval = -1;
 
+    // Adaptive vsync, the ini's `swapInterval = -2`: the interval above is 1 and a frame that
+    // misses its refresh is shown at once, torn, instead of waiting for the next one. The
+    // driver is asked through WGL_EXT_swap_control_tear's negative interval; without the
+    // extension the plain interval is used.
+    bool swapTear = false;
+
+    // Frame cap in flat mode, frames a second; 0 is none. The frame loop waits for each
+    // frame's slot before starting it (FlatFrames), so it applies to frameRate 1 and 2 and
+    // sits in front of whatever SwapBuffers does. It is what keeps a variable-refresh
+    // display under its ceiling, where vsync would take over the pacing.
+    int frameLimit = 0;
+
     // Present in a headset. Launches gplvr-xr.exe, hands it the back buffer through a
     // shared D3D11 texture, and lets it own the OpenXR session.
     //

@@ -39,6 +39,11 @@
 // frame afterwards: 1 draws one frame per display frame (per published view set in VR, per
 // refresh in flat mode, where SwapBuffers does the blocking), 2 draws them as fast as they can
 // be drawn, 0 leaves the loop exactly as GPL wrote it.
+//
+// THE FRAME CAP. In flat mode `frameLimit` gives every frame a slot and the loop waits for it
+// at the top of the iteration, before the latch. It is there for variable-refresh displays: kept
+// a few frames under the refresh rate, the display follows the game's frames, and SwapBuffers
+// never has to block for a refresh.
 
 #include <cstddef>
 

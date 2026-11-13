@@ -560,7 +560,7 @@ void reportOncePerSecond() {
 
     // Frames drawn between the simulation's ticks, in either mode. After the interp line, which
     // says what the blend did with them.
-    char flat[384] = {};
+    char flat[640] = {};
     if (flatFramesFormat(flat, sizeof(flat), seconds)) logf("%s", flat);
 
     // The drawn-mark list's peak and overflows, once a second while the world was drawn. Per
@@ -2685,7 +2685,12 @@ void loadOptions(const char* fileName) {
     // resolved interval, where -1 is "make no call". They share the number -1 and do not
     // share its meaning, which is why the ini's value stays in a local and never reaches the
     // option field unresolved.
+    //
+    // -2 is adaptive vsync, which is interval 1 with late frames allowed to tear. It becomes
+    // the pair (1, swapTear) here, so the resolved interval keeps its one meaning.
     int wanted = GetPrivateProfileIntA("gplvr", "swapInterval", -1, path);
+    g_options.swapTear = wanted == -2;
+    if (wanted == -2) wanted = 1;
     if (wanted < -1) wanted = -1;
     if (wanted > 4) wanted = 4;
 
@@ -2709,6 +2714,32 @@ void loadOptions(const char* fileName) {
                 logf("options: swapInterval = %d overrides the %d that frameRate = %d would "
                      "have chosen. -1 follows it again.",
                      wanted, derived, g_options.frameRate);
+        }
+    }
+    // Tearing is a property of a vsynced swap, so it goes with the interval it modifies.
+    if (g_options.swapInterval <= 0) g_options.swapTear = false;
+    if (g_options.swapTear)
+        logf("options: swapInterval = -2 -- adaptive vsync: one frame per refresh, and a frame "
+             "that misses its refresh is shown at once instead of waiting for the next");
+
+    g_options.frameLimit = GetPrivateProfileIntA("gplvr", "frameLimit", 0, path);
+    if (g_options.frameLimit < 0) g_options.frameLimit = 0;
+    if (g_options.frameLimit > 1000) g_options.frameLimit = 1000;
+    if (g_options.frameLimit > 0) {
+        if (g_options.vr) {
+            logf("options: frameLimit = %d is ignored in the headset, where the presenter sets "
+                 "the rate",
+                 g_options.frameLimit);
+            g_options.frameLimit = 0;
+        } else if (g_options.frameRate == 0) {
+            logf("options: frameLimit = %d is ignored with frameRate = 0, which draws one frame "
+                 "per sim tick",
+                 g_options.frameLimit);
+            g_options.frameLimit = 0;
+        } else {
+            logf("options: frameLimit = %d -- each frame waits for its slot before it starts, "
+                 "%.3f ms apart",
+                 g_options.frameLimit, 1000.0 / g_options.frameLimit);
         }
     }
     g_options.vrRendererType = GetPrivateProfileIntA("gplvr", "vrRendererType", 1, path);

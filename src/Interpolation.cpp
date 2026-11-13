@@ -6,6 +6,7 @@
 #include "Pe.h"
 #include "RenderPacing.h"
 #include "TaskRate.h"
+#include "TickClock.h"
 
 #include <windows.h>
 
@@ -325,7 +326,16 @@ struct Window {
     unsigned  viewCarCoupled = 0;  // frames where the view and the viewed car were snapped together
     unsigned  viewMirrorCoupled = 0;  // the same for the view and the mirror record
     long long costTicks = 0;
+};
 
+// The flat frame clock (flatFrameInstant). All times in QPC ticks.
+struct FrameClock {
+    bool   have = false;
+    double raw = 0.0;      // when the previous frame started
+    double instant = 0.0;  // the instant the previous frame was blended for
+    double refresh = 0.0;  // one display refresh: the monitor's mode, then measured from the frames
+    int    offCadence = 0;  // consecutive frames that took the wall clock
+    int    queryIn = 0;     // frames until the monitor is asked again
 };
 
 using CountFn = int(__cdecl*)();
@@ -415,6 +425,8 @@ struct State {
     int       lastLatchTick = 0;
     double    tickPeriod = 0.0;
     bool      haveTickModel = false;
+
+    FrameClock frameClock;
 
     Window window;
 };
@@ -944,14 +956,29 @@ void checkBlendedPosition(const History& h, const uint8_t* record, int base, int
 // asks here or asks interpolationActive().
 bool blendingEnabled() { return g_options.frameRate > 0; }
 
-// When a tick arrived, in QPC. RenderPacing's model is preferred where it exists; its own is
-// fitted to the tick counter over a whole run, while this one is a two-point extrapolation from
-// the last latch.
+// When a tick arrived, in QPC. Both modes read the grid fitted to the sim thread's own stamps
+// (TickClock.h). Before the first stamp VR has RenderPacing's grid, fitted to the tick counter as
+// the latch saw it and so late by the average wait for a latch; the last resort is a two-point
+// extrapolation from the last latch, which dates a tick by the frame that latched it.
 bool tickArrival(const State& s, int count, double& qpc) {
+    if (tickClockArrival(count, qpc)) return true;
     if (renderPacingTickArrival(count, qpc)) return true;
     if (!s.haveTickModel || s.tickPeriod <= 0.0) return false;
     qpc = static_cast<double>(s.lastLatchQpc) + (count - s.lastLatchTick) * s.tickPeriod;
     return true;
+}
+
+// One sim tick in QPC ticks, the same answer for every frame that asks: the tick grid's spacing,
+// then the scheduler's nominal rate, then the latch-to-latch average, which ripples with the
+// pattern of latches. The target is `an instant less one tick` on latched frames and on the
+// frames between them alike, so a tick that differed between the two would step the world at
+// every latch.
+double tickLength(const State& s) {
+    double tick = tickClockPeriod();
+    if (tick > 0.0) return tick;
+    int simHz = taskRateSimHz();
+    if (simHz > 0 && s.frequency > 0) return static_cast<double>(s.frequency) / simHz;
+    return s.tickPeriod;
 }
 
 // ONE DECISION FOR THE WHOLE FRAME, if the third copy is ever rebuilt.
@@ -1152,6 +1179,87 @@ void applyBlend(State& s, double target, const int* cars, int carCount, bool hav
     s.blendable = any;
 }
 
+// One refresh of the monitor the game window is on, in QPC ticks, from its display mode. 0 when
+// the mode does not say.
+double displayRefreshTicks(const State& s) {
+    HWND     window = gameWindow();
+    HMONITOR monitor = window ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) : nullptr;
+    MONITORINFOEXA info = {};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoA(monitor, &info)) return 0.0;
+    DEVMODEA mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsA(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0.0;
+    // 0 and 1 are "the hardware's default", which names no rate.
+    if (mode.dmDisplayFrequency <= 1) return 0.0;
+    return static_cast<double>(s.frequency) / static_cast<double>(mode.dmDisplayFrequency);
+}
+
+// The instant a flat frame starting at `now` stands for.
+//
+// With vsync pacing the loop, frames reach the screen a whole number of refreshes apart however
+// unevenly the loop wakes up after each swap. The wake-up jitter is not on the screen, so it must
+// not be in the world either: the instant advances by whole refreshes and is only steered towards
+// the wall clock, slowly enough that a millisecond of jitter moves it by a twentieth of that.
+//
+// A frame is judged by where it starts against the instant the previous frame stood for, which
+// carries none of that frame's own wake-up jitter. Measured at 144 Hz, frame starts land up to
+// 2.6 ms either side of the refresh, so a start-to-start gap carries two frames' jitter and a
+// fifth of a refresh rejected about one frame in eight -- each of which put the jitter back.
+// Within 0.45 of a whole number of refreshes it is on the cadence. Further out it is not --
+// vsync off, a variable-refresh display below its ceiling, a hitch -- and takes the wall clock
+// as it is, because there the screen follows the frame.
+//
+// `refresh` starts from the monitor's mode and then follows the measured spacing, which finds
+// 59.94 Hz behind a mode that says 60 and settles on a frame cap that sits just under the
+// refresh. It learns only from gaps that are themselves within the tolerance of the same whole
+// number, and slowly: its error is added on every frame and only the steer takes it back out.
+double flatFrameInstant(State& s, long long now) {
+    constexpr double kCadenceTolerance = 0.45;  // of a refresh, either side of a whole number
+    constexpr int    kMaxRefreshes = 4;         // a frame later than this is a hitch
+    constexpr double kRefreshGain = 0.005;
+    constexpr double kSteerGain = 0.05;
+    constexpr int    kRequeryAfter = 120;      // frames off cadence before the monitor is asked again
+
+    FrameClock& c = s.frameClock;
+    double      raw = static_cast<double>(now);
+    double      delta = raw - c.raw;
+    bool        had = c.have;
+    c.raw = raw;
+    c.have = true;
+
+    bool paced = g_options.swapInterval > 0;
+    if (paced && c.refresh <= 0.0 && --c.queryIn < 0) {
+        c.refresh = displayRefreshTicks(s);
+        c.queryIn = kRequeryAfter;
+    }
+    if (paced && had && c.refresh > 0.0) {
+        double refreshes = (raw - c.instant) / c.refresh;
+        int    whole = static_cast<int>(refreshes + 0.5);
+        if (whole >= 1 && whole <= kMaxRefreshes &&
+            std::fabs(refreshes - whole) <= kCadenceTolerance) {
+            if (std::fabs(delta / c.refresh - whole) <= kCadenceTolerance)
+                c.refresh += kRefreshGain * (delta / whole - c.refresh);
+            c.instant += whole * c.refresh;
+            c.instant += kSteerGain * (raw - c.instant);
+            c.offCadence = 0;
+            return c.instant;
+        }
+        // The measured refresh can be left behind by a mode change or a move to another monitor.
+        if (++c.offCadence >= kRequeryAfter) {
+            c.offCadence = 0;
+            c.refresh = 0.0;
+            c.queryIn = 0;
+        }
+    }
+    c.instant = raw;
+    return raw;
+}
+
+// A flat frame's blend target: its instant, less one tick so that it lies between the two newest
+// latched ticks.
+double flatTarget(State& s, long long now) { return flatFrameInstant(s, now) - tickLength(s); }
+
 void blendFrame(State& s, long long now, bool frozen) {
     Window& w = s.window;
     // No new tick since the last latch (the sim is stopped): the records hold the newest state.
@@ -1159,11 +1267,9 @@ void blendFrame(State& s, long long now, bool frozen) {
         ++w.frozen;
         return;
     }
-    // Flat mode has neither of the two clocks the VR path is built on: no presenter publishing a
-    // display time, and no task-rate probe (it is bound in VR only), so taskRateSimHz answers 0.
-    // The target is the one interpolationExtraFrame uses -- one measured tick behind the wall
-    // clock -- so that the latched frame and the frames drawn between the ticks sweep the same
-    // line instead of meeting in a sawtooth.
+    // Flat mode has no presenter publishing a display time, so the target is built from the
+    // frame's own instant. It is the one interpolationExtraFrame uses, so that the latched frame
+    // and the frames drawn between the ticks sweep the same line instead of meeting in a sawtooth.
     if (!g_options.vr) {
         if (!s.haveTickModel || s.tickPeriod <= 0.0) {
             ++w.untimed;
@@ -1171,8 +1277,8 @@ void blendFrame(State& s, long long now, bool frozen) {
             return;
         }
         ++w.costTimed;
-        applyBlend(s, holdTargetForward(s, static_cast<double>(now) - s.tickPeriod), s.latched,
-                   s.latchedCount, s.mirrorLatched, s.pitBoardLatched, false);
+        applyBlend(s, holdTargetForward(s, flatTarget(s, now)), s.latched, s.latchedCount,
+                   s.mirrorLatched, s.pitBoardLatched, false);
         return;
     }
 
@@ -1239,7 +1345,7 @@ void blendFrame(State& s, long long now, bool frozen) {
     // the mean of the samples since it, over a sliding window that drops the settling ones within
     // a second; the slow average takes over from that mean.
     constexpr double kLatencyGain = 0.004;
-    double tick = static_cast<double>(s.frequency) / simHz;
+    double tick = tickLength(s);
     double sample = static_cast<double>(display - now);
     bool   restart = !s.haveLatency || std::fabs(sample - s.latency) > 3.0 * tick;
     if (restart) ++w.latencyRestarts;
@@ -1674,9 +1780,8 @@ bool interpolationExtraFrame() {
     // different displays get consecutive ones, and the draw-time jitter cancels because it is
     // no longer in the expression.
     //
-    // Flat mode has no such clock -- renderPacingInstall is VR-only -- so there the wall clock
-    // is all there is, and SwapBuffers' own blocking is what keeps the draw-to-display interval
-    // steady enough for it.
+    // Flat mode has no such clock -- renderPacingInstall is VR-only -- so there the frame's own
+    // instant stands in for it (flatFrameInstant).
     double target = 0.0;
     if (g_options.vr) {
         long long display = 0;
@@ -1684,11 +1789,9 @@ bool interpolationExtraFrame() {
         if (!s.haveLatency ||
             !renderPacingDisplayTimeAt(now.QuadPart, now.QuadPart, display, fromPresenter))
             return false;
-        target = static_cast<double>(display) - s.latency - s.tickPeriod;
+        target = static_cast<double>(display) - s.latency - tickLength(s);
     } else {
-        // Flat mode has no display clock, so the wall clock is all there is; SwapBuffers' own
-        // blocking is what keeps the draw-to-display interval steady enough for it.
-        target = static_cast<double>(now.QuadPart) - s.tickPeriod;
+        target = flatTarget(s, now.QuadPart);
     }
     target = holdTargetForward(s, target);
 

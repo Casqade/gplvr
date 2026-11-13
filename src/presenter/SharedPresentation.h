@@ -548,12 +548,24 @@ static_assert(sizeof(ControlBlock) < 4096, "one page is plenty and keeps mapping
 // The mapping name is derived from an instance string -- the game's process id -- so two
 // copies of the game cannot find each other's frames.
 //
-// No event object to go with it. The presenter runs its own 90 Hz loop and always wants
+// No event object for the frames. The presenter runs its own 90 Hz loop and always wants
 // the newest frame the producer has finished, never the next one; waiting on an event
 // would only let a 36 Hz producer pace a 90 Hz compositor. So it polls frameSequence,
 // which is the correct relationship between the two rates as well as the simpler one.
 inline void makeMappingName(wchar_t (&out)[128], const wchar_t* instance) {
     _snwprintf_s(out, _TRUNCATE, L"Local\\gplvr-%s-block", instance);
+}
+
+// The views go the other way and do have one. With frameRate = 1 the game draws one frame per
+// view set, so it sleeps until the next set is published, and this event is what wakes it: the
+// producer creates it, the presenter signals it right after it moves viewSequence.
+//
+// It is an alarm and carries nothing. viewSequence is still what says a new set is there, so
+// a signal with no new set behind it, or a set with no signal, draws nothing wrong; and a
+// presenter built before the event existed simply never signals, which leaves the game on the
+// one-millisecond poll it had before. That is why this did not move kControlVersion.
+inline void makeViewEventName(wchar_t (&out)[128], const wchar_t* instance) {
+    _snwprintf_s(out, _TRUNCATE, L"Local\\gplvr-%s-views", instance);
 }
 
 }  // namespace gplvr

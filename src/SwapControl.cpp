@@ -3,6 +3,8 @@
 #include "Hooks.h"
 #include "Log.h"
 
+#include <cstring>
+
 namespace gplvr {
 namespace {
 
@@ -39,6 +41,31 @@ bool resolveBase() {
         logf("swap: opengl32 is loaded but wglGetCurrentContext/wglGetProcAddress did "
              "not resolve");
     return g_getCurrentContext && g_getProcAddress;
+}
+
+// Whether the current context's WGL extension string names WGL_EXT_swap_control_tear. Asked
+// through the EXT query, which takes no arguments, and then through the ARB one, which wants
+// the context's device.
+bool tearSupported() {
+    typedef const char*(WINAPI * WglGetExtensionsStringExtFn)();
+    typedef const char*(WINAPI * WglGetExtensionsStringArbFn)(HDC);
+    typedef HDC(WINAPI * WglGetCurrentDcFn)();
+
+    const char* extensions = nullptr;
+    auto        queryExt = reinterpret_cast<WglGetExtensionsStringExtFn>(
+        g_getProcAddress("wglGetExtensionsStringEXT"));
+    if (queryExt) extensions = queryExt();
+    if (!extensions) {
+        auto queryArb = reinterpret_cast<WglGetExtensionsStringArbFn>(
+            g_getProcAddress("wglGetExtensionsStringARB"));
+        HMODULE gl = GetModuleHandleA("opengl32.dll");
+        auto    currentDc = gl ? reinterpret_cast<WglGetCurrentDcFn>(
+                                     GetProcAddress(gl, "wglGetCurrentDC"))
+                               : nullptr;
+        HDC dc = currentDc ? currentDc() : nullptr;
+        if (queryArb && dc) extensions = queryArb(dc);
+    }
+    return extensions && std::strstr(extensions, "WGL_EXT_swap_control_tear") != nullptr;
 }
 
 }  // namespace
@@ -81,18 +108,37 @@ void swapControlApply() {
         return;
     }
 
-    const int wanted = g_options.swapInterval;
-    const BOOL ok = g_swapInterval(wanted);
+    // Adaptive vsync is the same interval negated, and only WGL_EXT_swap_control_tear makes a
+    // negative interval valid, so the extension is looked for first.
+    int wanted = g_options.swapInterval;
+    if (g_options.swapTear && wanted > 0) {
+        if (tearSupported()) {
+            wanted = -wanted;
+        } else {
+            logf("swap: this driver does not offer WGL_EXT_swap_control_tear, so adaptive vsync "
+                 "(swapInterval = -2) falls back to plain vsync");
+        }
+    }
+    BOOL ok = g_swapInterval(wanted);
+    if (!ok && wanted < 0) {
+        logf("swap: the driver refused interval %d -- asking for %d instead", wanted, -wanted);
+        wanted = -wanted;
+        ok = g_swapInterval(wanted);
+    }
 
     // Report what the driver actually did, not what we asked for. Vsync can be forced
     // on in the driver control panel, in which case the call succeeds and the interval
     // stays 1 -- and that is worth seeing in the log, because the symptom (still
     // locked to 72) would otherwise look like this code never ran.
+    //
+    // Drivers disagree on what they report for a tearing interval: some give the negative
+    // value back and some its magnitude, so either reads as the request having stood.
     if (g_getSwapInterval) {
         const int actual = g_getSwapInterval();
+        bool      stood = actual == wanted || (wanted < 0 && actual == -wanted);
         logf("swap: interval %d requested on context %p -- %s, driver reports %d%s",
              wanted, context, ok ? "accepted" : "REFUSED", actual,
-             actual == wanted ? "" : " (overridden in the driver control panel?)");
+             stood ? "" : " (overridden in the driver control panel?)");
     } else {
         logf("swap: interval %d requested on context %p -- %s (no "
              "wglGetSwapIntervalEXT to confirm with)",

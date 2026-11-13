@@ -122,11 +122,37 @@ void hookMainModuleImport(const char* name, void* replacement, Fn* original) {
     logf("IAT: main module does not import %s", name);
 }
 
+// -- timer resolution -------------------------------------------------------
+// GPL's frame loop and its BG lock both wait in Sleep(1) polls, and gplvr's own waits sleep
+// too. Sleep(1) lasts until the next system timer interrupt, which is up to 15.6 ms away at the
+// default resolution and about 1 ms away once a process has asked for that. Since Windows 10
+// 2004 the request only counts for the process that made it, so it is made here whatever else
+// is running. Resolved by name: winmm is the game's own dependency, and this keeps it out of
+// gplvr's import table.
+
+void raiseTimerResolution() {
+    using TimeBeginPeriodFn = UINT(WINAPI*)(UINT);
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+    auto    begin = winmm ? reinterpret_cast<TimeBeginPeriodFn>(
+                                GetProcAddress(winmm, "timeBeginPeriod"))
+                          : nullptr;
+    if (!begin) {
+        logf("timer: winmm's timeBeginPeriod did not resolve -- the system timer resolution is "
+             "left as it is");
+        return;
+    }
+    // 0 is TIMERR_NOERROR. The request lasts until the process exits.
+    UINT result = begin(1);
+    logf("timer: 1 ms system timer resolution requested for this process -- %s",
+         result == 0 ? "accepted" : "REFUSED");
+}
+
 // -- deferred install -------------------------------------------------------
 // The rasterizer globals stay null until the game has picked and loaded a
 // rasterizer DLL, so we wait for them rather than guessing at timing.
 
 DWORD WINAPI installThread(LPVOID) {
+    raiseTimerResolution();
     logf("waiting for a rasterizer to be loaded...");
 
     Binding binding;

@@ -179,6 +179,9 @@ private:
     HANDLE        mapping_ = nullptr;
     ControlBlock* block_ = nullptr;
     HANDLE        producerProcess_ = nullptr;
+    // The game's view-set event (makeViewEventName), signalled by publishViews. Null when the
+    // game did not create one.
+    HANDLE        viewEvent_ = nullptr;
 
     ID3D11Device*        device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
