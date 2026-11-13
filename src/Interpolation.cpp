@@ -336,6 +336,11 @@ struct FrameClock {
     double refresh = 0.0;  // one display refresh: the monitor's mode, then measured from the frames
     int    offCadence = 0;  // consecutive frames that took the wall clock
     int    queryIn = 0;     // frames until the monitor is asked again
+
+    // This frame's instant, taken at the top of the frame (interpolationFlatFrameInstant) so that
+    // the latch decision and the blend use the same one. The blend takes it once.
+    bool   pending = false;
+    double pendingInstant = 0.0;
 };
 
 using CountFn = int(__cdecl*)();
@@ -1257,8 +1262,13 @@ double flatFrameInstant(State& s, long long now) {
 }
 
 // A flat frame's blend target: its instant, less one tick so that it lies between the two newest
-// latched ticks.
-double flatTarget(State& s, long long now) { return flatFrameInstant(s, now) - tickLength(s); }
+// latched ticks. The instant is the one taken at the top of the frame where there is one.
+double flatTarget(State& s, long long now) {
+    FrameClock& c = s.frameClock;
+    double      instant = c.pending ? c.pendingInstant : flatFrameInstant(s, now);
+    c.pending = false;
+    return instant - tickLength(s);
+}
 
 void blendFrame(State& s, long long now, bool frozen) {
     Window& w = s.window;
@@ -1744,6 +1754,19 @@ void interpolationInstall() {
 }
 
 bool interpolationActive() { return g_state.installed && blendingEnabled(); }
+
+bool interpolationFlatFrameInstant(double& instant, double& refresh) {
+    State& s = g_state;
+    if (!s.installed || !blendingEnabled() || g_options.vr || s.frequency <= 0) return false;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    FrameClock& c = s.frameClock;
+    c.pendingInstant = flatFrameInstant(s, now.QuadPart);
+    c.pending = true;
+    instant = c.pendingInstant;
+    refresh = c.refresh;
+    return true;
+}
 
 bool interpolationExtraFrame() {
     State& s = g_state;

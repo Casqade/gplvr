@@ -38,6 +38,12 @@ bool interpolationActive();
 // pair -- in which case the extra frame draws the same world as the one before it.
 bool interpolationExtraFrame();
 
+// Flat mode: this frame's instant on the flat frame clock, in QPC ticks, and the clock's refresh
+// (0 when vsync does not pace the frames). Called once at the top of every frame, before the
+// latch, so the latch can be decided against the instant the blend will then use. False in VR,
+// with blending off, or before install.
+bool interpolationFlatFrameInstant(double& instant, double& refresh);
+
 // Which records the blend rewrites, as a bitmask. All of them, always; the bisect that cycled
 // these lives in docs/audit-2026-09-18/85-instrument-archive.md if it is ever wanted again.
 enum InterpolateParts {

@@ -44,6 +44,11 @@
 // at the top of the iteration, before the latch. It is there for variable-refresh displays: kept
 // a few frames under the refresh rate, the display follows the game's frames, and SwapBuffers
 // never has to block for a refresh.
+//
+// THE FRAME CLOCK DECIDES THE LATCH in flat mode. Each frame takes its instant on the flat frame
+// clock (Interpolation) first; a tick that has arrived but is due after that instant is left for
+// the next frame, and a tick due by it that has not arrived yet is waited for, briefly. The blend
+// then always finds its target between the two ticks the frame latched. See latchByFrameClock.
 
 #include <cstddef>
 

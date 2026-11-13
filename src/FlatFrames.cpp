@@ -5,11 +5,13 @@
 #include "Interpolation.h"
 #include "Log.h"
 #include "RenderProfile.h"
+#include "TickClock.h"
 #include "Window.h"
 #include "presenter/Producer.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -73,6 +75,7 @@ struct State {
     double    tickPeriod = 0.0;
     bool      haveTick = false;
     int       extras = 0;      // extra frames already drawn against this tick
+    int       deferrals = 0;   // frames that left a waiting tick unlatched since the last latch
 
     // The window since the last report.
     unsigned windowFrames = 0;
@@ -222,7 +225,7 @@ bool displayIsReady(const State& s) {
 // A signal can be left over from a set that was published while the last frame was being drawn.
 // It ends one step early and the counter says there is nothing new, so the loop comes back here
 // with the event spent.
-void waitForViews(State& s) {
+void waitForViews() {
     HANDLE event = presenterViewEvent();
     if (!event) {
         Sleep(1);
@@ -236,6 +239,57 @@ bool tickWaiting(const State& s) {
     // and "the sim has nothing new" is the answer that decides whether a frame is drawn at all.
     if (!g_lastLatchedBgCountAt) return false;
     return s.getBGCount() != *reinterpret_cast<volatile const int*>(g_lastLatchedBgCountAt);
+}
+
+// THE FRAME CLOCK DECIDES WHICH TICKS A FLAT FRAME DRAWS FROM.
+//
+// A flat frame is blended at its instant less one tick, which lies between its two latched ticks
+// only when the newest of them is due by that instant and the next one is not. The latch takes
+// whatever has arrived when the frame starts, and frame starts land a few milliseconds either side
+// of the instants the frame clock gives them (measured up to 2.6 ms at 144 Hz). When ticks arrive
+// inside that band the two disagree and the target leaves the pair. At a 144 Hz sim, where display
+// and sim drift through each other every few seconds, that was 5.4 % of frames clamped high, in
+// bursts of 20 to 50 a second; at 36 Hz the band is a tenth of a tick and it was about three a
+// second.
+//
+// So the tick grid and the frame's instant decide:
+//   a tick has arrived but is due after the instant     the frame leaves it for the next one and
+//                                                       is drawn from the current pair, exactly as
+//                                                       a frame between ticks is
+//   none has arrived but the next is due by the instant the frame waits for it, up to kDueGraceMs
+//                                                       past its grid time and half a refresh in
+//                                                       all; a tick later than that is a real
+//                                                       stall, and the frame goes on as before
+//
+// A waiting tick is left at most kMaxDeferrals frames and never past a BG request, which the
+// latch is what serves; a grid that puts it more than a tick away is not trusted to leave it.
+constexpr double kDueGraceMs = 1.5;
+constexpr int    kMaxDeferrals = 2;
+
+enum class ClockLatch { AsBefore, Defer };
+
+ClockLatch latchByFrameClock(State& s, double instant, double refresh) {
+    if (!s.haveTick || !g_lastLatchedBgCountAt || s.frequency <= 0) return ClockLatch::AsBefore;
+    int    latched = *reinterpret_cast<volatile const int*>(g_lastLatchedBgCountAt);
+    double due = 0.0;
+    double tick = tickClockPeriod();
+    if (tick <= 0.0 || !tickClockArrival(latched + 1, due)) return ClockLatch::AsBefore;
+
+    if (tickWaiting(s)) {
+        if (due <= instant || due - instant > tick) return ClockLatch::AsBefore;
+        if (s.deferrals >= kMaxDeferrals) return ClockLatch::AsBefore;
+        if (s.bgRequested && s.bgRequested()) return ClockLatch::AsBefore;
+        ++s.deferrals;
+        return ClockLatch::Defer;
+    }
+    if (due > instant) return ClockLatch::AsBefore;
+
+    long long start = now();
+    double    limit = due + kDueGraceMs * static_cast<double>(s.frequency) / 1000.0;
+    if (refresh > 0.0) limit = std::min(limit, static_cast<double>(start) + 0.5 * refresh);
+    if (static_cast<double>(start) >= limit) return ClockLatch::AsBefore;
+    while (!tickWaiting(s) && static_cast<double>(now()) < limit) SwitchToThread();
+    return ClockLatch::AsBefore;
 }
 
 // The stock frame: gpl_fgFrameSnapshotBegin, which waits for the tick if it has not landed,
@@ -254,6 +308,7 @@ void takeStockFrame(State& s) {
     s.tickStart = at;
     s.haveTick = true;
     s.extras = 0;
+    s.deferrals = 0;
     // A tick frame is a frame for the display too, so the gate counts from here as well.
     s.lastViewSequence = presenterViewSequence();
 }
@@ -261,6 +316,14 @@ void takeStockFrame(State& s) {
 void __cdecl snapshotBeginHook() {
     State& s = g_state;
     ++s.windowFrames;
+
+    // The frame starts here: after its slot under the frame cap, and with its instant on the flat
+    // frame clock taken for every frame that may blend, so that no blend is left an earlier
+    // frame's instant.
+    waitForFrameSlot(s);
+    double instant = 0.0;
+    double refresh = 0.0;
+    bool   clocked = interpolationFlatFrameInstant(instant, refresh);
 
     if (!extraFramesOn() || !s.getBGCount) {
         takeStockFrame(s);
@@ -271,8 +334,6 @@ void __cdecl snapshotBeginHook() {
         takeStockFrame(s);
         return;
     }
-
-    waitForFrameSlot(s);
 
     // EVERY ITERATION WAITS FOR THE DISPLAY, INCLUDING THE ONE THAT LATCHES.
     //
@@ -301,20 +362,24 @@ void __cdecl snapshotBeginHook() {
                 ++s.windowPreempted;
                 break;
             }
-            waitForViews(s);
+            waitForViews();
         }
     }
     s.lastViewSequence = presenterViewSequence();
 
+    // Flat mode: the frame's instant decides whether a waiting tick is latched now, and whether
+    // to wait for one that is due.
+    bool defer = clocked && latchByFrameClock(s, instant, refresh) == ClockLatch::Defer;
+
     // A tick is waiting, so this is the frame that latches it. gpl_fgFrameSnapshotBegin's own
     // poll returns immediately -- what it waits for has already arrived -- so this costs the
     // latch and nothing else.
-    if (tickWaiting(s) || !s.haveTick) {
+    if (!defer && (tickWaiting(s) || !s.haveTick)) {
         if (!s.haveTick) ++s.windowTickless;
         takeStockFrame(s);
         return;
     }
-    if (tickOverdue(s)) {
+    if (!defer && tickOverdue(s)) {
         ++s.windowOverdue;
         takeStockFrame(s);
         return;
