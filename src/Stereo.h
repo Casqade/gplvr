@@ -181,6 +181,14 @@ bool stereoSourceCarvedSize(int& width, int& height);
 // drops -- so a caller that needs the runtime's real IPD cannot silently get a stale one.
 bool stereoEyeGeometry(float& fov, float& separation);
 
+// How much bigger, in an eye `eyeWidth` pixels across, a thing drawn in eye pixels has to be to
+// keep the angular size it had on the headset gplvr's in-eye 2D was tuned on: the eye's focal
+// length in pixels over that headset's, 3172 pixels across 104 degrees (1239 pixels). A denser
+// headset, a higher vrRenderScale or a track the render target was shrunk on all change the
+// focal length, and with it the size GPL's text and the pointer would otherwise take. 1 until a
+// tracked frame has rendered, which is the size those things had before this existed.
+float stereoAngularScale(int eyeWidth);
+
 // Where straight ahead lands in an eye's picture, in that eye's pixels from its centre (x right,
 // y down): the eye camera's principal point. 2D drawn into the eyes relative to the picture's
 // centre moves by it, so it keeps one direction in both eyes. 0, 0 for a centred frustum, and

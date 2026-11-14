@@ -1023,6 +1023,52 @@ void rollRuns() {
     s.runCount = kept;
 }
 
+// THE SAME ON EVERY MONITOR AND HEADSET. vrGplTextScale and vrGplTextSpread were tuned on a
+// 2560x1440 layout and the headset stereoAngularScale measures against, and in raw pixels both
+// drift: GPL lays a 5120x1440 screen out twice as wide, so its runs sat twice as far out, and a
+// denser eye made every glyph smaller. Distances are therefore read in that layout's pixels,
+// per axis so an item GPL anchors to an edge lands where it does on 16:9, and every eye pixel
+// is scaled by the eye's focal length against the reference. The glyph multiple is rounded
+// to a whole number, which is what keeps the font sharp (Hooks.h, vrGplTextScale).
+constexpr float kReferenceLayoutWidth = 2560.0f;
+constexpr float kReferenceLayoutHeight = 1440.0f;
+
+struct TextGeometry {
+    int   scale = 1;        // eye pixels per GPL pixel inside a run
+    float spreadX = 0.0f;   // eye pixels per GPL pixel of a run's distance from the centre
+    float spreadY = 0.0f;
+    float angular = 1.0f;   // stereoAngularScale, kept for the log
+};
+
+TextGeometry textGeometry(int layoutWidth, int layoutHeight, int eyeWidth) {
+    TextGeometry g;
+    g.angular = stereoAngularScale(eyeWidth);
+    long scale = std::lround(static_cast<float>(g_options.vrGplTextScale) * g.angular);
+    g.scale = scale < 1 ? 1 : static_cast<int>(scale);
+    float inset = g_options.vrGplTextSpread * g.angular;
+    g.spreadX = inset * kReferenceLayoutWidth / static_cast<float>(layoutWidth);
+    g.spreadY = inset * kReferenceLayoutHeight / static_cast<float>(layoutHeight);
+    return g;
+}
+
+// One line whenever what the settings resolve to changes: a new layout, a new eye size, a new
+// headset. It is the line to compare between setups.
+void reportGeometry(const TextGeometry& g, int layoutWidth, int layoutHeight, int eyeWidth) {
+    static int   reportedScale = -1;
+    static float reportedX = -1.0f;
+    static float reportedY = -1.0f;
+    if (g.scale == reportedScale && g.spreadX == reportedX && g.spreadY == reportedY) return;
+    reportedScale = g.scale;
+    reportedX = g.spreadX;
+    reportedY = g.spreadY;
+    logf("fast text: vrGplTextScale %d and vrGplTextSpread %.2f resolve to glyphs x%d and a "
+         "spread of %.3f across, %.3f down, on a %dx%d layout in a %d-pixel eye whose focal "
+         "length is %.2f of the reference headset's",
+         g_options.vrGplTextScale, static_cast<double>(g_options.vrGplTextSpread), g.scale,
+         static_cast<double>(g.spreadX), static_cast<double>(g.spreadY), layoutWidth,
+         layoutHeight, eyeWidth, static_cast<double>(g.angular));
+}
+
 // THE INSET MOVES LINES TOGETHER WHILE THE SCALE MAKES THEM TALLER. Two of GPL's notices a line
 // apart end up a quarter of a line apart at twice the height, one over the other. So the runs are
 // laid out the way placeInEyes will put them -- the previous frame's extents, scaled about the
@@ -1038,9 +1084,11 @@ void separateRuns() {
     int layoutHeight = 0;
     windowEngineModeSize(layoutWidth, layoutHeight);
     if (layoutWidth <= 0 || layoutHeight <= 0) return;
+    int eye[4];
+    if (!stereoEyeRect(0, eye)) return;
 
-    float scale = static_cast<float>(g_options.vrGplTextScale);
-    float inset = g_options.vrGplTextSpread;
+    TextGeometry geometry = textGeometry(layoutWidth, layoutHeight, eye[2]);
+    float scale = static_cast<float>(geometry.scale);
     // A clear row between stacked lines, at the glyphs' own scale.
     float gap = scale;
 
@@ -1067,9 +1115,9 @@ void separateRuns() {
         PlacedRun& run = s.runs[order[k]];
         float centreX = 0.5f * static_cast<float>(run.lastMinX + run.lastMaxX);
         float halfWidth = 0.5f * static_cast<float>(run.lastMaxX - run.lastMinX) * scale;
-        float placedX = (centreX - 0.5f * static_cast<float>(layoutWidth)) * inset;
+        float placedX = (centreX - 0.5f * static_cast<float>(layoutWidth)) * geometry.spreadX;
         float placedY = (static_cast<float>(run.row) - 0.5f * static_cast<float>(layoutHeight)) *
-                        inset;
+                        geometry.spreadY;
         left[k] = placedX - halfWidth;
         right[k] = placedX + halfWidth;
         top[k] = placedY + static_cast<float>(run.lastTop) * scale;
@@ -1094,8 +1142,8 @@ void separateRuns() {
             --s.placeReports;
             logf("fast text: the run on GPL row %d (set %d) would overlap the one above it at "
                  "inset %.2f and scale %d -- moved down %.0f eye pixels to clear it",
-                 run.row, run.set, static_cast<double>(inset), g_options.vrGplTextScale,
-                 static_cast<double>(push));
+                 run.row, run.set, static_cast<double>(g_options.vrGplTextSpread),
+                 geometry.scale, static_cast<double>(push));
         }
         run.pushY = push;
         if (push > 0.0f) ++s.runsPushed;
@@ -1205,7 +1253,9 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
     // them is the glyph's own bearing, which the scale carries.
     float anchorY = static_cast<float>(baseY);
 
-    float scale = static_cast<float>(g_options.vrGplTextScale);
+    TextGeometry geometry = textGeometry(layoutWidth, layoutHeight, rect[0][2]);
+    reportGeometry(geometry, layoutWidth, layoutHeight, rect[0][2]);
+    float scale = static_cast<float>(geometry.scale);
     float inset = g_options.vrGplTextSpread;
 
     // GPL'S OWN PIXELS, PULLED TOWARD THE MIDDLE. This was a fraction of the layout re-read as
@@ -1213,9 +1263,10 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
     // 3172x3172 against a 2560x1440 layout, so that route stretched x by 1.24 and y by 2.20,
     // which no glyph size followed. A delta measured in GPL's pixels keeps the layout's shape
     // and matches the glyphs, which are drawn in those same pixels; `inset` is then just how
-    // much of the delta survives, and 0 would be dead centre.
-    float placedX = (anchorX - 0.5f * static_cast<float>(layoutWidth)) * inset;
-    float placedY = (anchorY - 0.5f * static_cast<float>(layoutHeight)) * inset;
+    // much of the delta survives, and 0 would be dead centre. textGeometry turns it into eye
+    // pixels per GPL pixel for this layout and this eye.
+    float placedX = (anchorX - 0.5f * static_cast<float>(layoutWidth)) * geometry.spreadX;
+    float placedY = (anchorY - 0.5f * static_cast<float>(layoutHeight)) * geometry.spreadY;
     if (run->known) placedY += run->pushY;
 
     float offsetX = (static_cast<float>(ax) - anchorX) * scale;
@@ -1279,8 +1330,8 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
             logf("fast text: a glyph of set %d at GPL (%d,%d) %dx%d landed outside both eye "
                  "rects at scale %d and inset %.2f -- %u glyphs have landed outside this "
                  "second. Lower vrGplTextScale or raise vrGplTextSpread.",
-                 set, ax, ay, width, height, g_options.vrGplTextScale,
-                 static_cast<double>(inset), s.window.placeOutsideEye);
+                 set, ax, ay, width, height, geometry.scale, static_cast<double>(inset),
+                 s.window.placeOutsideEye);
         }
         return true;
     }
@@ -1296,7 +1347,7 @@ bool placeInEyes(const StampSource& source, int set, int ax, int ay, int baseY, 
                                  0.5f * static_cast<float>(rect[0][2]) + placedX),
              static_cast<double>(static_cast<float>(rect[0][1]) +
                                  0.5f * static_cast<float>(rect[0][3]) + placedY),
-             rect[0][2], rect[0][3], g_options.vrGplTextScale, static_cast<double>(inset),
+             rect[0][2], rect[0][3], geometry.scale, static_cast<double>(inset),
              disparity, static_cast<double>(g_options.vrGplTextDepth),
              run->known ? "the previous frame's extent" : "this glyph alone, for one frame");
     }

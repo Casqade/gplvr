@@ -6,6 +6,7 @@
 #include "GameExit.h"
 #include "MenuScale.h"
 #include "Pe.h"
+#include "RenderTarget.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -554,10 +555,21 @@ int __cdecl instanceAllocThunk(void** out, void* source, int x, int y, int w, in
         // replay loaded from the menu, whose view is allocated before the target takes over,
         // went stereo. A request exactly the mode's width on a parent at least the mode's size
         // is measured against the mode.
-        int layoutWidth = parentWidth;
-        int layoutHeight = parentHeight;
+        //
+        // AND ON THE OFF-SCREEN TARGET, WHATEVER ITS SIZE. The target is the headset's shape, so
+        // it can be narrower than the mode: 3172x1586 at vrRenderScale 0.5 against a 5120x1440
+        // mode (2026-11-14), which a lower-resolution headset on a wide monitor reaches too.
+        // There the test above failed, the replay's view stayed letterboxed at 3172x1140, went
+        // out as a mono menu viewport, and the cockpit view after it was never recognised.
+        int  targetWidth = 0;
+        int  targetHeight = 0;
+        bool parentIsTarget = renderTargetActive() &&
+                              renderTargetBuiltSize(targetWidth, targetHeight) &&
+                              parentWidth == targetWidth && parentHeight == targetHeight;
+        int  layoutWidth = parentWidth;
+        int  layoutHeight = parentHeight;
         if (w != parentWidth && modeWidth > 0 && modeHeight > 0 && w == modeWidth &&
-            parentWidth >= modeWidth && parentHeight >= modeHeight) {
+            (parentIsTarget || (parentWidth >= modeWidth && parentHeight >= modeHeight))) {
             layoutWidth = modeWidth;
             layoutHeight = modeHeight;
         }
@@ -580,8 +592,9 @@ int __cdecl instanceAllocThunk(void** out, void* source, int x, int y, int w, in
         // so in as many words. The driving view is carved out of the back buffer, so
         // the parent must be the size the engine says its mode is; the same 7/8 margin
         // Stereo and RenderTarget use to tell a full-screen surface from a panel.
-        bool onTheBackBuffer = modeWidth > 0 && parentWidth * 8 >= modeWidth * 7 &&
-                               parentHeight * 8 >= modeHeight * 7;
+        bool onTheBackBuffer = parentIsTarget ||
+                               (modeWidth > 0 && parentWidth * 8 >= modeWidth * 7 &&
+                                parentHeight * 8 >= modeHeight * 7);
 
         if (onTheBackBuffer && x == 0 && w == layoutWidth && h * 2 >= layoutHeight) {
             int result = g_originalInstanceAlloc ? g_originalInstanceAlloc(out, source, x, y, w, h)

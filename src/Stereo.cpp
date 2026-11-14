@@ -1455,6 +1455,16 @@ bool stereoEyeGeometry(float& fov, float& separation) {
     return fov > 0.0f && separation > 0.0f;
 }
 
+float stereoAngularScale(int eyeWidth) {
+    // 1586 / tan(1.8148 / 2): half of 3172 pixels over the tangent of half of 104 degrees.
+    constexpr float kReferenceFocalPixels = 1239.0f;
+    if (!g_state.geometryValid || eyeWidth <= 0) return 1.0f;
+    float halfAngle = g_state.eyeFov * 0.5f;
+    if (halfAngle <= 0.0f || halfAngle >= 1.5f) return 1.0f;
+    float focal = static_cast<float>(eyeWidth) * 0.5f / std::tan(halfAngle);
+    return focal / kReferenceFocalPixels;
+}
+
 void stereoEyeCentreShift(int eye, float& dx, float& dy) {
     dx = 0.0f;
     dy = 0.0f;

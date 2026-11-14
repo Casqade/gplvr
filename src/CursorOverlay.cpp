@@ -18,6 +18,10 @@
 namespace gplvr {
 namespace {
 
+// Eye pixels per cursor pixel on the headset stereoAngularScale measures against, the size the
+// pointer had there: 3172-line eyes against a 1440-line window.
+constexpr float kEyeCursorScale = 3172.0f / 1440.0f;
+
 // -- what gets drawn -------------------------------------------------------------------
 //
 // THE REAL CURSOR, not a drawing of one. GetCursorInfo hands back the HCURSOR Windows is
@@ -1022,11 +1026,14 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
         drawnX[i] = static_cast<float>(rects[i][0]) + fx * static_cast<float>(rects[i][2]);
         drawnY[i] = static_cast<float>(rects[i][1]) + fy * static_cast<float>(rects[i][3]);
 
-        // Surface pixels per SCREEN pixel, so the cursor keeps the same relative size in
-        // the headset that it has on the desktop. Sizing it in surface pixels instead
-        // would make a 32-pixel arrow invisible the moment the off-screen target goes to
-        // 3172 lines an eye.
+        // Surface pixels per SCREEN pixel on a single image, so the cursor keeps the size it
+        // has on the desktop. In the eyes it is an ANGLE: the size it had in the 3172-line
+        // eyes of a 1440-line window, scaled by the eye's focal length against that headset
+        // (stereoAngularScale) -- by the window height it was a third smaller on a 4K
+        // monitor and a third bigger on 1080p.
         float scale = static_cast<float>(rects[i][3]) / static_cast<float>(clientH);
+        if (usedStereoRects)
+            scale = kEyeCursorScale * stereoAngularScale(rects[i][2]);
         if (g_image.height * scale < 8.0f)
             scale = 8.0f / static_cast<float>(g_image.height);
         drawnSize = g_image.height * scale;

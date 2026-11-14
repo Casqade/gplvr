@@ -117,11 +117,20 @@ constexpr int kPanelCount = sizeof(kPanels) / sizeof(kPanels[0]);
 constexpr const char* kLayoutFile = "gplvr_pribluda.ini";
 constexpr int         kUnset = INT_MIN;
 
-// Text on the panel, RELATIVE to pribluda's own size: 1.0 would keep the share of the panel
-// the text has of the monitor, which is too small to read at a panel's distance. Not a
-// setting -- the panel's own width already scales everything on it together, which is the
-// control someone actually wants, and two overlapping size controls is one too many.
-constexpr float kPribludaTextScale = 2.0f;
+// THE PANEL'S TEXT IS ITS OWN SIZE: a share of the panel's width, whatever pribluda.ini's
+// outlineOpenglFontSize and the monitor say. That key is in monitor pixels and was multiplied
+// by panel texels per monitor pixel, so the text shrank as the monitor grew -- half size on a
+// 5120x1440 screen, a third bigger on 1920x1080, where the boards grew into each other. The
+// share is the look the shipped gplvr_pribluda.ini was laid out with: outlineOpenglFontSize 9,
+// doubled, on a 2560-wide monitor, which is 14.4 texels of the 2048. Not a setting -- the
+// panel's own width already scales everything on it together.
+constexpr float kPanelFontShare = 9.0f * 2.0f / 2560.0f;
+
+// The panel's shape when gplvr_pribluda.ini lays it out: 16:9 on every monitor, the shape the
+// file's fractions were placed on. It followed the monitor, which squashed an ultrawide's
+// panel to 3.56:1 -- past the 3:1 at which pribluda switches to its triple-screen layout.
+constexpr int kPanelAspectWidth = 16;
+constexpr int kPanelAspectHeight = 9;
 
 // Written into gplvr's own folder when it is missing, and by Reset Pribluda layout. The same
 // text as the shipped config/gplvr_pribluda.ini, so a reset gives back the shipped layout; keep
@@ -1075,7 +1084,11 @@ void pribludaDrawHud() {
 
     int width = 0;
     int height = 0;
-    bool drawn = presenterHudBegin(monitorWidth, monitorHeight, width, height);
+    // Without the layout file pribluda's own monitor layout is mapped onto the panel, so the
+    // panel keeps the monitor's shape for it.
+    bool drawn = g_layout.present
+                     ? presenterHudBegin(kPanelAspectWidth, kPanelAspectHeight, width, height)
+                     : presenterHudBegin(monitorWidth, monitorHeight, width, height);
     float savedFont = *g_prib.fontSize;
     float font = savedFont;
 
@@ -1102,13 +1115,10 @@ void pribludaDrawHud() {
 
         swapBoxSizes();
 
-        // The panel has the monitor's aspect, so text keeps the share of the panel it has
-        // of the monitor. With the layout file the panel's texels ARE the coordinate space,
-        // and the glyphs are scaled by texels per monitor pixel; without it pribluda's own
-        // monitor-sized space is mapped onto the panel, which scales them already.
-        // kPribludaTextScale multiplies on top of either.
-        font = savedFont * kPribludaTextScale;
-        if (g_layout.present) font *= static_cast<float>(width) / monitorWidth;
+        // The font is in the units pribluda draws in: the panel's texels with the layout file,
+        // monitor pixels without it, where pribluda's monitor-sized space is mapped onto the
+        // panel. Either way it comes out the same share of the panel's width.
+        font = kPanelFontShare * static_cast<float>(g_layout.present ? width : monitorWidth);
         *g_prib.fontSize = font;
 
         if (g_layout.present) {
@@ -1165,11 +1175,12 @@ void pribludaDrawHud() {
         g_reportedWidth = width;
         g_reportedHeight = height;
         g_reportedFont = font;
-        logf("pribluda: drawn onto the %dx%d HUD panel %s, font %.2f -> %.2f",
+        logf("pribluda: drawn onto the %dx%d HUD panel %s, font %.2f (gplvr's own; "
+             "pribluda.ini's %.2f is for the %dx%d monitor and is not used in the headset)",
              width, height,
              g_layout.present ? "from gplvr_pribluda.ini"
                               : "with pribluda.ini's own monitor layout",
-             savedFont, font);
+             font, savedFont, monitorWidth, monitorHeight);
     }
 }
 

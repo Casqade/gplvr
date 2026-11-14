@@ -1174,9 +1174,14 @@ void renderTargetOverrideSurface(void* surfaceHandle) {
     // a world render to the eye-target code, and the front end went stereo. The same 7/8
     // margin Stereo uses to tell those apart, applied here so the two agree by
     // construction rather than by luck.
-    if (*widthField * 8 < g_surface.nativeWidth * 7 ||
-        *heightField * 8 < g_surface.nativeHeight * 7)
-        return;
+    //
+    // Against the smaller of the mode and the target, per axis: a view allocated mid-race is
+    // clipped to the target, and a target narrower than the mode -- 3172x1586 at vrRenderScale
+    // 0.5 against a 5120x1440 mode -- left it 3172 wide, which no 7/8 of 5120 admits.
+    int fullWidth = g_surface.nativeWidth < g_target.width ? g_surface.nativeWidth : g_target.width;
+    int fullHeight =
+        g_surface.nativeHeight < g_target.height ? g_surface.nativeHeight : g_target.height;
+    if (*widthField * 8 < fullWidth * 7 || *heightField * 8 < fullHeight * 7) return;
 
     static int lastFrom[2] = {0, 0};
     if (*widthField != lastFrom[0] || *heightField != lastFrom[1]) {

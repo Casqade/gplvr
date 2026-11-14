@@ -528,10 +528,11 @@ struct Options {
     // boxes, solid black in pribluda, stay solid.
     float vrHudBackdropOpacity = 0.30f;
 
-    // Text on the panel is drawn at kPribludaTextScale times pribluda's own size, a constant
-    // in Pribluda.cpp. It was `vrHudTextScale` until 2026-09-27, and it is not a setting
-    // because the panel's own size already decides how big the text looks: making the panel
-    // wider makes everything on it bigger together, which is the control a driver wants.
+    // Text on the panel is gplvr's own size, kPanelFontShare of the panel's width in
+    // Pribluda.cpp; pribluda.ini's outlineOpenglFontSize is for the monitor and is not used in
+    // the headset. It was `vrHudTextScale` until 2026-09-27, and it is not a setting because
+    // the panel's own size already decides how big the text looks: making the panel wider
+    // makes everything on it bigger together, which is the control a driver wants.
 
     // Switch the panel between fixed (vrHudMode 1) and head-locked (2) while the game runs.
     // Home by default; 0 disables. From vrHudMode 0 it goes to head-locked, which needs no
@@ -588,6 +589,11 @@ struct Options {
     // reproduces each source texel as an n-by-n block, which is what enlarging a bitmap font
     // means; a fractional multiple would drop and double rows unevenly along a line of text.
     //
+    // AN ANGLE, NOT A PIXEL COUNT: the multiple holds on the headset stereoAngularScale measures
+    // against, and on any other eye it is scaled by that eye's focal length and rounded to the
+    // nearest whole number (at least 1), so a denser headset or a higher vrRenderScale keeps the
+    // text the size it was. The resolved multiple is the `fast text: ... resolve to` line.
+    //
     // VR only. 1 is the size GPL authored.
     int vrGplTextScale = 2;
 
@@ -610,6 +616,10 @@ struct Options {
     // the replay band's 37-pixel button step. A run is recognised across frames by its stamp set
     // and the baseline GPL asked for, so its extent is known from the frame before and a line is
     // centred as a line.
+    //
+    // THE PIXELS ARE A 2560x1440 LAYOUT'S AND THE REFERENCE HEADSET'S: a run's distance is read
+    // per axis against a 2560x1440 layout, whatever GPL's mode is, and scaled into the eye by
+    // stereoAngularScale, so the layout sits the same on every monitor and headset.
     //
     // VR only.
     float vrGplTextSpread = 0.25f;
