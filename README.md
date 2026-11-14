@@ -16,6 +16,7 @@ Gameplay video: https://youtu.be/yPTQwbbPhSg
 - VR mod itself
 - In-game configurable Pribluda layout
 - Tweakable mirrors (fov & orientation)
+- Horizon Lock as an accessibility feature if you have motion sickness when driving in VR
 
 Despite its name and original intent, GPLVR offers additional features available in non-VR mode as well:
 - `Borderless fullscreen`: GPL won't mess with your display resolution settings or prevent ALT-tabbing. Optional widescreen & letterbox fixes come as part of it
@@ -108,8 +109,9 @@ If you're having trouble with any step or understanding its phrasing, feel free 
 
 ## Configuration
 
-1. If you're going to use GPLVR in flat (non-VR) mode, open `gplvr.ini`, set `vr` to `0` and save changes. Otherwise proceed to the next step
-2. GPLVR can be launched in two ways. Pick one which is easier for you:
+1. **Disable all compatibility fixes applied to your GPL executable (untick everything in File -> Properties -> Compatibility)**
+2. If you're going to use GPLVR in flat (non-VR) mode, open `gplvr.ini`, set `vr` to `0` and save changes. Otherwise proceed to the next step
+3. GPLVR can be launched in two ways. Pick one which is easier for you:
   - Via GPLVR launcher: if the exe you use to run GPL is NOT `gplc67.exe`, open gplvr.ini in text editor and rename `exe` value in `[loader]` section to the one you actually use (e.g. `gpl2020demo.exe`). Save changes and you're clear to run gplvr.exe
   - Via GPLVR loader patch: Put `gplvr-load.xml` from `gplvr/patches` dir into your GEM+ patches directory (`GPLSecrets/GEM+/Options`) and apply it in GEM+ so it picks up gplvr.dll automatically
 
