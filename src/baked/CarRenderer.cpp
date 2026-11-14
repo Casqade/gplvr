@@ -11,16 +11,25 @@
 namespace baked {
 namespace {
 
-// The car renderer's own units: the per-pass frame and draw tables, and the unit textures are
-// uploaded through. None is a unit the track renderer or roglv2 uses (RendererInternal.h).
-constexpr GLenum kFrameUnit = gl::kTexture0 + 6;
-constexpr GLenum kDrawUnit = gl::kTexture0 + 7;
+// The car renderer's own unit, which textures are uploaded through. Not a unit the track renderer
+// or roglv2 uses (RendererInternal.h).
 constexpr GLenum kUploadUnit = gl::kTexture0 + 6;
-// The resident rows' table (report 105 section 4.66); unit 9 is ResidualDepth's.
-constexpr GLenum kRowUnit = gl::kTexture0 + 8;
 
-constexpr unsigned kFrameFloats = 16;  // four RGBA32F texels
-constexpr unsigned kDrawWords = 8;     // two RGBA32UI texels
+// The car program's tables are shader storage blocks: the per-pass frames and draws, and the
+// resident rows (report 105 section 4.66). The merged track program's blocks are 0 and 1
+// (RendererMerged.cpp), bound for the whole of its phases, which the cars' draws run inside.
+// AMD's driver faults on buffer textures in this program: atioglxx 27.20.14044.2 in the first car
+// draw with the vertex stage's three buffer-texture slots on unit -1 (dump 9128, the merged
+// program's crash of 2026-11-08 in STATUS.md), 31.0.21924.61 on a unit left on the default buffer
+// texture (dump 7704).
+constexpr GLuint kFramesBinding = 2;
+constexpr GLuint kDrawsBinding = 3;
+constexpr GLuint kRowsBinding = 4;
+// A table's element is a vec4 or uvec4.
+constexpr uint32_t kTableElementBytes = 16;
+
+constexpr unsigned kFrameFloats = 16;  // four vec4 elements
+constexpr unsigned kDrawWords = 8;     // two uvec4 elements
 
 // Per draw, its place in its car's walk moves its depth towards the eye by this fraction of its
 // distance (a relative step of the view depth w, about 4 float ulps of reversed-Z depth): enough
@@ -67,7 +76,7 @@ constexpr uint32_t kRegionIndices = 262144;   // 1 MiB at the start of the index
 // A self-check readback (kCarRowCheckEvery) not done after this many prepares is given up.
 constexpr uint32_t kRowCheckGiveUp = 512;
 
-const char* const kCarVertexHead = R"(#version 400
+const char* const kCarVertexHead = R"(#version 430
 #extension GL_ARB_bindless_texture : require
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec2 a_uv;
@@ -78,11 +87,12 @@ layout(location = 5) in uint a_flags;    // CarLeafFlags
 layout(location = 7) in vec2 a_offset;   // a sprite corner's `flat` as two int16
 layout(location = 9) in uint a_draw;     // the draw's row, one per instance
 uniform mat4 u_clipFromView;
-uniform samplerBuffer u_frames;          // per frame: eye-relative world from local, 3 rows; half
-uniform usamplerBuffer u_draws;
-// Report 105 section 4.66: a list drawn from the GPU store reads its rows from u_rows at x, its
+// Per frame: eye-relative world from local, 3 rows; half vector. kFramesBinding.
+layout(std430, binding = 2) readonly buffer CarFrames { vec4 carFrames[]; };
+layout(std430, binding = 3) readonly buffer CarDraws { uvec4 carDraws[]; };  // kDrawsBinding
+// Report 105 section 4.66: a list drawn from the GPU store reads its rows from carRows at x, its
 // frames from y (z 1); the pass's own tables hold absolute rows and frames (0, 0, 0).
-uniform usamplerBuffer u_rows;
+layout(std430, binding = 4) readonly buffer CarRows { uvec4 carRows[]; };  // kRowsBinding
 uniform ivec3 u_rowSource;
 uniform vec3 u_light;                    // world, unit
 uniform vec4 u_lighting;                 // x lighting on, y specular on, z ka, w kd
@@ -101,7 +111,7 @@ noperspective out vec3 v_secondary;
 noperspective out float v_fogW;
 flat out uvec2 v_texture;
 flat out float v_rank;
-flat out int v_palette;   // the palette row's first texel in u_draws, -1 for none
+flat out int v_palette;   // the palette row's first element in carDraws, -1 for none
 flat out uint v_drawBits;  // d1.w & 14: walk-order only, palette, palette alpha ignored
 flat out vec2 v_paletteSize;  // a palette sprite's texture size, from its row
 const uint kSprite = 1u;
@@ -121,13 +131,13 @@ vec4 argb(uint word) {
 void main() {
     int draw = (int(a_draw) + u_rowSource.x) * 2;
     bool resident = u_rowSource.z != 0;
-    uvec4 d0 = resident ? texelFetch(u_rows, draw) : texelFetch(u_draws, draw);
-    uvec4 d1 = resident ? texelFetch(u_rows, draw + 1) : texelFetch(u_draws, draw + 1);
+    uvec4 d0 = resident ? carRows[draw] : carDraws[draw];
+    uvec4 d1 = resident ? carRows[draw + 1] : carDraws[draw + 1];
     int frame = (int(d0.z) + u_rowSource.y) * 4;
-    vec4 r0 = texelFetch(u_frames, frame);
-    vec4 r1 = texelFetch(u_frames, frame + 1);
-    vec4 r2 = texelFetch(u_frames, frame + 2);
-    vec3 halfVector = texelFetch(u_frames, frame + 3).xyz;
+    vec4 r0 = carFrames[frame];
+    vec4 r1 = carFrames[frame + 1];
+    vec4 r2 = carFrames[frame + 2];
+    vec3 halfVector = carFrames[frame + 3].xyz;
     mat3 rotation = transpose(mat3(r0.xyz, r1.xyz, r2.xyz));
     vec3 origin = vec3(r0.w, r1.w, r2.w);
     bool sprite = (a_flags & kSprite) != 0u;
@@ -204,7 +214,7 @@ void main() {
 // walk's order -- hidden where GPL's walk reached that surface after the car -- and over a car
 // by depth. The depth moves towards the eye by the draw's rank. Phase 2 (an overlay list, report 105
 // section 4.49) keeps every fragment above alpha 0, untested: it is drawn without depth, in order.
-const char* const kCarFragmentShader = R"(#version 400
+const char* const kCarFragmentShader = R"(#version 430
 #extension GL_ARB_bindless_texture : require
 in vec2 v_uv;
 noperspective in vec4 v_primary;
@@ -220,7 +230,7 @@ uniform int u_phase;
 // draw table. roglv2 expands such a mip with the current colormap and samples the result with
 // its own filter (mag LINEAR, one level LINEAR when TrilinearFiltering, else NEAREST), so the
 // four indices of the bilinear footprint are each looked up and the colours blended.
-uniform usamplerBuffer u_draws;
+layout(std430, binding = 3) readonly buffer CarDraws { uvec4 carDraws[]; };  // kDrawsBinding
 uniform int u_paletteLinear;
 uniform vec2 u_fog;
 uniform vec3 u_fogColour;
@@ -238,7 +248,7 @@ layout(location = 1) out uint o_order;
 const float kCoreAlpha = 0.99;  // RendererInternal.h kCoreAlpha
 vec4 paletteColour(float index) {
     uint i = uint(index * 255.0 + 0.5) & 15u;
-    uvec4 texel = texelFetch(u_draws, v_palette + int(i >> 2));
+    uvec4 texel = carDraws[v_palette + int(i >> 2)];
     uint lane = i & 3u;
     uint word = lane == 0u ? texel.x : lane == 1u ? texel.y : lane == 2u ? texel.z : texel.w;
     vec4 c = vec4(float((word >> 16) & 255u), float((word >> 8) & 255u), float(word & 255u),
@@ -298,6 +308,8 @@ static_assert(kWalkOnlyBit == 2u && kPaletteDrawBit == 4u && kPaletteOpaqueBit =
                   kPaletteTexels == 4u,
               "both car shaders repeat the draw bits and the palette layout");
 static_assert(kHookOrder == 0x80000000u, "kCarFragmentShader repeats kHookOrder");
+static_assert(kFramesBinding == 2 && kDrawsBinding == 3 && kRowsBinding == 4,
+              "both car shaders repeat the storage block bindings");
 static_assert(sizeof(CarVertex) == 36, "the attribute offsets below assume the 36-byte vertex");
 static_assert(kCarLeafSprite == 1 && kCarLeafLit == 2 && kCarLeafTextured == 4 &&
                   kCarLeafFlatFromTexture == 16 && kCarLeafInvisible == 128 &&
@@ -368,17 +380,15 @@ bool hasExtension(const GlApi& gl, const char* wanted) {
     return false;
 }
 
-// The bindings prepare and drawSolid change, and back.
+// The bindings prepare and drawSolid change, and back. The car program's storage blocks are
+// unbound: nothing else in the process uses those binding points.
 struct SavedBindings {
     GLint program = 0;
     GLint vertexArray = 0;
     GLint arrayBuffer = 0;
     GLint indirectBuffer = 0;
     GLint activeTexture = 0;
-    GLint frameUnitBuffer = 0;
-    GLint drawUnitBuffer = 0;
     GLint uploadUnit2D = 0;
-    GLint rowUnitBuffer = 0;
 };
 
 void saveBindings(const GlApi& gl, SavedBindings& s) {
@@ -387,22 +397,17 @@ void saveBindings(const GlApi& gl, SavedBindings& s) {
     gl.getIntegerv(gl::kArrayBufferBinding, &s.arrayBuffer);
     gl.getIntegerv(gl::kDrawIndirectBufferBinding, &s.indirectBuffer);
     gl.getIntegerv(gl::kActiveTexture, &s.activeTexture);
-    gl.activeTexture(kFrameUnit);
-    gl.getIntegerv(gl::kTextureBindingBuffer, &s.frameUnitBuffer);
+    gl.activeTexture(kUploadUnit);
     gl.getIntegerv(gl::kTextureBinding2D, &s.uploadUnit2D);
-    gl.activeTexture(kDrawUnit);
-    gl.getIntegerv(gl::kTextureBindingBuffer, &s.drawUnitBuffer);
-    gl.activeTexture(kRowUnit);
-    gl.getIntegerv(gl::kTextureBindingBuffer, &s.rowUnitBuffer);
 }
 
 void restoreBindings(const GlApi& gl, const SavedBindings& s) {
-    gl.activeTexture(kRowUnit);
-    gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.rowUnitBuffer));
-    gl.activeTexture(kDrawUnit);
-    gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.drawUnitBuffer));
-    gl.activeTexture(kFrameUnit);
-    gl.bindTexture(gl::kTextureBuffer, static_cast<GLuint>(s.frameUnitBuffer));
+    if (gl.bindBufferBase) {
+        gl.bindBufferBase(gl::kShaderStorageBuffer, kFramesBinding, 0);
+        gl.bindBufferBase(gl::kShaderStorageBuffer, kDrawsBinding, 0);
+        gl.bindBufferBase(gl::kShaderStorageBuffer, kRowsBinding, 0);
+    }
+    gl.activeTexture(kUploadUnit);
     gl.bindTexture(gl::kTexture2D, static_cast<GLuint>(s.uploadUnit2D));
     gl.activeTexture(static_cast<GLenum>(s.activeTexture));
     gl.bindBuffer(gl::kDrawIndirectBuffer, static_cast<GLuint>(s.indirectBuffer));
@@ -443,9 +448,28 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     }
     gl_.getIntegerv(gl::kMaxTextureSize, &maxTextureSize_);
     if (maxTextureSize_ < 256) maxTextureSize_ = 256;
-    gl_.getIntegerv(gl::kMaxTextureBufferSize, &maxTextureBufferSize_);
     for (int drained = 0; drained < 16 && gl_.getError() != 0; ++drained) {
     }
+    // Three storage blocks in the vertex stage, one in the fragment stage (the shaders' #version
+    // 430 refuses a driver below GL 4.3 at compile).
+    GLint vertexBlocks = 0;
+    GLint fragmentBlocks = 0;
+    GLint blockSize = 0;
+    gl_.getIntegerv(gl::kMaxVertexShaderStorageBlocks, &vertexBlocks);
+    gl_.getIntegerv(gl::kMaxFragmentShaderStorageBlocks, &fragmentBlocks);
+    gl_.getIntegerv(gl::kMaxShaderStorageBlockSize, &blockSize);
+    if (!gl_.bindBufferBase || vertexBlocks < 3 || fragmentBlocks < 1 ||
+        blockSize < static_cast<GLint>(kTableElementBytes)) {
+        char text[160];
+        std::snprintf(text, sizeof(text),
+                      "no shader storage blocks for the tables (glBindBufferBase %s, %d vertex and "
+                      "%d fragment blocks, %d bytes a block)",
+                      gl_.bindBufferBase ? "resolved" : "missing", vertexBlocks, fragmentBlocks,
+                      blockSize);
+        error = text;
+        return false;
+    }
+    maxTableElements_ = static_cast<uint32_t>(blockSize) / kTableElementBytes;
 
     const char* vertexSources[] = {kCarVertexHead, kGplLightingGlsl, kCarVertexBody};
     GLuint      vertex = compile(gl_, gl::kVertexShader, vertexSources, 3, error);
@@ -474,8 +498,6 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
         return false;
     }
     uClipFromView_ = gl_.getUniformLocation(program_, "u_clipFromView");
-    uFrames_ = gl_.getUniformLocation(program_, "u_frames");
-    uDraws_ = gl_.getUniformLocation(program_, "u_draws");
     uLight_ = gl_.getUniformLocation(program_, "u_light");
     uLighting_ = gl_.getUniformLocation(program_, "u_lighting");
     uGouraud_ = gl_.getUniformLocation(program_, "u_gouraud");
@@ -493,7 +515,6 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     uFog_ = gl_.getUniformLocation(program_, "u_fog");
     uFogColour_ = gl_.getUniformLocation(program_, "u_fogColour");
     uPaletteLinear_ = gl_.getUniformLocation(program_, "u_paletteLinear");
-    uRows_ = gl_.getUniformLocation(program_, "u_rows");
     uRowSource_ = gl_.getUniformLocation(program_, "u_rowSource");
 
     SavedBindings saved;
@@ -550,17 +571,9 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     gl_.genBuffers(1, &frameBuffer_);
     gl_.bindBuffer(gl::kArrayBuffer, frameBuffer_);
     gl_.bufferData(gl::kArrayBuffer, 16 * sizeof(float), nullptr, gl::kStreamDraw);
-    gl_.genTextures(1, &frameTexture_);
-    gl_.activeTexture(kFrameUnit);
-    gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
-    gl_.texBuffer(gl::kTextureBuffer, gl::kRgba32f, frameBuffer_);
     gl_.genBuffers(1, &drawBuffer_);
     gl_.bindBuffer(gl::kArrayBuffer, drawBuffer_);
     gl_.bufferData(gl::kArrayBuffer, 8 * sizeof(uint32_t), nullptr, gl::kStreamDraw);
-    gl_.genTextures(1, &drawTexture_);
-    gl_.activeTexture(kDrawUnit);
-    gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.texBuffer(gl::kTextureBuffer, gl::kRgba32ui, drawBuffer_);
     gl_.genBuffers(1, &commandBuffer_);
     gl_.bindBuffer(gl::kArrayBuffer, commandBuffer_);
     gl_.bufferData(gl::kArrayBuffer, sizeof(Command), nullptr, gl::kStreamDraw);
@@ -568,8 +581,9 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     restoreBindings(gl_, saved);
     GLenum glError = gl_.getError();
     logf("baked cars: car renderer ready -- GL %d.%d, one vertex and index buffer for every car "
-         "object, bindless textures, two indirect multi-draws a pass%s",
-         major, minor, glError ? " (a GL error was pending after setup)" : "");
+         "object, bindless textures, two indirect multi-draws a pass, tables in shader storage "
+         "blocks of up to %d bytes%s",
+         major, minor, blockSize, glError ? " (a GL error was pending after setup)" : "");
     initialised_ = true;
     return true;
 }
@@ -588,8 +602,6 @@ void CarRenderer::release(bool contextAlive) {
                             drawBuffer_, commandBuffer_};
         for (GLuint buffer : buffers)
             if (buffer) gl_.deleteBuffers(1, &buffer);
-        if (frameTexture_) gl_.deleteTextures(1, &frameTexture_);
-        if (drawTexture_) gl_.deleteTextures(1, &drawTexture_);
         if (vertexArray_) gl_.deleteVertexArrays(1, &vertexArray_);
         if (program_) gl_.deleteProgram(program_);
         releaseMirrorCopy();
@@ -605,7 +617,7 @@ void CarRenderer::release(bool contextAlive) {
     initialised_ = false;
     program_ = 0;
     vertexArray_ = vertexBuffer_ = indexBuffer_ = drawIndexBuffer_ = 0;
-    frameBuffer_ = frameTexture_ = drawBuffer_ = drawTexture_ = commandBuffer_ = 0;
+    frameBuffer_ = drawBuffer_ = commandBuffer_ = 0;
     vertexCapacity_ = indexCapacity_ = 0;
     drawIndexCapacity_ = 0;
     haveGeneration_ = false;
@@ -1008,8 +1020,8 @@ bool CarRenderer::appendCached(const CarScene& scene, const CarDrawList& list, u
     if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return false;
     CachedList* entry = cachedEntry(scene, list);
     if (!entry) return false;
-    auto maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
-    auto maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
+    uint32_t maxTexels = maxTableElements_;
+    uint32_t maxFrames = maxTableElements_ / 4;
     auto palettes = static_cast<uint32_t>(paletteWords_.size() / 16);
     if ((commands_.size() + list.drawOrder.size()) * 2 + (palettes + 1) * kPaletteTexels >
             maxTexels ||
@@ -1172,11 +1184,10 @@ bool CarRenderer::createRowStore(std::string& why) {
         why = "car objects are on the GPU already";
         return false;
     }
-    // Two RGBA32UI texels a row.
-    uint32_t rows = std::min(kStoreRows, static_cast<uint32_t>(maxTextureBufferSize_) / 2);
+    // Two uvec4 elements a row.
+    uint32_t rows = std::min(kStoreRows, maxTableElements_ / 2);
     SavedBindings saved;
     saveBindings(gl_, saved);
-    gl_.activeTexture(kRowUnit);
     bool made = store_.create(gl_, rows, why);
     restoreBindings(gl_, saved);
     if (!made) return false;
@@ -1369,7 +1380,7 @@ CarRenderer::StorePlan CarRenderer::planStore(const CarScene& scene, const CarDr
     if (!list.contentKey || !list.conditionOn.empty() || list.flagman || list.overlay) return plan;
     CachedList* entry = cachedEntry(scene, list);
     // appendCached refuses what cachedEntry refuses, and a list past the frame table.
-    if (!entry || frameBase + entry->frames > static_cast<uint32_t>(maxTextureBufferSize_) / 4) {
+    if (!entry || frameBase + entry->frames > maxTableElements_ / 4) {
         plan.path = kRowsOwn;
         return plan;
     }
@@ -1408,6 +1419,13 @@ CarRenderer::StorePlan CarRenderer::planStore(const CarScene& scene, const CarDr
     plan.rowStart = rows ? emitted->rowStart : 0;
     plan.rows = rows;
     return plan;
+}
+
+void CarRenderer::bindTables() {
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kFramesBinding, frameBuffer_);
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kDrawsBinding, drawBuffer_);
+    gl_.bindBufferBase(gl::kShaderStorageBuffer, kRowsBinding,
+                       store_.rowBuffer() ? store_.rowBuffer() : drawBuffer_);
 }
 
 void CarRenderer::setRowSource(const CarRange* range) {
@@ -1726,8 +1744,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     carRanges_.clear();
     paletteWords_.clear();
     paletteFixups_.clear();
-    uint32_t maxTexels = static_cast<uint32_t>(maxTextureBufferSize_);
-    uint32_t maxFrames = static_cast<uint32_t>(maxTextureBufferSize_) / 4;
+    uint32_t maxTexels = maxTableElements_;
+    uint32_t maxFrames = maxTableElements_ / 4;
     // One list's rows and commands, appended to the pass's; its command count.
     auto appendList = [&](uint32_t l) -> uint32_t {
         const CarDrawList& list = *passLists_[l];
@@ -1860,8 +1878,6 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.useProgram(program_);
     gl_.bindVertexArray(vertexArray_);
     gl_.uniformMatrix4fv(uClipFromView_, 1, 0, context.clipFromView);
-    gl_.uniform1i(uFrames_, static_cast<GLint>(kFrameUnit - gl::kTexture0));
-    gl_.uniform1i(uDraws_, static_cast<GLint>(kDrawUnit - gl::kTexture0));
     gl_.uniform3f(uLight_, light_[0], light_[1], light_[2]);
     gl_.uniform4f(uLighting_, lighting_.on ? 1.0f : 0.0f, lighting_.specular ? 1.0f : 0.0f,
                   lighting_.ambient, lighting_.diffuse);
@@ -1885,13 +1901,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.uniform1i(uSolidOrder_, static_cast<GLint>(kSolidOrderUnit - gl::kTexture0));
     gl_.uniform1i(uSolidDepth_, static_cast<GLint>(kSolidDepthUnit - gl::kTexture0));
     gl_.uniform1i(uOrderTest_, 1);
-    gl_.uniform1i(uRows_, static_cast<GLint>(kRowUnit - gl::kTexture0));
-    gl_.activeTexture(kFrameUnit);
-    gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
-    gl_.activeTexture(kDrawUnit);
-    gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.activeTexture(kRowUnit);
-    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
+    bindTables();
     rowSource_[0] = rowSource_[1] = rowSource_[2] = -1;
     setRowSource(nullptr);
 
@@ -1934,12 +1944,7 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
     gl_.useProgram(program_);
     gl_.bindVertexArray(vertexArray_);
     gl_.uniform1i(uWalkSlot_, static_cast<GLint>(car.slot));
-    gl_.activeTexture(kFrameUnit);
-    gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
-    gl_.activeTexture(kDrawUnit);
-    gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.activeTexture(kRowUnit);
-    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
+    bindTables();
     setRowSource(&car);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
@@ -2126,12 +2131,7 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
     gl_.bindVertexArray(vertexArray_);
     gl_.uniform1i(uPhase_, 2);
     gl_.uniform1i(uOrderTest_, 0);
-    gl_.activeTexture(kFrameUnit);
-    gl_.bindTexture(gl::kTextureBuffer, frameTexture_);
-    gl_.activeTexture(kDrawUnit);
-    gl_.bindTexture(gl::kTextureBuffer, drawTexture_);
-    gl_.activeTexture(kRowUnit);
-    gl_.bindTexture(gl::kTextureBuffer, rowUnitTexture());
+    bindTables();
     setRowSource(nullptr);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,

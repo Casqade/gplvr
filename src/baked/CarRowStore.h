@@ -44,10 +44,10 @@ public:
     static constexpr uint32_t kRowWords = 8;       // CarRenderer's kDrawWords
     static constexpr uint32_t kCommandBytes = 20;  // DrawElementsIndirectCommand
 
-    // The row buffer (with an RGBA32UI texture over it) and the command buffer, `rows` rows each,
-    // as immutable storage written only by glBufferSubData where glBufferStorage resolves, else
-    // glBufferData STATIC_DRAW. Needs the context current. False, with `why`, when a buffer,
-    // the texture or an entry point the store or its readback calls is missing.
+    // The row buffer (the car program's row storage block) and the command buffer, `rows` rows
+    // each, as immutable storage written only by glBufferSubData where glBufferStorage resolves,
+    // else glBufferData STATIC_DRAW. Needs the context current. False, with `why`, when a buffer
+    // or an entry point the store or its readback calls is missing.
     bool create(const GlApi& gl, uint32_t rows, std::string& why);
     // `contextAlive` false: the GL objects died with the context and are only forgotten.
     void release(const GlApi& gl, bool contextAlive);
@@ -58,7 +58,6 @@ public:
         return static_cast<uint64_t>(rows_) * (kRowWords * sizeof(uint32_t) + kCommandBytes);
     }
     GLuint rowBuffer() const { return rowBuffer_; }
-    GLuint rowTexture() const { return rowTexture_; }
     GLuint commandBuffer() const { return commandBuffer_; }
 
     // `count` rows' words and commands at row `first`, through the array buffer binding, which the
@@ -91,7 +90,6 @@ private:
     uint32_t rows_ = 0;
     bool     immutable_ = false;
     GLuint   rowBuffer_ = 0;
-    GLuint   rowTexture_ = 0;
     GLuint   commandBuffer_ = 0;
     GLuint   readback_ = 0;
     size_t   readbackCapacity_ = 0;

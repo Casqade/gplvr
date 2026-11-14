@@ -296,6 +296,7 @@ constexpr GLenum kDrawIndirectBufferBinding = 0x8F43;
 constexpr GLenum kShaderStorageBuffer = 0x90D2;
 constexpr GLenum kShaderStorageBufferBinding = 0x90D3;
 constexpr GLenum kMaxVertexShaderStorageBlocks = 0x90D6;
+constexpr GLenum kMaxFragmentShaderStorageBlocks = 0x90DA;
 constexpr GLenum kMaxShaderStorageBlockSize = 0x90DE;
 constexpr GLenum kClipDistance0 = 0x3000;
 constexpr GLenum kModelviewMatrix = 0x0BA6;

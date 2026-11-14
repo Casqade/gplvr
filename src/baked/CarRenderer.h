@@ -326,12 +326,11 @@ private:
     TextureFilter filter_;
     int           anisotropy_ = 0;
     GLint         maxTextureSize_ = 4096;
-    GLint         maxTextureBufferSize_ = 65536;
+    // The elements (16 bytes each) one of the program's storage blocks may hold.
+    uint32_t      maxTableElements_ = 65536;
 
     GLuint program_ = 0;
     GLint  uClipFromView_ = -1;
-    GLint  uFrames_ = -1;
-    GLint  uDraws_ = -1;
     GLint  uLight_ = -1;
     GLint  uLighting_ = -1;
     GLint  uGouraud_ = -1;
@@ -349,7 +348,6 @@ private:
     GLint  uFog_ = -1;
     GLint  uFogColour_ = -1;
     GLint  uPaletteLinear_ = -1;
-    GLint  uRows_ = -1;
     GLint  uRowSource_ = -1;
 
     GLuint vertexArray_ = 0;
@@ -360,9 +358,7 @@ private:
     size_t indexCapacity_ = 0;
     uint32_t drawIndexCapacity_ = 0;
     GLuint frameBuffer_ = 0;
-    GLuint frameTexture_ = 0;
     GLuint drawBuffer_ = 0;
-    GLuint drawTexture_ = 0;
     GLuint commandBuffer_ = 0;
 
     // The scene on the GPU: per CarScene object and texture, in the scene's own order.
@@ -402,12 +398,10 @@ private:
     // The u_rowSource the program holds; drawSolid sets it first.
     void setRowSource(const CarRange* range);
     int32_t rowSource_[3] = {-1, -1, -1};
-    // The buffer texture every car draw binds on kRowUnit for u_rows: the store's rows, or without
-    // a store the draw table (the same RGBA32UI format; with no resident list u_rows is never
-    // read). AMD's driver (atioglxx 31.0.21924.61) puts a null allocation in its list of the
-    // program's buffer textures for a unit left on the default buffer texture and faults on it at
-    // a later submission (dump 7704, the cockpit overlay's draw).
-    GLuint rowUnitTexture() const { return store_.rowTexture() ? store_.rowTexture() : drawTexture_; }
+    // Binds the frame, draw and row tables to the program's storage blocks. The row block gets the
+    // store's rows, or without a store the draw table, so it never has no buffer (with no resident
+    // list carRows is not read).
+    void bindTables();
     // drawSolid ran this pass, so the walk-order runs may be drawn.
     bool runsReady_ = false;
     // Report 105 section 4.49: the overlay lists' commands, after every other list's in commands_

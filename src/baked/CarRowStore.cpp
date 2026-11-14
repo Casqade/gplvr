@@ -51,7 +51,7 @@ void RangeAllocator::give(uint32_t first, uint32_t count) {
 
 bool CarRowStore::create(const GlApi& gl, uint32_t rows, std::string& why) {
     release(gl, true);
-    if (!gl.bufferSubData || !gl.texBuffer || !gl.uniform3i || !gl.copyBufferSubData ||
+    if (!gl.bufferSubData || !gl.uniform3i || !gl.copyBufferSubData ||
         !gl.fenceSync || !gl.clientWaitSync || !gl.deleteSync || !gl.getBufferSubData) {
         why = "glUniform3i, glCopyBufferSubData, glFenceSync, glClientWaitSync, glDeleteSync or "
               "glGetBufferSubData did not resolve";
@@ -72,11 +72,8 @@ bool CarRowStore::create(const GlApi& gl, uint32_t rows, std::string& why) {
     };
     make(rowBuffer_, static_cast<size_t>(rows) * kRowWords * sizeof(uint32_t));
     make(commandBuffer_, static_cast<size_t>(rows) * kCommandBytes);
-    gl.genTextures(1, &rowTexture_);
-    gl.bindTexture(gl::kTextureBuffer, rowTexture_);
-    gl.texBuffer(gl::kTextureBuffer, gl::kRgba32ui, rowBuffer_);
     GLenum error = gl.getError();
-    if (error || !rowBuffer_ || !commandBuffer_ || !rowTexture_) {
+    if (error || !rowBuffer_ || !commandBuffer_) {
         char text[96];
         std::snprintf(text, sizeof(text), "making the buffers failed (GL error 0x%04X)", error);
         why = text;
@@ -91,12 +88,11 @@ bool CarRowStore::create(const GlApi& gl, uint32_t rows, std::string& why) {
 void CarRowStore::release(const GlApi& gl, bool contextAlive) {
     readbackDrop(gl, contextAlive);
     if (contextAlive) {
-        if (rowTexture_) gl.deleteTextures(1, &rowTexture_);
         GLuint buffers[] = {rowBuffer_, commandBuffer_, readback_};
         for (GLuint buffer : buffers)
             if (buffer) gl.deleteBuffers(1, &buffer);
     }
-    rowBuffer_ = rowTexture_ = commandBuffer_ = readback_ = 0;
+    rowBuffer_ = commandBuffer_ = readback_ = 0;
     readbackCapacity_ = readbackBytes_ = 0;
     rows_ = 0;
     immutable_ = false;
