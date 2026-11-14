@@ -92,6 +92,7 @@ else()
         src/AddressSpace.cpp
         src/BuildStamp.cpp
         src/Billboard.cpp
+        src/CameraConfig.cpp
         src/CrashGuard.cpp
         src/CursorOverlay.cpp
         src/DataRebase.cpp

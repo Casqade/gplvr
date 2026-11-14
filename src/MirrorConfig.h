@@ -50,6 +50,12 @@ void mirrorConfigReset();
 // False, with an empty string, when no car set is loaded.
 bool mirrorConfigCarSetName(char* carSet, size_t carSetSize);
 
+// The section name a team slot's preset is kept under, `<cardir>/<teamfolder>` in lower case, as
+// gplvr_mirrors.ini names it. The cockpit camera's presets (CameraConfig) use the same key, so a
+// car is the same car in both files. False when the car-set directory cannot be read or the slot
+// is not one a section is kept for.
+bool mirrorConfigCarKey(int team, char* key, size_t size);
+
 // Remove the loaded car set's sections from gplvr_mirrors.ini and forget every cached car, so
 // that car set's cars are back to neutral and can be aimed again; other car sets' presets stay.
 // carSet receives the car set's name in lower case, cleared the number of sections removed.

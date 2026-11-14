@@ -365,6 +365,12 @@ bool mirrorConfigCarSetName(char* carSet, size_t carSetSize) {
     return true;
 }
 
+bool mirrorConfigCarKey(int team, char* key, size_t size) {
+    if (size) key[0] = '\0';
+    if (team < 0 || team >= kTeamSlots) return false;
+    return buildKey(team, key, size);
+}
+
 bool mirrorConfigClearCarSet(char* carSet, size_t carSetSize, int& cleared) {
     cleared = 0;
     char dir[kCarsetDirBytes + 1] = {};

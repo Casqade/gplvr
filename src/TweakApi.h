@@ -53,6 +53,12 @@ enum class TweakTarget : int32_t {
     // is, in metres. Saved to gplvr.ini's own vrHudHead*/vrHudSeat* keys, both layers at
     // once, by hudPlacementSave.
     HudPanel,
+    // The cockpit camera's position, in metres along the car's axes: CameraConfig's live offset,
+    // saved per car to gplvr_camera.ini. Its indices are the three directions -- forward, up,
+    // right -- and ONE IS ADJUSTED AT A TIME: an axis command with index -1 moves the
+    // selected direction only. Each direction has one axis, named after the stick that moves
+    // it: X for right, Y for up and for forward. A Reset with index -1 is the whole camera.
+    Camera,
     Count,
 };
 
@@ -65,8 +71,8 @@ enum class TweakAxis : int32_t {
     Yaw,    // Mirror, degrees
     Pitch,  // Mirror, degrees
     Fov,    // Mirror, a multiplier on the 40-degree pane, so a MULTIPLICATIVE axis
-    X,      // HudElement / HudPanel
-    Y,      // HudElement / HudPanel
+    X,      // HudElement / HudPanel / Camera (right)
+    Y,      // HudElement / HudPanel / Camera (up, forward)
     Depth,  // HudPanel, metres ahead
     Size,   // HudPanel width in metres; HudElement dash width as a fraction
     Show,   // 0 or 1, expressed as an axis so one setter covers it

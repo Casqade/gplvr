@@ -16,6 +16,7 @@
 #include "Letterbox.h"
 #include "MenuScale.h"
 #include "MirrorCache.h"
+#include "CameraConfig.h"
 #include "MirrorConfig.h"
 #include "MirrorTarget.h"
 #include "MirrorUv.h"
@@ -2810,6 +2811,7 @@ void loadOptions(const char* fileName) {
          g_options.vrMirrorTweakKey, g_options.vrMirrorTweakAngleSpeed,
          g_options.vrMirrorTweakFovSpeed, g_options.vrMirrorModeKey);
     mirrorConfigReset();
+    cameraConfigReset();
     g_options.vrMonitorEye = GetPrivateProfileIntA("gplvr", "vrMonitorEye", kMonitorRight, path);
     if (g_options.vrMonitorEye < kMonitorOff || g_options.vrMonitorEye > kMonitorBoth)
         g_options.vrMonitorEye = kMonitorRight;

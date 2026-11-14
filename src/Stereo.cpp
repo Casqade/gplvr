@@ -11,6 +11,7 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "MirrorCache.h"
+#include "CameraConfig.h"
 #include "MirrorConfig.h"
 #include "MirrorGeometry.h"
 #include "MirrorShared.h"
@@ -63,6 +64,9 @@ constexpr float kMirrorMountHeight = 0.35f;
 // bytes are tested first, the same test sub_46EFE0 makes. Driver slots run 0..31
 // (sub_46B990: 1544 bytes each up to the driver records).
 constexpr uintptr_t     kViewCarDriverIndex = 0x00776144;
+// The view's camera mode, latched beside it (Interpolation.cpp's kViewCameraMode); 1..3 are the
+// cockpit.
+constexpr uintptr_t     kViewCameraMode = 0x00776164;
 constexpr uintptr_t     kDriverRecords = 0x006CB4F8;
 constexpr int           kDriverRecordSize = 147;
 constexpr int           kDriverSlots = 32;
@@ -1118,26 +1122,22 @@ void publishPaneGlasses() {
     mirrorConfigSetGlasses(pointers, sides, count);
 }
 
-const PaneGeometry& viewedCarGlass(bool& changed) {
+// The viewed car's driver index and its team, for the mirror glasses and the cockpit camera.
+// `team` is what gpl_driverGetTeamIndex returned, or -1 when it was not asked; `fallback` says why
+// the team cannot be used as a 1967 team, null when it can. False when the driver index itself
+// cannot be placed in this image.
+bool viewedTeam(int& driver, int& team, const char*& fallback) {
     State& s = g_state;
-    changed = false;
-    if (mirrorConfigCarSetChanged()) s.paneDriver = -1000;
-
+    driver = -1;
+    team = -1;
+    fallback = nullptr;
     // Through rebase: nothing about the value read says whether it is a driver index. On the
     // plain link this global is 8 lower and the read returned a float -- around 61.8, moving
     // every frame -- so the team lookup refused for every car and the Lotus glasses stood in,
     // 7650 times in one session.
     uintptr_t driverAt = rebase(kViewCarDriverIndex);
-    if (!driverAt) {
-        if (!s.paneDriverRefusedSaid) {
-            s.paneDriverRefusedSaid = true;
-            logf("mirror: the viewed car's driver index %08X cannot be placed in this image "
-                 "(deltas %s), so every car gets the Lotus glasses",
-                 static_cast<unsigned>(kViewCarDriverIndex), rebaseSummary());
-        }
-        return kPaneGeometry[s.paneTeam];
-    }
-    int driver = *reinterpret_cast<const int*>(driverAt);
+    if (!driverAt) return false;
+    driver = *reinterpret_cast<const int*>(driverAt);
 
     if (!s.teamCodeChecked) {
         s.teamCodeChecked = true;
@@ -1146,8 +1146,6 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
                                         sizeof(kDriverGetTeamIndexCode)) == 0;
     }
 
-    const char* fallback = nullptr;
-    int         team = -1;
     if (!s.teamCodeMatches) {
         fallback = "gpl_driverGetTeamIndex (0x985AA6) does not hold the expected code";
     } else if (driver < 0 || driver >= kDriverSlots) {
@@ -1164,6 +1162,69 @@ const PaneGeometry& viewedCarGlass(bool& changed) {
             if (team < 0 || team >= kTeamCount)
                 fallback = "the team index is outside the 1967 table (another carset?)";
         }
+    }
+    return true;
+}
+
+// THE COCKPIT CAMERA'S PER-CAR POSITION (CameraConfig), added to both eyes. Moving the eyes rather
+// than GPL's eye moves everything placed from them with it: the passes, the walk's centre, the
+// mirror viewpoint and which glasses are in view, and the head the sound is heard from.
+//
+// The offset is in the car's axes -- the view's orientation as GPL handed it over, before the
+// horizon lock -- so the eyes stay put in the cockpit however the car pitches and rolls. The eye
+// offsets are in the levelled frame's axes, so it goes out to the world through the one and back
+// through the other. Only a cockpit camera (modes 1..3, gpl_camModeHasMirror 0x4550D0) is moved; a
+// TV or chase camera keeps GPL's eye.
+void applyCameraOffset(const float car[9], const float levelled[9], VrEye eyes[2]) {
+    static bool refusedSaid = false;
+    uintptr_t   modeAt = rebase(kViewCameraMode);
+    if (!modeAt) {
+        if (!refusedSaid) {
+            refusedSaid = true;
+            logf("camera config: the view's camera mode %08X cannot be placed in this image "
+                 "(deltas %s), so the cockpit camera is never moved",
+                 static_cast<unsigned>(kViewCameraMode), rebaseSummary());
+        }
+        return;
+    }
+    int mode = *reinterpret_cast<const int*>(modeAt);
+    if (mode < 1 || mode > 3) return;
+
+    int         driver = -1;
+    int         team = -1;
+    const char* fallback = nullptr;
+    // Without a viewed car the last car's position stays, as the mirror's aim does.
+    if (viewedTeam(driver, team, fallback) && driver >= 0 && driver < kDriverSlots)
+        cameraConfigViewedTeam(team, fallback);
+
+    float local[3];
+    if (!cameraConfigOffset(local)) return;
+    float world[3];
+    localToWorld(car, local[0], local[1], local[2], world[0], world[1], world[2]);
+    for (int axis = 0; axis < 3; ++axis) {
+        float moved = levelled[0 * 3 + axis] * world[0] + levelled[1 * 3 + axis] * world[1] +
+                      levelled[2 * 3 + axis] * world[2];
+        eyes[0].offset[axis] += moved;
+        eyes[1].offset[axis] += moved;
+    }
+}
+
+const PaneGeometry& viewedCarGlass(bool& changed) {
+    State& s = g_state;
+    changed = false;
+    if (mirrorConfigCarSetChanged()) s.paneDriver = -1000;
+
+    int         driver = -1;
+    int         team = -1;
+    const char* fallback = nullptr;
+    if (!viewedTeam(driver, team, fallback)) {
+        if (!s.paneDriverRefusedSaid) {
+            s.paneDriverRefusedSaid = true;
+            logf("mirror: the viewed car's driver index %08X cannot be placed in this image "
+                 "(deltas %s), so every car gets the Lotus glasses",
+                 static_cast<unsigned>(kViewCarDriverIndex), rebaseSummary());
+        }
+        return kPaneGeometry[s.paneTeam];
     }
 
     // THE SAME DRIVER IS NOT THE SAME CAR, AND THE SAME CAR IS NOT THE SAME MODEL. Picking
@@ -2048,6 +2109,9 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     }
 
     std::memcpy(savedOrientation, levelled, sizeof(levelled));
+
+    // Before anything reads the eye offsets for a position: the per-car cockpit camera.
+    applyCameraOffset(carOrientation, levelled, vr);
 
     // The head this frame is drawn from, for the sim thread's sound listener.
     headAudioPublish(carOrientation, levelled, vr);

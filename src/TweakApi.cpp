@@ -1,5 +1,6 @@
 #include "TweakApi.h"
 
+#include "CameraConfig.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "MirrorConfig.h"
@@ -558,6 +559,88 @@ bool applyHudPanel(const TweakCommand& command) {
     return true;
 }
 
+// -- the cockpit camera ---------------------------------------------------------------------
+//
+// One direction at a time. Index -1 is the selected direction; an axis that direction does not
+// have does nothing, silently, because it is the other half of the stick and not a mistake.
+
+int cameraDirection(int32_t index) {
+    return index >= 0 ? static_cast<int>(index) : cameraConfigSelected();
+}
+
+TweakAxis cameraAxisOf(int direction) {
+    return direction == kCameraRight ? TweakAxis::X : TweakAxis::Y;
+}
+
+TweakRange cameraRange(TweakAxis axis, int32_t index) {
+    TweakRange range;
+    int        direction = cameraDirection(index);
+    if (direction < 0 || direction >= kCameraDirections || axis != cameraAxisOf(direction))
+        return range;
+    range.exists = true;
+    range.minimum = -kCameraMaxOffset;
+    range.maximum = kCameraMaxOffset;
+    range.rate = 0.15f;  // metres per second at full deflection
+    range.step = 0.01f;
+    range.current = cameraConfigValue(direction);
+    range.defaultValue = 0.0f;
+    range.unit = "m";
+    return range;
+}
+
+bool applyCamera(const TweakCommand& command) {
+    switch (command.action) {
+        case TweakAction::Commit:
+            cameraConfigSave();
+            clearRefusal();
+            return true;
+        case TweakAction::Toggle:
+            return refuse("the camera has no on/off axis to toggle");
+        case TweakAction::Select:
+        case TweakAction::SelectNext:
+        case TweakAction::SelectPrevious: {
+            bool changed = false;
+            if (command.action == TweakAction::Select) {
+                if (command.index < 0 || command.index >= kCameraDirections)
+                    return refuse("there is no camera direction with that index");
+                changed = cameraConfigSelect(static_cast<int>(command.index));
+            } else {
+                int before = cameraConfigSelected();
+                changed = cameraConfigSelectStep(
+                              command.action == TweakAction::SelectNext ? 1 : -1) != before;
+            }
+            if (changed) {
+                logf("camera: now moving %s", cameraConfigDirectionName(cameraConfigSelected()));
+                clearRefusal();
+            }
+            return changed;
+        }
+        case TweakAction::Reset: {
+            int  first = command.index >= 0 ? static_cast<int>(command.index) : 0;
+            int  last = command.index >= 0 ? first : kCameraDirections - 1;
+            bool changed = false;
+            for (int direction = first; direction <= last; ++direction)
+                changed = cameraConfigSetValue(direction, 0.0f) || changed;
+            if (changed) {
+                logf("camera: %s back to where GPL puts it",
+                     command.index >= 0 ? cameraConfigDirectionName(first) : "the whole camera");
+                clearRefusal();
+            }
+            return changed;
+        }
+        default:
+            break;
+    }
+
+    TweakRange range = cameraRange(command.axis, command.index);
+    if (!range.exists) return false;
+    float value = range.current;
+    if (!resolveScalar(command, range, value)) return false;
+    if (!cameraConfigSetValue(cameraDirection(command.index), value)) return false;
+    clearRefusal();
+    return true;
+}
+
 // -- the default controller mapping ---------------------------------------------------------
 //
 // EVERY row here is provisional. The user asked for the API first and the feel later, and
@@ -650,6 +733,23 @@ const TweakBinding kHudPanelBindings[] = {
      "stick click: the panel back to its built-in default place and size"},
 };
 
+// Only the selected direction moves, so each stick row does something for its own directions
+// alone: sideways for X, forward and back for Y and Z.
+const TweakBinding kCameraBindings[] = {
+    {TweakTarget::Camera, TweakInputAxis::StickX, TweakInputButton::None,
+     TweakInputButton::None, TweakAxis::X, TweakAction::None, TweakMode::Rate, 1.0f,
+     "X selected: stick left and right moves the camera left and right"},
+    {TweakTarget::Camera, TweakInputAxis::StickY, TweakInputButton::None,
+     TweakInputButton::None, TweakAxis::Y, TweakAction::None, TweakMode::Rate, 1.0f,
+     "Y or Z selected: stick forward moves the camera up or forward, back moves it down or back"},
+    {TweakTarget::Camera, TweakInputAxis::None, TweakInputButton::Trigger,
+     TweakInputButton::None, TweakAxis::None, TweakAction::SelectNext, TweakMode::Absolute, 1.0f,
+     "trigger: the next direction to adjust -- Z, Y, X and round again"},
+    {TweakTarget::Camera, TweakInputAxis::None, TweakInputButton::StickClick,
+     TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
+     "stick click: the camera back to where GPL puts it"},
+};
+
 }  // namespace
 
 bool tweakApply(const TweakCommand& command) {
@@ -657,6 +757,7 @@ bool tweakApply(const TweakCommand& command) {
         case TweakTarget::Mirror: return applyMirror(command);
         case TweakTarget::HudElement: return applyHudElement(command);
         case TweakTarget::HudPanel: return applyHudPanel(command);
+        case TweakTarget::Camera: return applyCamera(command);
         default:
             return refuse("a command arrived with no target -- the binding table has a "
                           "row that was never filled in");
@@ -668,6 +769,7 @@ TweakRange tweakRange(TweakTarget target, TweakAxis axis, int32_t index) {
         case TweakTarget::Mirror: return mirrorRange(axis, index);
         case TweakTarget::HudElement: return hudElementRange(axis, index);
         case TweakTarget::HudPanel: return panelRange(axis);
+        case TweakTarget::Camera: return cameraRange(axis, index);
         default: return TweakRange{};
     }
 }
@@ -677,6 +779,7 @@ const char* tweakTargetName(TweakTarget target) {
         case TweakTarget::Mirror: return "mirror";
         case TweakTarget::HudElement: return "HUD element";
         case TweakTarget::HudPanel: return "HUD panel";
+        case TweakTarget::Camera: return "camera";
         default: return "nothing";
     }
 }
@@ -700,6 +803,7 @@ int32_t tweakIndexCount(TweakTarget target) {
         case TweakTarget::HudElement: return pribludaElementCount();
         case TweakTarget::Mirror: return mirrorConfigGlassCount();
         case TweakTarget::HudPanel: return 1;
+        case TweakTarget::Camera: return kCameraDirections;
         default: return 0;
     }
 }
@@ -708,6 +812,7 @@ const char* tweakIndexName(TweakTarget target, int32_t index) {
     if (target == TweakTarget::HudElement)
         return pribludaElementName(static_cast<int>(index));
     if (target == TweakTarget::Mirror) return mirrorConfigGlassName(static_cast<int>(index));
+    if (target == TweakTarget::Camera) return cameraConfigDirectionName(static_cast<int>(index));
     return tweakTargetName(target);
 }
 
@@ -715,6 +820,7 @@ int32_t tweakSelected(TweakTarget target) {
     if (target == TweakTarget::HudElement) return pribludaElementSelected();
     if (target == TweakTarget::Mirror) return mirrorConfigSelected();
     if (target == TweakTarget::HudPanel) return 0;
+    if (target == TweakTarget::Camera) return cameraConfigSelected();
     return -1;
 }
 
@@ -722,6 +828,7 @@ bool tweakIndexUsable(TweakTarget target, int32_t index) {
     if (target == TweakTarget::HudElement)
         return pribludaElementUsable(static_cast<int>(index));
     if (target == TweakTarget::Mirror) return index >= 0 && index < mirrorConfigGlassCount();
+    if (target == TweakTarget::Camera) return index >= 0 && index < kCameraDirections;
     return index == 0 && tweakIndexCount(target) == 1;
 }
 
@@ -738,6 +845,9 @@ const TweakBinding* tweakDefaultBindings(TweakTarget target, int32_t& count) {
             count = static_cast<int32_t>(sizeof(kHudPanelBindings) /
                                          sizeof(kHudPanelBindings[0]));
             return kHudPanelBindings;
+        case TweakTarget::Camera:
+            count = static_cast<int32_t>(sizeof(kCameraBindings) / sizeof(kCameraBindings[0]));
+            return kCameraBindings;
         default:
             count = 0;
             return nullptr;

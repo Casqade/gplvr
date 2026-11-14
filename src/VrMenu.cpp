@@ -1,6 +1,7 @@
 #include "VrMenu.h"
 
 #include "BuildStamp.h"
+#include "CameraConfig.h"
 #include "DataRebase.h"
 #include "HeadAudio.h"
 #include "Hooks.h"
@@ -255,6 +256,7 @@ enum class Mode {
     MirrorTweak,
     HudTweak,
     PanelTweak,
+    CameraTweak,
     // "Save changes?" on the way out of a tweak mode that changed something. Its own mode
     // rather than a flag, because while it is up the tweak mode's bindings must not run --
     // the stick answering the question must not also be moving the thing being asked about.
@@ -280,14 +282,34 @@ constexpr float kHelpCloseRight = 0.98f;
 enum ResetChoice {
     kResetVrSettings = 0,
     kResetMirrors,
+    kResetCamera,
     kResetPribluda,
     kResetEverything,
     kResetCancel,
     kResetCount
 };
 
-const char* const kResetLabel[kResetCount] = {"Reset VR settings", "Clear mirror presets",
-                                              "Reset Pribluda layout", "Reset ALL", "Cancel"};
+const char* const kResetLabel[kResetCount] = {"Reset VR settings",     "Clear mirror presets",
+                                              "Clear camera presets",  "Reset Pribluda layout",
+                                              "Reset ALL",             "Cancel"};
+
+// "Are you sure?" after any Reset answer but Cancel: every one of them writes a file at once and
+// none can be undone. No is drawn second and is the one it opens on.
+enum ResetSureChoice { kResetSureYes = 0, kResetSureNo, kResetSureCount };
+const char* const kResetSureLabel[kResetSureCount] = {"Yes", "No"};
+
+// A Reset answer as drawn and asked about: the mirror and camera rows name the car set they clear.
+void resetLabel(int choice, char* out, size_t size) {
+    char carSet[24] = {};
+    if ((choice == kResetMirrors || choice == kResetCamera) &&
+        mirrorConfigCarSetName(carSet, sizeof(carSet))) {
+        _snprintf_s(out, size, _TRUNCATE, "Clear %s %s presets", carSet,
+                    choice == kResetMirrors ? "mirror" : "camera");
+        return;
+    }
+    _snprintf_s(out, size, _TRUNCATE, "%s",
+                choice >= 0 && choice < kResetCount ? kResetLabel[choice] : "");
+}
 
 // The three answers to "save changes?", in the order they are drawn.
 enum ConfirmChoice { kConfirmSave = 0, kConfirmDiscard, kConfirmCancel, kConfirmCount };
@@ -327,6 +349,7 @@ enum RowCommand {
     kCommandMirrorTweak,
     kCommandHudTweak,
     kCommandPanelTweak,
+    kCommandCameraTweak,
     kCommandSaveSettings,
     kCommandResetSettings,
 };
@@ -384,7 +407,7 @@ bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
 MenuRow g_rows[] = {
     {"Save settings", kRowAction, kCommandSaveSettings, nullptr, nullptr, nullptr, 0, 0, 0,
      "Save changes to gplvr.ini\n"
-     "Pribluda state and mirror presets are saved upon exiting their setup modes",
+     "Pribluda state, mirror and camera presets are saved upon exiting their setup modes",
      kTabNone},
     {"Reset", kRowAction, kCommandResetSettings, nullptr, nullptr, nullptr, 0, 0, 0,
      "Reset GPLVR settings to default values", kTabNone},
@@ -419,6 +442,8 @@ MenuRow g_rows[] = {
      &g_options.vrHeadAudioWidth, 0.0f, 2.0f, 0.05f,
      "Positional audio panning effect intensity", kTabHeadset, headAudioWidthAdjustable},
 
+    {"Camera position", kRowAction, kCommandCameraTweak, nullptr, nullptr, nullptr, 0, 0, 0,
+     "Adjust camera position in the cockpit", kTabCockpit, nullptr, inSession},
     {"Mirror setup", kRowAction, kCommandMirrorTweak, nullptr, nullptr, nullptr, 0, 0, 0,
      "Enter mirror tweaking mode to tune car mirrors", kTabCockpit, nullptr, inSession},
     // vrHudMode: 0 off, 1 fixed in the car, 2 head-locked.
@@ -804,6 +829,10 @@ struct State {
     int  confirmChanged = 0;
     int  confirmChoice = 0;
     int  resetChoice = 0;
+    // The Reset answer waiting for "are you sure?", -1 while the list itself is up, and which of
+    // Yes and No is highlighted.
+    int  resetPending = -1;
+    int  resetSureChoice = 0;
     bool menuWasDown[kHands] = {};
 
     // Stick navigation. The stick is a set of detents, not an axis, for moving the
@@ -1090,7 +1119,7 @@ Surface hudPanelSurface();
 
 bool tweakMode() {
     return g_state.mode == Mode::MirrorTweak || g_state.mode == Mode::HudTweak ||
-           g_state.mode == Mode::PanelTweak;
+           g_state.mode == Mode::PanelTweak || g_state.mode == Mode::CameraTweak;
 }
 
 Surface drawnSurface() {
@@ -1142,7 +1171,9 @@ bool tweakPanelPlacement(const HudPlacement*& placement, int32_t& space, int& te
                          int& texelHeight) {
     bool sized =
         pribludaPanelSize(texelWidth, texelHeight) && texelWidth > 0 && texelHeight > 0;
-    if (g_state.mode == Mode::MirrorTweak) {
+    // Camera position hangs where mirror setup does, for the same reason: what is being
+    // adjusted is the world in front of the driver, and the quad must stay out of it.
+    if (g_state.mode == Mode::MirrorTweak || g_state.mode == Mode::CameraTweak) {
         if (!sized) {
             texelWidth = kStripCanvasWidth;
             texelHeight = kStripCanvasHeight;
@@ -1597,6 +1628,13 @@ void runCommand(int command) {
             }
             enterMode(Mode::PanelTweak, g_state.hand);
             break;
+        case kCommandCameraTweak:
+            if (windowInFrontEnd()) {
+                notice("The camera position can only be adjusted in a car");
+                break;
+            }
+            enterMode(Mode::CameraTweak, g_state.hand);
+            break;
         case kCommandSaveSettings:
             saveSettings();
             break;
@@ -1896,6 +1934,7 @@ TweakTarget targetOf(Mode mode) {
         case Mode::MirrorTweak: return TweakTarget::Mirror;
         case Mode::HudTweak: return TweakTarget::HudElement;
         case Mode::PanelTweak: return TweakTarget::HudPanel;
+        case Mode::CameraTweak: return TweakTarget::Camera;
         default: return TweakTarget::None;
     }
 }
@@ -1918,17 +1957,25 @@ struct TweakSnapshot {
     int         indices = 0;
     bool        exists[kSnapshotIndices][kSnapshotAxes] = {};
     float       value[kSnapshotIndices][kSnapshotAxes] = {};
-    // For the mirror: which car the values are of. They are indexed by glass, and the same
-    // index on another car is another glass.
-    unsigned    mirrorGeneration = 0;
+    // For the mirror and the camera: which car the values are of. They are indexed by glass or
+    // direction, and the same index on another car is another car's value.
+    unsigned    carGeneration = 0;
 };
+
+// The generation of the car a per-car target's values belong to; 0 for a target that is not
+// per car, which never changes.
+unsigned carGenerationOf(TweakTarget target) {
+    if (target == TweakTarget::Mirror) return mirrorConfigGeneration();
+    if (target == TweakTarget::Camera) return cameraConfigGeneration();
+    return 0;
+}
 
 TweakSnapshot g_snapshot;
 
 void snapshotTake(TweakTarget target) {
     g_snapshot = TweakSnapshot();
     if (target == TweakTarget::None) return;
-    g_snapshot.mirrorGeneration = mirrorConfigGeneration();
+    g_snapshot.carGeneration = carGenerationOf(target);
 
     int32_t count = tweakIndexCount(target);
     if (count < 0) count = 0;
@@ -1946,14 +1993,14 @@ void snapshotTake(TweakTarget target) {
     g_snapshot.valid = true;
 }
 
-// THE BASELINE FOLLOWS THE CAR. Changing the viewed car discards its unsaved aim (MirrorConfig),
-// so what the new car shows IS what its file holds -- which is the baseline for it. Without this
-// the old car's values stayed the baseline: Discard wrote them onto the new car's glasses by
-// index, and "changed" compared one car against another.
+// THE BASELINE FOLLOWS THE CAR. Changing the viewed car discards its unsaved aim (MirrorConfig)
+// or camera position (CameraConfig), so what the new car shows IS what its file holds -- which is
+// the baseline for it. Without this the old car's values stayed the baseline: Discard wrote them
+// onto the new car by index, and "changed" compared one car against another.
 void snapshotFollowCar() {
-    if (!g_snapshot.valid || g_snapshot.target != TweakTarget::Mirror) return;
-    if (g_snapshot.mirrorGeneration == mirrorConfigGeneration()) return;
-    snapshotTake(TweakTarget::Mirror);
+    if (!g_snapshot.valid) return;
+    if (g_snapshot.carGeneration == carGenerationOf(g_snapshot.target)) return;
+    snapshotTake(g_snapshot.target);
 }
 
 // How many axes now read differently from what the mode found. Compared with a tolerance in
@@ -2147,6 +2194,14 @@ void tweakSummary(Mode mode, char* out, size_t size) {
         case Mode::PanelTweak:
             _snprintf_s(out, size, _TRUNCATE, "Pribluda position");
             break;
+        // The direction the stick moves, and how far it is from where GPL put the eyes: the
+        // world shifting says which way, but not that a value is left over on another axis.
+        case Mode::CameraTweak: {
+            int selected = cameraConfigSelected();
+            _snprintf_s(out, size, _TRUNCATE, "Camera position: %s %+.3f m",
+                        cameraConfigDirectionName(selected), cameraConfigValue(selected));
+            break;
+        }
         default:
             out[0] = '\0';
             break;
@@ -2188,6 +2243,8 @@ void enterMode(Mode mode, int hand) {
     // The dialog opens on Save: it is what someone who has just spent a minute aiming their
     // mirrors means, and the answer that loses work is the one they have to move to.
     if (mode == Mode::Confirm) g_state.confirmChoice = kConfirmSave;
+    // Reset opens on its list, never on a question left over from last time.
+    g_state.resetPending = -1;
     g_state.navDetent = 0;
     g_state.navRepeatAt = 0;
     g_state.adjustDetent = 0;
@@ -2265,6 +2322,13 @@ void enterMode(Mode mode, int hand) {
                  "stick moves it, trigger+stick pushes it away, stick click resets, menu "
                  "leaves");
             break;
+        case Mode::CameraTweak: {
+            const char* key = cameraConfigKey();
+            logf("vr menu: camera position from the %s hand for %s -- %s",
+                 hand == kHandLeft ? "left" : "right", key ? key : "no identified car",
+                 "trigger picks X/Y/Z, stick moves along it, stick click resets, grip leaves");
+            break;
+        }
         default:
             break;
     }
@@ -2355,6 +2419,7 @@ const char* modeName(Mode mode) {
         case Mode::MirrorTweak: return "mirror preset";
         case Mode::HudTweak: return "Pribluda layout";
         case Mode::PanelTweak: return "Pribluda position";
+        case Mode::CameraTweak: return "camera position";
         default: return "the menu";
     }
 }
@@ -2424,6 +2489,20 @@ void answerReset(int choice) {
                                    carSet[0] ? "MIRRORS FAILED" : "no car set loaded");
         }
     }
+    if (all || choice == kResetCamera) {
+        char carSet[24] = {};
+        int  cleared = 0;
+        bool ok = cameraConfigClearCarSet(carSet, sizeof(carSet), cleared);
+        if (ok) {
+            written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE,
+                                   "%s%s camera presets (%d)", written ? ", " : "", carSet,
+                                   cleared);
+        } else {
+            written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE, "%s%s",
+                                   written ? ", " : "",
+                                   carSet[0] ? "CAMERA FAILED" : "no car set loaded");
+        }
+    }
     if (all || choice == kResetPribluda) {
         bool ok = pribludaResetLayout();
         written += _snprintf_s(done + written, sizeof(done) - written, _TRUNCATE, "%s%s",
@@ -2436,26 +2515,62 @@ void answerReset(int choice) {
     notice(text);
 }
 
-void pollReset(const VrHandInput& hand) {
+// A picked Reset answer asks before it runs; Cancel needs no question.
+void pickReset(int choice) {
+    State& state = g_state;
+    if (choice == kResetCancel) {
+        answerReset(choice);
+        return;
+    }
+    state.resetPending = choice;
+    state.resetSureChoice = kResetSureNo;
+    logf("vr menu: reset -- \"%s\" picked, asking to confirm", kResetLabel[choice]);
+}
+
+// The question's answer: Yes runs the pending choice, No goes back to the list on it.
+void answerResetSure(int sure) {
+    State& state = g_state;
+    int    choice = state.resetPending;
+    state.resetPending = -1;
+    if (sure == kResetSureYes && choice >= 0 && choice < kResetCount) {
+        answerReset(choice);
+        return;
+    }
+    state.resetChoice = choice >= 0 ? choice : kResetCancel;
+    logf("vr menu: reset -- not confirmed, nothing changed");
+}
+
+// One list of `count` answers under a title band, as the Reset dialog lays both of its pages out:
+// the stick moves the highlight, the ray picks one, and the answer taken is returned, or -1.
+int pollAnswerList(const VrHandInput& hand, int count, int& choice) {
     State& state = g_state;
     int step = stickDetent(hand.stickY, state.navDetent, state.navRepeatAt, qpcNow(),
                            state.frequency);
     if (step) {
-        state.resetChoice =
-            ((state.resetChoice - step) % kResetCount + kResetCount) % kResetCount;
+        choice = ((choice - step) % count + count) % count;
         state.stickOwnsHighlight = true;
     }
     int pointed = -1;
     if (state.pointerOn) {
-        int row = static_cast<int>(state.pointerV * static_cast<float>(kResetCount + 1)) - 1;
-        if (row >= 0 && row < kResetCount) pointed = row;
+        int row = static_cast<int>(state.pointerV * static_cast<float>(count + 1)) - 1;
+        if (row >= 0 && row < count) pointed = row;
     }
-    if (pointed >= 0 && !step) state.resetChoice = pointed;
+    if (pointed >= 0 && !step) choice = pointed;
     // The trigger takes the answer the ray is on; the stick click takes the highlighted one.
-    if (hand.triggerHeld.released && pointed >= 0 && pointed == state.resetChoice)
-        answerReset(state.resetChoice);
-    else if (hand.stick.pressed)
-        answerReset(state.resetChoice);
+    if (hand.triggerHeld.released && pointed >= 0 && pointed == choice) return choice;
+    if (hand.stick.pressed) return choice;
+    return -1;
+}
+
+void pollReset(const VrHandInput& hand) {
+    State& state = g_state;
+    if (state.resetPending >= 0) {
+        int sure = pollAnswerList(hand, kResetSureCount, state.resetSureChoice);
+        if (sure >= 0) answerResetSure(sure);
+        return;
+    }
+    int choice = pollAnswerList(hand, kResetCount, state.resetChoice);
+    if (choice >= 0) pickReset(choice);
 }
 
 // -- "help" --------------------------------------------------------------------------------
@@ -3166,6 +3281,13 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
             add("%s: go back to VR menu", grip);
             break;
         }
+        case Mode::CameraTweak:
+            add("%s: cycle the axis to adjust (forward/up/right)", trigger);
+            add("%s up/down: move the camera forward/back or up/down", stick);
+            add("%s left/right: move the camera left/right", stick);
+            add("%s click: reset camera position", stick);
+            add("%s: go back to VR menu", grip);
+            break;
         default:
             break;
     }
@@ -3280,8 +3402,10 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
         float hints = helpFooterHeight(kVrTextSmall, block.count);
         // The band is the panel's own bottom edge and in the Pribluda modes the panel is what
         // is being arranged, so the list gives way rather than covering the thing it is about.
-        // Mirror setup has nothing under it and takes the whole canvas.
-        float most = g_state.mode == Mode::MirrorTweak ? h : h * 0.55f;
+        // Mirror setup and camera position have nothing under them and take the whole canvas.
+        float most = g_state.mode == Mode::MirrorTweak || g_state.mode == Mode::CameraTweak
+                         ? h
+                         : h * 0.55f;
         if (readout + hints > most) hints = most - readout;
         if (hints < 0.0f) hints = 0.0f;
         float bandHeight = readout + hints;
@@ -3332,33 +3456,43 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     // destructive ones say what file they clear, because "reset" on its own does not tell
     // anyone whether their per-car mirror work is about to go.
     if (g_state.mode == Mode::Reset) {
-        float band = h / static_cast<float>(kResetCount + 1);
+        // The list, or the question about the answer picked from it: the same layout either way.
+        bool  sure = g_state.resetPending >= 0;
+        int   count = sure ? kResetSureCount : kResetCount;
+        int   highlighted = sure ? g_state.resetSureChoice : g_state.resetChoice;
+        float band = h / static_cast<float>(count + 1);
+        char  title[96] = {};
+        if (sure) {
+            char picked[48] = {};
+            resetLabel(g_state.resetPending, picked, sizeof(picked));
+            _snprintf_s(title, sizeof(title), _TRUNCATE, "%s? This cannot be undone", picked);
+        } else {
+            _snprintf_s(title, sizeof(title), _TRUNCATE, "Reset what?");
+        }
         gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
-        canvasText(gl, kVrTextBody, kHelpMargin, band * 0.5f, "Reset what?");
+        canvasText(gl, kVrTextBody, kHelpMargin, band * 0.5f, title);
 
-        for (int choice = 0; choice < kResetCount; ++choice) {
+        for (int choice = 0; choice < count; ++choice) {
             float top = band * static_cast<float>(choice + 1);
-            if (choice == g_state.resetChoice) {
+            if (choice == highlighted) {
                 gl.color4f(0.22f, 0.45f, 0.78f, 0.95f);
                 canvasQuad(gl, w * 0.02f, top + band * 0.06f, w * 0.98f, top + band * 0.94f);
                 gl.color4f(1.0f, 0.85f, 0.25f, 1.0f);
                 canvasOutline(gl, w * 0.02f, top + band * 0.06f, w * 0.98f,
                               top + band * 0.94f);
             }
-            // Reset ALL is red, the colour the page's Reset button is drawn in.
-            if (choice == kResetEverything)
+            // Reset ALL is red, the colour the page's Reset button is drawn in; so is the Yes
+            // that would run it.
+            if (sure ? choice == kResetSureYes && g_state.resetPending == kResetEverything
+                     : choice == kResetEverything)
                 setResetColour(gl);
             else
                 gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
-            // The mirror row names the car set it clears.
-            char        mirrorLabel[48] = {};
-            char        carSet[24] = {};
-            const char* label = kResetLabel[choice];
-            if (choice == kResetMirrors && mirrorConfigCarSetName(carSet, sizeof(carSet))) {
-                _snprintf_s(mirrorLabel, sizeof(mirrorLabel), _TRUNCATE,
-                            "Clear %s mirror presets", carSet);
-                label = mirrorLabel;
-            }
+            char label[48] = {};
+            if (sure)
+                _snprintf_s(label, sizeof(label), _TRUNCATE, "%s", kResetSureLabel[choice]);
+            else
+                resetLabel(choice, label, sizeof(label));
             canvasText(gl, kVrTextBody, w * 0.05f, top + band * 0.5f, label);
         }
         drawCanvasCursor(gl, w, h);
@@ -3615,8 +3749,8 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
         return;
     }
     if (g_state.mode == Mode::Reset) {
-        _snprintf_s(out + written, size - static_cast<size_t>(written), _TRUNCATE, "%d",
-                    g_state.resetChoice);
+        _snprintf_s(out + written, size - static_cast<size_t>(written), _TRUNCATE, "%d|%d|%d",
+                    g_state.resetChoice, g_state.resetPending, g_state.resetSureChoice);
         return;
     }
     // The popup's text changes only when the runtime renames a control.
@@ -3829,7 +3963,11 @@ void vrMenuPoll() {
             // ask is the one that changes nothing and goes back to where they were.
             enterMode(state.confirmFrom, state.hand);
         } else if (state.mode == Mode::Reset) {
-            enterMode(Mode::Menu, state.hand);
+            // From the question, back to the list; from the list, back to the menu.
+            if (state.resetPending >= 0)
+                answerResetSure(kResetSureNo);
+            else
+                enterMode(Mode::Menu, state.hand);
         } else if (state.mode == Mode::Help) {
             leaveHelp();
         } else {
@@ -4343,6 +4481,7 @@ bool vrMenuFormatStatus(char* out, size_t size) {
         case Mode::MirrorTweak: modeName = "mirror tweak"; break;
         case Mode::HudTweak: modeName = "HUD tweak"; break;
         case Mode::PanelTweak: modeName = "panel tweak"; break;
+        case Mode::CameraTweak: modeName = "camera tweak"; break;
         case Mode::Confirm: modeName = "save changes?"; break;
         case Mode::Reset: modeName = "reset what?"; break;
         case Mode::Help: modeName = "help"; break;
