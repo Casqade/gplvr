@@ -1892,6 +1892,10 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     const float savedZ = params->eyeZ;
     float       savedOrientation[9];
     std::memcpy(savedOrientation, params->orientation, sizeof(savedOrientation));
+    // What goes back into the game's block at the end. savedOrientation is levelled by the
+    // horizon lock below and the passes are built from that; GPL gets its own view back.
+    float gameOrientation[9];
+    std::memcpy(gameOrientation, params->orientation, sizeof(gameOrientation));
 
 
     // Head poses, or nothing. The runtime supplies the eye separation as well as the
@@ -2462,7 +2466,11 @@ bool stereoRender(SceneParams* params, void(__cdecl* original)(void*)) {
     params->eyeX = savedX;
     params->eyeY = savedY;
     params->eyeZ = savedZ;
-    std::memcpy(params->orientation, savedOrientation, sizeof(savedOrientation));
+    // GPL'S ORIENTATION, NOT THE LEVELLED ONE. This put savedOrientation back after the horizon
+    // lock had overwritten it, so the game's block was left holding a levelled view: later
+    // passes read exactly 0.00 pitch and roll as the car's, alternating with the real -6.50,
+    // and with vrReplayHorizonLock 1 the replay camera jumped up and down (2026-11-14).
+    std::memcpy(params->orientation, gameOrientation, sizeof(gameOrientation));
 
     // Flush the second eye.
     //
