@@ -44,6 +44,7 @@
 #include "Window.h"
 #include "XrRuntimeProbe.h"
 #include "GameExit.h"
+#include "HeadsetCheck.h"
 #include "presenter/Producer.h"
 
 #include <cmath>
@@ -2542,8 +2543,12 @@ void loadOptions(const char* fileName) {
     if (g_options.profileStallUs > 10000) g_options.profileStallUs = 10000;
     g_options.vr = GetPrivateProfileIntA("gplvr", "vr", 1, path) != 0;
     // Before anything reads vr: every VR-only install gate then sees the flat answer, exactly as
-    // with vr = 0 in the ini.
-    if (g_options.vr) {
+    // with vr = 0 in the ini. The second reading, after the presenter found no headset, takes
+    // the same way out.
+    if (g_options.vr && headsetCheckRefused()) {
+        g_options.vr = false;
+        logf("vr: vr = 1 is played as 0 -- the presenter found no headset");
+    } else if (g_options.vr) {
         char runtime[1200];
         if (xrRuntimeFind(runtime, sizeof(runtime))) {
             logf("vr: OpenXR runtime -- %s", runtime);

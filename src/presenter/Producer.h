@@ -6,18 +6,33 @@
 // told which adapter the OpenXR runtime wants, then hands it one shared D3D11 texture
 // per frame containing both eyes.
 //
-// It runs entirely from the frame hook on the game's render thread, and it is a state
-// machine rather than a blocking sequence: the presenter takes a second or two to bring
-// SteamVR up, and the game must not stop while that happens. Every step that can fail
-// logs once and drops the whole thing back to inactive, because a mod that stalls the
-// game waiting for a headset is worse than one that quietly does not start.
+// The presenter is launched before the game loads its rasterizer, and its first answer --
+// whether the runtime has a headset at all -- is waited for there (HeadsetCheck.h), because
+// whether to install for VR or for flat is decided once. Everything after that answer runs
+// from the frame hook on the game's render thread as a state machine rather than a blocking
+// sequence. Every step that can fail logs once and drops the whole thing back to inactive.
 
 #include "presenter/SharedPresentation.h"
 
 namespace gplvr {
 
-// Called once, after discovery. False means VR is off or the presenter could not be
-// launched; the game carries on as a flat stereo mod.
+// The control block and the presenter process, without the GL half presenterStart adds on the
+// first frame. The stage stays Off, so every frame-side call stays inert until then. False when
+// either could not be made; presenterAbandonLaunch then cleans up.
+bool presenterLaunchEarly();
+
+enum class HeadsetVerdict { Pending, Headset, NoHeadset };
+
+// The early-launched presenter's answer: a headset once it has published the runtime's
+// requirements, none once it has failed or exited first. Never Pending without a launch.
+HeadsetVerdict presenterHeadsetVerdict();
+
+// No headset: ask the presenter to stop and close the process handle and the control block.
+void presenterAbandonLaunch();
+
+// Called once, on the first frame. Resolves the GL transport and, if presenterLaunchEarly did
+// not, makes the control block and launches the presenter. False means VR is off or the channel
+// could not be built; the game carries on as a flat stereo mod.
 bool presenterStart();
 
 // Called from the frame hook, before the game presents, so the render target still

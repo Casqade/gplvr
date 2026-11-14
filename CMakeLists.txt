@@ -130,6 +130,7 @@ else()
         src/FrameTrace.cpp
         src/GlTrace.cpp
         src/HeadAudio.cpp
+        src/HeadsetCheck.cpp
         src/Paths.cpp
         src/Pe.cpp
         src/PostProfile.cpp

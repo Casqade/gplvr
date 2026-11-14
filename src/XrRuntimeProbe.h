@@ -9,8 +9,9 @@
 // is read in the 64-bit registry view. A path that names no file counts as no runtime: the
 // loader fails on it the same way.
 //
-// A runtime that is installed but cannot start -- SteamVR with the headset unplugged -- is
-// still a runtime here; the presenter finds that out, as before.
+// A runtime that is installed but has no headset -- SteamVR with the headset unplugged -- is
+// still a runtime here; the presenter finds that out before the install (HeadsetCheck.h), and
+// the game plays flat then too.
 
 #include <cstddef>
 

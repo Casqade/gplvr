@@ -21,6 +21,7 @@
 #include "FlatFrames.h"
 #include "GameExit.h"
 #include "HeadAudio.h"
+#include "HeadsetCheck.h"
 #include "Hooks.h"
 #include "Hud.h"
 #include "fast_text/FastText.h"
@@ -62,10 +63,21 @@ LoadLibraryAFn   g_loadLibraryA = nullptr;
 LoadLibraryWFn   g_loadLibraryW = nullptr;
 LoadLibraryExAFn g_loadLibraryExA = nullptr;
 
+// Below, with the sound patch it may take back.
+void settleHeadset(const char* where);
+
+// A rasterizer DLL is the one exporting the entry points GPL resolves into its raster table.
+// The game's thread holds here until the presenter has said whether there is a headset, so
+// the game goes no further than this until the install knows which mode it is installing.
+void settleHeadsetAtRasterizer(HMODULE module) {
+    if (GetProcAddress(module, "polySetDest")) settleHeadset("the rasterizer load");
+}
+
 HMODULE WINAPI loadLibraryAHook(LPCSTR name) {
     HMODULE result = g_loadLibraryA ? g_loadLibraryA(name) : LoadLibraryA(name);
     if (result) patchDisplaySettingsImports(result);
     if (result) glTraceInstall();
+    if (result) settleHeadsetAtRasterizer(result);
     return result;
 }
 
@@ -73,6 +85,7 @@ HMODULE WINAPI loadLibraryWHook(LPCWSTR name) {
     HMODULE result = g_loadLibraryW ? g_loadLibraryW(name) : LoadLibraryW(name);
     if (result) patchDisplaySettingsImports(result);
     if (result) glTraceInstall();
+    if (result) settleHeadsetAtRasterizer(result);
     return result;
 }
 
@@ -82,6 +95,7 @@ HMODULE WINAPI loadLibraryExAHook(LPCSTR name, HANDLE file, DWORD flags) {
     if (result && !(flags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE))) {
         patchDisplaySettingsImports(result);
         glTraceInstall();
+        settleHeadsetAtRasterizer(result);
     }
     return result;
 }
@@ -118,6 +132,8 @@ constexpr uintptr_t     kSampleBufferFlagsSite = 0x0050FEDB;
 constexpr unsigned char kSampleBufferFlagsStock[8] = {0xC7, 0x44, 0x24, 0x2C, 0xE0, 0x00, 0x00, 0x00};
 constexpr uint32_t      kGlobalFocus = 0x00008000;  // DSBCAPS_GLOBALFOCUS
 
+bool g_soundGlobalFocus = false;
+
 void soundGlobalFocusInstall() {
     if (!keepDrawingWhileUnfocused()) return;
 
@@ -136,8 +152,32 @@ void soundGlobalFocusInstall() {
              static_cast<unsigned>(kSampleBufferFlagsSite));
         return;
     }
+    g_soundGlobalFocus = true;
     logf("sound: Miles' buffers are made with DSBCAPS_GLOBALFOCUS -- the sound keeps playing "
          "while the game is not in the foreground, as the picture does");
+}
+
+// The patch above goes in at attach, when vr = 1 still stands. Once no headset turned that into
+// flat, Miles' stock flags are written back, so the flat game mutes in the background as with
+// vr = 0. A buffer made before this keeps the flags it was made with.
+void soundGlobalFocusReconsider() {
+    if (!g_soundGlobalFocus || keepDrawingWhileUnfocused()) return;
+    auto     site = reinterpret_cast<unsigned char*>(kSampleBufferFlagsSite);
+    uint32_t flags = 0xE0;
+    if (!patchBytes(site + 4, &flags, sizeof(flags))) {
+        logf("sound: could not write Miles' stock buffer flags back at %08X -- the flat game's "
+             "sound keeps playing while it is not in the foreground",
+             static_cast<unsigned>(kSampleBufferFlagsSite));
+        return;
+    }
+    g_soundGlobalFocus = false;
+    logf("sound: Miles' stock buffer flags written back -- playing flat, the sound stops while "
+         "the game is not in the foreground, as with vr = 0");
+}
+
+void settleHeadset(const char* where) {
+    headsetCheckSettle(where);
+    if (headsetCheckRefused()) soundGlobalFocusReconsider();
 }
 
 // Redirect one named import of the main module to `replacement`, remembering the
@@ -207,6 +247,9 @@ void raiseTimerResolution() {
 // rasterizer DLL, so we wait for them rather than guessing at timing.
 
 DWORD WINAPI installThread(LPVOID) {
+    // First, so the presenter's answer overlaps the seconds the game takes to reach its
+    // rasterizer.
+    headsetCheckStart();
     raiseTimerResolution();
     logf("waiting for a rasterizer to be loaded...");
 
@@ -220,6 +263,9 @@ DWORD WINAPI installThread(LPVOID) {
         }
         Sleep(25);
     }
+    // Already settled at the rasterizer's LoadLibrary unless the game loaded it some other way;
+    // either way nothing below runs before the answer is in.
+    settleHeadset("the install");
 
     if (!discover(binding)) {
         logf("discovery failed -- installing nothing. The game is unmodified.");

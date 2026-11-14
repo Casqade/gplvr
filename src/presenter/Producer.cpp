@@ -1447,21 +1447,68 @@ void drawMonitorHud(State& state, int monitorEye) {
 
 }  // namespace
 
+bool presenterLaunchEarly() {
+    State& state = g_state;
+    if (state.stage != Stage::Off) return false;
+    if (state.presenterProcess) return true;
+    wchar_t instance[32] = {};
+    return createControlBlock(state, instance) && launchPresenter(state, instance);
+}
+
+HeadsetVerdict presenterHeadsetVerdict() {
+    State& state = g_state;
+    if (!state.block || !state.presenterProcess) return HeadsetVerdict::NoHeadset;
+    auto presenterState = [&state] {
+        return static_cast<ProcessState>(InterlockedCompareExchange(
+            reinterpret_cast<volatile LONG*>(&state.block->presenterState), 0, 0));
+    };
+    // An exit is checked first: a presenter that finds no HMD closes through the same path as
+    // any other, which leaves Stopped in the block -- a state numerically past
+    // RequirementsReady. Anything it published before it exited is no use without it.
+    if (WaitForSingleObject(state.presenterProcess, 0) == WAIT_OBJECT_0)
+        return HeadsetVerdict::NoHeadset;
+    ProcessState presenter = presenterState();
+    if (presenter == ProcessState::Failed || presenter >= ProcessState::Stopping)
+        return HeadsetVerdict::NoHeadset;
+    if (presenter >= ProcessState::RequirementsReady) return HeadsetVerdict::Headset;
+    return HeadsetVerdict::Pending;
+}
+
+void presenterAbandonLaunch() {
+    State& state = g_state;
+    if (state.block)
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&state.block->shutdownRequested),
+                            1);
+    // Not waited for: a presenter that found no headset is already on its way out, and one
+    // that is not sees shutdownRequested -- or the game gone -- and stops by itself.
+    if (state.presenterProcess) CloseHandle(state.presenterProcess);
+    state.presenterProcess = nullptr;
+    if (state.block) UnmapViewOfFile(state.block);
+    state.block = nullptr;
+    if (state.mapping) CloseHandle(state.mapping);
+    state.mapping = nullptr;
+}
+
 bool presenterStart() {
     State& state = g_state;
     if (state.stage != Stage::Off) return state.stage == Stage::Publishing ||
                                           state.stage == Stage::WaitingForRequirements;
 
+    // A presenter launched early has already found the headset and is waiting for the shared
+    // textures; it must not be left holding a session for a channel that will never open.
     if (!glResolve(state.gl)) {
+        presenterAbandonLaunch();
         fail("opengl32 is not in this process, so there is no back buffer to share");
         return false;
     }
     const HDC dc = state.gl.wglGetCurrentDC();
     if (!dc || !state.gl.wglGetCurrentContext()) {
+        presenterAbandonLaunch();
         fail("no current GL context on the render thread");
         return false;
     }
     if (!glResolveInterop(state.gl, dc)) {
+        presenterAbandonLaunch();
         fail("WGL_NV_DX_interop is unavailable, and it is the only transport built");
         return false;
     }
@@ -1469,14 +1516,16 @@ bool presenterStart() {
     // back buffer, exactly as it did before there was an off-screen path at all.
     state.targetResolved = renderTargetResolve(state.gl);
 
-    wchar_t instance[32] = {};
-    if (!createControlBlock(state, instance)) {
-        fail("the shared control block could not be created");
-        return false;
-    }
-    if (!launchPresenter(state, instance)) {
-        fail("the presenter would not start");
-        return false;
+    if (!state.presenterProcess) {
+        wchar_t instance[32] = {};
+        if (!createControlBlock(state, instance)) {
+            fail("the shared control block could not be created");
+            return false;
+        }
+        if (!launchPresenter(state, instance)) {
+            fail("the presenter would not start");
+            return false;
+        }
     }
 
     state.stage = Stage::WaitingForRequirements;
