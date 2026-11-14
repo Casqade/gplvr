@@ -46,7 +46,7 @@ static_assert(kCanvasWidth <= kMenuPanelWidth && kCanvasHeight <= kMenuPanelHeig
 // GPL's 37-pixel buttons about two and a half degrees across, which a hand can hit.
 constexpr float kPanelAhead = 1.0f;
 constexpr float kPanelDown = 0.30f;
-constexpr float kPanelWidth = 0.80f;
+constexpr float kPanelWidth = 1.0f;
 constexpr float kPanelHeight =
     kPanelWidth * static_cast<float>(kCanvasHeight) / static_cast<float>(kCanvasWidth);
 
