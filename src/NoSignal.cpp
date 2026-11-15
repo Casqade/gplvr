@@ -1,7 +1,9 @@
 #include "NoSignal.h"
 
+#include "Hooks.h"
 #include "Log.h"
 #include "Pe.h"
+#include "Window.h"
 
 #include <windows.h>
 
@@ -45,6 +47,16 @@ bool readable(const void* address, size_t bytes) {
 }
 
 char __fastcall drawThunk(void* self, void*, int argument) {
+    // GPL REPAINTS ITS WINDOW ONE DIRTY RECTANGLE AT A TIME. gpl_windowRedrawAndPresent
+    // (0x5022A0) binds a sub-surface of the back buffer cut to each rectangle and draws every
+    // widget that overlaps it, so the full-screen driving view comes here once per rectangle --
+    // twice in most frames while the frame counter's old and new rectangles do not merge. Flat,
+    // each pass is clipped to its rectangle. The stereo render fills both eyes whatever the
+    // rectangle, so a second pass painted the world over the 2D drawn after the first, and GPL
+    // redraws only the widgets inside the second rectangle: the Pause prompt flickered or went
+    // (2026-11-15). Once this frame's stereo world is in the eyes, a later pass has nothing to
+    // add to them, and the widgets of its rectangle still draw over it.
+    if (g_options.vr && stereoWorldRenderedThisFrame() && !windowInFrontEnd()) return 0;
     char result = g_original(self, argument);
     auto flag = static_cast<const uint8_t*>(self) + kStaticFlag;
     if (!readable(flag, 1) || !*flag) return result;

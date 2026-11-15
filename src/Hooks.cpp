@@ -3118,6 +3118,8 @@ void setCursorClip(const RECT& rect) {
 
 bool frameAlreadyPublished() { return g_framePublished; }
 
+bool stereoWorldRenderedThisFrame() { return g_stereoRenderedFrame; }
+
 bool hooksMainWalkRedirected() { return g_mainWalkRedirected; }
 
 unsigned hooksFrameCount() { return g_frames; }

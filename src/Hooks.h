@@ -877,6 +877,10 @@ void windowProcUnchain();
 // that reaches the monitor and not the eyes, which is the difference between "the HUD is
 // in the wrong place" and "the HUD is drawn too late to be seen".
 bool frameAlreadyPublished();
+
+// True once a sceneRender of the frame being drawn has rendered the stereo world into the eyes;
+// cleared when that frame is published.
+bool stereoWorldRenderedThisFrame();
 void releaseCursorClip();
 
 // Whether the game should keep rendering and presenting without the foreground.
