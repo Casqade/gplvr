@@ -470,6 +470,11 @@ struct Options {
     // nearer is bigger.
     float vrGplMenuDistance = 2.0f;
 
+    // Metres from the seat to the replay panel (GPL's replay controls on a panel ahead of and
+    // below the eyes), 0.5 to 3.0. The panel's size is fixed, so nearer is bigger; it stays at
+    // the same angle below the eye line. GPL's dialogs over the race keep their own place.
+    float vrReplayPanelDistance = 1.0f;
+
     // The size of the Windows pointer gplvr draws into the headset, 0.1 to 1.0, in proportion:
     // 0.25 is a 32-pixel arrow about 0.95 degrees tall, the size it had on the menu panel from a
     // 1440-line window. It is an angle on the menu panel, on a head-locked menu and in the eyes,

@@ -41,11 +41,12 @@ constexpr int kCanvasHeight = 2 * kBandRows * kCanvasScale;
 static_assert(kCanvasWidth <= kMenuPanelWidth && kCanvasHeight <= kMenuPanelHeight,
               "the replay bands must fit the VR menu panel's one size (Producer.h)");
 
-// Where the panel hangs in the seat's frame: ahead of and below the eyes, turned to face them,
-// like a tablet held at the wheel. Far enough to focus without effort; the width makes one of
-// GPL's 37-pixel buttons about two and a half degrees across, which a hand can hit.
-constexpr float kPanelAhead = 1.0f;
-constexpr float kPanelDown = 0.30f;
+// Where the panel hangs in the seat's frame: vrReplayPanelDistance metres ahead and
+// kPanelDownPerAhead of that below the eyes, turned to face them, like a tablet held at the wheel.
+// The panel's size is fixed, so nearer is bigger, and the angle below the eye line stays the
+// same at any distance. At the default 1 m the width makes one of GPL's 37-pixel buttons about
+// three degrees across, which a hand can hit.
+constexpr float kPanelDownPerAhead = 0.30f;
 constexpr float kPanelWidth = 1.0f;
 constexpr float kPanelHeight =
     kPanelWidth * static_cast<float>(kCanvasHeight) / static_cast<float>(kCanvasWidth);
@@ -461,6 +462,10 @@ void canvasArrow(const GlFunctions& gl, float x, float y) {
 // A panel `ahead` metres in front of the seat's eye line and `down` below it, turned about its
 // own x axis toward the eyes, so the face is square to the line of sight rather than to the
 // horizon.
+float panelAhead() { return g_options.vrReplayPanelDistance; }
+
+float panelDown() { return g_options.vrReplayPanelDistance * kPanelDownPerAhead; }
+
 void facingPlacement(float ahead, float down, float centre[3], float orientation[4]) {
     float pitch = std::atan2(-down, ahead);
     centre[0] = 0.0f;
@@ -856,7 +861,7 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
     // shape cannot be read.
     if (cursorOn) {
         float canvasRadians = kPanelWidth / static_cast<float>(kCanvasWidth) /
-                              std::sqrt(kPanelAhead * kPanelAhead + kPanelDown * kPanelDown);
+                              std::sqrt(panelAhead() * panelAhead() + panelDown() * panelDown());
         bool  shape = cursorOverlayDrawShape(gl, static_cast<float>(canvasX),
                                              static_cast<float>(canvasY),
                                              cursorOverlayRadiansPerPixel() / canvasRadians);
@@ -897,8 +902,8 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
     if (!p.published)
         logf("replay panel: on the headset -- %s on a %.2f x %.2f m panel %.2f m ahead and "
              "%.2f m below the seat's eye line, %dx%d texels",
-             modeName(mode), panelWidth, panelHeight, replay ? kPanelAhead : kDialogAhead,
-             replay ? kPanelDown : kDialogDown, canvasWidth, canvasHeight);
+             modeName(mode), panelWidth, panelHeight, replay ? panelAhead() : kDialogAhead,
+             replay ? panelDown() : kDialogDown, canvasWidth, canvasHeight);
     p.published = true;
     p.drawnSinceCompose = false;
     p.cursorOn = cursorOn;
@@ -910,7 +915,7 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
 bool replayPanelShown() { return g_panel.published && g_panel.mode == Mode::Replay; }
 
 void replayPanelPlacement(float centre[3], float orientation[4], float& width, float& height) {
-    facingPlacement(kPanelAhead, kPanelDown, centre, orientation);
+    facingPlacement(panelAhead(), panelDown(), centre, orientation);
     width = kPanelWidth;
     height = kPanelHeight;
 }

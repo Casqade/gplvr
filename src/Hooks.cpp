@@ -2616,6 +2616,10 @@ void loadOptions(const char* fileName) {
     g_options.vrGplMenuDistance = static_cast<float>(atof(text));
     if (!(g_options.vrGplMenuDistance >= 0.75f)) g_options.vrGplMenuDistance = 0.75f;
     if (g_options.vrGplMenuDistance > 5.0f) g_options.vrGplMenuDistance = 5.0f;
+    GetPrivateProfileStringA("gplvr", "vrReplayPanelDistance", "1.0", text, sizeof(text), path);
+    g_options.vrReplayPanelDistance = static_cast<float>(atof(text));
+    if (!(g_options.vrReplayPanelDistance >= 0.5f)) g_options.vrReplayPanelDistance = 0.5f;
+    if (g_options.vrReplayPanelDistance > 3.0f) g_options.vrReplayPanelDistance = 3.0f;
     GetPrivateProfileStringA("gplvr", "vrCursorScale", "0.25", text, sizeof(text), path);
     g_options.vrCursorScale = static_cast<float>(atof(text));
     if (!(g_options.vrCursorScale >= 0.1f)) g_options.vrCursorScale = 0.1f;
@@ -2851,11 +2855,12 @@ void loadOptions(const char* fileName) {
          g_options.vrNoSignalDelay);
 
     logf("options: vrGplMenuMode=%d (%s) vrGplMenuScale=%.2f vrGplMenuDistance=%.2f "
-         "vrCursorScale=%.2f",
+         "vrReplayPanelDistance=%.2f vrCursorScale=%.2f",
          g_options.vrGplMenuMode,
          g_options.vrGplMenuMode == 1 ? "a panel fixed in front of the seat"
                                       : "head-locked in the eye images",
-         g_options.vrGplMenuScale, g_options.vrGplMenuDistance, g_options.vrCursorScale);
+         g_options.vrGplMenuScale, g_options.vrGplMenuDistance, g_options.vrReplayPanelDistance,
+         g_options.vrCursorScale);
     logf("options: vrGamma=%.2f vrGplTextDepth=%.2f vrRenderScale=%.2f "
          "vrRecentreKey=0x%02X vrMonitorEye=%d",
          g_options.vrGamma, g_options.vrGplTextDepth,

@@ -507,6 +507,9 @@ MenuRow g_rows[] = {
     {"GPL menu distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
      &g_options.vrGplMenuDistance, 0.75f, 5.0f, 0.25f, "How far to draw the fixed GPL menu",
      kTabDisplay, gplMenuFixed},
+    {"Replay panel distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.vrReplayPanelDistance, 0.5f, 3.0f, 0.25f,
+     "How far to draw the GPL replay controls panel", kTabDisplay},
     {"Cursor size", kRowSliderFloat, kCommandNone, nullptr, nullptr, &g_options.vrCursorScale,
      0.1f, 1.0f, 0.05f, "Size of GPL mouse cursor", kTabDisplay},
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
@@ -1703,6 +1706,7 @@ bool saveSettings() {
     writeInt("vrGplMenuMode", g_options.vrGplMenuMode);
     writeFloat("vrGplMenuScale", g_options.vrGplMenuScale);
     writeFloat("vrGplMenuDistance", g_options.vrGplMenuDistance);
+    writeFloat("vrReplayPanelDistance", g_options.vrReplayPanelDistance);
     writeFloat("vrCursorScale", g_options.vrCursorScale);
     writeFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
     writeInt("vrGplTextScale", g_options.vrGplTextScale);
@@ -1717,7 +1721,7 @@ bool saveSettings() {
     if (failed) {
         notice("Some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 20 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 21 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return false;
     }
@@ -1726,13 +1730,15 @@ bool saveSettings() {
          "mirrorMode=%d "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
-         "vrCursorScale=%.3f vrHudBackdropOpacity=%.3f vrGplTextScale=%d "
+         "vrReplayPanelDistance=%.3f vrCursorScale=%.3f vrHudBackdropOpacity=%.3f "
+         "vrGplTextScale=%d "
          "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrReplayHorizonLock=%.3f "
          "vrWorldScale=%.3f vrHeadAudioWidth=%.3f vrMonitorEye=%d",
          path, g_options.vrHudMode, g_options.mirrorUpdateInterval, g_options.mirrorMode,
          g_options.frameRate, g_options.vrRendererType,
          g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
-         g_options.vrGplMenuScale, g_options.vrGplMenuDistance, g_options.vrCursorScale,
+         g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
+         g_options.vrReplayPanelDistance, g_options.vrCursorScale,
          g_options.vrHudBackdropOpacity, g_options.vrGplTextScale, g_options.vrGplTextSpread,
          g_options.vrGamma, g_options.vrHorizonLock, g_options.vrReplayHorizonLock,
          g_options.vrWorldScale, g_options.vrHeadAudioWidth, g_options.vrMonitorEye);
