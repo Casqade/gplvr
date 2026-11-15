@@ -856,9 +856,10 @@ struct State {
     int      fixedBeamHand = -1;
     float    fixedBeamLength = 0.0f;
     bool     fixedBeamOn = false;  // ending on the panel, where the beam marks the spot
-    Vec3     pointerLastDirection;
-    bool     pointerHaveLast = false;
-    LONGLONG pointerMovedAt = 0;
+    // Per hand: each hand's ray is compared with its own previous one.
+    Vec3     pointerLastDirection[kHands];
+    bool     pointerHaveLast[kHands] = {};
+    LONGLONG pointerMovedAt[kHands] = {};
     LONGLONG frequency = 0;
     // A LEFTDOWN this has sent and not yet matched with a LEFTUP. The down and the up are
     // two separate polls, and everything that can take the front end's pointer away
@@ -2628,25 +2629,26 @@ void pollConfirm(const VrHandInput& hand) {
 
 // Only while the hand is doing something. Otherwise a controller resting on the desk would
 // pin the pointer to a corner and the mouse would be unusable.
-bool pointerAwake(const VrHandInput& hand, const Vec3& direction) {
+bool pointerAwake(int handIndex, const VrHandInput& hand, const Vec3& direction) {
     bool moving = hand.triggerHeld.down || hand.squeezeHeld.down || hand.primary.down ||
                   hand.secondary.down || hand.stick.down || hand.stickX != 0.0f ||
                   hand.stickY != 0.0f;
-    if (g_state.pointerHaveLast && !moving) {
-        // The angle between this frame's ray and the last one's. A hand held still reads
-        // as a few tenths of a milliradian of tracking noise, which is well under the
+    if (g_state.pointerHaveLast[handIndex] && !moving) {
+        // The angle between this hand's ray and its own previous one. A hand held still
+        // reads as a few tenths of a milliradian of tracking noise, which is well under the
         // threshold.
-        const Vec3  previous = g_state.pointerLastDirection;
-        const float cosine = dot(previous, direction);
+        Vec3  previous = g_state.pointerLastDirection[handIndex];
+        float cosine = dot(previous, direction);
         moving = cosine < std::cos(kPointerWakeRadians);
     }
-    g_state.pointerLastDirection = direction;
-    g_state.pointerHaveLast = true;
+    g_state.pointerLastDirection[handIndex] = direction;
+    g_state.pointerHaveLast[handIndex] = true;
 
-    const LONGLONG now = qpcNow();
-    if (moving) g_state.pointerMovedAt = now;
-    if (!g_state.pointerMovedAt) return false;
-    const double idle = static_cast<double>(now - g_state.pointerMovedAt) /
+    LONGLONG  now = qpcNow();
+    LONGLONG& movedAt = g_state.pointerMovedAt[handIndex];
+    if (moving) movedAt = now;
+    if (!movedAt) return false;
+    const double idle = static_cast<double>(now - movedAt) /
                         static_cast<double>(g_state.frequency);
     return idle < kPointerIdleSeconds;
 }
@@ -2847,7 +2849,8 @@ void pollFrontEndPointer() {
     for (int i = 0; i < kHands; ++i) {
         const VrHandInput& candidate = vrInputHand(order[i]);
         if (!candidate.present) continue;
-        if (!pointerAwake(candidate, rotate(quatOf(candidate.aimPose), {0.0f, 0.0f, -1.0f})))
+        if (!pointerAwake(order[i], candidate,
+                          rotate(quatOf(candidate.aimPose), {0.0f, 0.0f, -1.0f})))
             continue;
         order[0] = order[i];
         order[1] = order[i] == kHandRight ? kHandLeft : kHandRight;
@@ -2858,7 +2861,7 @@ void pollFrontEndPointer() {
         if (!hand.present) continue;
 
         const Vec3 direction = rotate(quatOf(hand.aimPose), {0.0f, 0.0f, -1.0f});
-        const bool awake = pointerAwake(hand, direction);
+        const bool awake = pointerAwake(order[i], hand, direction);
         if (onPanel) {
             // The ray follows this hand while it is awake, on the panel or not.
             g_state.replayHand = awake ? order[i] : -1;
@@ -3010,8 +3013,8 @@ void frontEndPointerRelease(const char* why) {
     // Idempotent, so every caller can say it unconditionally. It clears the pointer
     // filter, and a race frame calling it every poll would reset the in-race ray's
     // smoothing on every sample.
-    if (!state.frontEndButtonDown && !state.pointerHasMouse && !state.pointerHaveLast &&
-        !state.haveLastCursor)
+    if (!state.frontEndButtonDown && !state.pointerHasMouse && !state.pointerHaveLast[0] &&
+        !state.pointerHaveLast[1] && !state.haveLastCursor)
         return;
 
     if (state.frontEndButtonDown) {
@@ -3029,7 +3032,7 @@ void frontEndPointerRelease(const char* why) {
         state.pointerHasMouse = false;
         logf("vr menu: the mouse has the front end's pointer again -- %s", why);
     }
-    state.pointerHaveLast = false;
+    for (bool& have : state.pointerHaveLast) have = false;
     state.haveLastCursor = false;
     state.smoothValid = false;
 }
