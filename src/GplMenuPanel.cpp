@@ -4,14 +4,41 @@
 #include "Log.h"
 #include "MenuScale.h"
 #include "VrCamera.h"
+#include "presenter/Producer.h"
 
 #include <windows.h>
+
+#include <cmath>
 
 namespace gplvr {
 namespace {
 
 GplMenuPanel g_shown;
 bool         g_shownOn = false;
+float        g_headLockedRadians = 0.0f;
+
+// Radians per picture pixel of a head-locked frame at the eye's centre, as Consumer.cpp draws
+// it: the picture fitted into the eye image by its aspect and shrunk by vrGplMenuScale, the eye
+// image spanning the left eye's located field of view, so one eye pixel is that span over the
+// image's height in tangent and 1 / (1 + t^2) radians per unit of tangent at the centre. 0
+// while the views or the eye size are unknown.
+float headLockedRadians(int pictureWidth, int pictureHeight, int eyeWidth, int eyeHeight) {
+    if (pictureWidth <= 0 || pictureHeight <= 0 || eyeWidth <= 0 || eyeHeight <= 0) return 0.0f;
+    SharedView views[2] = {};
+    SharedPose head = {};
+    if (!presenterLatestViews(views, head)) return 0.0f;
+    float up = std::tan(views[0].fov.angleUp);
+    float down = std::tan(views[0].fov.angleDown);
+    if (!(up - down > 1e-3f)) return 0.0f;
+    float fitX = static_cast<float>(eyeWidth) / static_cast<float>(pictureWidth);
+    float fitY = static_cast<float>(eyeHeight) / static_cast<float>(pictureHeight);
+    float fit = fitX < fitY ? fitX : fitY;
+    float monoScale = g_options.vrGplMenuScale;
+    if (!(monoScale > 0.05f && monoScale <= 1.0f)) monoScale = 0.5f;
+    float centre = 0.5f * (up + down);
+    return fit * monoScale * (up - down) / static_cast<float>(eyeHeight) /
+           (1.0f + centre * centre);
+}
 
 // What the last line said, so the log changes only when the answer does.
 const char* g_reported = "";
@@ -34,12 +61,18 @@ void report(const char* state, int width, int height) {
 }  // namespace
 
 bool gplMenuPanelForFrame(int frameWidth, int frameHeight, bool sideBySide, bool stretchToFill,
-                          const int* monoRect, GplMenuPanel& out) {
+                          const int* monoRect, int eyeWidth, int eyeHeight, GplMenuPanel& out) {
     out = GplMenuPanel{};
     g_shownOn = false;
+    g_headLockedRadians = 0.0f;
     // Side-by-side and stretched frames are the world; the mode is about the frames mode 0
     // shrinks by vrGplMenuScale, and says nothing while there are none.
     if (sideBySide || stretchToFill || frameWidth <= 0 || frameHeight <= 0) return false;
+    // Until a panel takes it below, the frame goes to the eyes head-locked, as the presenter
+    // draws it: the picture is the rect it names or the whole frame.
+    g_headLockedRadians = headLockedRadians(monoRect ? monoRect[2] : frameWidth,
+                                            monoRect ? monoRect[3] : frameHeight, eyeWidth,
+                                            eyeHeight);
     if (g_options.vrGplMenuMode != 1) {
         report("is head-locked in the eye images (vrGplMenuMode 0)", 0, 0);
         return false;
@@ -82,6 +115,7 @@ bool gplMenuPanelForFrame(int frameWidth, int frameHeight, bool sideBySide, bool
 
     g_shown = out;
     g_shownOn = true;
+    g_headLockedRadians = 0.0f;
     report("is on a panel fixed in front of the seat (vrGplMenuMode 1)", out.rect[2], out.rect[3]);
     return true;
 }
@@ -89,6 +123,12 @@ bool gplMenuPanelForFrame(int frameWidth, int frameHeight, bool sideBySide, bool
 bool gplMenuPanelShown(GplMenuPanel& out) {
     if (!g_shownOn) return false;
     out = g_shown;
+    return true;
+}
+
+bool gplMenuHeadLockedRadiansPerPixel(float& out) {
+    if (!(g_headLockedRadians > 0.0f)) return false;
+    out = g_headLockedRadians;
     return true;
 }
 

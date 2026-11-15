@@ -850,12 +850,16 @@ void replayPanelUpdate(const GlFunctions& gl, bool layerFree) {
     }
     gl.disable(GL_TEXTURE_2D);
 
-    // The Windows pointer's own shape, at the panel's scale -- the arrow the desktop and the
-    // front end show -- or a drawn arrow when the shape cannot be read.
+    // The Windows pointer's own shape -- the arrow the desktop and the front end show -- at the
+    // angle it has everywhere else in the headset: the panel's metres per canvas pixel at its
+    // distance from the eyes give the radians one canvas pixel covers. A drawn arrow when the
+    // shape cannot be read.
     if (cursorOn) {
-        bool shape = cursorOverlayDrawShape(gl, static_cast<float>(canvasX),
-                                            static_cast<float>(canvasY),
-                                            static_cast<float>(kCanvasScale));
+        float canvasRadians = kPanelWidth / static_cast<float>(kCanvasWidth) /
+                              std::sqrt(kPanelAhead * kPanelAhead + kPanelDown * kPanelDown);
+        bool  shape = cursorOverlayDrawShape(gl, static_cast<float>(canvasX),
+                                             static_cast<float>(canvasY),
+                                             cursorOverlayRadiansPerPixel() / canvasRadians);
         if (!shape) canvasArrow(gl, static_cast<float>(canvasX), static_cast<float>(canvasY));
         if (!p.loggedShape) {
             p.loggedShape = true;

@@ -470,6 +470,13 @@ struct Options {
     // nearer is bigger.
     float vrGplMenuDistance = 2.0f;
 
+    // The size of the Windows pointer gplvr draws into the headset, 0.1 to 1.0, in proportion:
+    // 0.25 is a 32-pixel arrow about 0.95 degrees tall, the size it had on the menu panel from a
+    // 1440-line window. It is an angle on the menu panel, on a head-locked menu and in the eyes,
+    // whatever the window's resolution, the headset, vrGplMenuDistance or vrGplMenuScale. The
+    // pointer's own size in Windows multiplies it.
+    float vrCursorScale = 0.25f;
+
     // Gamma the presenter applies to everything it draws in the headset: the eyes, the menus
     // and the HUD panel. 1.0 leaves the game's colours exactly as the monitor shows them;
     // above 1.0 lifts mid-tones and shadows, with black and white staying put. 0.5 to 3.0.

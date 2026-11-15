@@ -28,12 +28,20 @@ struct GplMenuPanel {
 // at vrGplMenuScale (not side by side, not stretched to the eye) and there is a seat; with no
 // seat yet one is taken from the head now (vrSettleSeat), which is also what applies a recentre
 // asked for in the front end. False otherwise, and the frame goes to the eyes as in mode 0.
-// `monoRect` is the frame's own picture rect when it names one, or null. Logs on change.
+// `monoRect` is the frame's own picture rect when it names one, or null; `eyeWidth` and
+// `eyeHeight` are the eye images the presenter fits a head-locked frame into. Logs on change.
 bool gplMenuPanelForFrame(int frameWidth, int frameHeight, bool sideBySide, bool stretchToFill,
-                          const int* monoRect, GplMenuPanel& out);
+                          const int* monoRect, int eyeWidth, int eyeHeight, GplMenuPanel& out);
 
 // The panel the last published frame was put on, for the controller's ray. False when that
 // frame went to the eyes.
 bool gplMenuPanelShown(GplMenuPanel& out);
+
+// When the last published frame went to the eyes head-locked: the radians one of its pixels
+// covers at the eye's centre. The presenter fits the picture into the eye image and shrinks it
+// by vrGplMenuScale (Consumer.cpp), and the eye image spans the display's field of view, which
+// the presenter publishes with its views. False when that frame was not head-locked or the
+// views or eye size are not known yet.
+bool gplMenuHeadLockedRadiansPerPixel(float& out);
 
 }  // namespace gplvr

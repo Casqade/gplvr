@@ -1824,8 +1824,10 @@ void presenterFrame(bool sideBySide, bool stretchToFill, const int* monoRect) {
             block->eyeRect[eye][i] = have ? static_cast<uint32_t>(rect[i]) : 0u;
     }
     GplMenuPanel gplMenu;
-    block->gplMenuMode = gplMenuPanelForFrame(width, height, sideBySide, stretchToFill,
-                                              haveMonoRect ? monoRect : nullptr, gplMenu);
+    block->gplMenuMode = gplMenuPanelForFrame(
+        width, height, sideBySide, stretchToFill, haveMonoRect ? monoRect : nullptr,
+        static_cast<int>(block->targetEyeWidth), static_cast<int>(block->targetEyeHeight),
+        gplMenu);
     block->gplMenuPose = gplMenu.pose;
     block->gplMenuWidthMetres = gplMenu.width;
     block->gplMenuHeightMetres = gplMenu.height;

@@ -1,5 +1,6 @@
 #include "CursorOverlay.h"
 
+#include "GplMenuPanel.h"
 #include "Hooks.h"
 #include "Log.h"
 #include "ReplayPanel.h"
@@ -18,9 +19,18 @@
 namespace gplvr {
 namespace {
 
-// Eye pixels per cursor pixel on the headset stereoAngularScale measures against, the size the
-// pointer had there: 3172-line eyes against a 1440-line window.
-constexpr float kEyeCursorScale = 3172.0f / 1440.0f;
+// Radians per cursor pixel at vrCursorScale kCursorScaleReference: the size the pointer had on
+// GPL's menu panel (vrGplMenuMode 1) from a 1440-line window, one surface pixel per cursor
+// pixel, on the 1.50 m tall panel of a 1920x1440 menu 2.00 m ahead. About 0.95 degrees for a
+// 32-pixel arrow.
+constexpr float kCursorRadians = 1.50f / 1440.0f / 2.00f;
+constexpr float kCursorScaleReference = 0.25f;
+// stereoAngularScale's reference eye: 1586 pixels over tan(52 degrees), the focal length in
+// pixels of a 3172-pixel eye across 104 degrees.
+constexpr float kReferenceEyeFocalPixels = 1239.0f;
+// Before a menu frame has been published, or while the presenter's views are not known, the
+// pointer is a share of the menu's height, the share it had in a 1440-line window.
+constexpr float kReferenceMenuLines = 1440.0f;
 
 // -- what gets drawn -------------------------------------------------------------------
 //
@@ -632,6 +642,10 @@ void cursorOverlayReleaseGl() {
     g_pending = Pending{};
 }
 
+float cursorOverlayRadiansPerPixel() {
+    return kCursorRadians * g_options.vrCursorScale / kCursorScaleReference;
+}
+
 bool cursorOverlayDrawShape(const GlFunctions& gl, float x, float y, float scale) {
     if (!entryPointsPresent(gl)) return false;
     CURSORINFO info = {};
@@ -1022,18 +1036,36 @@ void cursorOverlayDraw(const GlFunctions& gl, bool sideBySide) {
     float drawnX[2] = {0.0f, 0.0f};
     float drawnY[2] = {0.0f, 0.0f};
     float drawnSize = 0.0f;
+    float sizeFactor = g_options.vrCursorScale / kCursorScaleReference;
+    float radians = cursorOverlayRadiansPerPixel();
+    // On GPL's menu panel the panel's metres per picture pixel and its distance give the
+    // radians one surface pixel covers. The panel's rect is in the window's pixels, so this
+    // holds for a cursor drawn into the window's own back buffer.
+    // Head-locked, the published frame's own radians per pixel says the same.
+    float        menuScale = 0.0f;
+    GplMenuPanel panel;
+    float        headLockedRadians = 0.0f;
+    if (!sideBySide && framebuffer == 0 && gplMenuPanelShown(panel) && panel.rect[3] > 0 &&
+        panel.height > 0.0f && panel.pose.positionZ < 0.0f)
+        menuScale = radians * -panel.pose.positionZ * static_cast<float>(panel.rect[3]) /
+                    panel.height;
+    else if (!sideBySide && framebuffer == 0 &&
+             gplMenuHeadLockedRadiansPerPixel(headLockedRadians))
+        menuScale = radians / headLockedRadians;
     for (int i = 0; i < count; ++i) {
         drawnX[i] = static_cast<float>(rects[i][0]) + fx * static_cast<float>(rects[i][2]);
         drawnY[i] = static_cast<float>(rects[i][1]) + fy * static_cast<float>(rects[i][3]);
 
-        // Surface pixels per SCREEN pixel on a single image, so the cursor keeps the size it
-        // has on the desktop. In the eyes it is an ANGLE: the size it had in the 3172-line
-        // eyes of a 1440-line window, scaled by the eye's focal length against that headset
-        // (stereoAngularScale) -- by the window height it was a third smaller on a 4K
-        // monitor and a third bigger on 1080p.
-        float scale = static_cast<float>(rects[i][3]) / static_cast<float>(clientH);
-        if (usedStereoRects)
-            scale = kEyeCursorScale * stereoAngularScale(rects[i][2]);
+        // Surface pixels per cursor pixel. The pointer is an ANGLE, vrCursorScale's, whatever
+        // the window's resolution, the headset, vrGplMenuDistance or vrGplMenuScale: in an eye
+        // the radians times its focal length in pixels; sized by the window's height instead,
+        // it was a third smaller on a 4K monitor and a third bigger on 1080p. Before the first
+        // menu frame is published, a share of the menu's height.
+        float scale = radians * kReferenceEyeFocalPixels * stereoAngularScale(rects[i][2]);
+        if (!sideBySide)
+            scale = menuScale > 0.0f ? menuScale
+                                     : sizeFactor * static_cast<float>(rects[i][3]) /
+                                           kReferenceMenuLines;
         if (g_image.height * scale < 8.0f)
             scale = 8.0f / static_cast<float>(g_image.height);
         drawnSize = g_image.height * scale;

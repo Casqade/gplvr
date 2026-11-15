@@ -96,6 +96,10 @@ void cursorOverlayForgetSaveFrom(GLuint framebuffer);
 // frame that draws rebuilds it from the HCURSOR.
 void cursorOverlayReleaseGl();
 
+// The angle one pixel of the Windows pointer covers in the headset, vrCursorScale's: what a
+// surface of gplvr's own divides by its own radians per pixel to size the pointer.
+float cursorOverlayRadiansPerPixel();
+
 // The Windows pointer's own shape -- the texture cursorOverlayDraw keeps -- with its hotspot at
 // (x, y) and `scale` units of the current 2D transform per screen pixel, drawn into whatever is
 // bound. For a surface of gplvr's own rather than the frame: the replay panel draws the pointer on
