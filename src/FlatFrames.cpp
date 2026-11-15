@@ -51,6 +51,55 @@ constexpr uintptr_t kLastLatchedBgCount = 0x00582114;
 // The same global as this image keeps it, placed in flatFramesInstall. Zero until then.
 uintptr_t g_lastLatchedBgCountAt = 0;
 
+// THE WEEKEND SCREEN'S SESSION INDEX IS HELD ACROSS A TICK'S EXTRA FRAMES.
+//
+// gpl_fgEventLoop calls the screen's update (vtable +0x18, via gpl_fgSnapshotNotifySlot24
+// 0x4EF630) on every iteration whose snapshot is open -- and an extra frame holds the snapshot
+// open, so the update runs again against the records it has already consumed. Every screen with
+// a snapshot table was audited for that (car setup, team info, results, Settings, the five track
+// selection screens, the two controls dialogs): their updates are guarded by one-shot bytes or
+// by "has it changed" tests, or switch screens, which ends the loop. The weekend's is the one
+// exception. gpl_garageScreenUpdate 0x43D8E0 stores the session record the latch delivered
+// (messages 6 and 9 of its table 0x553EA8: gpl_latchResults 0x4A8800 and gpl_latchPlayerRecord
+// 0x4A8940, each reading the session to deliver through the entry's pointer to dword_5F2468)
+// into slot dword_5F2468, then advances dword_5F2468 round-robin over four (0x43DF3C..0x43DF4E).
+// Called twice a tick, it files one session's record under the next session's slot. Once the
+// current session is the race, sub_43D380 (vtable +0x14) reads the race's slot; with a finished
+// practice record filed there (its byte +0xDE set) it decides the race is over: the red button
+// is hidden and shown by turns as the slot flips between the real and the misfiled record, and
+// +0x2C28 is latched, after which the green button (sub_43EE50) calls the red one's
+// gpl_weekendExit -- "save the practice results?", "abandon the race?".
+//
+// GPL reads dword_5F2468 in those two places only: the latch, inside gpl_fgFrameSnapshotBegin,
+// and the update, later in the same loop iteration. So the value it holds just before a stock
+// Begin is the session the latch delivers, and an extra frame on the weekend puts that value back
+// before the update runs: the update files the same record in the same slot and advances the
+// index exactly as the tick's stock frame did. When any check below fails, the weekend instead
+// gets one frame per tick, as GPL draws it.
+//
+// gpl_fgCurrentState holds the screen the loop runs; a screen is told apart by its vtable, which
+// sits in .rdata and does not move between links. The globals and the table are reference-link
+// addresses, rebased.
+constexpr uintptr_t kRetailForegroundState = 0x0094D718;
+constexpr uint32_t  kWeekendVtable = 0x005384D8;  // weekend.win
+constexpr uintptr_t kWeekendUpdateSlot = 0x005384F0;  // weekend.win +0x18
+constexpr uintptr_t kWeekendUpdate = 0x0043D8E0;      // gpl_garageScreenUpdate
+constexpr uintptr_t kRetailSessionIndex = 0x005F2468;  // dword_5F2468
+
+// The update's advance of the index, 0x43DF3C: mov eax,[idx]; inc eax; cdq; xor eax,edx;
+// sub eax,edx; and eax,3; xor eax,edx; sub eax,edx; mov [idx],eax. Two operands name the index.
+constexpr uintptr_t     kIndexAdvance = 0x0043DF3C;
+constexpr unsigned char kIndexAdvanceBytes[] = {
+    0xA1, 0x68, 0x24, 0x5F, 0x00, 0x40, 0x99, 0x33, 0xC2, 0x2B, 0xC2, 0x83,
+    0xE0, 0x03, 0x33, 0xC2, 0x2B, 0xC2, 0xA3, 0x68, 0x24, 0x5F, 0x00};
+
+// The weekend table's entries for messages 6 and 9: {id, delivered pointer, request argument}.
+constexpr uintptr_t kRetailResultsEntry = 0x00553EF0;
+constexpr uintptr_t kRetailPlayerRecordEntry = 0x00553F08;
+
+uintptr_t g_foregroundStateAt = 0;
+uintptr_t g_sessionIndexAt = 0;  // zero when the checks failed: the weekend gets stock frames
+
 using BeginFn = void(__cdecl*)();
 using EndFn = void(__cdecl*)();
 using CountFn = int(__cdecl*)();
@@ -86,6 +135,15 @@ struct State {
     unsigned windowOverdue = 0;   // stock frames taken because the tick was overdue
     unsigned windowBackground = 0;  // stock frames taken because nothing will be presented
     unsigned windowTickless = 0;  // refused because no tick has been latched yet
+    unsigned windowWeekend = 0;   // stock frames the weekend took: no held index for its update
+    unsigned windowWeekendHeld = 0;  // weekend extra frames whose update had its index held
+
+    // The weekend: whether this frame's Begin found it current, and the session index its latch
+    // read at the last stock Begin while it was. Dropped at any Begin it is not current, so a
+    // re-entered weekend (its setup writes the index) never gets an older screen visit's value.
+    bool    onWeekend = false;
+    bool    haveWeekendIndex = false;
+    int32_t weekendIndex = 0;
     unsigned windowMaxExtra = 0;  // the most drawn against any one tick in the window
     unsigned windowHeld = 0;      // ends deferred so the frame survived into an extra draw
     unsigned windowReleased = 0;  // ends let through because a BG request was waiting
@@ -292,10 +350,109 @@ ClockLatch latchByFrameClock(State& s, double instant, double refresh) {
     return ClockLatch::AsBefore;
 }
 
+// True while gpl_fgCurrentState is the weekend screen. Logged at every change, with what was read:
+// a wrong rebase delta would read a neighbour and answer a plausible "no" for ever.
+bool weekendShown() {
+    uintptr_t state = 0;
+    uint32_t  vtable = 0;
+    if (g_foregroundStateAt)
+        std::memcpy(&state, reinterpret_cast<const void*>(g_foregroundStateAt), sizeof(state));
+    if (state) std::memcpy(&vtable, reinterpret_cast<const void*>(state), sizeof(vtable));
+    bool shown = vtable == kWeekendVtable;
+
+    static int said = -1;
+    if (said != static_cast<int>(shown)) {
+        said = static_cast<int>(shown);
+        logf("frames: GPL's foreground state at %08X is %08X (vtable %08X) -- %s",
+             static_cast<unsigned>(g_foregroundStateAt), static_cast<unsigned>(state),
+             static_cast<unsigned>(vtable),
+             !shown ? "not the weekend screen"
+             : g_sessionIndexAt
+                 ? "the weekend screen: frames between ticks put its session index back to the "
+                   "one the tick's latch read, so its update files each record once"
+                 : "the weekend screen: one frame per tick, as GPL draws it, until it is left (the "
+                   "session index checks failed at install, see above)");
+    }
+    return shown;
+}
+
+// The weekend's session index as this image keeps it, once its update and its table are the ones
+// studied; otherwise 0, and the weekend gets one frame per tick. Says which, and why.
+uintptr_t weekendIndexCheck() {
+    uintptr_t index = rebase(kRetailSessionIndex);
+    if (!index) {
+        logf("frames: the weekend's session index %08X cannot be placed in this image (deltas %s) "
+             "-- the weekend screen gets one frame per tick",
+             static_cast<unsigned>(kRetailSessionIndex), rebaseSummary());
+        return 0;
+    }
+
+    uint32_t update = 0;
+    std::memcpy(&update, reinterpret_cast<const void*>(kWeekendUpdateSlot), sizeof(update));
+    if (update != kWeekendUpdate) {
+        logf("frames: weekend.win's update slot %08X holds %08X, not gpl_garageScreenUpdate %08X "
+             "-- the weekend screen gets one frame per tick",
+             static_cast<unsigned>(kWeekendUpdateSlot), static_cast<unsigned>(update),
+             static_cast<unsigned>(kWeekendUpdate));
+        return 0;
+    }
+
+    unsigned char expected[sizeof(kIndexAdvanceBytes)];
+    std::memcpy(expected, kIndexAdvanceBytes, sizeof(expected));
+    unsigned named = rebaseOperands(expected, sizeof(expected), kRetailSessionIndex, index);
+    auto code = reinterpret_cast<const unsigned char*>(kIndexAdvance);
+    if (named != 2 || std::memcmp(code, expected, sizeof(expected)) != 0) {
+        logf("frames: the weekend update's index advance at %08X is not the code studied (%u of 2 "
+             "operands named the index in the template) -- the weekend screen gets one frame per "
+             "tick",
+             static_cast<unsigned>(kIndexAdvance), named);
+        return 0;
+    }
+
+    // Messages 6 and 9 must be asked for the session this index names, or holding it would hold
+    // nothing the latch reads.
+    struct Entry {
+        uintptr_t reference;
+        int32_t   id;
+        const char* name;
+    };
+    const Entry entries[] = {{kRetailResultsEntry, 6, "results"},
+                             {kRetailPlayerRecordEntry, 9, "player record"}};
+    for (const Entry& e : entries) {
+        uintptr_t at = rebase(e.reference);
+        int32_t   id = -1;
+        uint32_t  argument = 0;
+        if (at) {
+            std::memcpy(&id, reinterpret_cast<const void*>(at), sizeof(id));
+            std::memcpy(&argument, reinterpret_cast<const void*>(at + 8), sizeof(argument));
+        }
+        if (!at || id != e.id || argument != index) {
+            logf("frames: the weekend table's %s entry (retail %08X, here %08X) reads id %d, "
+                 "argument %08X -- expected id %d asking for the session at %08X; the weekend "
+                 "screen gets one frame per tick",
+                 e.name, static_cast<unsigned>(e.reference), static_cast<unsigned>(at), id,
+                 static_cast<unsigned>(argument), e.id, static_cast<unsigned>(index));
+            return 0;
+        }
+    }
+
+    logf("frames: the weekend screen keeps its frames between ticks -- its session index at %08X "
+         "(retail %08X) is put back to the latched value before each extra frame's update, so "
+         "gpl_garageScreenUpdate files each session record once a tick, as in stock GPL",
+         static_cast<unsigned>(index), static_cast<unsigned>(kRetailSessionIndex));
+    return index;
+}
+
 // The stock frame: gpl_fgFrameSnapshotBegin, which waits for the tick if it has not landed,
 // takes the lock and runs the latch. The tick this frame draws begins when that returns, and the
 // slices below are measured from there.
 void takeStockFrame(State& s) {
+    // The session the weekend's latch is about to deliver: the latch reads it inside Begin.
+    if (s.onWeekend && g_sessionIndexAt) {
+        std::memcpy(&s.weekendIndex, reinterpret_cast<const void*>(g_sessionIndexAt),
+                    sizeof(s.weekendIndex));
+        s.haveWeekendIndex = true;
+    }
     s.begin();
     long long at = now();
     if (s.haveTick) {
@@ -325,12 +482,21 @@ void __cdecl snapshotBeginHook() {
     double refresh = 0.0;
     bool   clocked = interpolationFlatFrameInstant(instant, refresh);
 
+    s.onWeekend = weekendShown();
+    if (!s.onWeekend) s.haveWeekendIndex = false;
+
     if (!extraFramesOn() || !s.getBGCount) {
         takeStockFrame(s);
         return;
     }
     if (nothingPresented()) {
         ++s.windowBackground;
+        takeStockFrame(s);
+        return;
+    }
+    // No index to hold: the weekend's update would misfile its records on an extra frame.
+    if (s.onWeekend && !s.haveWeekendIndex) {
+        ++s.windowWeekend;
         takeStockFrame(s);
         return;
     }
@@ -392,6 +558,14 @@ void __cdecl snapshotBeginHook() {
     ++s.extras;
     ++s.windowExtra;
     if (interpolationExtraFrame()) ++s.windowBlended;
+
+    // The weekend's update runs again in this iteration against the record the tick's latch
+    // delivered: give it the slot that record was delivered for.
+    if (s.onWeekend) {
+        std::memcpy(reinterpret_cast<void*>(g_sessionIndexAt), &s.weekendIndex,
+                    sizeof(s.weekendIndex));
+        ++s.windowWeekendHeld;
+    }
 }
 
 void __cdecl snapshotEndHook() {
@@ -441,6 +615,17 @@ void flatFramesInstall() {
              static_cast<unsigned>(kLastLatchedBgCount), rebaseSummary());
         return;
     }
+
+    // Without the weekend test an extra frame there misfiles the session records (see
+    // kWeekendVtable), so no state address means no frames between the ticks at all.
+    g_foregroundStateAt = rebase(kRetailForegroundState);
+    if (!g_foregroundStateAt) {
+        logf("frames: gpl_fgCurrentState %08X cannot be placed in this image (deltas %s), so the "
+             "weekend screen could not be told apart -- no frames between the ticks",
+             static_cast<unsigned>(kRetailForegroundState), rebaseSummary());
+        return;
+    }
+    g_sessionIndexAt = weekendIndexCheck();
 
     HMODULE exe = GetModuleHandleA(nullptr);
     s.getBGCount = exe ? reinterpret_cast<CountFn>(GetProcAddress(exe, "?getBGCount@@YAHXZ"))
@@ -557,14 +742,15 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
                   "frames: %u frames in %.1f s (%.1f/s), %u of them between ticks (%u moved the "
                   "world, %u drew a repeat) | up to %u per tick against a %.1f ms tick | %u "
                   "waited for the display, %u of those gave up so a tick would not pass "
-                  "unlatched | %u for an overdue tick, %u unfocused, %u before the first tick | "
-                  "frame held open %u times, released early for a BG request %u | %u waited for "
-                  "the frame cap",
+                  "unlatched | %u for an overdue tick, %u unfocused, %u on the weekend screen "
+                  "with no index to hold, %u before the first tick | weekend extra frames with "
+                  "the session index held %u | frame held open %u times, released early for a "
+                  "BG request %u | %u waited for the frame cap",
                   s.windowFrames, seconds, seconds > 0.0 ? s.windowFrames / seconds : 0.0,
                   s.windowExtra, s.windowBlended, s.windowExtra - s.windowBlended,
                   s.windowMaxExtra, period, s.windowWaited, s.windowPreempted,
-                  s.windowOverdue, s.windowBackground, s.windowTickless, s.windowHeld,
-                  s.windowReleased, s.windowCapped);
+                  s.windowOverdue, s.windowBackground, s.windowWeekend, s.windowTickless,
+                  s.windowWeekendHeld, s.windowHeld, s.windowReleased, s.windowCapped);
 
     s.windowFrames = 0;
     s.windowExtra = 0;
@@ -574,6 +760,8 @@ bool flatFramesFormat(char* out, size_t size, double seconds) {
     s.windowOverdue = 0;
     s.windowBackground = 0;
     s.windowTickless = 0;
+    s.windowWeekend = 0;
+    s.windowWeekendHeld = 0;
     s.windowMaxExtra = 0;
     s.windowHeld = 0;
     s.windowReleased = 0;
