@@ -2845,7 +2845,6 @@ void loadOptions(const char* fileName) {
     logf("options: debugKeys=%d (%s)", g_options.debugKeys ? 1 : 0,
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
                              : "no hotkey is polled; the VR menu has every setting they toggle");
-    vrFovLoadOptions(path);
     vrMenuKeysLoadOptions(path);
 
     logf("build: GPLVR_MIRROR_SKIP_OUT_OF_VIEW=%d (%s) GPLVR_MIRROR_COPY_REBIND=%d",

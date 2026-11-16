@@ -1365,7 +1365,7 @@ void stereoOnCameraBind(void* camera) {
         // vertically by about an eighth of half-height, and pitched the whole VR image
         // down by nine degrees for nine sessions. The eye's own principal point replaces
         // GPL's: the centre for a centred frustum, and where the runtime's frustum is
-        // centred for an off-centre one with vrAsymmetricFovFix.
+        // centred for an off-centre one.
         float cx = g_state.pendingPrincipal[pass][0];
         float cy = g_state.pendingPrincipal[pass][1];
         if (cx != 0.0f || cy != 0.0f)

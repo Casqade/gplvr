@@ -73,11 +73,6 @@ struct State {
 
 State g_state;
 
-const char* fovFixText(bool fix) {
-    return fix ? "rendered off-centre through GPL's principal point, the whole display used"
-               : "rendered centred on the eye's axis, a black band on the display's wider side";
-}
-
 // POSITION PREDICTION LIVED HERE AND MOVED THE EYES BY ZERO. Removed 2026-10-05.
 //
 // It counted the display periods between the views the presenter published and the display
@@ -353,14 +348,6 @@ void vrClearRendered() {
 
 bool vrFrustumInjected() { return g_state.injected; }
 
-void vrFovLoadOptions(const char* path) {
-    g_options.vrAsymmetricFovFix =
-        GetPrivateProfileIntA("gplvr", "vrAsymmetricFovFix", 1, path) != 0;
-    logf("options: vrAsymmetricFovFix=%d (an off-centre eye frustum is %s; the presenter "
-         "places each eye inside the display's frustum either way)",
-         g_options.vrAsymmetricFovFix ? 1 : 0, fovFixText(g_options.vrAsymmetricFovFix));
-}
-
 bool vrLastRenderedViews(SharedView out[2]) {
     if (!g_state.haveRendered) return false;
     out[0] = g_state.rendered[0];
@@ -471,28 +458,20 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
         const float halfV = (tanUp - tanDown) * 0.5f;
         if (halfH <= 0.0f || halfV <= 0.0f) return false;
 
-        // The camera covers halfH either side of its principal point. vrAsymmetricFovFix puts that
-        // point where the runtime's frustum is centred, so the camera renders exactly that
-        // frustum; without it the point stays in the middle, which renders the same width
-        // centred on the eye's axis.
-        bool offCentre = g_options.vrAsymmetricFovFix;
-        out[eye].principalX = offCentre ? -centreH / halfH : 0.0f;
-        out[eye].principalY = offCentre ? centreV / halfV : 0.0f;
+        // The camera covers halfH either side of its principal point, which is put where the
+        // runtime's frustum is centred, so the camera renders exactly that frustum and the whole
+        // display is used.
+        out[eye].principalX = -centreH / halfH;
+        out[eye].principalY = centreV / halfV;
         float coverH = std::fabs(tanLeft) > std::fabs(tanRight) ? std::fabs(tanLeft)
                                                                 : std::fabs(tanRight);
-        out[eye].coverFov = 2.0f * std::atan(offCentre ? coverH : halfH);
+        out[eye].coverFov = 2.0f * std::atan(coverH);
 
         // The frustum the picture covers, which the producer echoes back with the frame and the
-        // presenter places inside the display's own frustum (Consumer::drawEye). It must be the
-        // one rendered: claiming the runtime's for a picture rendered centred moved each eye's
-        // by centreH, the two eyes opposite ways -- the double vision of 2026-11-10.
-        float shiftH = offCentre ? centreH : 0.0f;
-        float shiftV = offCentre ? centreV : 0.0f;
+        // presenter places inside the display's own frustum (Consumer::drawEye): the runtime's,
+        // as rendered. A frustum other than the rendered one moves each eye's picture, the two
+        // eyes opposite ways -- the double vision of 2026-11-10.
         renderedLocal[eye] = views[eye];
-        renderedLocal[eye].fov.angleLeft = std::atan(shiftH - halfH);
-        renderedLocal[eye].fov.angleRight = std::atan(shiftH + halfH);
-        renderedLocal[eye].fov.angleUp = std::atan(shiftV + halfV);
-        renderedLocal[eye].fov.angleDown = std::atan(shiftV - halfV);
 
         out[eye].fov = 2.0f * std::atan(halfH);
         out[eye].aspect = (halfV / halfH) * (static_cast<float>(eyeWidth) /
@@ -502,15 +481,12 @@ bool vrAcquireEyes(VrEye out[2], int eyeWidth, int eyeHeight) {
             (std::fabs(tanRight + tanLeft) > 1e-3f ||
              std::fabs(tanUp + tanDown) > 1e-3f)) {
             g_state.loggedAsymmetric = true;
-            logf("vr: eye %d has an OFF-CENTRE frustum (tan L%.4f R%.4f U%.4f D%.4f) -- "
-                 "vrAsymmetricFovFix %d: %s",
-                 eye, tanLeft, tanRight, tanUp, tanDown, g_options.vrAsymmetricFovFix ? 1 : 0,
-                 fovFixText(g_options.vrAsymmetricFovFix));
-            if (offCentre)
-                logf("vr: eye %d's principal point cx %.4f cy %.4f (straight ahead lands there in "
-                     "the picture; the display's widest side is %.1f deg from it)",
-                     eye, out[eye].principalX, out[eye].principalY,
-                     std::atan(coverH) * 57.29578f);
+            logf("vr: eye %d has an OFF-CENTRE frustum (tan L%.4f R%.4f U%.4f D%.4f) -- rendered "
+                 "off-centre through GPL's principal point, the whole display used",
+                 eye, tanLeft, tanRight, tanUp, tanDown);
+            logf("vr: eye %d's principal point cx %.4f cy %.4f (straight ahead lands there in "
+                 "the picture; the display's widest side is %.1f deg from it)",
+                 eye, out[eye].principalX, out[eye].principalY, std::atan(coverH) * 57.29578f);
         }
     }
 
