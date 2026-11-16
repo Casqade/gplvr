@@ -1767,10 +1767,19 @@ bool Renderer::drawComposited(const Scene& scene, const ViewInputs& view,
     gl_.drawBuffers(2, both);
     gl_.depthMask(1);
     gl_.colorMask(1, 1, 1, 1);
+    // A clear ignores the viewport, so the scissor holds it to the pass's corner: a mirror pane is
+    // about 1 % of the eye-sized target. Every reader of depth and order stays inside the rect
+    // (the residual pass clamps its reads to it, ResidualDepth.cpp bakedWAt).
+    GLint scissorBox[4] = {0, 0, 0, 0};
+    gl_.getIntegerv(gl::kScissorBox, scissorBox);
+    gl_.scissor(0, 0, rect[2], rect[3]);
+    gl_.enable(gl::kScissorTest);
     gl_.clearDepth(reversedZ_ ? 0.0 : 1.0);
     gl_.clear(gl::kDepthBufferBit);
     GLuint noOrder[4] = {0, 0, 0, 0};
     gl_.clearBufferuiv(gl::kColor, 1, noOrder);
+    gl_.disable(gl::kScissorTest);
+    gl_.scissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
     gl_.clearDepth(depthClear);
     gl_.colorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
     gl_.depthMask(depthMask);

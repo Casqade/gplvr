@@ -60,6 +60,8 @@ constexpr const char kFileHeader[] =
     "; One section per car: [<car-set folder>/<team folder>], lower case, e.g. [cars67/lotus].\r\n"
     "; In it <mirror>Yaw, <mirror>Pitch and <mirror>FovScale for each mirror -- left, right or centre.\r\n"
     "; Positive yaw turns that mirror's view toward the car's right, so a symmetric pair has opposite signs.\r\n"
+    "; <mirror>CarOffset moves your car in that mirror, metres along the car, positive forward;\r\n"
+    "; <mirror>CarReflection 0 leaves your car out of it (3D mirrors with your car in them).\r\n"
     "; To reset a car preset, delete its section.\r\n"
     "\r\n";
 
@@ -74,6 +76,9 @@ constexpr int kAimSlots = 16;
 constexpr float kMaxAimAngle = 45.0f;
 constexpr float kMinFovScale = 0.25f;
 constexpr float kMaxFovScale = 6.0f;
+
+// The values writeSet writes per glass.
+constexpr int kAimValues = 5;
 
 struct NamedAim {
     char      name[kMirrorGlassNameBytes] = {};
@@ -137,8 +142,9 @@ void formatSet(const AimSet& set, char* out, size_t size) {
     for (int i = 0; i < set.count && used < size; ++i) {
         const NamedAim& entry = set.glass[i];
         int wrote = _snprintf_s(out + used, size - used, _TRUNCATE,
-                                "%s%s yaw %.2f pitch %.2f fov %.3f", i ? ", " : "", entry.name,
-                                entry.aim.yaw, entry.aim.pitch, entry.aim.fovScale);
+                                "%s%s yaw %.2f pitch %.2f fov %.3f car %s %+.3f m", i ? ", " : "",
+                                entry.name, entry.aim.yaw, entry.aim.pitch, entry.aim.fovScale,
+                                entry.aim.carReflection ? "on" : "off", entry.aim.carOffset);
         if (wrote < 0) break;
         used += static_cast<size_t>(wrote);
     }
@@ -253,11 +259,13 @@ bool loadEntry(int slot, CarEntry& entry) {
         struct Suffix {
             const char* text;
             float       low, high;
-            int         which;  // 0 yaw, 1 pitch, 2 fov
+            int         which;  // 0 yaw, 1 pitch, 2 fov, 3 car offset, 4 car reflection
         };
         const Suffix suffixes[] = {{"FovScale", kMinFovScale, kMaxFovScale, 2},
                                    {"Pitch", -kMaxAimAngle, kMaxAimAngle, 1},
-                                   {"Yaw", -kMaxAimAngle, kMaxAimAngle, 0}};
+                                   {"Yaw", -kMaxAimAngle, kMaxAimAngle, 0},
+                                   {"CarOffset", -kMaxMirrorCarOffset, kMaxMirrorCarOffset, 3},
+                                   {"CarReflection", 0.0f, 1.0f, 4}};
         bool matched = false;
         for (const Suffix& suffix : suffixes) {
             size_t suffixLength = std::strlen(suffix.text);
@@ -276,7 +284,9 @@ bool loadEntry(int slot, CarEntry& entry) {
             if (value > suffix.high) value = suffix.high;
             if (suffix.which == 0) aim->yaw = value;
             else if (suffix.which == 1) aim->pitch = value;
-            else aim->fovScale = value;
+            else if (suffix.which == 2) aim->fovScale = value;
+            else if (suffix.which == 3) aim->carOffset = value;
+            else aim->carReflection = value >= 0.5f;
             entry.perCar = true;
             matched = true;
             break;
@@ -286,7 +296,8 @@ bool loadEntry(int slot, CarEntry& entry) {
     // A key this does not read is a value somebody expected to matter, most likely one written
     // before the aim was per glass. Said once per car rather than dropped in silence.
     if (ignored)
-        logf("mirror config: [%s] has %d key%s that %s not a <glass>Yaw/Pitch/FovScale value and "
+        logf("mirror config: [%s] has %d key%s that %s not a <glass>Yaw/Pitch/FovScale/CarOffset/"
+             "CarReflection value and "
              "%s ignored",
              entry.key, ignored, ignored == 1 ? "" : "s", ignored == 1 ? "is" : "are",
              ignored == 1 ? "is" : "are");
@@ -333,6 +344,8 @@ int writeSet(const char* key, const AimSet& set, const char* path, DWORD& error)
         write("Yaw", "%.2f", entry.aim.yaw);
         write("Pitch", "%.2f", entry.aim.pitch);
         write("FovScale", "%.3f", entry.aim.fovScale);
+        write("CarOffset", "%.3f", entry.aim.carOffset);
+        write("CarReflection", "%.0f", entry.aim.carReflection ? 1.0f : 0.0f);
     }
     return failed;
 }
@@ -590,9 +603,9 @@ void mirrorConfigFormatAims(char* out, size_t size) {
     for (int i = 0; i < c.glasses && used < size; ++i) {
         MirrorAim aim = mirrorAimFor(i);
         int wrote = _snprintf_s(out + used, size - used, _TRUNCATE,
-                                "%s%s%s yaw %.2f pitch %.2f fov %.3f", i ? ", " : "",
+                                "%s%s%s yaw %.2f pitch %.2f fov %.3f car %s %+.3f m", i ? ", " : "",
                                 i == c.selected ? "*" : "", c.glassName[i], aim.yaw, aim.pitch,
-                                aim.fovScale);
+                                aim.fovScale, aim.carReflection ? "on" : "off", aim.carOffset);
         if (wrote < 0) break;
         used += static_cast<size_t>(wrote);
     }
@@ -646,7 +659,7 @@ void mirrorConfigSave() {
     if (failed) {
         logf("mirror config: %d of %d values for [%s] could not be written to %s (error %lu) -- "
              "the aim stays until the game exits",
-             failed, 3 * c.live.count, c.key, path, error);
+             failed, kAimValues * c.live.count, c.key, path, error);
         return;
     }
     c.edited = false;

@@ -2,6 +2,7 @@
 
 #include "GlInterop.h"
 #include "Log.h"
+#include "MirrorWindow.h"
 #include "RenderTarget.h"
 
 namespace gplvr {
@@ -283,6 +284,8 @@ void mirrorCacheSave(int eye) {
     if (eye < 0 || eye > 1) return;
     if (!ensure(s)) return;
     s.held[eye] = copyTexture(s, s.mirror, s.eye[eye]);
+    // The housed glasses' mapping follows the pictures it was made for (MirrorWindow.h).
+    if (s.held[eye]) mirrorWindowPictureSaved(eye);
 }
 
 bool mirrorCacheRestore(int eye) {
@@ -290,6 +293,7 @@ bool mirrorCacheRestore(int eye) {
     if (eye < 0 || eye > 1 || !s.held[eye]) return false;
     if (!ensure(s)) return false;
     if (!copyTexture(s, s.eye[eye], s.mirror)) return false;
+    mirrorWindowPictureRestored(eye);
     ++s.restores;
     return true;
 }

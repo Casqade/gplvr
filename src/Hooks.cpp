@@ -139,8 +139,8 @@ const char* mirrorModeText(int mode) {
             return "one pane every glass shares, rendered once from the head centre: no depth, 1 "
                    "mirror render a frame";
         default:
-            return "a pane per glass, rendered from each eye: depth, 2 mirror renders a frame per "
-                   "glass";
+            return "a pane per glass, rendered from each eye with its image plane on the glass, as "
+                   "a real mirror shows it: depth, 2 mirror renders a frame per glass";
     }
 }
 
@@ -308,24 +308,65 @@ constexpr uintptr_t     kWorldWalk = 0x00485960;
 bool g_mainWalkPending = false;
 bool g_mainWalkRedirected = false;
 
-// gpl_mirrorDistanceScale. gpl_sceneRender scales the two draw-distance globals by this around
-// the mirror walk and restores them after (0x487A12 and 0x487A62), so it sets how far back the
-// mirror sees. At the stock 0.25 the mirror reaches about 78 m ahead and 29 m behind, where the
-// eye reaches 312 and 117.
+// gpl_mirrorDistanceScale. gpl_sceneRender scales the full- and mid-detail distance globals by
+// this around the mirror walk and restores them after (0x487A12 and 0x487A62). At the stock 0.25
+// the mirror keeps full detail to about 29 m and mid to 78 m, where the eye has 117 and 312.
+// Every track parsed (2026-11-16, 38 folders) puts the same object nodes in a segment's full, mid
+// and far bands; only the inline terrain and road mesh differs. So the scale changes that mesh's
+// tessellation inside the mirror's reach, which the far bound alone sets (BakedMirror.cpp).
 //
-// A modded track builds its horizon as ordinary finite scenery instead of the background
-// primitive vanilla uses, and that mesh lies outside the mirror's quartered reach -- which is
-// the white sky above about 13 degrees of glass pitch. 1.0 gives the mirror the eye's own reach
-// and was confirmed to fix it on spa67.
+// On spa67, 0.25 -> 1.0 was reported (2026-09-27) to fix a white sky above about 13 degrees of
+// glass pitch. The band contents do not explain that: its hill scenery is in all three bands
+// and its horizon is the background object, drawn outside the walk.
 //
-// Back at GPL's own 0.25 for now, because the cost has never been measured: the mirror passes
-// were only 0.25 ms each BECAUSE the window was quartered, and the session that proved the fix
-// ran with profileStages off. This is where an ini key belongs -- read it into
-// kMirrorDistanceScaleWanted and the rest of this works unchanged.
+// In VR the value is Options::mirrorDetailDistance (default 1.0). Flat mode keeps GPL's own 0.25.
+// The extra track geometry at 1.0 is tens to a few hundred polygons a pane on most tracks.
 // A reference-link address, placed on the running image through DataRebase before it is written.
 constexpr uintptr_t kMirrorDistanceScale = 0x0076E768;
-constexpr float     kMirrorDistanceScaleWanted = 0.25f;
+constexpr float     kMirrorDistanceScaleFlat = 0.25f;
 bool                g_mirrorDistanceScaleSaid = false;
+float               g_mirrorDistanceScaleLogged = -1.0f;
+// Set at the first rebind, once the image's data can be placed; the per-frame apply waits for it.
+bool                g_mirrorDistanceScaleBound = false;
+
+float mirrorDistanceScaleWanted() {
+    return g_options.vr ? g_options.mirrorDetailDistance : kMirrorDistanceScaleFlat;
+}
+
+// gpl_mirrorDistanceScale to the wanted value. On every rebind (GPL takes it from the graphics
+// options and a mode change puts the stock value back) and every frame, so the VR menu's row
+// takes effect at once; a compare when nothing changed.
+void mirrorDistanceScaleApply() {
+    auto* mirrorScale = reinterpret_cast<float*>(rebase(kMirrorDistanceScale));
+    if (!mirrorScale) {
+        if (!g_mirrorDistanceScaleSaid) {
+            g_mirrorDistanceScaleSaid = true;
+            logf("mirror: gpl_mirrorDistanceScale %08X cannot be placed in this image (deltas "
+                 "%s), so it is left alone and the mirror keeps GPL's detail distances",
+                 static_cast<unsigned>(kMirrorDistanceScale), rebaseSummary());
+        }
+        return;
+    }
+    float wanted = mirrorDistanceScaleWanted();
+    if (*mirrorScale == wanted) return;
+    float stock = *mirrorScale;
+    bool  wrote = patchBytes(mirrorScale, &wanted, sizeof(float));
+    // Said for each new value, not for each rebind that puts it back.
+    if (wrote && wanted == g_mirrorDistanceScaleLogged) return;
+    if (wrote) {
+        g_mirrorDistanceScaleLogged = wanted;
+        logf("mirror: gpl_mirrorDistanceScale at %08X set %.2f -> %.2f (mirrorDetailDistance): "
+             "the mirror keeps the track's full detail to about %.0f m and mid to %.0f m, capped "
+             "by its draw distance",
+             static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock, wanted,
+             117.0f * wanted, 312.0f * wanted);
+    } else if (!g_mirrorDistanceScaleSaid) {
+        g_mirrorDistanceScaleSaid = true;
+        logf("mirror: could not write gpl_mirrorDistanceScale at %08X -- it stays at %.2f and the "
+             "mirror keeps GPL's detail distances",
+             static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock);
+    }
+}
 
 // A mirror-only render (Stereo.cpp) fills one mirror pane and must leave the eye untouched,
 // so the main walk is skipped. Everything else in the call runs: the per-pass resets after
@@ -645,6 +686,7 @@ void mirrorTweakEnter() {
         return;
     }
     pribludaTweakExit(" -- mirror tweak mode entered");
+    tweakModeEntered(TweakTarget::Mirror);
     g_mirrorTweak.active = true;
     g_mirrorTweak.unlogged = false;
     const char* key = mirrorConfigKey();
@@ -844,12 +886,15 @@ void pollToggle() {
     // in GPL's order: out of the car, then the main menu's Exit. Either mode.
     gameExitPoll();
 
+    // The VR menu's mirror draw distance, live.
+    if (g_mirrorDistanceScaleBound) mirrorDistanceScaleApply();
+
     // The next mirror mode. The pass loop reads mirrorMode every frame and the main world walk
     // redirect is installed whichever way it started, so the modes swap freely.
     if (g_options.vr && g_options.vrMirrorModeKey) {
         bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
         if (down && !g_vrMirrorModeKeyLast && !hotkeyOwnedByMode(g_options.vrMirrorModeKey)) {
-            g_options.mirrorMode = (g_options.mirrorMode + 1) % 3;
+            g_options.mirrorMode = (g_options.mirrorMode + 1) % (kMirrorPerGlass + 1);
             logf("mirror: mode %d -- %s", g_options.mirrorMode,
                  mirrorModeText(g_options.mirrorMode));
         }
@@ -1972,31 +2017,8 @@ void applyPendingSceneRenderHook() {
     // the value that would identify the wrong one: on the plain link the global is 8 lower and
     // 0.25 went into a gpl_flushSegmentDrawQueue variable instead, which the log reported as a
     // successful write.
-    auto* mirrorScale = reinterpret_cast<float*>(rebase(kMirrorDistanceScale));
-    if (!mirrorScale) {
-        if (!g_mirrorDistanceScaleSaid) {
-            g_mirrorDistanceScaleSaid = true;
-            logf("mirror: gpl_mirrorDistanceScale %08X cannot be placed in this image (deltas "
-                 "%s), so it is left alone and the mirror keeps whatever reach GPL gave it",
-                 static_cast<unsigned>(kMirrorDistanceScale), rebaseSummary());
-        }
-    } else if (*mirrorScale != kMirrorDistanceScaleWanted) {
-        float stock = *mirrorScale;
-        bool  wrote = patchBytes(mirrorScale, &kMirrorDistanceScaleWanted, sizeof(float));
-        if (!g_mirrorDistanceScaleSaid) {
-            g_mirrorDistanceScaleSaid = true;
-            if (wrote)
-                logf("mirror: gpl_mirrorDistanceScale at %08X set %.2f -> %.2f, which is the "
-                     "fraction of the eye's draw distance the mirror walks. At 1.00 a modded "
-                     "track's horizon is in reach and the sky is right; below that it is not.",
-                     static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock,
-                     kMirrorDistanceScaleWanted);
-            else
-                logf("mirror: could not write gpl_mirrorDistanceScale at %08X -- it stays at "
-                     "%.2f and the mirror keeps its shorter reach",
-                     static_cast<unsigned>(reinterpret_cast<uintptr_t>(mirrorScale)), stock);
-        }
-    }
+    mirrorDistanceScaleApply();
+    g_mirrorDistanceScaleBound = true;
 }
 
 BOOL WINAPI clipCursorHook(const RECT* rect) {
@@ -2497,8 +2519,32 @@ void loadOptions(const char* fileName) {
     char text[64] = {};
 
     g_options.mirrorMode = GetPrivateProfileIntA("gplvr", "mirrorMode", kMirrorPerGlass, path);
-    if (g_options.mirrorMode < kMirrorSharedHeadCentre || g_options.mirrorMode > kMirrorPerGlass)
+    if (g_options.mirrorMode < kMirrorSharedHeadCentre ||
+        g_options.mirrorMode > kMirrorPerGlass)
         g_options.mirrorMode = kMirrorPerGlass;
+    g_options.mirrorPlayerCar =
+        GetPrivateProfileIntA("gplvr", "mirrorPlayerCar", 1, path) != 0 ? 1 : 0;
+    logf("options: mirrorPlayerCar=%d (mirrorMode 2: %s)", g_options.mirrorPlayerCar,
+         g_options.mirrorPlayerCar
+             ? "the viewed car's own body in each glass whose preset does not leave it out"
+             : "no car of its own in the glasses");
+    GetPrivateProfileStringA("gplvr", "mirrorDrawDistance", "1.0", text, sizeof(text), path);
+    g_options.mirrorDrawDistance = static_cast<float>(atof(text));
+    if (!(g_options.mirrorDrawDistance >= 0.5f)) g_options.mirrorDrawDistance = 0.5f;
+    // No further than the main view's own cut: gpl_renderOneSegment queues 1-4 entries a segment
+    // into a 512-entry queue it never bounds (STATUS.md report 82, main walk peak 45).
+    if (g_options.mirrorDrawDistance > 1.0f) g_options.mirrorDrawDistance = 1.0f;
+    logf("options: mirrorDrawDistance=%.2f (VR with vrRendererType 1: the mirrors' far cut at "
+         "%.0f%% of the track's far distance, where GPL halves it; flat mode keeps GPL's)",
+         g_options.mirrorDrawDistance, 100.0f * g_options.mirrorDrawDistance);
+    GetPrivateProfileStringA("gplvr", "mirrorDetailDistance", "1.0", text, sizeof(text), path);
+    g_options.mirrorDetailDistance = static_cast<float>(atof(text));
+    if (!(g_options.mirrorDetailDistance >= kMirrorDistanceScaleFlat))
+        g_options.mirrorDetailDistance = kMirrorDistanceScaleFlat;
+    if (g_options.mirrorDetailDistance > 1.0f) g_options.mirrorDetailDistance = 1.0f;
+    logf("options: mirrorDetailDistance=%.2f (VR: the mirrors keep the track's full and mid "
+         "detail to %.0f%% of the eye's distances; flat mode keeps GPL's 25%%)",
+         g_options.mirrorDetailDistance, 100.0f * g_options.mirrorDetailDistance);
     g_options.mirrorUpdateInterval = GetPrivateProfileIntA("gplvr", "mirrorUpdateInterval", 1, path);
     if (g_options.mirrorUpdateInterval < 0) g_options.mirrorUpdateInterval = 0;
     if (g_options.mirrorUpdateInterval > 16) g_options.mirrorUpdateInterval = 16;

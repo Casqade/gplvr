@@ -68,7 +68,13 @@ struct Options {
     //
     // kMirrorPerGlass: a pane per glass, each aimed as that glass reflects the eye, rendered on
     //   EACH eye's pass from that eye -- the reflection has stereo depth like the rest of the
-    //   frame. 2 x glasses mirror renders a frame (6 on the 2020 demo's Ferrari 330 P4).
+    //   frame. 2 x glasses mirror renders a frame (6 on the 2020 demo's Ferrari 330 P4). Each
+    //   pane's image plane is on its glass (MirrorShared.h, MirrorPortal): an off-centre camera,
+    //   so both eyes see the reflection a real mirror shows, with no height mismatch between
+    //   them, and nothing between the camera and the glass; the model's glass is textured per
+    //   eye from the aimed plane seen through it (MirrorWindow.h), its field fitted to what that
+    //   eye sees of the glass. A pane whose exact camera cannot be made falls back to one looking
+    //   along the reflected direction.
     // kMirrorShared: one pane every glass reads its part of, as GPL renders its mirror
     //   (MirrorShared.h), laid out and rendered on each eye's pass from that eye -- the same
     //   depth, 2 renders a frame whatever the glass count; the glasses share mirror.mip's
@@ -82,6 +88,26 @@ struct Options {
     // mirror off is `mirrorUpdateInterval = 0`. Each pane after the first in a pass costs a
     // sceneRender whose main pass is skipped. VR only.
     int mirrorMode = kMirrorPerGlass;
+
+    // kMirrorPerGlass: the viewed car's own body in each glass (MirrorOwnCar.h), unless that glass's
+    // preset leaves it out (MirrorAim::carReflection). One more car in every mirror render; the
+    // car needs the GPL VR renderer. "Show player car reflection" in the VR menu.
+    int mirrorPlayerCar = 1;
+
+    // VR only, with vrRendererType 1 (the mirror walk's redirect, BakedMirror.cpp): the mirror's
+    // hard cut for track, scenery and cars, as a fraction of the track's far-distance table bound
+    // the main view uses. GPL halves it for the mirror (0.5, flt_539FE8), and the detail distances
+    // below are capped by it. 1.0 gives the mirror the main view's cut, and is the most: past it
+    // the walk's unbounded 512-entry segment queue (gpl_renderOneSegment) has no measured margin.
+    // "Mirror draw distance" in the VR menu.
+    float mirrorDrawDistance = 1.0f;
+
+    // VR only: how far the mirror keeps the track's full- and mid-detail bands, as the fraction of
+    // the eye's distances written to gpl_mirrorDistanceScale (GPL's own 0.25: full detail to about
+    // 29 m, mid to 78 m, where the eye has 117 and 312). The bands share every object, so this
+    // changes only the inline terrain and road mesh's tessellation inside the same reach; cars
+    // are unaffected. Flat mode keeps 0.25. "Mirror detail distance" in the VR menu.
+    float mirrorDetailDistance = 1.0f;
 
     // Render the mirror on one frame in N, counting from the frame that latched the sim tick.
     //
@@ -796,10 +822,13 @@ struct Options {
 
 extern Options g_options;
 
-// The two things Options::mirrorMode decides: whether each eye renders the mirror from its own
-// viewpoint, and whether the glasses share one pane.
+// The things Options::mirrorMode decides: whether each eye renders the mirror from its own
+// viewpoint, whether the glasses share one pane or each has an exact pane of its own, and, with
+// mirrorPlayerCar, whether the panes show the viewed car.
 inline bool mirrorFromEachEye() { return g_options.mirrorMode != kMirrorSharedHeadCentre; }
-inline bool mirrorSharedPane() { return g_options.mirrorMode != kMirrorPerGlass; }
+inline bool mirrorSharedPane() { return g_options.mirrorMode < kMirrorPerGlass; }
+inline bool mirrorExact() { return g_options.mirrorMode == kMirrorPerGlass; }
+inline bool mirrorOwnCar() { return mirrorExact() && g_options.mirrorPlayerCar != 0; }
 
 // The renderer type of the mode running now (Options::vrRendererType, flatRendererType).
 inline int rendererType() {

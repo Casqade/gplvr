@@ -3,6 +3,7 @@
 #include "DataRebase.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "MirrorOwnCar.h"
 #include "Pe.h"
 
 #include "baked/CarScene.h"
@@ -920,16 +921,20 @@ void emitLeaf(Walk& walk, uintptr_t node, uint8_t type, const Frame& frame, bool
     if (glass && !(leaf.flags & baked::kCarLeafNoGeometry)) {
         static baked::CarVertex corners[kMaxSkinCorners];
         uint32_t                count = 0;
-        if (skinned || !cockpitGlassCorners(object, leaf, node, corners, kMaxSkinCorners, count)) {
+        uint32_t                base = 0;
+        if (skinned ||
+            !cockpitGlassCorners(object, leaf, node, corners, kMaxSkinCorners, count, &base)) {
             ++emit.glassRefused;
             return;
         }
+        cockpitGlassTurn(node, corners, count);
         ++emit.leaves;
         ++emit.glassListed;
-        // A kept list takes the UVs again at each assembly (report 105 section 4.50).
+        // A kept list takes the UVs and the aim again at each assembly (report 105 section 4.50).
         if (walk.program)
             walk.tape->glass.push_back(ShareGlass{
-                node, static_cast<uint32_t>(walk.list->dynamicVertices.size()), count});
+                node, static_cast<uint32_t>(walk.list->dynamicVertices.size()), count,
+                static_cast<uint32_t>(walk.object), base});
         baked::appendDynamicCarLeaf(*walk.list, leaf, corners, count, frame.index, walk.material,
                                     walk.condition);
         return;
@@ -1775,6 +1780,8 @@ ListOutcome listOurs(State& s, uintptr_t record, int driver, uintptr_t instance,
     list.cockpit = glassTexture != 0;
     list.overlay = overlay;
     list.mirror = mirror;
+    list.hideMirrorBody =
+        mirror && !glassTexture && mirrorOwnCarHidesBody(reinterpret_cast<const void*>(record));
     // The cockpit's translucent parts (the windscreen) go after all of the track's walk-order
     // content, where nothing GPL's walk reaches later paints over them.
     list.walkSlot = glassTexture ? baked::kWalkSlotLast : bakedPassWalkPosition();
@@ -1976,9 +1983,22 @@ void drawCockpit(State& s, void* recordPointer, int driver, uintptr_t instance, 
         cockpitGplDrawChecked(registers, passed, lines, polygonsDrawn() - before);
 }
 
+// The pose of handle node `handle` as GPL's pose left it, local to the dispatch frame; false when
+// it is not an XFORM. For MirrorOwnCar's placement check.
+bool handlePose(uintptr_t handle, float m[12]) {
+    if (!handle) return false;
+    uint8_t type = static_cast<uint8_t>(at<uint32_t>(handle));
+    if (type != 0x0D && type != 0x13 && type != 0x16) return false;
+    uint32_t words[7] = {};
+    for (unsigned i = 0; i < 6; ++i) words[i] = word(handle, 1 + i);
+    poseMatrix(words, m);
+    return true;
+}
+
 // GPL's car draw, through the car vtable slot. A call outside a baked pass of its kind (the
 // renderer switched to vanilla, a pass it refused, a pass of another kind) goes to GPL whole.
 void __fastcall carDraw(void* recordPointer, void*) {
+    if (mirrorOwnCarSkips(recordPointer)) return;
     State& s = g_car;
     auto record = reinterpret_cast<uintptr_t>(recordPointer);
     int  driver = at<int32_t>(record + kRecordDriver);
@@ -1994,6 +2014,10 @@ void __fastcall carDraw(void* recordPointer, void*) {
     uintptr_t registers = at<uint32_t>(s.at.backgroundTable);
     bool      mirror = registers == s.at.registersMirror;
     bool      mainPass = registers == s.at.registersMain;
+    float placed[12];
+    if (((cockpit && mainPass) || (mirror && mirrorOwnCarHidesBody(recordPointer))) &&
+        handlePose(handle, placed))
+        mirrorOwnCarPlaced(cockpit, placed);
     // The register file names the pass (gpl_sceneRender switches it at 0x487766 and 0x487C9C); a
     // call is gplvr's only inside a baked pass of the same kind.
     if (cockpit) {
@@ -2142,6 +2166,8 @@ void carWalkInstall() {
          static_cast<unsigned>(kBodyCall), wrapped);
     carProgramInstall();
 }
+
+bool carWalkInstalled() { return g_car.installed; }
 
 void carWalkPassBegin(bool mirror, int pane) {
     PassArena& arena = g_car.arena;

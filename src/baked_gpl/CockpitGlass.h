@@ -41,8 +41,18 @@ const uintptr_t* cockpitGlassNodes(uint32_t& count);
 // `node` -- words 4.., u and v per corner, as MirrorUv rewrites them per glass -- into `corners`
 // (room for `room`). False, with nothing written, when the node's corner count is not the
 // leaf's or its baked corners are not found.
+// `base`, when given, receives the first corner's index in the object's vertices.
 bool cockpitGlassCorners(const baked::CarObject& object, const baked::CarLeaf& leaf,
                          uintptr_t node, baked::CarVertex* corners, uint32_t room,
-                         uint32_t& count);
+                         uint32_t& count, uint32_t* base = nullptr);
+
+// mirrorExact (Hooks.h): turns glass polygon `node`'s corners, as the model holds them, by its
+// glass's aim about the glass centre, so the glass drawn is the plane the pane's exact camera
+// shows (MirrorShared.h, MirrorPortal). A mirror aimed but drawn where the model put it shows
+// each eye a different keystone: no single camera has the reflection of an aimed plane seen
+// through another plane. The aim turns the normal about the car's Z, then its Y, and the corners
+// are turned the same way, which needs the polygon's frame to be the car's axes: a polygon
+// whose corners do not lie on its glass's plane, about its centre, is left as it is (logged once).
+void cockpitGlassTurn(uintptr_t node, baked::CarVertex* corners, uint32_t count);
 
 }  // namespace gplvr

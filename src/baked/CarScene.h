@@ -54,7 +54,15 @@ enum CarLeafFlags : uint16_t {
     kCarLeafInvisible = 1u << 7,    // family A with literal alpha 0 (cars18's placeholders)
     kCarLeafFacing = 1u << 8,       // sprite: screen-aligned (.srb SRH2)
     kCarLeafNoGeometry = 1u << 9,   // counted as GPL counts it, but nothing to draw
+    // A leaf of a mirror object (CarObject::mirrorBody): not drawn under a frame whose list hides
+    // them (CarDrawList::hideMirrorBody).
+    kCarLeafMirrorBody = 1u << 10,
+    // A housed cockpit glass corner, textured per fragment from its glass's ViewInputs::window,
+    // the glass in bits 12-13 (MirrorWindow.h).
+    kCarLeafWindow = 1u << 11,
 };
+constexpr unsigned kCarLeafWindowGlassShift = 12;
+constexpr uint16_t kCarLeafWindowGlassMask = 3u << kCarLeafWindowGlassShift;
 
 constexpr uint32_t kNoCarLeaf = 0xFFFFFFFFu;
 
@@ -101,6 +109,9 @@ struct CarObject {
     // each entry of a list), first appearance first; the host resolves them to files.
     std::vector<uint32_t> textureHandles;
     CarObjectStats        stats;
+    // A car's mirror, housing and glass: a small object binding the car set's mirror.mip
+    // (CarBake.cpp). Its leaves and corners carry kCarLeafMirrorBody.
+    bool mirrorBody = false;
 
     // The leaf at PRIM byte `offset`, or kNoCarLeaf.
     uint32_t leafAt(uint32_t offset) const {
@@ -209,6 +220,9 @@ struct CarDrawList {
     int   driver = 0;
     bool  cockpit = false;
     bool  mirror = false;
+    // Its kCarLeafMirrorBody leaves are not drawn: the viewed car in its own mirror's pass
+    // (MirrorOwnCar.h), set by the host for every list it makes.
+    bool  hideMirrorBody = false;
     // Drawn over the pass's finished image instead of among the cars (report 105 section 4.49, the
     // cockpit): after GPL's last flush, in list order, without a depth test, its translucent parts
     // blended in place (CarRenderer::drawOverlay).

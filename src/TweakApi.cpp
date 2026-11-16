@@ -85,9 +85,37 @@ float* mirrorField(MirrorAim& aim, TweakAxis axis) {
         case TweakAxis::Yaw: return &aim.yaw;
         case TweakAxis::Pitch: return &aim.pitch;
         case TweakAxis::Fov: return &aim.fovScale;
+        case TweakAxis::CarOffset: return &aim.carOffset;
         default: return nullptr;
     }
 }
+
+// MirrorAim::carReflection is a flag, so it is read and written apart from the float fields.
+bool mirrorAxisValue(const MirrorAim& aim, TweakAxis axis, float& value) {
+    if (axis == TweakAxis::CarShown) {
+        value = aim.carReflection ? 1.0f : 0.0f;
+        return true;
+    }
+    MirrorAim copy = aim;
+    const float* field = mirrorField(copy, axis);
+    if (!field) return false;
+    value = *field;
+    return true;
+}
+
+bool mirrorAxisSet(MirrorAim& aim, TweakAxis axis, float value) {
+    if (axis == TweakAxis::CarShown) {
+        aim.carReflection = value >= 0.5f;
+        return true;
+    }
+    float* field = mirrorField(aim, axis);
+    if (!field) return false;
+    *field = value;
+    return true;
+}
+
+// Mirror setup's page: kMirrorPageAim or kMirrorPageCar.
+int32_t g_mirrorPage = kMirrorPageAim;
 
 // The axis of one glass. For "all" there is no single value to report, so it answers for the
 // first glass, which is what a slider would have to show anyway.
@@ -96,11 +124,11 @@ TweakRange mirrorRange(TweakAxis axis, int32_t index) {
     int glass = mirrorGlass(index);
     if (glass < 0) glass = 0;
     if (glass >= mirrorConfigGlassCount()) return range;
-    MirrorAim    aim = mirrorAimFor(glass);
-    const float* field = mirrorField(aim, axis);
-    if (!field) return range;
+    MirrorAim aim = mirrorAimFor(glass);
+    float     current = 0.0f;
+    if (!mirrorAxisValue(aim, axis, current)) return range;
     range.exists = true;
-    range.current = *field;
+    range.current = current;
     switch (axis) {
         case TweakAxis::Yaw:
         case TweakAxis::Pitch:
@@ -121,6 +149,20 @@ TweakRange mirrorRange(TweakAxis axis, int32_t index) {
             range.multiplicative = true;
             range.unit = "x";
             break;
+        case TweakAxis::CarOffset:
+            range.minimum = -kMaxMirrorCarOffset;
+            range.maximum = kMaxMirrorCarOffset;
+            range.rate = 0.10f;  // metres per second at full deflection
+            range.step = 0.01f;
+            range.defaultValue = 0.0f;
+            range.unit = "m";
+            break;
+        case TweakAxis::CarShown:
+            range.minimum = 0.0f;
+            range.maximum = 1.0f;
+            range.step = 1.0f;
+            range.defaultValue = 1.0f;
+            break;
         default:
             break;
     }
@@ -133,8 +175,14 @@ bool applyMirror(const TweakCommand& command) {
         clearRefusal();
         return true;
     }
-    if (command.action == TweakAction::Toggle)
-        return refuse("the mirror has no on/off axis to toggle");
+    if (command.action == TweakAction::Toggle && command.axis == TweakAxis::Page) {
+        g_mirrorPage = g_mirrorPage == kMirrorPageAim ? kMirrorPageCar : kMirrorPageAim;
+        logf("mirror: setup now %s", tweakPageName(TweakTarget::Mirror));
+        clearRefusal();
+        return true;
+    }
+    if (command.action == TweakAction::Toggle && command.axis != TweakAxis::CarShown)
+        return refuse("the mirror has no such on/off axis to toggle");
 
     int glasses = mirrorConfigGlassCount();
     if (glasses < 1)
@@ -166,18 +214,42 @@ bool applyMirror(const TweakCommand& command) {
     int first = glass < 0 ? 0 : glass;
     int last = glass < 0 ? glasses - 1 : glass;
 
+    if (command.action == TweakAction::Toggle) {
+        // Every glass of the selection to the same answer: off when any of them shows the car.
+        bool anyShown = false;
+        for (int i = first; i <= last; ++i) anyShown = anyShown || mirrorAimFor(i).carReflection;
+        bool changed = false;
+        for (int i = first; i <= last; ++i) {
+            MirrorAim* aim = mirrorAimSlot(i);
+            if (!aim || aim->carReflection == !anyShown) continue;
+            aim->carReflection = !anyShown;
+            changed = true;
+        }
+        if (changed) {
+            mirrorConfigMarkEdited();
+            logf("mirror: your car %s in %s", anyShown ? "left out of" : "shown",
+                 mirrorConfigSelectedName());
+            clearRefusal();
+        }
+        return changed;
+    }
+
     if (command.action == TweakAction::Reset) {
         bool            changed = false;
-        const TweakAxis axes[3] = {TweakAxis::Yaw, TweakAxis::Pitch, TweakAxis::Fov};
+        // The page's own values: the aim on the aim page, the car on the car page.
+        const TweakAxis aimAxes[] = {TweakAxis::Yaw, TweakAxis::Pitch, TweakAxis::Fov};
+        const TweakAxis carAxes[] = {TweakAxis::CarOffset, TweakAxis::CarShown};
+        bool            carPage = g_mirrorPage == kMirrorPageCar;
+        const TweakAxis* axes = carPage ? carAxes : aimAxes;
+        int              axisCount = carPage ? 2 : 3;
         for (int i = first; i <= last; ++i)
-            for (TweakAxis axis : axes) {
+            for (int a = 0; a < axisCount; ++a) {
+                TweakAxis axis = axes[a];
                 if (command.axis != TweakAxis::None && command.axis != axis) continue;
                 TweakRange range = mirrorRange(axis, i);
                 if (!range.exists || range.current == range.defaultValue) continue;
                 MirrorAim* aim = mirrorAimSlot(i);
-                float*     field = aim ? mirrorField(*aim, axis) : nullptr;
-                if (!field) continue;
-                *field = range.defaultValue;
+                if (!aim || !mirrorAxisSet(*aim, axis, range.defaultValue)) continue;
                 changed = true;
             }
         if (changed) {
@@ -207,9 +279,7 @@ bool applyMirror(const TweakCommand& command) {
         float      value = range.current;
         if (!resolveScalar(one, range, value)) continue;
         MirrorAim* aim = mirrorAimSlot(i);
-        float*     field = aim ? mirrorField(*aim, command.axis) : nullptr;
-        if (!field) continue;
-        *field = value;
+        if (!aim || !mirrorAxisSet(*aim, command.axis, value)) continue;
         changed = true;
     }
     if (!changed) return false;
@@ -654,22 +724,30 @@ const TweakBinding kMirrorBindings[] = {
     // stick away to magnify is the direction every other zoom control in the world uses.
     {TweakTarget::Mirror, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::Trigger, TweakAxis::Fov, TweakAction::None, TweakMode::Rate, -1.0f,
-     "trigger held: stick forward zooms the mirror in, back zooms it out"},
+     "trigger held: stick forward zooms the mirror in, back zooms it out", kMirrorPageAim},
     {TweakTarget::Mirror, TweakInputAxis::StickX, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Yaw, TweakAction::None, TweakMode::Rate, 1.0f,
-     "stick left and right turns the mirror"},
+     "stick left and right turns the mirror", kMirrorPageAim},
     {TweakTarget::Mirror, TweakInputAxis::StickY, TweakInputButton::None,
      TweakInputButton::None, TweakAxis::Pitch, TweakAction::None, TweakMode::Rate, 1.0f,
-     "stick forward and back tilts the mirror"},
+     "stick forward and back tilts the mirror", kMirrorPageAim},
+    {TweakTarget::Mirror, TweakInputAxis::StickY, TweakInputButton::None,
+     TweakInputButton::None, TweakAxis::CarOffset, TweakAction::None, TweakMode::Rate, 1.0f,
+     "car page: stick forward moves your car forward in the mirror, back moves it back",
+     kMirrorPageCar},
+    {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Trigger,
+     TweakInputButton::None, TweakAxis::CarShown, TweakAction::Toggle, TweakMode::Absolute, 1.0f,
+     "car page: trigger shows or leaves out your car in the selected mirror", kMirrorPageCar},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::StickClick,
      TweakInputButton::None, TweakAxis::None, TweakAction::Reset, TweakMode::Absolute, 1.0f,
-     "stick click: the selected mirror (or all of them) back to straight and unzoomed"},
+     "stick click: the selected mirror (or all of them) back to straight and unzoomed, or on "
+     "the car page your car back in it, unmoved"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Primary,
      TweakInputButton::None, TweakAxis::None, TweakAction::SelectNext, TweakMode::Absolute,
      1.0f, "A or X: next mirror -- all of them together, then each one in turn"},
     {TweakTarget::Mirror, TweakInputAxis::None, TweakInputButton::Secondary,
-     TweakInputButton::None, TweakAxis::None, TweakAction::SelectPrevious, TweakMode::Absolute,
-     1.0f, "B or Y: previous mirror"},
+     TweakInputButton::None, TweakAxis::Page, TweakAction::Toggle, TweakMode::Absolute, 1.0f,
+     "B or Y: switch between aiming the mirror and placing your car in it"},
 };
 
 const TweakBinding kHudElementBindings[] = {
@@ -794,8 +872,24 @@ const char* tweakAxisName(TweakAxis axis) {
         case TweakAxis::Depth: return "depth";
         case TweakAxis::Size: return "size";
         case TweakAxis::Show: return "shown";
+        case TweakAxis::CarOffset: return "car offset";
+        case TweakAxis::CarShown: return "car shown";
+        case TweakAxis::Page: return "page";
         default: return "none";
     }
+}
+
+int32_t tweakPage(TweakTarget target) {
+    return target == TweakTarget::Mirror ? g_mirrorPage : 0;
+}
+
+const char* tweakPageName(TweakTarget target) {
+    if (target != TweakTarget::Mirror) return "";
+    return g_mirrorPage == kMirrorPageCar ? "your car in the mirror" : "the mirror's aim";
+}
+
+void tweakModeEntered(TweakTarget target) {
+    if (target == TweakTarget::Mirror) g_mirrorPage = kMirrorPageAim;
 }
 
 int32_t tweakIndexCount(TweakTarget target) {

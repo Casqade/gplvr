@@ -76,6 +76,9 @@ enum class TweakAxis : int32_t {
     Depth,  // HudPanel, metres ahead
     Size,   // HudPanel width in metres; HudElement dash width as a fraction
     Show,   // 0 or 1, expressed as an axis so one setter covers it
+    CarOffset,  // Mirror, metres: the viewed car moved along its forward axis in the glass
+    CarShown,   // Mirror, 0 or 1: the viewed car in the glass at all
+    Page,       // Mirror: which page of mirror setup the controls work (tweakPage); Toggle steps it
     Count,
 };
 
@@ -214,7 +217,20 @@ struct TweakBinding {
     float            scale = 1.0f;
     // What the binding is for, in the log and in the menu's help line.
     const char*      description = "";
+    // The page of the target's tweak mode the row works on (tweakPage), or kTweakAnyPage.
+    int32_t          page = -1;
 };
+
+constexpr int32_t kTweakAnyPage = -1;
+
+// Mirror setup's pages: aiming the glass, and the viewed car in it (MirrorAim::carOffset and
+// carReflection). Every other target has one page, 0.
+constexpr int32_t kMirrorPageAim = 0;
+constexpr int32_t kMirrorPageCar = 1;
+int32_t     tweakPage(TweakTarget target);
+const char* tweakPageName(TweakTarget target);
+// A tweak mode being entered: it opens on its first page (Mirror setup on the aim).
+void        tweakModeEntered(TweakTarget target);
 
 // The default controller mapping for a target's tweak mode. THIS TABLE IS THE MAPPING:
 // nothing outside it decides that the stick turns the glasses or that the trigger picks

@@ -122,9 +122,11 @@ else()
         src/MirrorConfig.cpp
         src/MirrorDriverArms.cpp
         src/MirrorGeometry.cpp
+        src/MirrorOwnCar.cpp
         src/MirrorShared.cpp
         src/MirrorTarget.cpp
         src/MirrorUv.cpp
+        src/MirrorWindow.cpp
         src/MouseLook.cpp
         src/NoSignal.cpp
         src/FrameTrace.cpp

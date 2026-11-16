@@ -184,6 +184,10 @@ struct ShareGlass {
     uintptr_t node;
     uint32_t  firstVertex;
     uint32_t  count;
+    // Where its corners are in the car scene, as the model holds them: each assembly turns them
+    // by the glass's aim now (cockpitGlassTurn).
+    uint32_t  object;
+    uint32_t  baseVertex;
 };
 
 // Its vectors are ArenaVectors: a kept program's copy of its build's tape lies in the program region

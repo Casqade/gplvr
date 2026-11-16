@@ -63,12 +63,35 @@ struct MirrorGlass {
 // What one glass shows an eye: a camera at the eye reflected through the glass plane (the normal
 // turned by the driver's aim), looking along the eye's view of the glass reflected about that
 // normal, with the glass's angular size from the eye (times the aim's fovScale) as its field.
+//
+// THE EXACT PANE (`exact`, kMirrorPerGlass). The pane's picture is pasted onto the glass by
+// the glass's UVs, a linear map of the picture onto the glass. That is right only when the
+// camera's image plane IS the glass plane: the same camera, looking along the glass's normal, its
+// left and up the glass's own across and vertical axes, its field the glass's half sizes over
+// the camera's distance to the plane, and its principal point moved onto the glass centre --
+// which, seen from the reflected eye, lies well off that normal. Then every point of the glass
+// shows exactly what lies behind it along the reflected ray, for each eye, as a real mirror does.
+// The stock aim above looks at the glass centre instead, so its image plane is square to the
+// reflected view and the paste keystones it differently for each eye: a height mismatch between
+// the eyes. The near plane at the glass also cuts everything between the camera and the glass.
+struct MirrorPortal {
+    float forward[3];  // unit, the glass's normal, from the camera toward the eye's side
+    float up[3];       // unit, the glass's vertical, aimed
+    float fov;         // horizontal, radians, the glass's halfWidth over `depth`
+    float fovV;        // vertical, radians
+    float cx;          // principal point, GPL's normalised units (screen edges at +/-1)
+    float cy;
+    float depth;       // from the camera to the glass plane, metres; 0 when there is none
+};
+
 struct MirrorGlassView {
     float camera[3];
     float direction[3];  // unit
+    float normal[3];     // the glass's, aimed, unit, toward the eye
     float fov;           // horizontal, radians
     float fovV;          // vertical, radians
     float distance;      // from the eye to the glass centre, metres
+    MirrorPortal exact;
 };
 bool mirrorGlassView(const MirrorGlass& glass, const MirrorAim& aim, const float eye[3],
                      MirrorGlassView& out);

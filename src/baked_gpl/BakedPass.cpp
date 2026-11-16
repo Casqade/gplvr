@@ -15,6 +15,8 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
+#include "MirrorOwnCar.h"
+#include "MirrorWindow.h"
 #include "Pe.h"
 #include "RenderTarget.h"
 #include "Stereo.h"
@@ -1051,11 +1053,16 @@ void endPass(State& s, SceneParams* params, bool mirror) {
     if (mirror) {
         std::memcpy(view.eye, params->mirrorEye, sizeof(view.eye));
         std::memcpy(view.orientation, params->mirrorOrientation, sizeof(view.orientation));
+        view.carClipOn = mirrorOwnCarClip(view.carClip);
+        mirrorOwnCarShift(view.carShift);
     } else {
         view.eye[0] = params->eyeX;
         view.eye[1] = params->eyeY;
         view.eye[2] = params->eyeZ;
         std::memcpy(view.orientation, params->orientation, sizeof(view.orientation));
+        static_assert(baked::ViewInputs::kWindowPlanes == kMaxWindowGlasses * kWindowVectorsPerGlass,
+                      "ViewInputs::window holds MirrorWindow's vectors");
+        view.windowCount = mirrorWindowVectors(view.window);
     }
     auto camera = static_cast<const unsigned char*>(cameraObject);
     std::memcpy(view.projection, camera + kCameraProjection, sizeof(view.projection));

@@ -78,6 +78,53 @@ bool project(const float corner[4][3], const float forward[3], const float right
     return true;
 }
 
+float clampFov(float fov) {
+    return fov < kMirrorMinFov ? kMirrorMinFov : (fov > kMirrorMaxFov ? kMirrorMaxFov : fov);
+}
+
+// MirrorPortal for `view`, whose camera and normal are set, with `n` the aimed normal. The glass's
+// level edge, n0 x Z, is turned by the aim as the normal is; its vertical is n x that edge, upward.
+bool mirrorPortal(const MirrorGlass& glass, const MirrorAim& aim, const float n[3],
+                  MirrorGlassView& view) {
+    MirrorPortal& p = view.exact;
+    const float*  n0 = glass.normal;
+    float         cy = std::cos(aim.yaw * kDegree), sy = std::sin(aim.yaw * kDegree);
+    float         cp = std::cos(aim.pitch * kDegree), sp = std::sin(aim.pitch * kDegree);
+    float         h0[3] = {n0[1], -n0[0], 0.0f};
+    if (!normalise(h0)) return false;
+    float hx = h0[0] * cy - h0[1] * sy;
+    float hy = h0[0] * sy + h0[1] * cy;
+    float h[3] = {hx * cp + h0[2] * sp, hy, -hx * sp + h0[2] * cp};
+    float v[3] = {n[1] * h[2] - n[2] * h[1], n[2] * h[0] - n[0] * h[2], n[0] * h[1] - n[1] * h[0]};
+    if (v[2] < 0.0f)
+        for (float& c : v) c = -c;
+    if (!normalise(v)) return false;
+
+    // GPL's camera axes: X forward, Y left = up x forward, Z up.
+    for (int i = 0; i < 3; ++i) {
+        p.forward[i] = view.normal[i];
+        p.up[i] = v[i];
+    }
+    const float* f = p.forward;
+    float left[3] = {v[1] * f[2] - v[2] * f[1], v[2] * f[0] - v[0] * f[2],
+                     v[0] * f[1] - v[1] * f[0]};
+    if (!normalise(left)) return false;
+
+    float d[3] = {glass.centre[0] - view.camera[0], glass.centre[1] - view.camera[1],
+                  glass.centre[2] - view.camera[2]};
+    p.depth = dot(d, f);
+    if (p.depth < 1e-3f) return false;
+
+    // The glass's half sizes over the depth are the half field, and the glass centre is put at
+    // the picture's centre: gpl_cameraRebuildProjection's screen_x = cx - cot(fov/2) y/x and
+    // screen_y = cy - z/(x tan(fovV/2)) are 0 there.
+    p.fov = clampFov(2.0f * std::atan(glass.halfWidth * aim.fovScale / p.depth));
+    p.fovV = clampFov(2.0f * std::atan(glass.halfHeight * aim.fovScale / p.depth));
+    p.cx = dot(d, left) / (p.depth * std::tan(p.fov * 0.5f));
+    p.cy = dot(d, v) / (p.depth * std::tan(p.fovV * 0.5f));
+    return true;
+}
+
 }  // namespace
 
 bool mirrorGlassView(const MirrorGlass& glass, const MirrorAim& aim, const float eye[3],
@@ -85,13 +132,15 @@ bool mirrorGlassView(const MirrorGlass& glass, const MirrorAim& aim, const float
     // Yaw turns the normal about the car's up axis, positive anticlockwise seen from above, and a
     // mirror turned by an angle turns its reflection by twice that the same way -- so a positive
     // yaw swings the view, which looks astern, toward the car's right. Pitch then turns it about
-    // the car's sideways axis so a positive angle lifts the face.
+    // the car's sideways axis so a positive angle lifts the face: a rotation, (x, z) to
+    // (x cp + z sp, -x sp + z cp), the same in mirrorPortal and CockpitGlass.cpp, so the glass's
+    // in-plane axes stay square to its normal whatever the aim.
     const float* n0 = glass.normal;
     float        cy = std::cos(aim.yaw * kDegree), sy = std::sin(aim.yaw * kDegree);
     float        cp = std::cos(aim.pitch * kDegree), sp = std::sin(aim.pitch * kDegree);
     float        yx = n0[0] * cy - n0[1] * sy;
     float        yy = n0[0] * sy + n0[1] * cy;
-    float        n[3] = {yx * cp - n0[2] * sp, yy, -yx * sp + n0[2] * cp};
+    float        n[3] = {yx * cp + n0[2] * sp, yy, -yx * sp + n0[2] * cp};
     if (!normalise(n)) return false;
 
     float t[3] = {glass.centre[0] - eye[0], glass.centre[1] - eye[1], glass.centre[2] - eye[2]};
@@ -105,6 +154,7 @@ bool mirrorGlassView(const MirrorGlass& glass, const MirrorAim& aim, const float
     for (int i = 0; i < 3; ++i) {
         out.camera[i] = eye[i] - 2.0f * along * n[i];
         out.direction[i] = t[i] / distance - 2.0f * un * n[i];
+        out.normal[i] = along < 0.0f ? -n[i] : n[i];
     }
 
     // The field: the glass's angular size from the eye.
@@ -118,6 +168,7 @@ bool mirrorGlassView(const MirrorGlass& glass, const MirrorAim& aim, const float
     out.fov = fov;
     out.fovV = fovV;
     out.distance = distance;
+    if (!mirrorPortal(glass, aim, n, out)) out.exact.depth = 0.0f;
     return true;
 }
 

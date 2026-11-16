@@ -11,6 +11,7 @@
 #include "baked_gpl/CarPassView.h"
 #include "baked_gpl/CarUnion.h"
 #include "baked_gpl/CarWalk.h"
+#include "baked_gpl/CockpitGlass.h"
 #include "baked_gpl/ProgramArena.h"
 
 #include <windows.h>
@@ -915,10 +916,19 @@ void assemble(Program& p, const baked::CarDrawList& fresh, baked::CarDrawList& o
     for (const ShareGlass& g : p.tape.glass) {
         const auto*       uv = reinterpret_cast<const float*>(g.node + 16);
         baked::CarVertex* corners = &out.dynamicVertices[g.firstVertex];
+        bool modelled = g.object < scene.objects.size() &&
+                        g.baseVertex + g.count <= scene.objects[g.object].vertices.size();
         for (uint32_t i = 0; i < g.count; ++i) {
+            if (modelled) {
+                const baked::CarVertex& held = scene.objects[g.object].vertices[g.baseVertex + i];
+                std::memcpy(corners[i].position, held.position, sizeof(held.position));
+                std::memcpy(corners[i].normal, held.normal, sizeof(held.normal));
+                corners[i].flags = held.flags;
+            }
             corners[i].uv[0] = uv[2 * i];
             corners[i].uv[1] = uv[2 * i + 1];
         }
+        if (modelled) cockpitGlassTurn(g.node, corners, g.count);
     }
     out.conditionOn.clear();
     out.sealed = 0;

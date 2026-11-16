@@ -6,6 +6,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "MenuScale.h"
+#include "MirrorOwnCar.h"
 #include "Pe.h"
 
 #include <windows.h>
@@ -34,6 +35,27 @@ struct State {
 
 State g_mirror;
 
+// THE MIRROR'S DRAW DISTANCE (Options::mirrorDrawDistance). gpl_sceneRender 0x4879C3..0x487A4B hands the
+// mirror walk its far bounds from the camera segment's far-distance table entry, chosen by the
+// heading against the track (astern, |a4| > 0x60000000: word 3 ahead, word 2 behind), each times
+// flt_539FE8 = 0.5 and NOT times gpl_farDistanceScale, the main walk's own factor (0x487F86):
+//     a5 = a7 = ahead far, a6 = a8 = behind far.
+// gpl_worldRenderSegmentRange (0x485960) takes, with the camera's two dlongs equal as here, a5 as
+// the ahead far bound when |a4| > 0x60000000 (a7 otherwise) and a6 as the behind one, and caps
+// the mid- and full-detail distances on each side by a7 and a8: so the halved table bound is the
+// mirror's hard cut, and gpl_mirrorDistanceScale cannot reach past it. Every bound is then
+// clamped to half a lap. The four are scaled together, by the setting over GPL's 0.5.
+constexpr float kMirrorFarStock = 0.5f;
+constexpr float kDlongPerMetre = 19685.0f;
+float           g_farScaleLogged = -1.0f;
+
+int scaledBound(int bound, float factor) {
+    double value = static_cast<double>(bound) * factor;
+    if (value > 2147483647.0) return 2147483647;
+    if (value < 0.0) return 0;
+    return static_cast<int>(value);
+}
+
 // Replaces the rel32 of the mirror walk's call. The parameter block is the one gpl_sceneRender
 // was handed, as the main walk's thunk reads it (Hooks.cpp). End runs whether or not the pass was
 // baked.
@@ -46,8 +68,28 @@ State g_mirror;
 void __cdecl mirrorWorldWalkThunk(int a1, int a2, int a3, int a4, int a5, int a6, int a7,
                                   int a8) {
     void* params = hooksLastSceneParams();
-    bool  baked = bakedPassBeginMirror(params);
+    // The redirect stays installed after a live switch to the vanilla renderer, which keeps GPL's
+    // bounds.
+    if (g_options.vr && rendererType() != 0 && g_options.mirrorDrawDistance != kMirrorFarStock) {
+        float factor = g_options.mirrorDrawDistance / kMirrorFarStock;
+        if (g_farScaleLogged != g_options.mirrorDrawDistance) {
+            g_farScaleLogged = g_options.mirrorDrawDistance;
+            logf("baked mirrors: the mirror walk's far bounds times %.2f (mirrorDrawDistance "
+                 "%.2f of the table's, GPL's %.2f) -- this walk: ahead %.0f -> %.0f m, behind "
+                 "%.0f -> %.0f m, before the half-lap clamp",
+                 factor, g_options.mirrorDrawDistance, kMirrorFarStock, a5 / kDlongPerMetre,
+                 scaledBound(a5, factor) / kDlongPerMetre, a6 / kDlongPerMetre,
+                 scaledBound(a6, factor) / kDlongPerMetre);
+        }
+        a5 = scaledBound(a5, factor);
+        a6 = scaledBound(a6, factor);
+        a7 = scaledBound(a7, factor);
+        a8 = scaledBound(a8, factor);
+    }
+    bool baked = bakedPassBeginMirror(params);
+    mirrorOwnCarWalkBegin(baked && bakedPassDrawsCars());
     reinterpret_cast<WorldWalkFn>(kWorldWalk)(a1, a2, a3, a4, a5, a6, a7, a8);
+    mirrorOwnCarWalkEnd();
     bakedPassEndMirror(params);
     if (baked) {
         rasterFlushPending();
@@ -81,6 +123,7 @@ void bakedMirrorInstall() {
          "is a baked pass from the mirror camera",
          static_cast<unsigned>(kMirrorWalkSite),
          static_cast<unsigned>(reinterpret_cast<uintptr_t>(&mirrorWorldWalkThunk)));
+    mirrorOwnCarInstall();
 }
 
 void bakedMirrorRefused(MirrorRefusal why) {

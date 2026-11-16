@@ -339,6 +339,7 @@ private:
     GLint  uViewUp_ = -1;
     GLint  uFaceEye_ = -1;
     GLint  uOffsetStep_ = -1;
+    GLint  uCarClip_ = -1;
     GLint  uPhase_ = -1;
     GLint  uDepthBias_ = -1;
     GLint  uSolidOrder_ = -1;
@@ -413,6 +414,11 @@ private:
     uint32_t overlayCount_ = 0;
     bool     overlayReady_ = false;
     bool     overlayGlass_ = false;
+    // The pass's ViewInputs::window, for drawOverlay's clip of the cockpit glass.
+    int      overlayWindowCount_ = 0;
+    float    overlayWindow_[ViewInputs::kWindowPlanes][4] = {};
+    GLint    uWindow_ = -1;
+    GLint    uWindowOn_ = -1;
     // The live mirror texture and the renderer's copy of it, with its bindless handle and the
     // read and draw framebuffers of the copy.
     GLuint   mirrorSource_ = 0;

@@ -78,6 +78,7 @@ static_assert(offsetof(SceneParams, mirrorFlags) == 85 * 4, "p[85] is the mirror
 enum : unsigned {
     kCameraSurface = 0x00,  // void*  destination bitmap
     kCameraNear = 0x04,     // float
+    kCameraInvNear = 0x08,  // float, 1 / near (gpl_cameraCreate), handed on by cameraBind
     // Half extents, and the principal point PRE-MULTIPLIED by them -- gpl_cameraCreate
     // stores cx*halfW and cy*halfH, which is why cameraRebuildProjection can divide by
     // the centre and get a plain normalised cx back.

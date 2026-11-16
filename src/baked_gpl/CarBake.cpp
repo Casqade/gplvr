@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -28,6 +29,13 @@ namespace {
 // Reference-link data, placed through rebase().
 constexpr uintptr_t kResourceCacheHead = 0x0086A128;  // -> the newest resource cache entry
 constexpr uintptr_t kCarsetDirName = 0x005A1928;      // gpl_carsetDirName, e.g. "cars67"
+// gpl_mirrorMip, the car set's mirror.mip handle (CarWalkAddresses.h's kMirrorMip).
+constexpr uintptr_t kMirrorMipHandle = 0x005A1920;
+
+// A car's mirror is an object of its own: the stock 1967 cars' (emirror.3do, bmirror.3do, ...)
+// hold 27 to 29 polygons, two to four of them textured. An object binding mirror.mip
+// with more leaves than this is a cockpit or a body with the glass inside it, not a mirror.
+constexpr size_t kMirrorBodyMaxLeaves = 64;
 
 // A resource cache entry (gpl_resourceCacheAcquire 0x4CA420): pushed at the head after its load
 // returns, so older entries follow `next` and newer ones `prev`. A second acquire of the same
@@ -608,6 +616,34 @@ void logObject(const baked::CarObject& object, uint32_t vertexCount, uint32_t no
              refusal.first.c_str());
 }
 
+// A mirror object (CarObject::mirrorBody): one binding mirror.mip, or named "*mirror*", with at
+// most kMirrorBodyMaxLeaves leaves, every leaf and corner flagged. Logged either way. The stock
+// housings bind another texture (their glass is in the body object), so the name is what finds them.
+void markMirrorBody(baked::CarObject& object) {
+    uintptr_t global = rebase(kMirrorMipHandle);
+    uint32_t  mirrorMip = global ? *reinterpret_cast<const uint32_t*>(global) : 0;
+    bool binds = mirrorMip && std::find(object.textureHandles.begin(), object.textureHandles.end(),
+                                        mirrorMip) != object.textureHandles.end();
+    std::string lower = object.name;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool named = lower.find("mirror") != std::string::npos;
+    if (!binds && !named) return;
+    const char* name = object.name.empty() ? "?" : object.name.c_str();
+    if (object.leaves.size() > kMirrorBodyMaxLeaves) {
+        logf("baked cars: object %s binds mirror.mip but has %zu leaves, more than a mirror's %zu "
+             "-- not a mirror object; a mirror inside it stays in the 3D mirrors' pictures of "
+             "the car",
+             name, object.leaves.size(), kMirrorBodyMaxLeaves);
+        return;
+    }
+    object.mirrorBody = true;
+    for (baked::CarLeaf& leaf : object.leaves) leaf.flags |= baked::kCarLeafMirrorBody;
+    for (baked::CarVertex& vertex : object.vertices) vertex.flags |= baked::kCarLeafMirrorBody;
+    logf("baked cars: object %s is a mirror (%s, %zu leaves) -- left out of the viewed car's own "
+         "mirror pictures in the 3D mirrors",
+         name, binds ? "binds mirror.mip" : "named so", object.leaves.size());
+}
+
 // Resolving a sprite or texture can re-read the cache, which rebuilds `known`; so the object is
 // baked from a copy of its entry and the result is written to whatever entry holds it after.
 void bakeKnown(State& s, Known source) {
@@ -642,6 +678,7 @@ void bakeKnown(State& s, Known source) {
         logObject(object, image.model.vertexCount(),
                   static_cast<uint32_t>(image.model.normals.size() / 3), resolved, missing,
                   milliseconds);
+        markMirrorBody(object);
         index = static_cast<int32_t>(s.scene.objects.size());
         s.scene.objects.push_back(std::move(object));
         ++s.totals.objects;

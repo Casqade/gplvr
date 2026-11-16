@@ -11,4 +11,8 @@ void gplMatrixToEuler(const float m[9], float& yaw, float& pitch, float& roll);
 // Rebuild in the order the decomposition implies, so the two can be compared.
 void gplEulerToMatrix(float yaw, float pitch, float roll, float out[9]);
 
+// The roll that puts the up axis (column 2) of a camera at `yaw`, `pitch` on `up`, a unit vector
+// square to that camera's forward.
+float gplRollForUp(float yaw, float pitch, const float up[3]);
+
 }  // namespace gplvr

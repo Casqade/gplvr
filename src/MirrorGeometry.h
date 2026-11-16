@@ -30,6 +30,9 @@ constexpr int kMaxMirrorSurfaces = 8;
 // car set, so this is well over double.
 constexpr int kMaxMirrorPolysPerSurface = 48;
 
+// Outline points a surface keeps (MirrorSurface::outline).
+constexpr int kMaxMirrorOutline = 64;
+
 struct MirrorSurface {
     // Car axes, metres: X forward, Y left, Z up, origin at the cockpit node's own frame -- the
     // same frame kPaneGeometry's rows are quoted in.
@@ -62,6 +65,18 @@ struct MirrorSurface {
     int       polys;
     uintptr_t poly[kMaxMirrorPolysPerSurface];
     int       polyVerts[kMaxMirrorPolysPerSurface];
+    // Each polygon's corners' mean in car axes: against the same mean in the polygon's own frame
+    // it gives where that frame sits, so the glass can be turned about its centre there.
+    float     polyMean[kMaxMirrorPolysPerSurface][3];
+
+    // THE GLASS'S OUTLINE, car axes: its polygons' distinct corners, or their convex hull across
+    // the glass's plane when there are more than kMaxMirrorOutline. The housed glass's pane field
+    // is fitted to these as each eye sees them (MirrorWindow.h); a polygon's projection from an
+    // eye onto a plane reaches its extremes at its corners, so they bound the footprint whatever
+    // the outline's shape. 0 when a corner could not be read or the hull has too many points, and
+    // the rectangle of halfWidth x halfHeight about the centre stands in.
+    int   outlinePoints;
+    float outline[kMaxMirrorOutline][3];
 };
 
 struct MirrorSurfaceSet {
@@ -79,6 +94,12 @@ struct MirrorSurfaceSet {
     // The cockpit node the walk started from. It is what says the model has been reloaded
     // underneath the polygon addresses above.
     uintptr_t cockpit = 0;
+
+    // The poses the walk stepped over below the car's placement, and their translations and
+    // angles summed: the glasses leave them out, so anything but 0 moves every glass by it.
+    int   innerPoses = 0;
+    float innerTranslation[3] = {};
+    float innerAngles[3] = {};
 
     // False when a surface has more polygons than `poly` keeps room for. The UV remap needs
     // every polygon of a glass or none: half of them moved to a new region and half left on the

@@ -385,6 +385,19 @@ struct MenuRow {
 // ignored.
 bool pribludaRowOffered() { return pribludaPresence() != kPribludaAbsent; }
 
+// Settings only gplvr's renderer acts on are hidden while the vanilla one draws.
+bool gplvrRendererSelected() { return rendererType() != 0; }
+
+// The player car belongs to the 3D mirror mode, drawn by gplvr's renderer (MirrorOwnCar.cpp).
+bool mirrorPlayerCarRowOffered() { return mirrorExact() && gplvrRendererSelected(); }
+
+// The mirror's far bounds are scaled in gplvr's renderer's walk redirect (BakedMirror.cpp).
+bool mirrorDrawDistanceRowOffered() { return g_options.vr && gplvrRendererSelected(); }
+
+// GPL's own gpl_mirrorDistanceScale, written in the headset under either renderer; flat mode
+// keeps GPL's.
+bool mirrorDetailDistanceRowOffered() { return g_options.vr; }
+
 // One of the GPL menu's two sliders is on the page at a time: size for the head-locked mode,
 // distance for the fixed panel, each the only setting its mode has.
 bool gplMenuHeadLocked() { return g_options.vrGplMenuMode != 1; }
@@ -485,6 +498,21 @@ MenuRow g_rows[] = {
      "2.5D: with depth, all mirrors share one rear view\n"
      "3D: with depth, each mirror gets its own view",
      kTabPerformance},
+    {"Show player car in mirror", kRowNamedInt, kCommandNone, nullptr,
+     &g_options.mirrorPlayerCar, nullptr, 0, 1, 1,
+     "Show player car in the mirrors\n"
+     "Toggle it for each mirror or change its offset in Mirror Setup",
+     kTabPerformance, mirrorPlayerCarRowOffered},
+    {"Mirror draw distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.mirrorDrawDistance, 0.5f, 1.0f, 0.05f,
+     "Where mirrors stop drawing track, scenery and cars, as a fraction of forward draw distance.\n"
+     "0.50: same as in vanilla GPL, fastest. 1.0: same as forward draw distance, slowest",
+     kTabPerformance, mirrorDrawDistanceRowOffered},
+    {"Mirror LOD distance", kRowSliderFloat, kCommandNone, nullptr, nullptr,
+     &g_options.mirrorDetailDistance, 0.25f, 1.0f, 0.05f,
+     "How far the mirrors keep the track surface at full and medium detail, as a fraction of\n"
+     "forward draw distance. 0.25: same as in vanilla GPL, fastest. 1.00: same as forward draw distance, slowest. Doesn't affect cars",
+     kTabPerformance, mirrorDetailDistanceRowOffered},
     {"Mirror update rate", kRowRateInt, kCommandNone, nullptr, &g_options.mirrorUpdateInterval,
      nullptr, 0, 4, 1, "Render mirrors every Nth frame", kTabPerformance},
     {"Pribluda update rate", kRowRateInt, kCommandNone, nullptr,
@@ -1378,6 +1406,7 @@ const char* namedValue(const MenuRow& row) {
             default: return "3D";
         }
     }
+    if (row.intValue == &g_options.mirrorPlayerCar) return *row.intValue ? "On" : "Off";
     if (row.intValue == &g_options.vrGplMenuMode) return *row.intValue == 1 ? "Fixed" : "Head-locked";
     if (row.intValue == &g_options.vrHudMode) {
         switch (*row.intValue) {
@@ -1613,6 +1642,7 @@ void runCommand(int command) {
                      "(vrMirrorTweakKey) first");
                 break;
             }
+            tweakModeEntered(TweakTarget::Mirror);
             enterMode(Mode::MirrorTweak, g_state.hand);
             break;
         case kCommandHudTweak:
@@ -1698,6 +1728,9 @@ bool saveSettings() {
     // quietly wrong -- so they are kept in the same order to make the omission visible.
     writeInt("vrHudMode", g_options.vrHudMode);
     writeInt("mirrorMode", g_options.mirrorMode);
+    writeInt("mirrorPlayerCar", g_options.mirrorPlayerCar);
+    writeFloat("mirrorDrawDistance", g_options.mirrorDrawDistance);
+    writeFloat("mirrorDetailDistance", g_options.mirrorDetailDistance);
     writeInt("mirrorUpdateInterval", g_options.mirrorUpdateInterval);
     writeInt("frameRate", g_options.frameRate);
     writeInt("vrRendererType", g_options.vrRendererType);
@@ -1721,13 +1754,13 @@ bool saveSettings() {
     if (failed) {
         notice("Some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 21 settings could not be written to %s (error %lu)", failed, path,
+        logf("vr menu: %d of 24 settings could not be written to %s (error %lu)", failed, path,
              GetLastError());
         return false;
     }
     notice("Saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudMode=%d mirrorUpdateInterval=%d "
-         "mirrorMode=%d "
+         "mirrorMode=%d mirrorPlayerCar=%d mirrorDrawDistance=%.3f mirrorDetailDistance=%.3f "
          "frameRate=%d vrRendererType=%d pribludaUpdateInterval=%d "
          "vrRenderScale=%.3f vrGplMenuMode=%d vrGplMenuScale=%.3f vrGplMenuDistance=%.3f "
          "vrReplayPanelDistance=%.3f vrCursorScale=%.3f vrHudBackdropOpacity=%.3f "
@@ -1735,7 +1768,9 @@ bool saveSettings() {
          "vrGplTextSpread=%.3f vrGamma=%.3f vrHorizonLock=%.3f vrReplayHorizonLock=%.3f "
          "vrWorldScale=%.3f vrHeadAudioWidth=%.3f vrMonitorEye=%d",
          path, g_options.vrHudMode, g_options.mirrorUpdateInterval, g_options.mirrorMode,
-         g_options.frameRate, g_options.vrRendererType,
+         g_options.mirrorPlayerCar, g_options.mirrorDrawDistance, g_options.mirrorDetailDistance,
+         g_options.frameRate,
+         g_options.vrRendererType,
          g_options.pribludaUpdateInterval, g_options.vrRenderScale, g_options.vrGplMenuMode,
          g_options.vrGplMenuScale, g_options.vrGplMenuDistance,
          g_options.vrReplayPanelDistance, g_options.vrCursorScale,
@@ -2110,6 +2145,7 @@ void applyBindings(Mode mode, const VrHandInput& hand, float seconds) {
 
     for (int32_t i = 0; i < count; ++i) {
         const TweakBinding& binding = bindings[i];
+        if (binding.page != kTweakAnyPage && binding.page != tweakPage(target)) continue;
         if (binding.modifier != TweakInputButton::None &&
             !buttonDown(hand, binding.modifier))
             continue;
@@ -2189,9 +2225,22 @@ void tweakSummary(Mode mode, char* out, size_t size) {
     switch (mode) {
         // Which glass the stick is moving, since that is the one thing the glasses themselves
         // do not show.
-        case Mode::MirrorTweak:
-            _snprintf_s(out, size, _TRUNCATE, "Mirror setup: %s", mirrorConfigSelectedName());
+        // On the car page the car's state too, since a car left out of the glass shows nothing to
+        // read it from.
+        case Mode::MirrorTweak: {
+            int selected = mirrorConfigSelected();
+            if (tweakPage(TweakTarget::Mirror) != kMirrorPageCar) {
+                _snprintf_s(out, size, _TRUNCATE, "Mirror setup: %s", mirrorConfigSelectedName());
+            } else if (selected < 0) {
+                _snprintf_s(out, size, _TRUNCATE, "Car reflection: all mirrors");
+            } else {
+                MirrorAim aim = mirrorAimFor(selected);
+                _snprintf_s(out, size, _TRUNCATE, "Car reflection: %s -- %s, %+.2f m",
+                            mirrorConfigSelectedName(), aim.carReflection ? "shown" : "hidden",
+                            aim.carOffset);
+            }
             break;
+        }
         // WHAT IS BEING ADJUSTED, not what it currently reads. The numbers were there from
         // the keyboard modes, where there was nothing else to look at; in the headset the
         // thing itself is right in front of the driver and moving as they push the stick,
@@ -3285,11 +3334,20 @@ void buildHelpBlock(HelpBlock& block, int slot, float width) {
             else
                 _snprintf_s(which, sizeof(which), _TRUNCATE, "the %s mirror",
                             mirrorConfigGlassName(selected));
-            add("%s: rotate the mirror", stick);
-            add("%s + %s: change mirror magnification", trigger, stick);
-            add("%s click: reset state for %s", stick, which);
-            add("%s / %s: cycle mirrors", controlName(kInputPrimary),
+            if (tweakPage(TweakTarget::Mirror) == kMirrorPageCar) {
+                add("%s up/down: move reflected car forward/back in %s", stick, which);
+                add("%s: show/hide reflected car in %s", trigger, which);
+                add("%s click: reset reflected car offset in %s", stick, which);
+            } else {
+                add("%s: rotate the mirror", stick);
+                add("%s + %s: change mirror magnification", trigger, stick);
+                add("%s click: reset state for %s", stick, which);
+            }
+            add("%s: cycle between mirrors", controlName(kInputPrimary));
+            add("%s: switch between mirror setup and player car reflection offset",
                 controlName(kInputSecondary));
+            if (tweakPage(TweakTarget::Mirror) == kMirrorPageCar && !mirrorOwnCar())
+                add("Player's car is shown only in 3D mirrors with \"Show player car in mirror\" on");
             add("%s: go back to VR menu", grip);
             break;
         }

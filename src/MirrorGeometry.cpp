@@ -5,6 +5,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -176,9 +177,10 @@ Xform compose(const Xform& parent, const float R[9], const Vec3& t) {
     return out;
 }
 
-// One mirror polygon, reduced to what grouping and sizing need. The vertices themselves are not
-// kept: a polygon's extent along any axis comes from its bounding box, which for the flat glass
-// these all are is the same answer.
+// One mirror polygon, reduced to what grouping and sizing need. `centre` is its corners' mean,
+// which is what grouping compares; the glass's own centre and size are measured along its plane's
+// axes from the corners again (`place` and `vertexAt`), since a mean leans toward wherever the
+// corners crowd -- an arched top's -- and a car-axes box is not the size of a glass seen askew.
 struct Poly {
     Vec3  centre;
     Vec3  normal;
@@ -189,6 +191,8 @@ struct Poly {
     // decides which surface a polygon belongs to, and the UV remap needs the nodes per surface.
     uintptr_t node;
     int       verts;
+    Xform     place;
+    uintptr_t vertexAt;
 };
 
 struct Walk {
@@ -286,6 +290,8 @@ void addPoly(Walk& walk, uintptr_t node, const Xform& place) {
     p.group = -1;
     p.node = node;
     p.verts = count;
+    p.place = place;
+    p.vertexAt = vertexAt;
 
     Vec3 sum;
     Vec3 first, previous;
@@ -546,6 +552,65 @@ bool nearby(const Poly& a, const Poly& b) {
     return overlap;
 }
 
+// The outline's corners: a facet shares most of its corners with its neighbours, and the LOD
+// selector can reach one polygon twice, so corners this close are one.
+constexpr int   kMaxOutlineGather = 384;
+constexpr float kOutlineMerge = 0.0005f;
+
+// Adds `at` unless a gathered corner is already there; false when there is no room.
+bool gatherCorner(Vec3 corner[], int& count, const Vec3& at) {
+    for (int i = 0; i < count; ++i)
+        if (length(corner[i] - at) < kOutlineMerge) return true;
+    if (count >= kMaxOutlineGather) return false;
+    corner[count++] = at;
+    return true;
+}
+
+// The corners into `s.outline`, all of them when they fit, else their convex hull in the glass's
+// in-plane axes (monotone chain). Returns how many were kept, 0 when the hull does not fit either.
+int keepOutline(MirrorSurface& s, const Vec3 corner[], int count, const Vec3& across,
+                const Vec3& up) {
+    int kept[kMaxOutlineGather];
+    int keptCount = 0;
+    if (count <= kMaxMirrorOutline) {
+        for (int i = 0; i < count; ++i) kept[keptCount++] = i;
+    } else {
+        float a[kMaxOutlineGather], b[kMaxOutlineGather];
+        int   order[kMaxOutlineGather];
+        for (int i = 0; i < count; ++i) {
+            a[i] = dot(corner[i], across);
+            b[i] = dot(corner[i], up);
+            order[i] = i;
+        }
+        std::sort(order, order + count, [&](int i, int j) {
+            return a[i] < a[j] || (a[i] == a[j] && b[i] < b[j]);
+        });
+        auto turnsLeft = [&](int o, int p, int q) {
+            return (a[p] - a[o]) * (b[q] - b[o]) - (b[p] - b[o]) * (a[q] - a[o]) > 0.0f;
+        };
+        int hull[2 * kMaxOutlineGather];
+        int k = 0;
+        for (int i = 0; i < count; ++i) {
+            while (k >= 2 && !turnsLeft(hull[k - 2], hull[k - 1], order[i])) --k;
+            hull[k++] = order[i];
+        }
+        for (int i = count - 2, lower = k + 1; i >= 0; --i) {
+            while (k >= lower && !turnsLeft(hull[k - 2], hull[k - 1], order[i])) --k;
+            hull[k++] = order[i];
+        }
+        // The chain ends on its first point again.
+        keptCount = k - 1;
+        if (keptCount < 3 || keptCount > kMaxMirrorOutline) return 0;
+        for (int i = 0; i < keptCount; ++i) kept[i] = hull[i];
+    }
+    for (int i = 0; i < keptCount; ++i) {
+        s.outline[i][0] = corner[kept[i]].x;
+        s.outline[i][1] = corner[kept[i]].y;
+        s.outline[i][2] = corner[kept[i]].z;
+    }
+    return keptCount;
+}
+
 void group(Walk& walk, MirrorSurfaceSet& out) {
     int groups = 0;
     for (int i = 0; i < walk.polys; ++i) {
@@ -616,11 +681,56 @@ void group(Walk& walk, MirrorSurfaceSet& out) {
         if (length(across) < 0.5f) across = normalise(cross(normal, Vec3{1.0f, 0.0f, 0.0f}));
         Vec3 up = normalise(cross(normal, across));
 
-        Vec3 extent = hi - lo;
-        s.halfWidth = 0.5f * std::fabs(dot(extent, across));
-        s.halfHeight = 0.5f * std::fabs(dot(extent, up));
+        // The corners' extent along the two in-plane axes, from the mean: its middle is the
+        // glass's centre, its half the half sizes.
+        float aLo = 1e9f, aHi = -1e9f, bLo = 1e9f, bHi = -1e9f;
+        bool  measured = true;
+        Vec3  corner[kMaxOutlineGather];
+        int   corners = 0;
+        bool  gathered = true;
+        for (int i = 0; i < walk.polys && measured; ++i) {
+            const Poly& p = walk.poly[i];
+            if (p.group != g) continue;
+            for (int k = 0; k < p.verts; ++k) {
+                uint32_t vertexPointer = 0;
+                float    xyz[3];
+                if (!readWord(p.vertexAt + static_cast<uintptr_t>(4) * k, vertexPointer) ||
+                    !plausiblePointer(vertexPointer) ||
+                    !readWords(vertexPointer + 4, xyz, sizeof(xyz))) {
+                    measured = false;
+                    break;
+                }
+                Vec3  at = apply(p.place, Vec3{xyz[0], xyz[1], xyz[2]});
+                Vec3  d = at - centre;
+                float a = dot(d, across), b = dot(d, up);
+                if (gathered) gathered = gatherCorner(corner, corners, at);
+                aLo = a < aLo ? a : aLo;
+                aHi = a > aHi ? a : aHi;
+                bLo = b < bLo ? b : bLo;
+                bHi = b > bHi ? b : bHi;
+            }
+        }
+        if (measured && aHi > aLo && bHi > bLo) {
+            float shiftA = 0.5f * (aLo + aHi), shiftB = 0.5f * (bLo + bHi);
+            if (std::fabs(shiftA) > 0.002f || std::fabs(shiftB) > 0.002f)
+                logf("mirror geometry: surface %d's centre is the middle of its extent, %+.1f mm "
+                     "across and %+.1f mm up from its corners' mean",
+                     out.count, shiftA * 1000.0f, shiftB * 1000.0f);
+            centre = centre + across * shiftA + up * shiftB;
+            s.centre[0] = centre.x;
+            s.centre[1] = centre.y;
+            s.centre[2] = centre.z;
+            s.halfWidth = 0.5f * (aHi - aLo);
+            s.halfHeight = 0.5f * (bHi - bLo);
+        } else {
+            Vec3 extent = hi - lo;
+            s.halfWidth = 0.5f * std::fabs(dot(extent, across));
+            s.halfHeight = 0.5f * std::fabs(dot(extent, up));
+        }
         // A glass with no measurable size is not a glass.
         if (s.halfWidth < 0.002f || s.halfHeight < 0.002f) continue;
+        s.outlinePoints =
+            measured && gathered ? keepOutline(s, corner, corners, across, up) : 0;
 
         s.u0 = u0;
         s.u1 = u1;
@@ -644,6 +754,9 @@ void group(Walk& walk, MirrorSurfaceSet& out) {
                 break;
             }
             s.polyVerts[s.polys] = p.verts;
+            s.polyMean[s.polys][0] = p.centre.x;
+            s.polyMean[s.polys][1] = p.centre.y;
+            s.polyMean[s.polys][2] = p.centre.z;
             s.poly[s.polys++] = p.node;
         }
         // Y is left-positive, so the sign names the side and a glass on the centreline is the
@@ -733,6 +846,16 @@ bool mirrorGeometryDerive(int team, MirrorSurfaceSet& out) {
         uint32_t words[9];
         if (!readWords(root, words, sizeof(words))) break;
         if (!plausiblePointer(words[8])) break;
+        if (skipped > 0) {
+            ++out.innerPoses;
+            for (int i = 0; i < 3; ++i) {
+                float t = 0.0f, a = 0.0f;
+                std::memcpy(&t, &words[1 + i], sizeof(t));
+                std::memcpy(&a, &words[4 + i], sizeof(a));
+                out.innerTranslation[i] += t;
+                out.innerAngles[i] += a;
+            }
+        }
         root = words[8];
         ++skipped;
     }
@@ -807,13 +930,22 @@ void mirrorGeometryReport(int team, const MirrorSurfaceSet& set) {
     }
     logf("mirror geometry: team %d has %d mirror surface%s, read out of the loaded model", team,
          set.count, set.count == 1 ? "" : "s");
+    if (set.innerPoses)
+        logf("  %d pose%s below the car's placement stepped over and left out of the glasses: "
+             "translation %+.4f %+.4f %+.4f, angles %+.4f %+.4f %+.4f rad",
+             set.innerPoses, set.innerPoses == 1 ? "" : "s", set.innerTranslation[0],
+             set.innerTranslation[1], set.innerTranslation[2], set.innerAngles[0],
+             set.innerAngles[1], set.innerAngles[2]);
+    else
+        logf("  no pose below the car's placement: the glasses are in the placement's own frame");
     for (int i = 0; i < set.count; ++i) {
         const MirrorSurface& s = set.surface[i];
         logf("  [%d] %-6s centre %+.4f %+.4f %+.4f  normal %+.3f %+.3f %+.3f  %.0f x %.0f mm  "
-             "u %.3f-%.3f v %.3f-%.3f  %d polygon%s",
+             "u %.3f-%.3f v %.3f-%.3f  %d polygon%s, outline %d point%s",
              i, s.label, s.centre[0], s.centre[1], s.centre[2], s.normal[0], s.normal[1],
              s.normal[2], s.halfWidth * 2000.0f, s.halfHeight * 2000.0f, s.u0, s.u1, s.v0, s.v1,
-             s.polygons, s.polygons == 1 ? "" : "s");
+             s.polygons, s.polygons == 1 ? "" : "s", s.outlinePoints,
+             s.outlinePoints == 1 ? "" : "s");
     }
 }
 

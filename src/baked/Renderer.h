@@ -29,6 +29,21 @@ struct ViewInputs {
     // space: rows 0 and 1 give x and y (y grows downward), row 3 gives w = forward distance.
     float projection[16] = {};
     float nearPlane = 0.125f;
+    // A plane the host's cars are cut at (SolidHook): kept where dot(world - eye, carClip.xyz) +
+    // carClip.w >= 0. A mirror glass's, so the car the glass sits on shows only what lies in front
+    // of the glass.
+    bool  carClipOn = false;
+    float carClip[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // A main pass's housed cockpit glasses (kCarLeafWindow): four vectors per glass, glass-major,
+    // in the glass polygon's own frame -- the aimed glass's centre and normal, and its texture
+    // coordinate's u and v as {gradient, value at the centre}. `windowCount` 0: none.
+    static constexpr int kWindowPlanes = 16;
+    int   windowCount = 0;
+    float window[kWindowPlanes][4] = {};
+    // A mirror pass's move of the viewed car in its own mirror (MirrorOwnCar.h mirrorOwnCarShift),
+    // world metres: added to every frame of a list that hides its mirror objects
+    // (CarDrawList::hideMirrorBody).
+    float carShift[3] = {};
 };
 
 // The host's fog, as roglv2 sets it in GL (rogl_displayFogEnable 0x20009E20): GL_EXP or GL_EXP2

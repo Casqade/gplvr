@@ -49,4 +49,14 @@ void gplEulerToMatrix(float yaw, float pitch, float roll, float out[9]) {
     out[8] = cy * cx;
 }
 
+// gplEulerToMatrix's column 2 is -sin(roll) * column 1 + cos(roll) * column 2 of the same camera
+// at roll 0.
+float gplRollForUp(float yaw, float pitch, const float up[3]) {
+    float level[9];
+    gplEulerToMatrix(yaw, pitch, 0.0f, level);
+    float alongLeft = up[0] * level[1] + up[1] * level[4] + up[2] * level[7];
+    float alongUp = up[0] * level[2] + up[1] * level[5] + up[2] * level[8];
+    return std::atan2(-alongLeft, alongUp);
+}
+
 }  // namespace gplvr

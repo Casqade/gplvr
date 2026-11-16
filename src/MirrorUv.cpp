@@ -598,4 +598,28 @@ void mirrorUvClearRegions() {
     restore();
 }
 
+bool mirrorUvGlassOf(uintptr_t node, int& glass, float centre[3], float normal[3],
+                     float polyMean[3]) {
+    State& s = g_state;
+    if (!s.haveSet || !s.set.derived || !node) return false;
+    for (int g = 0; g < s.set.count; ++g) {
+        const MirrorSurface& surface = s.set.surface[g];
+        for (int p = 0; p < surface.polys && p < kMaxMirrorPolysPerSurface; ++p) {
+            if (surface.poly[p] != node) continue;
+            glass = g;
+            std::memcpy(centre, surface.centre, sizeof(surface.centre));
+            std::memcpy(normal, surface.normal, sizeof(surface.normal));
+            std::memcpy(polyMean, surface.polyMean[p], sizeof(surface.polyMean[p]));
+            return true;
+        }
+    }
+    return false;
+}
+
+const MirrorSurface* mirrorUvSurface(int glass) {
+    const State& s = g_state;
+    if (!s.haveSet || !s.set.derived || glass < 0 || glass >= s.set.count) return nullptr;
+    return &s.set.surface[glass];
+}
+
 }  // namespace gplvr

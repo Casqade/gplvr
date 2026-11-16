@@ -110,6 +110,8 @@ void carWalkDetached(const CarBuildSnapshot& snapshot, ShareTape& tape, baked::C
 // Called once, on the render thread before a main walk, when the baked renderer is on. Every check
 // comes before the first patch; logs what it installed or why not (GPL then draws every car).
 void carWalkInstall();
+// Whether the car vtable slot goes through gplvr.
+bool carWalkInstalled();
 
 // bakedPassBegin opens a new pass's arena (`mirror`: a mirror pass); bakedPassEnd reads its lists,
 // one per car drawn by gplvr, in the order GPL first called each car. In VR the first eye's lists

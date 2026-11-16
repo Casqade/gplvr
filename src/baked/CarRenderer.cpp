@@ -102,6 +102,12 @@ uniform vec3 u_viewLeft;
 uniform vec3 u_viewUp;
 uniform vec2 u_faceEye;
 uniform float u_offsetStep;
+uniform vec4 u_carClip;                  // ViewInputs::carClip, eye-relative world
+uniform vec4 u_window[16];               // ViewInputs::window, drawOverlay's
+uniform int u_windowOn;
+// A housed glass's texture coordinate (MirrorWindow.h) as (uv q, q), linear across the polygon;
+// 0 for every other corner.
+out vec3 v_window;
 out vec2 v_uv;
 // roglv2 hands GL window positions with w = 1 and the corner colours as they are
 // (rogl_convertVertsMode5 0x200100D0); only the texture coordinates go perspective-correct. So
@@ -120,6 +126,8 @@ const uint kTextured = 4u;
 const uint kFlatFromTexture = 16u;
 const uint kInvisible = 128u;
 const uint kFacing = 256u;
+const uint kMirrorBody = 1024u;
+const uint kWindow = 2048u;
 )";
 
 // After kGplLightingGlsl.
@@ -137,7 +145,8 @@ void main() {
     vec4 r0 = carFrames[frame];
     vec4 r1 = carFrames[frame + 1];
     vec4 r2 = carFrames[frame + 2];
-    vec3 halfVector = carFrames[frame + 3].xyz;
+    vec4 r3 = carFrames[frame + 3];
+    vec3 halfVector = r3.xyz;  // w: 1 where the list hides its mirror objects
     mat3 rotation = transpose(mat3(r0.xyz, r1.xyz, r2.xyz));
     vec3 origin = vec3(r0.w, r1.w, r2.w);
     bool sprite = (a_flags & kSprite) != 0u;
@@ -148,10 +157,13 @@ void main() {
     v_drawBits = d1.w & 14u;
     v_paletteSize = v_palette >= 0 ? vec2(float(d1.y), float(d1.z)) : vec2(1.0);
     v_uv = a_uv;
+    v_window = vec3(0.0);
     v_secondary = vec3(0.0);
-    if ((a_flags & kInvisible) != 0u) {
-        // Literal alpha 0: roglv2's alpha test drops every fragment of it.
+    if ((a_flags & kInvisible) != 0u || ((a_flags & kMirrorBody) != 0u && r3.w > 0.5)) {
+        // Literal alpha 0: roglv2's alpha test drops every fragment of it. A hidden mirror object
+        // goes the same way.
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_ClipDistance[0] = 1.0;
         v_primary = vec4(0.0);
         v_fogW = 0.0;
         return;
@@ -204,6 +216,22 @@ void main() {
     vec4 clip = u_clipFromView * vec4(relative, 1.0);
     v_fogW = clip.w;
     gl_Position = clip;
+    gl_ClipDistance[0] = dot(relative, u_carClip.xyz) + u_carClip.w;
+    // A housed glass corner, in its frame: the eye's ray through it meets the aimed glass's plane
+    // (centre c, normal n) at x = e + (p - e) / q, q = ((p - e).n) / ((c - e).n), whose texture
+    // coordinate is a + B (x - c). Times q that is a q + B ((p - e) - q (c - e)), linear in p.
+    if (u_windowOn != 0 && (a_flags & kWindow) != 0u) {
+        int g = int((a_flags >> 12) & 3u) * 4;
+        vec3 c = u_window[g].xyz;
+        vec3 n = u_window[g + 1].xyz;
+        vec4 b0 = u_window[g + 2];
+        vec4 b1 = u_window[g + 3];
+        vec3 e = inverse(rotation) * -origin;
+        vec3 fromEye = a_position - e;
+        float q = dot(fromEye, n) / dot(c - e, n);
+        vec3 along = fromEye - q * (c - e);
+        v_window = vec3(b0.w * q + dot(b0.xyz, along), b1.w * q + dot(b1.xyz, along), q);
+    }
 }
 )";
 
@@ -217,6 +245,7 @@ void main() {
 const char* const kCarFragmentShader = R"(#version 430
 #extension GL_ARB_bindless_texture : require
 in vec2 v_uv;
+in vec3 v_window;
 noperspective in vec4 v_primary;
 noperspective in vec3 v_secondary;
 noperspective in float v_fogW;
@@ -269,9 +298,10 @@ vec4 paletteTexel(sampler2D indices) {
     return mix(below, above, f.y);
 }
 void main() {
+    vec2 uv = v_window.z > 0.0 ? v_window.xy / v_window.z : v_uv;
     vec4 colour = (v_texture.x | v_texture.y) == 0u ? v_primary
                 : v_palette >= 0 ? paletteTexel(sampler2D(v_texture)) * v_primary
-                                 : texture(sampler2D(v_texture), v_uv) * v_primary;
+                                 : texture(sampler2D(v_texture), uv) * v_primary;
     colour.rgb = min(colour.rgb + v_secondary, vec3(1.0));
     // A walk-order-only draw (a flagman) has no core: all of it is painted in phase 1.
     bool walkOnly = (v_drawBits & 2u) != 0u;
@@ -313,7 +343,9 @@ static_assert(kFramesBinding == 2 && kDrawsBinding == 3 && kRowsBinding == 4,
 static_assert(sizeof(CarVertex) == 36, "the attribute offsets below assume the 36-byte vertex");
 static_assert(kCarLeafSprite == 1 && kCarLeafLit == 2 && kCarLeafTextured == 4 &&
                   kCarLeafFlatFromTexture == 16 && kCarLeafInvisible == 128 &&
-                  kCarLeafFacing == 256,
+                  kCarLeafFacing == 256 && kCarLeafMirrorBody == 1024 &&
+                  kCarLeafWindow == 2048 && kCarLeafWindowGlassShift == 12 &&
+                  ViewInputs::kWindowPlanes == 16,
               "kCarVertexHead repeats the CarLeafFlags");
 
 GLuint compile(const GlApi& gl, GLenum type, const char* const* sources, GLsizei count,
@@ -506,6 +538,9 @@ bool CarRenderer::init(const GlApi& gl, std::string& error) {
     uViewUp_ = gl_.getUniformLocation(program_, "u_viewUp");
     uFaceEye_ = gl_.getUniformLocation(program_, "u_faceEye");
     uOffsetStep_ = gl_.getUniformLocation(program_, "u_offsetStep");
+    uCarClip_ = gl_.getUniformLocation(program_, "u_carClip");
+    uWindow_ = gl_.getUniformLocation(program_, "u_window");
+    uWindowOn_ = gl_.getUniformLocation(program_, "u_windowOn");
     uPhase_ = gl_.getUniformLocation(program_, "u_phase");
     uDepthBias_ = gl_.getUniformLocation(program_, "u_depthBias");
     uSolidOrder_ = gl_.getUniformLocation(program_, "u_solidOrder");
@@ -1571,6 +1606,8 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
     commands_.clear();
     runsReady_ = false;
     discardOverlay();
+    overlayWindowCount_ = view.windowCount;
+    std::memcpy(overlayWindow_, view.window, sizeof(overlayWindow_));
     if (!initialised_) return;
     if (++prepares_ % 256 == 0) evictIdle();
     // What the last prepare drew and gave back since is free now: its draws were issued.
@@ -1662,8 +1699,12 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
         size_t frameCount = list.frames.size();
         size_t at = frames_.size();
         frames_.resize(at + frameCount * kFrameFloats, 0.0f);
-        for (size_t f = 0; f < frameCount; ++f)
-            multiply34(eyeFromRoot, list.frames[f].rootFromLocal, &frames_[at + f * kFrameFloats]);
+        for (size_t f = 0; f < frameCount; ++f) {
+            float* frame = &frames_[at + f * kFrameFloats];
+            multiply34(eyeFromRoot, list.frames[f].rootFromLocal, frame);
+            if (list.hideMirrorBody)
+                for (int row = 0; row < 3; ++row) frame[row * 4 + 3] += view.carShift[row];
+        }
         for (size_t f = 0; f < frameCount; ++f) {
             // GPL's half vector, normalize(normalize(eye) + L) in the frame its last rotation
             // set it in (report 103 section 4), carried to world by that frame's rotation.
@@ -1678,6 +1719,7 @@ void CarRenderer::prepare(const CarScene& scene, uint32_t generation, const CarD
                 half[2] = eyeDirection[2] + light_[2];
                 if (!normalise(half)) half[0] = half[1] = half[2] = 0.0f;
             }
+            half[3] = list.hideMirrorBody ? 1.0f : 0.0f;
         }
         // The car's distance: its `car` frame, else the dispatch frame.
         const float* placed = &frames_[at + (frameCount > 1 ? 1 : 0) * kFrameFloats];
@@ -1889,6 +1931,13 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
     gl_.uniform2f(uFaceEye_, context.verticalFacesEye ? 1.0f : 0.0f,
                   context.screenFacesEye ? 1.0f : 0.0f);
     gl_.uniform1f(uOffsetStep_, kSpriteOffsetStep);
+    // Every draw of the pass keeps the plane; GL_CLIP_DISTANCE0 is on only around this pass's
+    // draws, here and in drawWalkOrderRun.
+    if (view.carClipOn)
+        gl_.uniform4f(uCarClip_, view.carClip[0], view.carClip[1], view.carClip[2],
+                      view.carClip[3]);
+    else
+        gl_.uniform4f(uCarClip_, 0.0f, 0.0f, 0.0f, 1.0f);
     gl_.uniform2f(uFog_, frame.fog.on ? (frame.fog.squared ? 2.0f : 1.0f) : 0.0f,
                   frame.fog.density);
     gl_.uniform3f(uFogColour_, frame.fog.colour[0], frame.fog.colour[1], frame.fog.colour[2]);
@@ -1915,6 +1964,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
         gl_.drawBuffers(2, solid);
         gl_.depthMask(1);
         gl_.uniform1i(uPhase_, 0);
+        if (view.carClipOn) gl_.enable(gl::kClipDistance0);
         for (const CarRange& run : solidRuns_) {
             setRowSource(&run);
             gl_.multiDrawElementsIndirect(
@@ -1922,6 +1972,7 @@ void CarRenderer::drawSolid(const SolidHookContext& context) {
                 reinterpret_cast<const void*>(static_cast<uintptr_t>(run.first) * sizeof(Command)),
                 static_cast<GLsizei>(run.count), sizeof(Command));
         }
+        if (view.carClipOn) gl_.disable(gl::kClipDistance0);
     }
     gl_.uniform1i(uPhase_, 1);
     restoreBindings(gl_, saved);
@@ -1936,9 +1987,10 @@ uint32_t CarRenderer::walkOrderRuns() const {
 uint32_t CarRenderer::walkOrderSlot(uint32_t run) const { return walkRuns_[run].slot; }
 
 void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
-                                   const SolidHookContext& /*context*/) {
+                                   const SolidHookContext& context) {
     if (run >= walkRuns_.size()) return;
     const CarRange&    car = walkRuns_[run];
+    bool               clip = context.view && context.view->carClipOn;
     SavedBindings      saved;
     saveBindings(gl_, saved);
     gl_.useProgram(program_);
@@ -1946,10 +1998,12 @@ void CarRenderer::drawWalkOrderRun(uint32_t run, uint32_t /*position*/,
     gl_.uniform1i(uWalkSlot_, static_cast<GLint>(car.slot));
     bindTables();
     setRowSource(&car);
+    if (clip) gl_.enable(gl::kClipDistance0);
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
         reinterpret_cast<const void*>(static_cast<uintptr_t>(car.first) * sizeof(Command)),
         static_cast<GLsizei>(car.count), sizeof(Command));
+    if (clip) gl_.disable(gl::kClipDistance0);
     restoreBindings(gl_, saved);
 }
 
@@ -2133,10 +2187,19 @@ int CarRenderer::drawOverlay(GLuint framebuffer, const int rect[4]) {
     gl_.uniform1i(uOrderTest_, 0);
     bindTables();
     setRowSource(nullptr);
+    // The housed glasses' texture mapping (MirrorWindow.h), on the flagged glass corners alone.
+    bool window = overlayWindowCount_ > 0 && uWindow_ >= 0 && uWindowOn_ >= 0;
+    if (window) {
+        for (int i = 0; i < ViewInputs::kWindowPlanes; ++i)
+            gl_.uniform4f(uWindow_ + i, overlayWindow_[i][0], overlayWindow_[i][1],
+                          overlayWindow_[i][2], overlayWindow_[i][3]);
+        gl_.uniform1i(uWindowOn_, 1);
+    }
     gl_.multiDrawElementsIndirect(
         gl::kTriangles, gl::kUnsignedInt,
         reinterpret_cast<const void*>(static_cast<uintptr_t>(overlayFirst_) * sizeof(Command)),
         static_cast<GLsizei>(overlayCount_), sizeof(Command));
+    if (window) gl_.uniform1i(uWindowOn_, 0);
 
     restoreBindings(gl_, saved);
     if (cullFace) gl_.enable(gl::kCullFace);

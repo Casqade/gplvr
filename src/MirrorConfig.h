@@ -31,11 +31,22 @@ namespace gplvr {
 // A symmetric pair therefore stores opposite signs, and "all glasses" in tweak mode moves them
 // that way -- both inboard or both outboard together -- which is what the single car-wide yaw
 // always did.
+//
+// THE CAR IN THE GLASS (the 3D mirror mode with mirrorPlayerCar on, MirrorOwnCar.h): carOffset
+// moves the viewed car's outside model along the car's forward axis in this glass's picture,
+// metres, positive forward. An outside model's housing can sit ahead of the cockpit's glass, so the
+// cut at the glass leaves its rim in the picture; moving the car back puts it behind. carReflection
+// off leaves the car out of this glass.
 struct MirrorAim {
     float yaw = 0.0f;
     float pitch = 0.0f;
     float fovScale = 1.0f;
+    float carOffset = 0.0f;
+    bool  carReflection = true;
 };
+
+// The limits of MirrorAim::carOffset, metres either way.
+constexpr float kMaxMirrorCarOffset = 0.5f;
 
 // The longest glass name, terminator included: "centre" plus a digit for a car with two of them.
 constexpr int kMirrorGlassNameBytes = 12;

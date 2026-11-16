@@ -93,4 +93,13 @@ void mirrorUvClearRegions();
 // eye. False when a set of `count` is not applied.
 bool mirrorUvMoveRegions(const MirrorUvRegion regions[], int count);
 
+// The derived glass polygon node `node` belongs to: its index (the pane's and the aim's), that
+// glass's centre and unit normal (sign unresolved) in car axes, and the polygon's own corners'
+// mean in car axes. False for any other node.
+bool mirrorUvGlassOf(uintptr_t node, int& glass, float centre[3], float normal[3],
+                     float polyMean[3]);
+
+// Derived glass `glass` as the geometry walk left it, or null when there is no derived set.
+const MirrorSurface* mirrorUvSurface(int glass);
+
 }  // namespace gplvr
