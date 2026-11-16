@@ -97,8 +97,12 @@ T readAt(uintptr_t address) {
 }
 
 bool templateMatches(const Template& t) {
-    unsigned char expected[32];
-    if (t.length > sizeof(expected)) return false;
+    unsigned char expected[64];
+    if (t.length > sizeof(expected)) {
+        logf("text entry: %s's template is %u bytes, more than the %u compared -- refused", t.name,
+             static_cast<unsigned>(t.length), static_cast<unsigned>(sizeof(expected)));
+        return false;
+    }
     std::memcpy(expected, t.bytes, t.length);
     if (rebaseOperands(expected, t.length, kRetailWidgetMgr, g_mgrSlot) != t.mgrOperands) {
         logf("text entry: %s's template names %08X a different number of times than %u -- "
