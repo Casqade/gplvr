@@ -6,6 +6,7 @@
 #include "DataRebase.h"
 #include "Log.h"
 #include "Paths.h"
+#include "TextEntry.h"
 #include "VrMenu.h"
 #include "presenter/Producer.h"
 
@@ -1212,7 +1213,9 @@ void pribludaPollTweak() {
     bool focused = GetForegroundWindow() == gameWindow();
 
     if (!g_tweak.active) {
-        if (togglePressed && live && focused) enterTweak();
+        if (togglePressed && live && focused &&
+            hotkeyPressAllowed(g_options.vrHudTweakKey, "vrHudTweakKey"))
+            enterTweak();
         return;
     }
     if (!live) {

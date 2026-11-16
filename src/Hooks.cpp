@@ -36,6 +36,7 @@
 #include "Stereo.h"
 #include "SwapControl.h"
 #include "TaskRate.h"
+#include "TextEntry.h"
 #include "TweakApi.h"
 #include "VrCamera.h"
 #include "VrInput.h"
@@ -727,7 +728,7 @@ void mirrorTweakPoll() {
         if (g_mirrorTweak.active) {
             // The key IS the save. Nothing else writes.
             mirrorTweakExit("", true);
-        } else {
+        } else if (hotkeyPressAllowed(g_options.vrMirrorTweakKey, "vrMirrorTweakKey")) {
             mirrorTweakEnter();
         }
         return;
@@ -838,7 +839,8 @@ void pollToggle() {
     // see STATUS.md -- so without this the view starts a standing height too high.
     if (g_options.vr && g_options.vrRecentreKey) {
         const bool down = (GetAsyncKeyState(g_options.vrRecentreKey) & 0x8000) != 0;
-        if (down && !g_vrRecentreKeyLast && !hotkeyOwnedByMode(g_options.vrRecentreKey))
+        if (down && !g_vrRecentreKeyLast && !hotkeyOwnedByMode(g_options.vrRecentreKey) &&
+            hotkeyPressAllowed(g_options.vrRecentreKey, "vrRecentreKey"))
             vrRequestRecentre();
         g_vrRecentreKeyLast = down;
     }
@@ -848,7 +850,8 @@ void pollToggle() {
     // would be invisible, so one is published on the spot.
     if (g_options.vr && g_options.vrHudLayerKey) {
         bool down = (GetAsyncKeyState(g_options.vrHudLayerKey) & 0x8000) != 0;
-        if (down && !g_vrHudLayerKeyLast && !hotkeyOwnedByMode(g_options.vrHudLayerKey)) {
+        if (down && !g_vrHudLayerKeyLast && !hotkeyOwnedByMode(g_options.vrHudLayerKey) &&
+            hotkeyPressAllowed(g_options.vrHudLayerKey, "vrHudLayerKey")) {
             g_options.vrHudMode = hudLayer() == 1 ? 1 : 2;
             const char* seat = "";
             if (hudLayer() == 2 && !presenterSeatPublished()) {
@@ -893,7 +896,8 @@ void pollToggle() {
     // redirect is installed whichever way it started, so the modes swap freely.
     if (g_options.vr && g_options.vrMirrorModeKey) {
         bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
-        if (down && !g_vrMirrorModeKeyLast && !hotkeyOwnedByMode(g_options.vrMirrorModeKey)) {
+        if (down && !g_vrMirrorModeKeyLast && !hotkeyOwnedByMode(g_options.vrMirrorModeKey) &&
+            hotkeyPressAllowed(g_options.vrMirrorModeKey, "vrMirrorModeKey")) {
             g_options.mirrorMode = (g_options.mirrorMode + 1) % (kMirrorPerGlass + 1);
             logf("mirror: mode %d -- %s", g_options.mirrorMode,
                  mirrorModeText(g_options.mirrorMode));
@@ -921,7 +925,8 @@ void pollToggle() {
     // the headset cannot be blamed for anything.
     if (g_options.vrMouseLookKey) {
         const bool down = (GetAsyncKeyState(g_options.vrMouseLookKey) & 0x8000) != 0;
-        if (down && !g_vrMouseLookKeyLast && !hotkeyOwnedByMode(g_options.vrMouseLookKey)) {
+        if (down && !g_vrMouseLookKeyLast && !hotkeyOwnedByMode(g_options.vrMouseLookKey) &&
+            hotkeyPressAllowed(g_options.vrMouseLookKey, "vrMouseLookKey")) {
             g_options.vrMouseLook = !g_options.vrMouseLook;
             logf("mouselook toggled %s%s", g_options.vrMouseLook ? "ON" : "off",
                  (g_options.vrMouseLook && g_options.vr)
@@ -2833,18 +2838,20 @@ void loadOptions(const char* fileName) {
 
     // The hotkeys are debug controls; the VR menu has what each of them toggles. Off, every key
     // reads 0, which each poll, each swallow and the clash table already take as "no key".
+    // vrRecentreKey stays: a press is left to GPL while one of its text fields has the keyboard
+    // (TextEntry.h), and textEntryInstall takes the key away when that check is refused.
     g_options.debugKeys = GetPrivateProfileIntA("gplvr", "debugKeys", 0, path) != 0;
     if (!g_options.debugKeys) {
         g_options.vrMirrorTweakKey = 0;
         g_options.vrMirrorModeKey = 0;
-        g_options.vrRecentreKey = 0;
         g_options.vrMouseLookKey = 0;
         g_options.vrHudLayerKey = 0;
         g_options.vrHudTweakKey = 0;
     }
     logf("options: debugKeys=%d (%s)", g_options.debugKeys ? 1 : 0,
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
-                             : "no hotkey is polled; the VR menu has every setting they toggle");
+                             : "only vrRecentreKey is polled; the VR menu has every setting the "
+                               "others toggle");
     vrMenuKeysLoadOptions(path);
 
     logf("build: GPLVR_MIRROR_SKIP_OUT_OF_VIEW=%d (%s) GPLVR_MIRROR_COPY_REBIND=%d",

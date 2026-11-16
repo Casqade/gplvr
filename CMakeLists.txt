@@ -150,6 +150,7 @@ else()
         src/StereoEuler.cpp
         src/SwapControl.cpp
         src/TaskRate.cpp
+        src/TextEntry.cpp
         src/TickClock.cpp
         src/TweakApi.cpp
         src/VrCamera.cpp

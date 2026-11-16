@@ -39,6 +39,7 @@
 #include "RenderProfile.h"
 #include "SkidFlood.h"
 #include "Stereo.h"
+#include "TextEntry.h"
 #include "Log.h"
 #include "LogDir.h"
 #include "Window.h"
@@ -410,6 +411,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         dataRebaseResolve();
 
         loadOptions("gplvr.ini");
+        // Straight after the options, before any poll: it decides whether vrRecentreKey stays.
+        // Reads code and places one global; patches nothing.
+        textEntryInstall();
 
         // Deterministic: this runs before the game's entry point, so every
         // LoadLibrary the game makes afterwards passes through us.

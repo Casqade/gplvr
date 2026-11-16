@@ -150,9 +150,9 @@ struct Options {
     // with Ctrl it does not share a press with any plain key there.
     int vrMenuKey = 'M';
 
-    // EVERY HOTKEY BELOW (every option ending in Key) is a debug control: the VR menu has what
-    // each one toggles. Off, loadOptions sets all of them to 0, so none is polled, swallowed or
-    // checked for a clash; on, each reads its own line of gplvr.ini as before.
+    // EVERY HOTKEY BELOW (every option ending in Key) except vrRecentreKey is a debug control: the
+    // VR menu has what each one toggles. Off, loadOptions sets them to 0, so none is polled,
+    // swallowed or checked for a clash; on, each reads its own line of gplvr.ini as before.
     bool debugKeys = false;
 
     // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
@@ -386,7 +386,9 @@ struct Options {
     // exactly as it would without it.
     bool vr = true;
 
-    // Take the current head pose as the seat. '3' by default; 0 disables.
+    // Take the current head pose as the seat. '3' by default; 0 disables. Polled whatever
+    // debugKeys says; a press while one of GPL's text fields has the keyboard is left to the text
+    // (TextEntry.h), and without that check the key is polled only with debugKeys.
     //
     // Not optional comfort: OpenXR's LOCAL space turns out to have its origin on the
     // floor rather than at the head -- measured, see STATUS.md -- so without a recentre
