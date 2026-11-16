@@ -5,6 +5,7 @@
 #include "DataRebase.h"
 #include "HeadAudio.h"
 #include "Hooks.h"
+#include "HotkeyBind.h"
 #include "Interpolation.h"
 #include "GplMenuPanel.h"
 #include "Log.h"
@@ -333,14 +334,30 @@ enum RowKind {
     kRowSliderFloat,
     // One of the tabs across the strip under the buttons. Its `tab` is the tab it opens.
     kRowTab,
+    // A keyboard hotkey, `intValue` its option in HotkeyBind's table. A press waits for the
+    // next key on the keyboard and binds it (HotkeyBind.h).
+    kRowKey,
+    // One of a tab's subtabs, across the first line of its page. `tab` is the tab it is on and
+    // `subtab` the subtab it opens.
+    kRowSubtab,
 };
 
 // THE TABS. Each setting lives on one, filed where somebody chasing the symptom would look:
 // the update rates are on Performance rather than beside the mirror and the panel, because a
 // driver reaches for them when the frame rate drops. The page's own buttons -- Save settings,
 // Reset, Help -- are on no tab and sit above the strip, so they are there whichever tab is open.
-enum MenuTab { kTabHeadset = 0, kTabCockpit, kTabPerformance, kTabDisplay, kTabCount };
+enum MenuTab {
+    kTabHeadset = 0,
+    kTabCockpit,
+    kTabPerformance,
+    kTabDisplay,
+    kTabControls,
+    kTabCount
+};
 constexpr int kTabNone = -1;
+
+// Controls' subtabs: the bindings every player has, and the debug hotkeys with their switch.
+enum ControlsSubtab { kSubtabGeneral = 0, kSubtabDebug };
 
 enum RowCommand {
     kCommandNone = 0,
@@ -377,6 +394,9 @@ struct MenuRow {
     // band and can be highlighted, so its help still reads, but is drawn greyed out; its
     // command says why when pressed.
     bool (*available)();
+    // On a tab with subtabs, the subtab the row is on; for a kRowSubtab the subtab it opens.
+    // 0 on every other tab.
+    int subtab;
 };
 
 // pribluda's rows. The overlay is a separate mod and a GEM+ patch, so an install can
@@ -408,6 +428,9 @@ bool inSession() { return !windowInFrontEnd(); }
 // With Pribluda mode Off there is no panel to arrange or place, so the rows leave the page.
 bool pribludaSetupOffered() { return pribludaRowOffered() && g_options.vrHudMode != 0; }
 bool gplMenuFixed() { return g_options.vrGplMenuMode == 1; }
+// The debug hotkeys' rows are on the page while they are polled.
+bool debugKeysOn() { return g_options.debugKeys; }
+bool pribludaDebugKeyOffered() { return debugKeysOn() && pribludaRowOffered(); }
 
 // The root page. Every row here changes a live value and nothing else; Save settings is what
 // writes them to gplvr.ini, so a page of experiments is thrown away by not pressing it.
@@ -432,6 +455,7 @@ MenuRow g_rows[] = {
     {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "",
      kTabPerformance},
     {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabDisplay},
+    {"Controls", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls},
 
     {"Recenter view", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
      "When VR menu is closed, use any unbound controller button to recenter your view",
@@ -543,12 +567,71 @@ MenuRow g_rows[] = {
     {"Monitor view", kRowNamedInt, kCommandNone, nullptr, &g_options.vrMonitorEye, nullptr,
      kMonitorOff, kMonitorBoth, 1,
      "Which eye view to show on your PC screen while you're in VR", kTabDisplay},
+
+    // Each binding row is a keyboard key and a wheel or joystick button for the same action.
+    {"General", kRowSubtab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls,
+     nullptr, nullptr, kSubtabGeneral},
+    {"Debug", kRowSubtab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls,
+     nullptr, nullptr, kSubtabDebug},
+    {"VR menu", kRowKey, kCommandNone, nullptr, &g_options.vrMenuKey, nullptr, 0, 0, 0,
+     "Opens and closes this menu: Ctrl and the key, or the button", kTabControls},
+    {"Recenter", kRowKey, kCommandNone, nullptr, &g_options.vrRecentreKey, nullptr, 0, 0, 0,
+     "Recenters your view.\n"
+     "The key types as usual while a GPL text field (a save name, a chat line) is being edited",
+     kTabControls},
+    {"Camera forward", kRowKey, kCommandNone, nullptr, &g_options.vrCameraForwardKey, nullptr, 0,
+     0, 0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Camera back", kRowKey, kCommandNone, nullptr, &g_options.vrCameraBackKey, nullptr, 0, 0, 0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Camera up", kRowKey, kCommandNone, nullptr, &g_options.vrCameraUpKey, nullptr, 0, 0, 0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Camera down", kRowKey, kCommandNone, nullptr, &g_options.vrCameraDownKey, nullptr, 0, 0, 0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Camera left", kRowKey, kCommandNone, nullptr, &g_options.vrCameraLeftKey, nullptr, 0, 0, 0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Camera right", kRowKey, kCommandNone, nullptr, &g_options.vrCameraRightKey, nullptr, 0, 0,
+     0,
+     "Moves the cockpit camera while held, as Camera position does.\n"
+     "Saved for the car when you let go",
+     kTabControls},
+    {"Debug hotkeys", kRowToggleBool, kCommandNone, &g_options.debugKeys, nullptr, nullptr, 0, 0,
+     0,
+     "Hotkeys for testing, bound below: mirror and Pribluda setup, mirror mode, mouse look.\n"
+     "This menu has everything they do except mouse look",
+     kTabControls, nullptr, nullptr, kSubtabDebug},
+    {"Mirror setup", kRowKey, kCommandNone, nullptr, &g_options.vrMirrorTweakKey, nullptr, 0, 0,
+     0, "Enters and leaves keyboard mirror setup, saving the aim", kTabControls, debugKeysOn,
+     nullptr, kSubtabDebug},
+    {"Mirror mode", kRowKey, kCommandNone, nullptr, &g_options.vrMirrorModeKey, nullptr, 0, 0, 0,
+     "Steps to the next mirror mode", kTabControls, debugKeysOn, nullptr, kSubtabDebug},
+    {"Mouse look", kRowKey, kCommandNone, nullptr, &g_options.vrMouseLookKey, nullptr, 0, 0, 0,
+     "Switches mouse look on and off; head tracking stops while it is on", kTabControls,
+     debugKeysOn, nullptr, kSubtabDebug},
+    {"Pribluda panel", kRowKey, kCommandNone, nullptr, &g_options.vrHudLayerKey, nullptr, 0, 0, 0,
+     "Switches Pribluda between fixed and head-locked", kTabControls, pribludaDebugKeyOffered,
+     nullptr, kSubtabDebug},
+    {"Pribluda layout", kRowKey, kCommandNone, nullptr, &g_options.vrHudTweakKey, nullptr, 0, 0,
+     0, "Enters and leaves keyboard Pribluda layout editing, saving the layout", kTabControls,
+     pribludaDebugKeyOffered, nullptr, kSubtabDebug},
 };
 
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
 
-// The tab on show. It outlives the menu, so the menu reopens where the driver left it.
+// The tab on show, and each tab's open subtab. They outlive the menu, so the menu reopens where
+// the driver left it.
 int g_openTab = kTabHeadset;
+int g_openSubtab[kTabCount] = {};
 
 // -- which rows are on the page -----------------------------------------------------------
 //
@@ -558,6 +641,9 @@ int g_openTab = kTabHeadset;
 // first line with the title, the tabs share the second, and the open tab's rows take one line
 // each below them. The layout, the hit test, the stick and the draw all count in lines and
 // convert, and nothing that remembers a row has to be told the page changed shape.
+//
+// A TAB WITH SUBTABS has them side by side on the first line of its page, and the open
+// subtab's rows below them.
 //
 // THE PAGE IS AS TALL AS ITS TALLEST TAB, whichever tab is open, so switching tabs moves
 // nothing that stays: the buttons and the strip keep their place under the pointer, and a
@@ -576,31 +662,60 @@ bool rowAvailable(int row) {
     return !g_rows[row].available || g_rows[row].available();
 }
 
-// A setting on `tab` that is on the page, as opposed to a button or a tab of the strip.
-bool rowOnTab(int row, int tab) {
-    return rowOffered(row) && g_rows[row].kind != kRowTab && g_rows[row].tab == tab;
+// How many subtabs `tab` has: 0 for a tab without them.
+int subtabCount(int tab) {
+    int count = 0;
+    for (int row = 0; row < kRowCount; ++row)
+        if (g_rows[row].kind == kRowSubtab && g_rows[row].tab == tab &&
+            g_rows[row].subtab + 1 > count)
+            count = g_rows[row].subtab + 1;
+    return count;
 }
 
-// The line `row` is drawn on, or -1 when it is not on the page: refused, or on a tab that is
-// not open.
+bool tabHasSubtabs(int tab) { return subtabCount(tab) > 0; }
+
+// A setting on `tab`'s `subtab` that is on the page, as opposed to a button, a tab of the strip
+// or a subtab.
+bool rowOnSubtab(int row, int tab, int subtab) {
+    return rowOffered(row) && g_rows[row].kind != kRowTab && g_rows[row].kind != kRowSubtab &&
+           g_rows[row].tab == tab && g_rows[row].subtab == subtab;
+}
+
+// The open tab's subtab line, or -1 when it has no subtabs.
+int subtabLine() { return tabHasSubtabs(g_openTab) ? kFirstRowLine : -1; }
+
+// The line `row` is drawn on, or -1 when it is not on the page: refused, or on a tab or subtab
+// that is not open.
 int rowLine(int row) {
     if (!rowOffered(row)) return -1;
-    if (g_rows[row].kind == kRowTab) return kTabLine;
-    if (g_rows[row].tab == kTabNone) return kButtonLine;
-    if (g_rows[row].tab != g_openTab) return -1;
-    int line = kFirstRowLine;
+    const MenuRow& item = g_rows[row];
+    if (item.kind == kRowTab) return kTabLine;
+    if (item.tab == kTabNone) return kButtonLine;
+    if (item.tab != g_openTab) return -1;
+    if (item.kind == kRowSubtab) return kFirstRowLine;
+    int subtab = g_openSubtab[g_openTab];
+    if (item.subtab != subtab) return -1;
+    int line = kFirstRowLine + (tabHasSubtabs(g_openTab) ? 1 : 0);
     for (int i = 0; i < row; ++i)
-        if (rowOnTab(i, g_openTab)) ++line;
+        if (rowOnSubtab(i, g_openTab, subtab)) ++line;
     return line;
+}
+
+// A line of side-by-side boxes rather than one row: the buttons, the tabs, a page's subtabs.
+bool stripLine(int line) {
+    return line == kButtonLine || line == kTabLine || (line >= 0 && line == subtabLine());
 }
 
 int lineCount() {
     int tallest = 0;
     for (int tab = 0; tab < kTabCount; ++tab) {
-        int rows = 0;
-        for (int row = 0; row < kRowCount; ++row)
-            if (rowOnTab(row, tab)) ++rows;
-        if (rows > tallest) tallest = rows;
+        int subtabs = subtabCount(tab);
+        for (int subtab = 0; subtab < (subtabs ? subtabs : 1); ++subtab) {
+            int rows = subtabs ? 1 : 0;  // the subtab line
+            for (int row = 0; row < kRowCount; ++row)
+                if (rowOnSubtab(row, tab, subtab)) ++rows;
+            if (rows > tallest) tallest = rows;
+        }
     }
     return kFirstRowLine + (tallest > 0 ? tallest : 1);
 }
@@ -646,11 +761,26 @@ int tabRow(int tab) {
     return -1;
 }
 
+// The open tab's row on its subtab line for `subtab`, or -1.
+int subtabRow(int subtab) {
+    for (int row = 0; row < kRowCount; ++row)
+        if (g_rows[row].kind == kRowSubtab && g_rows[row].tab == g_openTab &&
+            g_rows[row].subtab == subtab)
+            return row;
+    return -1;
+}
+
 // Where the highlight goes when it has nowhere better: the open tab's first setting, or its
 // tab on the strip when the tab has none on the page.
 int firstRow() {
     int row = lineRow(kFirstRowLine, 0);
     return row >= 0 ? row : tabRow(g_openTab);
+}
+
+void openSubtab(int subtab) {
+    if (subtab == g_openSubtab[g_openTab] || subtabRow(subtab) < 0) return;
+    g_openSubtab[g_openTab] = subtab;
+    logf("vr menu: %s subtab", g_rows[subtabRow(subtab)].label);
 }
 
 void openTab(int tab) {
@@ -752,6 +882,7 @@ int footerLines() {
 // guarded against. The hook stays because setRowInt and setRowBool are the funnel every writer
 // goes through, and the next such rule belongs in exactly one place.
 void enforceRowRules(const MenuRow& changed) {
+    if (changed.boolValue == &g_options.debugKeys) hotkeyDebugKeysChanged();
     if (changed.intValue == &g_options.frameRate && g_options.frameRate > 0 &&
         !interpolationActive())
         notice("Can't set frame rate higher than GPL's vanilla: "
@@ -1369,7 +1500,7 @@ int rowAt(float u, float v) {
     int line = static_cast<int>(v / rowBand());
     int count = lineWidth(line);
     if (count <= 0) return -1;
-    if (line >= kFirstRowLine) return lineRow(line, 0);
+    if (!stripLine(line)) return lineRow(line, 0);
     float left = 0.0f;
     float right = 1.0f;
     lineSpan(line, left, right);
@@ -1454,6 +1585,12 @@ void rowValueText(const MenuRow& row, char* out, size_t size) {
         }
         case kRowSliderFloat:
             _snprintf_s(out, size, _TRUNCATE, "%.2f", row.floatValue ? *row.floatValue : 0.0f);
+            break;
+        case kRowKey:
+            if (hotkeyCaptureTarget(row.intValue))
+                _snprintf_s(out, size, _TRUNCATE, "Press a key or button...");
+            else
+                hotkeyBindingText(row.intValue, out, size);
             break;
         default:
             out[0] = '\0';
@@ -1592,6 +1729,24 @@ void resetRow(int row) {
     if (item.boolValue) {
         bool value = false;
         if (defaultOf(item.boolValue, value)) setRowBool(item, value);
+    } else if (item.kind == kRowKey && item.intValue) {
+        // A button's default is none. The default key may be another hotkey's by now, which
+        // then gives it up.
+        int  value = 0;
+        bool hadButton = joyButtonBound(hotkeyButton(item.intValue));
+        hotkeyButtonClear(item.intValue);
+        if (!defaultOf(item.intValue, value)) return;
+        if (value == *item.intValue && !hadButton) return;
+        setRowInt(item, value);
+        char name[48] = {};
+        char taken[128] = {};
+        char text[200] = {};
+        hotkeyKeyName(value, hotkeyBindingOf(item.intValue)->chord, name, sizeof(name));
+        hotkeyResolveClash(item.intValue, taken, sizeof(taken));
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "%s back to %s, no button%s%s", item.label,
+                    name, taken[0] ? ". " : "", taken);
+        notice(text);
+        return;
     } else if (item.intValue) {
         int value = 0;
         if (defaultOf(item.intValue, value)) setRowInt(item, value);
@@ -1704,7 +1859,9 @@ bool saveSettings() {
     pathsOwnFile(path, sizeof(path), "gplvr.ini");
 
     int  failed = 0;
+    int  total = 0;
     auto writeText = [&](const char* key, const char* value) {
+        ++total;
         if (!WritePrivateProfileStringA("gplvr", key, value, path)) ++failed;
     };
     // THE LEADING SPACE IS THE VALUE'S. WritePrivateProfileString keeps the text left of the
@@ -1750,14 +1907,28 @@ bool saveSettings() {
     writeFloat("vrWorldScale", g_options.vrWorldScale);
     writeFloat("vrHeadAudioWidth", g_options.vrHeadAudioWidth);
     writeInt("vrMonitorEye", g_options.vrMonitorEye);
+    // The Controls tab: the switch, then each binding of HotkeyBind's table, a key or a button.
+    writeInt("debugKeys", g_options.debugKeys ? 1 : 0);
+    char keys[1024] = {};
+    int  keysUsed = 0;
+    for (int i = 0; i < hotkeyBindingCount(); ++i) {
+        const HotkeyBinding& binding = hotkeyBinding(i);
+        char                 text[160] = {" "};
+        hotkeyBindingIniText(binding, text + 1, sizeof(text) - 1);
+        writeText(binding.name, text);
+        int added = _snprintf_s(keys + keysUsed, sizeof(keys) - keysUsed, _TRUNCATE, " %s=%s",
+                                binding.name, text + 1);
+        if (added > 0) keysUsed += added;
+    }
 
     if (failed) {
         notice("Some settings could not be written to gplvr.ini -- is the game folder "
                "read-only?");
-        logf("vr menu: %d of 24 settings could not be written to %s (error %lu)", failed, path,
-             GetLastError());
+        logf("vr menu: %d of %d settings could not be written to %s (error %lu)", failed, total,
+             path, GetLastError());
         return false;
     }
+    logf("vr menu: saved debugKeys=%d%s", g_options.debugKeys ? 1 : 0, keys);
     notice("Saved to gplvr.ini");
     logf("vr menu: saved to %s -- vrHudMode=%d mirrorUpdateInterval=%d "
          "mirrorMode=%d mirrorPlayerCar=%d mirrorDrawDistance=%.3f mirrorDetailDistance=%.3f "
@@ -1805,8 +1976,22 @@ void activateRow(int row) {
         openTab(item.tab);
         return;
     }
+    if (item.kind == kRowSubtab) {
+        openSubtab(item.subtab);
+        return;
+    }
     if (item.kind == kRowAction) {
         runCommand(item.command);
+        return;
+    }
+    if (item.kind == kRowKey && hotkeyBindingOf(item.intValue)) {
+        hotkeyCaptureBegin(item.intValue);
+        char text[160] = {};
+        _snprintf_s(text, sizeof(text), _TRUNCATE,
+                    "Press a key or a wheel/joystick button for %s. Esc or grip cancels, "
+                    "Backspace or Delete unbinds",
+                    item.label);
+        notice(text);
         return;
     }
     if (item.kind == kRowToggleBool && item.boolValue) setRowBool(item, !*item.boolValue);
@@ -1861,6 +2046,7 @@ void dragRow(int row, float u) {
 // last highlighted on the button line, the one row anywhere else.
 int entryRow(int line) {
     if (line == kTabLine) return tabRow(g_openTab);
+    if (line == subtabLine()) return subtabRow(g_openSubtab[g_openTab]);
     if (line == kButtonLine) {
         int row = lineRow(line, g_state.buttonColumn);
         return row >= 0 ? row : lineRow(line, 0);
@@ -1915,7 +2101,7 @@ void adjustWithStick(const VrHandInput& hand, float seconds) {
     // tab it reaches opens: a driver on the stick alone cannot otherwise see what a tab holds
     // without a trigger pull per tab.
     int line = rowLine(g_state.hovered);
-    if (line == kButtonLine || line == kTabLine) {
+    if (stripLine(line)) {
         int step = stickDetent(x, g_state.adjustDetent, g_state.adjustRepeatAt, qpcNow(),
                                g_state.frequency);
         if (!step) return;
@@ -1925,6 +2111,7 @@ void adjustWithStick(const VrHandInput& hand, float seconds) {
         if (column >= count) column = count - 1;
         g_state.hovered = lineRow(line, column);
         if (line == kTabLine) openTab(g_rows[g_state.hovered].tab);
+        if (g_rows[g_state.hovered].kind == kRowSubtab) openSubtab(g_rows[g_state.hovered].subtab);
         return;
     }
 
@@ -2271,6 +2458,7 @@ void tweakSummary(Mode mode, char* out, size_t size) {
 
 void closeMenu(const char* why) {
     if (g_state.mode == Mode::Closed) return;
+    hotkeyCaptureCancel(" -- the VR menu closed");
     logf("vr menu: closed%s", why ? why : "");
     g_state.mode = Mode::Closed;
     g_state.hand = -1;
@@ -3648,7 +3836,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
     // THE BUTTONS AND THE STRIP: boxes side by side, each with its label centred. The open tab
     // is filled and underlined so it reads as the page below it; the highlight is the same
     // bar-and-outline every row gets, on top of either.
-    for (int line = kButtonLine; line <= kTabLine; ++line) {
+    // A page's subtabs are drawn the same way, the open one as the open tab is.
+    for (int line = kButtonLine; line < lines; ++line) {
+        if (!stripLine(line)) continue;
         int   count = lineWidth(line);
         float left = 0.0f;
         float right = 1.0f;
@@ -3660,7 +3850,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
             int   row = lineRow(line, column);
             float x0 = w * (left + cell * static_cast<float>(column)) + 4.0f;
             float x1 = w * (left + cell * static_cast<float>(column + 1)) - 4.0f;
-            bool  open = g_rows[row].kind == kRowTab && g_rows[row].tab == g_openTab;
+            bool  open = (g_rows[row].kind == kRowTab && g_rows[row].tab == g_openTab) ||
+                        (g_rows[row].kind == kRowSubtab &&
+                         g_rows[row].subtab == g_openSubtab[g_openTab]);
 
             if (row == g_state.hovered)
                 gl.color4f(0.22f, 0.45f, 0.78f, 0.95f);
@@ -3678,7 +3870,14 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                 canvasOutline(gl, x0, top, x1, bottom);
             }
 
-            float labelWidth = static_cast<float>(vrTextWidth(kVrTextBody, g_rows[row].label));
+            // A label wider than its box, as "Performance" is with six tabs, drops to the small
+            // size rather than running into its neighbour.
+            int   font = kVrTextBody;
+            float labelWidth = static_cast<float>(vrTextWidth(font, g_rows[row].label));
+            if (labelWidth > x1 - x0 - 8.0f) {
+                font = kVrTextSmall;
+                labelWidth = static_cast<float>(vrTextWidth(font, g_rows[row].label));
+            }
             if (!rowAvailable(row))
                 gl.color4f(0.50f, 0.53f, 0.58f, 1.0f);
             else if (g_rows[row].command == kCommandResetSettings)
@@ -3687,8 +3886,8 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
                 gl.color4f(0.45f, 0.95f, 0.50f, 1.0f);
             else
                 gl.color4f(0.94f, 0.96f, 1.0f, 1.0f);
-            canvasText(gl, kVrTextBody, (x0 + x1 - labelWidth) * 0.5f,
-                       (top + bottom) * 0.5f, g_rows[row].label);
+            canvasText(gl, font, (x0 + x1 - labelWidth) * 0.5f, (top + bottom) * 0.5f,
+                       g_rows[row].label);
         }
     }
     gl.color4f(0.30f, 0.34f, 0.42f, 0.9f);
@@ -3714,6 +3913,7 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
 
     char value[64] = {};
     for (int line = kFirstRowLine; line < lines; ++line) {
+        if (stripLine(line)) continue;
         const int row = lineRow(line, 0);
         if (row < 0) break;
         const float top = band * static_cast<float>(line);
@@ -3861,8 +4061,8 @@ void buildCanvasSignature(char* out, size_t size, int width, int height) {
     // The open tab and lineCount() go in because they decide which row is drawn where: a tab
     // switch or a row that stops being offered moves rows without changing any value, and the
     // canvas has to be rebuilt for that alone.
-    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|%d|%d|",
-                        footer, g_openTab, lineCount());
+    used += _snprintf_s(out + used, size - static_cast<size_t>(used), _TRUNCATE, "%08X|%d|%d|%d|",
+                        footer, g_openTab, g_openSubtab[g_openTab], lineCount());
 
     char value[64] = {};
     for (int row = 0; row < kRowCount && used > 0 && static_cast<size_t>(used) + 40 < size;
@@ -4025,6 +4225,22 @@ void vrMenuPoll() {
     // that is Ctrl + the menu key, or Esc.
     bool back = gripTapped(hand, state.gripSince[state.hand], state.gripConsumed[state.hand]);
     back = back || keys.toggle || keys.back;
+
+    // A KEY BEING BOUND HAS THE WHOLE MENU, and so does the key that bound it until it is let
+    // go: the Enter, Esc or arrow that ended a capture must not also work the page. Back cancels.
+    if (hotkeyCaptureActive() && state.mode != Mode::Menu)
+        hotkeyCaptureCancel(" -- the menu left its page");
+    char captured[200] = {};
+    if (hotkeyCapturePoll(captured, sizeof(captured))) notice(captured);
+    if (hotkeyCaptureActive()) {
+        if (back) {
+            hotkeyCaptureCancel(" -- back");
+            notice("Binding cancelled");
+        }
+        return;
+    }
+    if (hotkeyCaptureBusy()) return;
+
     if (back) {
         if (state.mode == Mode::Menu) {
             closeMenu(" -- the grip");
@@ -4220,7 +4436,7 @@ void vrMenuPoll() {
     // and activates, and the trigger only ever acts on what the ray is on.
     if (hand.stick.pressed) {
         int kind = state.hovered >= 0 ? g_rows[state.hovered].kind : -1;
-        if (kind == kRowAction || kind == kRowTab) {
+        if (kind == kRowAction || kind == kRowTab || kind == kRowSubtab) {
             // It may have left the page -- closed the menu, opened a tweak mode or the reset
             // dialog -- so nothing below runs against it this poll.
             activateRow(state.hovered);

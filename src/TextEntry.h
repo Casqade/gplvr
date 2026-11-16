@@ -30,11 +30,15 @@ void textEntryInstall();
 // True once textEntryInstall has verified everything the walk reads.
 bool textEntryReady();
 
+// vrRecentreKey as polled: always with the check ready, otherwise only with debugKeys; 0 is none.
+int recentreKey();
+
 // True while a shown window holds a focused, writable edit box -- GPL is taking typed text. False
 // when the check is not ready. A walk that faults answers true and is counted.
 bool gplTextEntryActive();
 
-// For a hotkey's press edge: false, with a log line naming the key, while GPL is taking typed text.
+// For a hotkey's press edge: false while the VR menu is capturing a key binding
+// (hotkeyCaptureBusy), and, with a log line naming the key, while GPL is taking typed text.
 bool hotkeyPressAllowed(int virtualKey, const char* name);
 
 }  // namespace gplvr

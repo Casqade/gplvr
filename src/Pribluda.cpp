@@ -6,7 +6,7 @@
 #include "DataRebase.h"
 #include "Log.h"
 #include "Paths.h"
-#include "TextEntry.h"
+#include "HotkeyBind.h"
 #include "VrMenu.h"
 #include "presenter/Producer.h"
 
@@ -751,7 +751,6 @@ struct Tweak {
     bool     active = false;
     bool     moved = false;
     int      selected = 0;
-    bool     keyLast = false;
     bool     previousLast = false;
     bool     nextLast = false;
     LONGLONG frequency = 0;
@@ -1186,7 +1185,7 @@ void pribludaDrawHud() {
 }
 
 void pribludaPollTweak() {
-    if (!g_options.vr || !g_options.vrHudTweakKey || !g_layout.present) return;
+    if (!g_options.vr || !g_options.debugKeys || !g_layout.present) return;
 
     LONGLONG now = qpcNow();
     double seconds = g_tweak.lastPoll ? static_cast<double>(now - g_tweak.lastPoll) /
@@ -1195,13 +1194,12 @@ void pribludaPollTweak() {
     g_tweak.lastPoll = now;
     if (seconds > kMaxStepSeconds) seconds = kMaxStepSeconds;
 
-    bool toggle = keyHeld(g_options.vrHudTweakKey);
+    // Its key or its button (HotkeyBind.h).
+    bool togglePressed = hotkeyActionPressed(&g_options.vrHudTweakKey);
     bool previous = keyHeld(VK_PRIOR);
     bool next = keyHeld(VK_NEXT);
-    bool togglePressed = toggle && !g_tweak.keyLast;
     bool previousPressed = previous && !g_tweak.previousLast;
     bool nextPressed = next && !g_tweak.nextLast;
-    g_tweak.keyLast = toggle;
     g_tweak.previousLast = previous;
     g_tweak.nextLast = next;
 
@@ -1213,9 +1211,7 @@ void pribludaPollTweak() {
     bool focused = GetForegroundWindow() == gameWindow();
 
     if (!g_tweak.active) {
-        if (togglePressed && live && focused &&
-            hotkeyPressAllowed(g_options.vrHudTweakKey, "vrHudTweakKey"))
-            enterTweak();
+        if (togglePressed && live && focused) enterTweak();
         return;
     }
     if (!live) {

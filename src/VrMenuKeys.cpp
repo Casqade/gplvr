@@ -1,6 +1,7 @@
 #include "VrMenuKeys.h"
 
 #include "Hooks.h"
+#include "HotkeyBind.h"
 #include "Log.h"
 #include "VrMenu.h"
 
@@ -50,10 +51,12 @@ bool owned(unsigned key) { return key < 256 && g_owned[key].load(); }
 
 }  // namespace
 
-void vrMenuKeysLoadOptions(const char* path) {
-    g_options.vrMenuKey = GetPrivateProfileIntA("gplvr", "vrMenuKey", 'M', path);
-    if (g_options.vrMenuKey < 0 || g_options.vrMenuKey > 0xFE) g_options.vrMenuKey = 0;
-    if (g_options.vrMenuKey)
+void vrMenuKeysLoadOptions(const char*) {
+    // The key itself is read with every other binding (hotkeyBindingsLoad); this says what it is.
+    if (joyButtonBound(hotkeyButton(&g_options.vrMenuKey)))
+        logf("options: vrMenuKey is a wheel/joystick button -- it opens the VR menu and steps "
+             "back out; the keyboard's arrows, Enter and Esc still work the menu");
+    else if (g_options.vrMenuKey)
         logf("options: vrMenuKey=0x%02X ('%c') -- Ctrl and that key open the VR menu and step "
              "back out; inside it the arrows move and change, Enter selects, Esc steps back",
              g_options.vrMenuKey,
@@ -65,13 +68,16 @@ void vrMenuKeysLoadOptions(const char* path) {
 VrMenuKeys vrMenuKeysPoll() {
     State&     s = g_state;
     VrMenuKeys keys;
-    if (!g_options.vr || !g_options.vrMenuKey || GetForegroundWindow() != gameWindow()) {
+    bool bound = g_options.vrMenuKey || joyButtonBound(hotkeyButton(&g_options.vrMenuKey));
+    if (!g_options.vr || !bound || GetForegroundWindow() != gameWindow()) {
         s.toggleDown = s.backDown = s.enterDown = false;
         return keys;
     }
 
     bool open = vrMenuActive();
-    bool toggle = held(g_options.vrMenuKey) && held(VK_CONTROL);
+    // Ctrl and the key, or the menu's wheel or joystick button (HotkeyBind.h).
+    bool toggle = (held(g_options.vrMenuKey) && held(VK_CONTROL)) ||
+                  hotkeyButtonHeld(&g_options.vrMenuKey);
     bool back = held(VK_ESCAPE);
     bool enter = held(VK_RETURN);
     // Esc and Enter mean something only with the menu open; with it shut they are GPL's.

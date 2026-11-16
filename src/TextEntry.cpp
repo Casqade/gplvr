@@ -2,6 +2,7 @@
 
 #include "DataRebase.h"
 #include "Hooks.h"
+#include "HotkeyBind.h"
 #include "Log.h"
 
 #include <windows.h>
@@ -186,14 +187,16 @@ void textEntryInstall() {
                   "keyboard is left to the text"
                 : "refused -- hotkeys are not held back while a text field has the keyboard");
     }
-    if (!g_ready && !g_options.debugKeys && g_options.vrRecentreKey) {
-        g_options.vrRecentreKey = 0;
-        logf("options: vrRecentreKey=0 -- without the text field check a digit typed into a name "
-             "would recentre; set debugKeys=1 to poll it anyway");
-    }
+    if (!g_ready)
+        logf("options: vrRecentreKey is polled only with debugKeys -- without the text field "
+             "check a digit typed into a name would recentre");
 }
 
 bool textEntryReady() { return g_ready; }
+
+int recentreKey() {
+    return (g_ready || g_options.debugKeys) ? g_options.vrRecentreKey : 0;
+}
 
 bool gplTextEntryActive() {
     if (!g_ready) return false;
@@ -205,6 +208,8 @@ bool gplTextEntryActive() {
 }
 
 bool hotkeyPressAllowed(int virtualKey, const char* name) {
+    // The VR menu is taking a key for a binding, or the key that gave it one is still down.
+    if (hotkeyCaptureBusy()) return false;
     if (!gplTextEntryActive()) return true;
     ++g_inhibited;
     if (g_inhibited <= 8 || g_inhibited % 64 == 0)

@@ -151,8 +151,9 @@ struct Options {
     int vrMenuKey = 'M';
 
     // EVERY HOTKEY BELOW (every option ending in Key) except vrRecentreKey is a debug control: the
-    // VR menu has what each one toggles. Off, loadOptions sets them to 0, so none is polled,
-    // swallowed or checked for a clash; on, each reads its own line of gplvr.ini as before.
+    // VR menu has what each one toggles. Each poll and swallow reads its key through debugKey(),
+    // which is 0 ("no key") while this is off; the keys keep their values, so the VR menu's
+    // Controls tab switches them on and off live and rebinds them (HotkeyBind.h).
     bool debugKeys = false;
 
     // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
@@ -394,6 +395,19 @@ struct Options {
     // floor rather than at the head -- measured, see STATUS.md -- so without a recentre
     // the view sits a standing height above the driver.
     int vrRecentreKey = '3';
+
+    // Move the cockpit camera while the key is held, as the VR menu's Camera position does
+    // (CameraConfig.h); the viewed car's position is saved when the last one is let go. 0 (the
+    // default) is unbound. Not debug keys. Each action also takes a wheel or joystick button,
+    // vr<Action>Button in gplvr.ini (HotkeyBind.h), as every hotkey above and below does.
+    int vrCameraForwardKey = 0;
+    int vrCameraBackKey = 0;
+    int vrCameraUpKey = 0;
+    int vrCameraDownKey = 0;
+    int vrCameraLeftKey = 0;
+    int vrCameraRightKey = 0;
+    // Metres a second the camera keys move it.
+    float vrCameraMoveSpeed = 0.10f;
 
     // Drive the camera with the MOUSE, and stop head tracking driving it.
     //
@@ -816,6 +830,9 @@ struct Options {
 };
 
 extern Options g_options;
+
+// A debug hotkey as polled: its binding while debugKeys is on, 0 ("no key") while it is off.
+inline int debugKey(int key) { return g_options.debugKeys ? key : 0; }
 
 // The things Options::mirrorMode decides: whether each eye renders the mirror from its own
 // viewpoint, whether the glasses share one pane or each has an exact pane of its own, and, with

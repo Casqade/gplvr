@@ -112,6 +112,8 @@ else()
         src/GplMenuPanel.cpp
         src/GpuTimer.cpp
         src/Hooks.cpp
+        src/HotkeyBind.cpp
+        src/Joystick.cpp
         src/Hud.cpp
         src/Interpolation.cpp
         src/Letterbox.cpp
@@ -210,7 +212,8 @@ else()
     # only way to read them. Unlike d3d11 and opengl32 this costs nothing to import --
     # gdi32 is already loaded in any GUI process, opengl32 itself depends on it, and it
     # is a KnownDLL so the import cannot be redirected by anything on disk.
-    target_link_libraries(gplvr PRIVATE user32 gdi32)
+    # dinput8 and dxguid: Joystick.cpp's wheel and joystick buttons.
+    target_link_libraries(gplvr PRIVATE user32 gdi32 dinput8 dxguid)
 
     # -- the loader --------------------------------------------------------------
     # Starts the game suspended, injects gplvr.dll, resumes. See the comment at the top

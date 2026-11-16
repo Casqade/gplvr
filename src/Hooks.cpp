@@ -36,6 +36,7 @@
 #include "Stereo.h"
 #include "SwapControl.h"
 #include "TaskRate.h"
+#include "HotkeyBind.h"
 #include "TextEntry.h"
 #include "TweakApi.h"
 #include "VrCamera.h"
@@ -125,10 +126,6 @@ unsigned  g_sceneOrigCalls = 0;  // times we called the engine's sceneRender
 long long g_sceneTicks = 0;      // total time inside the original, all invocations
 long long g_sceneTicksWorst = 0;
 bool      g_vrStarted = false;
-bool      g_vrRecentreKeyLast = false;
-bool      g_vrHudLayerKeyLast = false;
-bool      g_vrMirrorModeKeyLast = false;
-bool      g_vrMouseLookKeyLast = false;
 bool      g_loggedMouseLook = false;
 
 const char* mirrorModeText(int mode) {
@@ -659,7 +656,6 @@ constexpr double   kMirrorTweakLogSeconds = 0.5;      // between progress lines 
 
 struct MirrorTweak {
     bool     active = false;
-    bool     keyLast = false;
     bool     selectLast = false;  // Home, which steps once per press rather than per poll
     bool     unlogged = false;  // the values changed since the last line
     LONGLONG frequency = 0;
@@ -702,7 +698,7 @@ void mirrorTweakEnter() {
 
 // Once a frame from the key poll, after HUD tweak mode's.
 void mirrorTweakPoll() {
-    if (!g_options.vr || !g_options.vrMirrorTweakKey) return;
+    if (!g_options.vr || !g_options.debugKeys) return;
 
     LARGE_INTEGER counter;
     if (!g_mirrorTweak.frequency) {
@@ -718,9 +714,8 @@ void mirrorTweakPoll() {
     g_mirrorTweak.lastPoll = now;
     if (seconds > kMirrorTweakMaxStepSeconds) seconds = kMirrorTweakMaxStepSeconds;
 
-    bool toggle = mirrorTweakKeyHeld(g_options.vrMirrorTweakKey);
-    bool togglePressed = toggle && !g_mirrorTweak.keyLast;
-    g_mirrorTweak.keyLast = toggle;
+    // Its key or its button (HotkeyBind.h).
+    bool togglePressed = hotkeyActionPressed(&g_options.vrMirrorTweakKey);
 
     // Keys typed into another window are not for it.
     if (GetForegroundWindow() != gameWindow()) return;
@@ -728,7 +723,7 @@ void mirrorTweakPoll() {
         if (g_mirrorTweak.active) {
             // The key IS the save. Nothing else writes.
             mirrorTweakExit("", true);
-        } else if (hotkeyPressAllowed(g_options.vrMirrorTweakKey, "vrMirrorTweakKey")) {
+        } else {
             mirrorTweakEnter();
         }
         return;
@@ -791,8 +786,8 @@ void mirrorTweakPoll() {
 // toggles, which is in VR with a key set, and the adjusting keys while the mode is on. Only
 // presses; releases still reach the game.
 bool mirrorTweakSwallowsKey(unsigned virtualKey) {
-    if (!g_options.vr || !g_options.vrMirrorTweakKey) return false;
-    if (virtualKey == static_cast<unsigned>(g_options.vrMirrorTweakKey)) return true;
+    if (!g_options.vr || !debugKey(g_options.vrMirrorTweakKey)) return false;
+    if (virtualKey == static_cast<unsigned>(debugKey(g_options.vrMirrorTweakKey))) return true;
     if (!g_mirrorTweak.active) return false;
     for (unsigned key : kMirrorTweakKeys) {
         if (key == virtualKey) return true;
@@ -834,24 +829,20 @@ void mirrorTweakExit(const char* why, bool save) {
 namespace {
 
 void pollToggle() {
+    // The wheels and joysticks, then the camera keys, before any action is asked about
+    // (HotkeyBind.h). Each action below fires on its key or its button.
+    hotkeyPollFrame();
+
     // Recentre: whatever pose the driver is in becomes the seat. Needed because
     // OpenXR's LOCAL space has its origin on the floor, not at the head -- measured,
     // see STATUS.md -- so without this the view starts a standing height too high.
-    if (g_options.vr && g_options.vrRecentreKey) {
-        const bool down = (GetAsyncKeyState(g_options.vrRecentreKey) & 0x8000) != 0;
-        if (down && !g_vrRecentreKeyLast && !hotkeyOwnedByMode(g_options.vrRecentreKey) &&
-            hotkeyPressAllowed(g_options.vrRecentreKey, "vrRecentreKey"))
-            vrRequestRecentre();
-        g_vrRecentreKeyLast = down;
-    }
+    if (g_options.vr && hotkeyActionPressed(&g_options.vrRecentreKey)) vrRequestRecentre();
 
     // Pribluda's panel between the head and the seat. Tweak mode is left as it is, so an
     // element being placed can be looked at both ways. A seat panel with no seat published
     // would be invisible, so one is published on the spot.
-    if (g_options.vr && g_options.vrHudLayerKey) {
-        bool down = (GetAsyncKeyState(g_options.vrHudLayerKey) & 0x8000) != 0;
-        if (down && !g_vrHudLayerKeyLast && !hotkeyOwnedByMode(g_options.vrHudLayerKey) &&
-            hotkeyPressAllowed(g_options.vrHudLayerKey, "vrHudLayerKey")) {
+    if (g_options.vr) {
+        if (hotkeyActionPressed(&g_options.vrHudLayerKey)) {
             g_options.vrHudMode = hudLayer() == 1 ? 1 : 2;
             const char* seat = "";
             if (hudLayer() == 2 && !presenterSeatPublished()) {
@@ -863,7 +854,6 @@ void pollToggle() {
             logf("vr: HUD panel switched to %s%s",
                  hudLayer() == 1 ? "follow the head" : "the seat", seat);
         }
-        g_vrHudLayerKeyLast = down;
     }
 
     // The controllers, before anything that reacts to them. One read of the shared block
@@ -894,17 +884,10 @@ void pollToggle() {
 
     // The next mirror mode. The pass loop reads mirrorMode every frame and the main world walk
     // redirect is installed whichever way it started, so the modes swap freely.
-    if (g_options.vr && g_options.vrMirrorModeKey) {
-        bool down = (GetAsyncKeyState(g_options.vrMirrorModeKey) & 0x8000) != 0;
-        if (down && !g_vrMirrorModeKeyLast && !hotkeyOwnedByMode(g_options.vrMirrorModeKey) &&
-            hotkeyPressAllowed(g_options.vrMirrorModeKey, "vrMirrorModeKey")) {
-            g_options.mirrorMode = (g_options.mirrorMode + 1) % (kMirrorPerGlass + 1);
-            logf("mirror: mode %d -- %s", g_options.mirrorMode,
-                 mirrorModeText(g_options.mirrorMode));
-        }
-        g_vrMirrorModeKeyLast = down;
+    if (g_options.vr && hotkeyActionPressed(&g_options.vrMirrorModeKey)) {
+        g_options.mirrorMode = (g_options.mirrorMode + 1) % (kMirrorPerGlass + 1);
+        logf("mirror: mode %d -- %s", g_options.mirrorMode, mirrorModeText(g_options.mirrorMode));
     }
-
 
     // THE TOP OF A FRAME, BEFORE ANYTHING ASKS FOR A SURFACE. The session that owned gplvr's
     // cached rasterizer handles has ended, and a handle outliving its session is what killed
@@ -923,17 +906,10 @@ void pollToggle() {
     // Deliberately NOT gated on g_options.vr: the whole reason this exists is to drive
     // the camera with vr = 0, on a flat monitor, where a straight line is straight and
     // the headset cannot be blamed for anything.
-    if (g_options.vrMouseLookKey) {
-        const bool down = (GetAsyncKeyState(g_options.vrMouseLookKey) & 0x8000) != 0;
-        if (down && !g_vrMouseLookKeyLast && !hotkeyOwnedByMode(g_options.vrMouseLookKey) &&
-            hotkeyPressAllowed(g_options.vrMouseLookKey, "vrMouseLookKey")) {
-            g_options.vrMouseLook = !g_options.vrMouseLook;
-            logf("mouselook toggled %s%s", g_options.vrMouseLook ? "ON" : "off",
-                 (g_options.vrMouseLook && g_options.vr)
-                     ? " -- head tracking is now inhibited"
-                     : "");
-        }
-        g_vrMouseLookKeyLast = down;
+    if (hotkeyActionPressed(&g_options.vrMouseLookKey)) {
+        g_options.vrMouseLook = !g_options.vrMouseLook;
+        logf("mouselook toggled %s%s", g_options.vrMouseLook ? "ON" : "off",
+             (g_options.vrMouseLook && g_options.vr) ? " -- head tracking is now inhibited" : "");
     }
 
     if (g_options.vrMouseLook && mouseLookEnsureStarted()) {
@@ -2198,12 +2174,21 @@ LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPA
     // have seen the deactivation at all.
     if (message == WM_ACTIVATEAPP) releaseStuckModifiers(window, wParam != FALSE);
 
+    // A wheel or joystick came or went: the button bindings list the devices again.
+    if (message == WM_DEVICECHANGE) joystickRequestRescan();
+
     // The window and menu-scaling messages first. It may answer the message outright
     // (WM_GETMINMAXINFO, WM_CLOSE) or rewrite lParam and let it carry on down the chain,
     // which is what the mouse remap does -- the platform wndproc below takes the click
     // position straight out of lParam.
     LRESULT handled = 0;
     if (windowHandleMessage(window, message, wParam, lParam, handled)) return handled;
+
+    // The VR menu's key binding takes the next key press and keeps it, and its characters, from
+    // the game and from every other swallow below (HotkeyBind.h).
+    if (hotkeyCaptureSwallow(message, static_cast<unsigned>(wParam),
+                             static_cast<unsigned>(lParam)))
+        return 0;
 
     // HUD tweak mode steers with the arrows and Page Up/Down. GPL takes its keyboard only
     // from these messages, in the keyboard proc below, so the presses stop here while the
@@ -2215,8 +2200,8 @@ LRESULT CALLBACK activationWndProc(HWND window, UINT message, WPARAM wParam, LPA
     // Mirror tweak mode steers with the same keys, and its toggle key stops here as well.
     if (message == WM_KEYDOWN && mirrorTweakSwallowsKey(static_cast<unsigned>(wParam)))
         return 0;
-    if (message == WM_KEYDOWN && g_options.vr && g_options.vrMirrorModeKey &&
-        static_cast<unsigned>(wParam) == static_cast<unsigned>(g_options.vrMirrorModeKey))
+    if (int key = debugKey(g_options.vrMirrorModeKey); message == WM_KEYDOWN && g_options.vr &&
+                                                        key && wParam == static_cast<WPARAM>(key))
         return 0;
 
     // The VR menu's keys: Ctrl + its own key always, the arrows, Enter and Esc while it is open.
@@ -2455,22 +2440,20 @@ void windowProcUnchain() {
 // both handlers polled GetAsyncKeyState independently, and one press did both things with
 // nothing refusing.
 //
-// This is the whole table. A key added without a line here is a key this cannot see.
+// The table is HotkeyBind's, every plain key in it; vrMenuKey is pressed with Ctrl.
 void hotkeyCollisionReport() {
     struct Entry {
         const char* name;
         int         code;
         bool        modeToggle;  // enters or leaves a keyboard tweak mode
     };
-    const Entry keys[] = {
-        {"vrMirrorTweakKey", g_options.vrMirrorTweakKey, true},
-        {"vrMirrorModeKey", g_options.vrMirrorModeKey, false},
-        {"vrRecentreKey", g_options.vrRecentreKey, false},
-        {"vrMouseLookKey", g_options.vrMouseLookKey, false},
-        {"vrHudLayerKey", g_options.vrHudLayerKey, false},
-        {"vrHudTweakKey", g_options.vrHudTweakKey, true},
-    };
-    int count = static_cast<int>(sizeof(keys) / sizeof(keys[0]));
+    Entry keys[32] = {};
+    int   count = 0;
+    for (int i = 0; i < hotkeyBindingCount() && count < 32; ++i) {
+        const HotkeyBinding& binding = hotkeyBinding(i);
+        if (binding.chord) continue;
+        keys[count++] = {binding.name, *binding.value, binding.modeToggle};
+    }
     int clashes = 0;
     int enabled = 0;
     for (int i = 0; i < count; ++i) {
@@ -2562,8 +2545,9 @@ void loadOptions(const char* fileName) {
              "naming what refused. Until they exist every frame renders, as before.",
              g_options.mirrorUpdateInterval);
     }
-    g_options.vrMirrorTweakKey = GetPrivateProfileIntA("gplvr", "vrMirrorTweakKey", 'M', path);
-    g_options.vrMirrorModeKey = GetPrivateProfileIntA("gplvr", "vrMirrorModeKey", 'N', path);
+    // Every hotkey's line, a key or a wheel/joystick button (HotkeyBind.h), before anything
+    // below reads or zeroes one.
+    hotkeyBindingsLoad(path);
     GetPrivateProfileStringA("gplvr", "vrMirrorTweakAngleSpeed", "10.0", text, sizeof(text),
                              path);
     g_options.vrMirrorTweakAngleSpeed = static_cast<float>(atof(text));
@@ -2610,7 +2594,10 @@ void loadOptions(const char* fileName) {
                  runtime);
         }
     }
-    g_options.vrRecentreKey = GetPrivateProfileIntA("gplvr", "vrRecentreKey", '3', path);
+    GetPrivateProfileStringA("gplvr", "vrCameraMoveSpeed", "0.10", text, sizeof(text), path);
+    g_options.vrCameraMoveSpeed = static_cast<float>(atof(text));
+    if (!(g_options.vrCameraMoveSpeed > 0.0f) || g_options.vrCameraMoveSpeed > 1.0f)
+        g_options.vrCameraMoveSpeed = 0.10f;
     g_options.vrMouseLook =
         GetPrivateProfileIntA("gplvr", "vrMouseLook", 0, path) != 0;
     GetPrivateProfileStringA("gplvr", "vrMouseLookSensitivity", "0.08", text,
@@ -2618,8 +2605,6 @@ void loadOptions(const char* fileName) {
     g_options.vrMouseLookSensitivity = static_cast<float>(atof(text));
     g_options.vrMouseLookInvertPitch =
         GetPrivateProfileIntA("gplvr", "vrMouseLookInvertPitch", 0, path) != 0;
-    g_options.vrMouseLookKey =
-        GetPrivateProfileIntA("gplvr", "vrMouseLookKey", '6', path);
     GetPrivateProfileStringA("gplvr", "vrHorizonLock", "0.0", text, sizeof(text), path);
     g_options.vrHorizonLock = static_cast<float>(atof(text));
     GetPrivateProfileStringA("gplvr", "vrReplayHorizonLock", "1.0", text, sizeof(text), path);
@@ -2715,8 +2700,6 @@ void loadOptions(const char* fileName) {
     readFloat("vrHudBackdropOpacity", g_options.vrHudBackdropOpacity);
     if (g_options.vrHudBackdropOpacity < 0.0f) g_options.vrHudBackdropOpacity = 0.0f;
     if (g_options.vrHudBackdropOpacity > 1.0f) g_options.vrHudBackdropOpacity = 1.0f;
-    g_options.vrHudLayerKey = GetPrivateProfileIntA("gplvr", "vrHudLayerKey", VK_HOME, path);
-    g_options.vrHudTweakKey = GetPrivateProfileIntA("gplvr", "vrHudTweakKey", VK_END, path);
     GetPrivateProfileStringA("gplvr", "vrHudTweakSpeed", "0.10", text, sizeof(text), path);
     g_options.vrHudTweakSpeed = static_cast<float>(atof(text));
     if (g_options.vrHudTweakSpeed < 0.005f) g_options.vrHudTweakSpeed = 0.005f;
@@ -2836,18 +2819,11 @@ void loadOptions(const char* fileName) {
         // what used to make it read as a VR feature.
     }
 
-    // The hotkeys are debug controls; the VR menu has what each of them toggles. Off, every key
-    // reads 0, which each poll, each swallow and the clash table already take as "no key".
-    // vrRecentreKey stays: a press is left to GPL while one of its text fields has the keyboard
-    // (TextEntry.h), and textEntryInstall takes the key away when that check is refused.
+    // The hotkeys are debug controls; the VR menu has what each of them toggles, and its Controls
+    // tab switches them on and off live. Off, each poll and swallow reads its key through
+    // debugKey(), which gives 0, "no key". vrRecentreKey stays: a press is left to GPL while one of
+    // its text fields has the keyboard (TextEntry.h), and without that check it needs debugKeys.
     g_options.debugKeys = GetPrivateProfileIntA("gplvr", "debugKeys", 0, path) != 0;
-    if (!g_options.debugKeys) {
-        g_options.vrMirrorTweakKey = 0;
-        g_options.vrMirrorModeKey = 0;
-        g_options.vrMouseLookKey = 0;
-        g_options.vrHudLayerKey = 0;
-        g_options.vrHudTweakKey = 0;
-    }
     logf("options: debugKeys=%d (%s)", g_options.debugKeys ? 1 : 0,
          g_options.debugKeys ? "the hotkeys of gplvr.ini are polled"
                              : "only vrRecentreKey is polled; the VR menu has every setting the "
