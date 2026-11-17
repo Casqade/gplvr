@@ -262,7 +262,7 @@ enum class Mode {
     // rather than a flag, because while it is up the tweak mode's bindings must not run --
     // the stick answering the question must not also be moving the thing being asked about.
     Confirm,
-    // "Reset what?" -- five answers rather than three, and its own mode for the same reason
+    // "Reset what?" -- a list of answers (ResetChoice), and its own mode for the same reason
     // Confirm is: while a question about the settings is up, nothing else may write them.
     Reset,
     // The Help button's popup: how the controllers work the menu, and a Close button.
@@ -285,6 +285,7 @@ enum ResetChoice {
     kResetMirrors,
     kResetCamera,
     kResetPribluda,
+    kResetBindings,
     kResetEverything,
     kResetCancel,
     kResetCount
@@ -292,7 +293,8 @@ enum ResetChoice {
 
 const char* const kResetLabel[kResetCount] = {"Reset VR settings",     "Clear mirror presets",
                                               "Clear camera presets",  "Reset Pribluda layout",
-                                              "Reset ALL",             "Cancel"};
+                                              "Reset input bindings",  "Reset ALL",
+                                              "Cancel"};
 
 // "Are you sure?" after any Reset answer but Cancel: every one of them writes a file at once and
 // none can be undone. No is drawn second and is the one it opens on.
@@ -1842,6 +1844,40 @@ void runCommand(int command) {
 // WHAT A TWEAK MODE CHANGES IS NOT HERE. The mirror aim and the pribluda layout live in
 // their own files, the HUD panel's placement in its own eight keys of this one, and each
 // tweak mode asks about its own on the way out -- so none of them needs this row.
+// Each binding of HotkeyBind's table as its gplvr.ini line, a key or a button, with the leading
+// space saveSettings explains. `keys` collects " name=value" for the log. Returns how many lines
+// could not be written.
+int writeBindingLines(const char* path, char* keys, size_t keysSize) {
+    int failed = 0;
+    int used = 0;
+    for (int i = 0; i < hotkeyBindingCount(); ++i) {
+        const HotkeyBinding& binding = hotkeyBinding(i);
+        char                 text[160] = {" "};
+        hotkeyBindingIniText(binding, text + 1, sizeof(text) - 1);
+        if (!WritePrivateProfileStringA("gplvr", binding.name, text, path)) ++failed;
+        int added = _snprintf_s(keys + used, keysSize - used, _TRUNCATE, " %s=%s", binding.name,
+                                text + 1);
+        if (added > 0) used += added;
+    }
+    return failed;
+}
+
+// The bindings alone, for Reset input bindings: the other settings on the page keep whatever
+// the file has, saved or not. True when every line was written.
+bool saveBindings() {
+    char path[MAX_PATH] = {};
+    pathsOwnFile(path, sizeof(path), "gplvr.ini");
+    char keys[1024] = {};
+    int  failed = writeBindingLines(path, keys, sizeof(keys));
+    if (failed) {
+        logf("vr menu: %d of %d bindings could not be written to %s (error %lu)", failed,
+             hotkeyBindingCount(), path, GetLastError());
+        return false;
+    }
+    logf("vr menu: bindings saved to %s --%s", path, keys);
+    return true;
+}
+
 // True when every key was written.
 bool saveSettings() {
     // The same file loadOptions read, beside gplvr. Writing one in the game's folder instead
@@ -1901,16 +1937,8 @@ bool saveSettings() {
     // The Controls tab: the switch, then each binding of HotkeyBind's table, a key or a button.
     writeInt("debugKeys", g_options.debugKeys ? 1 : 0);
     char keys[1024] = {};
-    int  keysUsed = 0;
-    for (int i = 0; i < hotkeyBindingCount(); ++i) {
-        const HotkeyBinding& binding = hotkeyBinding(i);
-        char                 text[160] = {" "};
-        hotkeyBindingIniText(binding, text + 1, sizeof(text) - 1);
-        writeText(binding.name, text);
-        int added = _snprintf_s(keys + keysUsed, sizeof(keys) - keysUsed, _TRUNCATE, " %s=%s",
-                                binding.name, text + 1);
-        if (added > 0) keysUsed += added;
-    }
+    total += hotkeyBindingCount();
+    failed += writeBindingLines(path, keys, sizeof(keys));
 
     if (failed) {
         notice("Some settings could not be written to gplvr.ini -- is the game folder "
@@ -2712,14 +2740,28 @@ void answerReset(int choice) {
     char done[192] = {};
     int  written = 0;
 
+    // The key and button rows are Reset input bindings'; Reset VR settings leaves them. Saved
+    // at once, like the mirror presets and the Pribluda layout below, so every choice in this
+    // dialog leaves its file as the notice says.
+    bool bindings = all || choice == kResetBindings;
+    if (bindings)
+        for (int row = 0; row < kRowCount; ++row)
+            if (g_rows[row].kind == kRowKey) resetRow(row);
     if (all || choice == kResetVrSettings) {
-        // Saved at once, like the mirror presets and the Pribluda layout below, so every
-        // choice in this dialog leaves its file as the notice says.
-        for (int row = 0; row < kRowCount; ++row) resetRow(row);
+        for (int row = 0; row < kRowCount; ++row)
+            if (g_rows[row].kind != kRowKey) resetRow(row);
+        // saveSettings writes the bindings too.
         bool saved = saveSettings();
         written += _snprintf_s(done, sizeof(done), _TRUNCATE, "%s",
-                               saved ? "Settings saved to gplvr.ini"
-                                     : "Failed to write settings: gplvr.ini could not be written");
+                               !saved     ? "Failed to write settings: gplvr.ini could not be written"
+                               : bindings ? "Settings and input bindings saved to gplvr.ini"
+                                          : "Settings saved to gplvr.ini");
+    } else if (bindings) {
+        bool saved = saveBindings();
+        written += _snprintf_s(done, sizeof(done), _TRUNCATE, "%s",
+                               saved ? "Input bindings saved to gplvr.ini"
+                                     : "Failed to write input bindings: gplvr.ini could not be "
+                                       "written");
     }
     if (all || choice == kResetMirrors) {
         char carSet[24] = {};
@@ -3709,9 +3751,9 @@ void drawCanvasContent(const GlFunctions& gl, int width, int height) {
         return;
     }
 
-    // "RESET WHAT?" -- the same three-part shape as the save dialog, with five answers. The
-    // destructive ones say what file they clear, because "reset" on its own does not tell
-    // anyone whether their per-car mirror work is about to go.
+    // "RESET WHAT?" -- the same three-part shape as the save dialog, with ResetChoice's
+    // answers. The destructive ones say what file they clear, because "reset" on its own does
+    // not tell anyone whether their per-car mirror work is about to go.
     if (g_state.mode == Mode::Reset) {
         // The list, or the question about the answer picked from it: the same layout either way.
         bool  sure = g_state.resetPending >= 0;
