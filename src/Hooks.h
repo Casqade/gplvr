@@ -146,17 +146,23 @@ struct Options {
 
     // The VR menu from the keyboard, debugKeys or not (VrMenuKeys.h): Ctrl and this key open it
     // and step back out like a grip tap, the arrows move the highlight and change values, Enter
-    // selects, Esc steps back. 'M' by default; 0 disables. VR only. Not in the hotkey clash table:
-    // with Ctrl it does not share a press with any plain key there.
+    // selects, Esc steps back. 'M' by default; none disables. Bound to a wheel or joystick button
+    // it needs no Ctrl. VR only. Not in the hotkey clash table: with Ctrl it does not share a
+    // press with any plain key there.
+    //
+    // EVERY OPTION ENDING IN Key is one binding, a keyboard key or a wheel/joystick button, on one
+    // gplvr.ini line (HotkeyBind.h): `vkey_<n>` for Windows virtual key code n (a bare number reads
+    // the same), the button form `046D:C24F 0 B6 G27 Racing Wheel`, or `none` (or 0) for unbound.
+    // A missing line keeps the default here. The VR menu's Controls tab binds them.
     int vrMenuKey = 'M';
 
-    // EVERY HOTKEY BELOW (every option ending in Key) except vrRecentreKey is a debug control: the
-    // VR menu has what each one toggles. Each poll and swallow reads its key through debugKey(),
-    // which is 0 ("no key") while this is off; the keys keep their values, so the VR menu's
-    // Controls tab switches them on and off live and rebinds them (HotkeyBind.h).
+    // EVERY HOTKEY BELOW (every option ending in Key) except vrRecentreKey and the camera keys is
+    // a debug control: the VR menu has what each one toggles. Each poll and swallow reads its key
+    // through debugKey(), which is 0 ("no key") while this is off; the keys keep their values, so
+    // the VR menu's Controls tab, Debug subtab, switches them on and off live and rebinds them.
     bool debugKeys = false;
 
-    // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; 0 disables.
+    // Mirror tweak mode, for aiming the glasses from the headset. 'M' by default; none disables.
     // VR only. While on, Left/Right turn the glasses, Up/Down tilt them and Page Up/Down
     // widen them, live in both, and those keys do not reach the game; the key again leaves
     // and, if anything changed, writes the three values to the viewed car's section of
@@ -164,15 +170,16 @@ struct Options {
     // it (saving the same way).
     int vrMirrorTweakKey = 'M';
 
-    // How fast mirror tweak mode turns the glasses, in degrees per second.
+    // How fast mirror tweak mode (vrMirrorTweakKey, so debugKeys) turns the glasses, in degrees
+    // per second.
     float vrMirrorTweakAngleSpeed = 10.0f;
 
-    // How fast mirror tweak mode widens the glasses, in doublings per second: 0.5
+    // How fast mirror tweak mode zooms the glasses, in doublings per second: 0.5
     // doubles or halves it every two seconds, the same share of the field at any scale.
     float vrMirrorTweakFovSpeed = 0.5f;
 
     // Step mirrorMode to the next mode while the game runs, for an A/B from the seat (the VR
-    // menu's Mirrors row). 'N' by default; 0 disables. VR only.
+    // menu's Mirrors row). 'N' by default; none disables. VR only.
     int vrMirrorModeKey = 'N';
 
     // KEEP DRAWING AND PRESENTING WHILE ANOTHER APPLICATION HAS THE FOREGROUND.
@@ -248,7 +255,7 @@ struct Options {
     //      about them is VR-specific, they are just a much worse thing to be shown in a headset
     //      you are trying to take off.
     //   2  (default) 1, and Alt+F4 and the window's Close exit the game through GPL's own exits
-    //      (GameExit.h)
+    //      (GameExit.h); Alt+F4 twice within a second kills the process
     int exitMode = 2;
 
     // Turn on GPL's mirror "driver arms" option, which has no ini key or checkbox of its own and
@@ -294,7 +301,8 @@ struct Options {
     // Both halves are close to free. The counters run whether anything reads them, and
     // the glFinish being timed is one roglv2 issues itself -- so unlike `profileGpuWait`
     // this changes nothing about the frame it measures. Off by default because it writes
-    // three of roglv2's import slots. See RenderProfile.h.
+    // three of roglv2's import slots. VR only: loadOptions turns it off in flat mode. See
+    // RenderProfile.h.
     bool profileStages = false;
 
     // Report every millisecond of the frame as CPU WORK or CPU WAIT, in both modes
@@ -322,7 +330,7 @@ struct Options {
     bool profilePost = false;
 
     // GlTrace.h: 1 logs the driver's GL_KHR_debug messages, 2 also finishes and logs every step
-    // of the first frames' baked passes and presents. 0 (default) installs nothing.
+    // of the first 300 frames' baked passes and presents. 0 (default) installs nothing.
     int glTrace = 0;
 
     // Keep the baked track's textures in texture arrays, one bindless handle for each array of
@@ -387,7 +395,7 @@ struct Options {
     // exactly as it would without it.
     bool vr = true;
 
-    // Take the current head pose as the seat. '3' by default; 0 disables. Polled whatever
+    // Take the current head pose as the seat. '3' by default; none disables. Polled whatever
     // debugKeys says; a press while one of GPL's text fields has the keyboard is left to the text
     // (TextEntry.h), and without that check the key is polled only with debugKeys.
     //
@@ -397,16 +405,15 @@ struct Options {
     int vrRecentreKey = '3';
 
     // Move the cockpit camera while the key is held, as the VR menu's Camera position does
-    // (CameraConfig.h); the viewed car's position is saved when the last one is let go. 0 (the
-    // default) is unbound. Not debug keys. Each action also takes a wheel or joystick button,
-    // vr<Action>Button in gplvr.ini (HotkeyBind.h), as every hotkey above and below does.
+    // (CameraConfig.h); the viewed car's position is saved when the last one is let go. Unbound
+    // (none) by default; meant for a POV hat's directions. Not debug keys. VR only.
     int vrCameraForwardKey = 0;
     int vrCameraBackKey = 0;
     int vrCameraUpKey = 0;
     int vrCameraDownKey = 0;
     int vrCameraLeftKey = 0;
     int vrCameraRightKey = 0;
-    // Metres a second the camera keys move it.
+    // Metres a second the camera keys move it, above 0 and at most 1.
     float vrCameraMoveSpeed = 0.10f;
 
     // Drive the camera with the MOUSE, and stop head tracking driving it.
@@ -438,7 +445,7 @@ struct Options {
     bool vrMouseLookInvertPitch = false;
 
     // Toggle it in game. '6' by default, since 1-5 are taken above and the in-game
-    // cameras have the function keys; 0 disables the toggle.
+    // cameras have the function keys; none disables the toggle.
     int vrMouseLookKey = '6';
 
     // HORIZON LOCK, 0 to 1. How much of the car's pitch is taken out of the view.
@@ -521,8 +528,8 @@ struct Options {
     // 0.25 is a 32-pixel arrow about 0.95 degrees tall, the size it had on the menu panel from a
     // 1440-line window. It is an angle on the menu panel, on a head-locked menu and in the eyes,
     // whatever the window's resolution, the headset, vrGplMenuDistance or vrGplMenuScale. The
-    // pointer's own size in Windows multiplies it.
-    float vrCursorScale = 0.25f;
+    // pointer's own size in Windows multiplies it. 0.5 by default, "Cursor size" in the VR menu.
+    float vrCursorScale = 0.5f;
 
     // Gamma the presenter applies to everything it draws in the headset: the eyes, the menus
     // and the HUD panel. 1.0 leaves the game's colours exactly as the monitor shows them;
@@ -589,17 +596,18 @@ struct Options {
     // makes everything on it bigger together, which is the control a driver wants.
 
     // Switch the panel between fixed (vrHudMode 1) and head-locked (2) while the game runs.
-    // Home by default; 0 disables. From vrHudMode 0 it goes to head-locked, which needs no
-    // seat.
+    // Home by default; none disables. From vrHudMode 0 it goes to head-locked, which needs no
+    // seat. Does nothing inside keyboard mirror tweak mode, which uses Home itself.
     int vrHudLayerKey = VK_HOME;
 
     // HUD tweak mode, for placing pribluda's elements on the panel from the headset. End by
-    // default; 0 disables. Pressed in a race with the panel drawn it outlines one element:
+    // default; none disables. Pressed in a race with the panel drawn it outlines one element:
     // the arrows move it, Page Up/Down select another, and the key again leaves and writes
     // the positions to gplvr_pribluda.ini. Independent of vrHudLayerKey.
     int vrHudTweakKey = VK_END;
 
-    // How fast the arrows move an element in tweak mode, in fractions of the panel per second.
+    // How fast the arrows move an element in tweak mode (vrHudTweakKey, so debugKeys), in panel
+    // widths per second: 0.10 crosses the panel in ten seconds.
     float vrHudTweakSpeed = 0.10f;
 
     // ONE FRAME IN N, exactly as mirrorUpdateInterval above, and shown the same way in the menu:
@@ -778,7 +786,7 @@ struct Options {
 
     // What the flat window shows while VR is on:
     //
-    //   0  nothing from gplvr: no blit and no clear. roglv2 still presents the window, so
+    //   0  nothing from gplvr, which saves a little work: no blit and no clear. roglv2 still presents the window, so
     //      it shows whatever its back buffer held -- black, or the last picture blitted
     //      there -- with pribluda's monitor overlay drawn over it every frame, which
     //      accumulates because nothing wipes it. Saves the blit's GPU time.
@@ -786,8 +794,7 @@ struct Options {
     //   2  the right eye
     //   3  both eyes
     //
-    // Only meaningful with vrOffscreen on, because without an off-screen frame the window
-    // IS the render and there is nothing to choose. Flat mode (vr = 0) never reads it.
+    // "Monitor view" in the VR menu. Flat mode (vr = 0) never reads it.
     int vrMonitorEye = kMonitorRight;
 
     // Drain GL with glFinish after the frame transfer's wglDXUnlockObjectsNV, before the frame

@@ -356,7 +356,7 @@ enum MenuTab {
 };
 constexpr int kTabNone = -1;
 
-// Controls' subtabs: the bindings every player has, and the debug hotkeys with their switch.
+// Input' subtabs: the bindings every player has, and the debug hotkeys with their switch.
 enum ControlsSubtab { kSubtabGeneral = 0, kSubtabDebug };
 
 enum RowCommand {
@@ -455,7 +455,7 @@ MenuRow g_rows[] = {
     {"Performance", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "",
      kTabPerformance},
     {"Display", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabDisplay},
-    {"Controls", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls},
+    {"Input", kRowTab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls},
 
     {"Recenter view", kRowAction, kCommandRecentre, nullptr, nullptr, nullptr, 0, 0, 0,
      "When VR menu is closed, use any unbound controller button to recenter your view",
@@ -574,41 +574,33 @@ MenuRow g_rows[] = {
     {"Debug", kRowSubtab, kCommandNone, nullptr, nullptr, nullptr, 0, 0, 0, "", kTabControls,
      nullptr, nullptr, kSubtabDebug},
     {"VR menu", kRowKey, kCommandNone, nullptr, &g_options.vrMenuKey, nullptr, 0, 0, 0,
-     "Opens and closes this menu: Ctrl and the key, or the button", kTabControls},
-    {"Recenter", kRowKey, kCommandNone, nullptr, &g_options.vrRecentreKey, nullptr, 0, 0, 0,
-     "Recenters your view.\n"
-     "The key types as usual while a GPL text field (a save name, a chat line) is being edited",
+     "Shortcut for opening VR menu: Ctrl+key/button", kTabControls},
+    {"Recenter view", kRowKey, kCommandNone, nullptr, &g_options.vrRecentreKey, nullptr, 0, 0, 0,
+     "Recenters your view",
      kTabControls},
     {"Camera forward", kRowKey, kCommandNone, nullptr, &g_options.vrCameraForwardKey, nullptr, 0,
      0, 0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+     "Hold it to move camera forward. Release to save changes",
      kTabControls},
-    {"Camera back", kRowKey, kCommandNone, nullptr, &g_options.vrCameraBackKey, nullptr, 0, 0, 0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+    {"Camera backward", kRowKey, kCommandNone, nullptr, &g_options.vrCameraBackKey, nullptr, 0, 0, 0,
+     "Hold it to move camera backward. Release to save changes",
      kTabControls},
     {"Camera up", kRowKey, kCommandNone, nullptr, &g_options.vrCameraUpKey, nullptr, 0, 0, 0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+     "Hold it to move camera up. Release to save changes",
      kTabControls},
     {"Camera down", kRowKey, kCommandNone, nullptr, &g_options.vrCameraDownKey, nullptr, 0, 0, 0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+     "Hold it to move camera down. Release to save changes",
      kTabControls},
     {"Camera left", kRowKey, kCommandNone, nullptr, &g_options.vrCameraLeftKey, nullptr, 0, 0, 0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+     "Hold it to move camera left. Release to save changes",
      kTabControls},
     {"Camera right", kRowKey, kCommandNone, nullptr, &g_options.vrCameraRightKey, nullptr, 0, 0,
      0,
-     "Moves the cockpit camera while held, as Camera position does.\n"
-     "Saved for the car when you let go",
+     "Hold it to move camera right. Release to save changes",
      kTabControls},
     {"Debug hotkeys", kRowToggleBool, kCommandNone, &g_options.debugKeys, nullptr, nullptr, 0, 0,
      0,
-     "Hotkeys for testing, bound below: mirror and Pribluda setup, mirror mode, mouse look.\n"
-     "This menu has everything they do except mouse look",
+     "Hotkeys for debugging: mirror and Pribluda setup, mirror mode, mouse look",
      kTabControls, nullptr, nullptr, kSubtabDebug},
     {"Mirror setup", kRowKey, kCommandNone, nullptr, &g_options.vrMirrorTweakKey, nullptr, 0, 0,
      0, "Enters and leaves keyboard mirror setup, saving the aim", kTabControls, debugKeysOn,
@@ -616,10 +608,10 @@ MenuRow g_rows[] = {
     {"Mirror mode", kRowKey, kCommandNone, nullptr, &g_options.vrMirrorModeKey, nullptr, 0, 0, 0,
      "Steps to the next mirror mode", kTabControls, debugKeysOn, nullptr, kSubtabDebug},
     {"Mouse look", kRowKey, kCommandNone, nullptr, &g_options.vrMouseLookKey, nullptr, 0, 0, 0,
-     "Switches mouse look on and off; head tracking stops while it is on", kTabControls,
+     "Switches mouse look on and off; head tracking stops while it's active", kTabControls,
      debugKeysOn, nullptr, kSubtabDebug},
     {"Pribluda panel", kRowKey, kCommandNone, nullptr, &g_options.vrHudLayerKey, nullptr, 0, 0, 0,
-     "Switches Pribluda between fixed and head-locked", kTabControls, pribludaDebugKeyOffered,
+     "Switches Pribluda between fixed and head-locked mode", kTabControls, pribludaDebugKeyOffered,
      nullptr, kSubtabDebug},
     {"Pribluda layout", kRowKey, kCommandNone, nullptr, &g_options.vrHudTweakKey, nullptr, 0, 0,
      0, "Enters and leaves keyboard Pribluda layout editing, saving the layout", kTabControls,
@@ -1588,7 +1580,7 @@ void rowValueText(const MenuRow& row, char* out, size_t size) {
             break;
         case kRowKey:
             if (hotkeyCaptureTarget(row.intValue))
-                _snprintf_s(out, size, _TRUNCATE, "Press a key or button...");
+                _snprintf_s(out, size, _TRUNCATE, "Press any key or button to bind...");
             else
                 hotkeyBindingText(row.intValue, out, size);
             break;
@@ -1988,8 +1980,8 @@ void activateRow(int row) {
         hotkeyCaptureBegin(item.intValue);
         char text[160] = {};
         _snprintf_s(text, sizeof(text), _TRUNCATE,
-                    "Press a key or a wheel/joystick button for %s. Esc or grip cancels, "
-                    "Backspace or Delete unbinds",
+                    "Press any key or a wheel/joystick button for %s. Escape or grip cancels the binding, "
+                    "Backspace or Delete unbinds it",
                     item.label);
         notice(text);
         return;

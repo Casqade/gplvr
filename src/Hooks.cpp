@@ -2656,7 +2656,7 @@ void loadOptions(const char* fileName) {
     g_options.vrReplayPanelDistance = static_cast<float>(atof(text));
     if (!(g_options.vrReplayPanelDistance >= 0.5f)) g_options.vrReplayPanelDistance = 0.5f;
     if (g_options.vrReplayPanelDistance > 3.0f) g_options.vrReplayPanelDistance = 3.0f;
-    GetPrivateProfileStringA("gplvr", "vrCursorScale", "0.25", text, sizeof(text), path);
+    GetPrivateProfileStringA("gplvr", "vrCursorScale", "0.5", text, sizeof(text), path);
     g_options.vrCursorScale = static_cast<float>(atof(text));
     if (!(g_options.vrCursorScale >= 0.1f)) g_options.vrCursorScale = 0.1f;
     if (g_options.vrCursorScale > 1.0f) g_options.vrCursorScale = 1.0f;
