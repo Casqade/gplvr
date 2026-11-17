@@ -1789,7 +1789,6 @@ void runCommand(int command) {
                      "(vrMirrorTweakKey) first");
                 break;
             }
-            tweakModeEntered(TweakTarget::Mirror);
             enterMode(Mode::MirrorTweak, g_state.hand);
             break;
         case kCommandHudTweak:
@@ -2490,6 +2489,8 @@ void enterMode(Mode mode, int hand) {
     g_state.adjustRepeatAt = 0;
     g_state.pressed = -1;
     g_state.draggingSlider = false;
+    g_state.grabbed = false;
+    g_state.grabDragging = false;
     g_state.lastLoggedRefusal = -1;
     // The strip and the panel are different sizes and hang at different heights, so the
     // pose is recaptured: entering a tweak mode with the head turned away would otherwise
@@ -2514,11 +2515,17 @@ void enterMode(Mode mode, int hand) {
     // cancelling out of the dialog comes back here for the same target -- taking a fresh
     // snapshot then would adopt the half-finished edits as the baseline and the next question
     // would find nothing changed. Returning to the menu is what ends a session.
+    //
+    // A new session also opens the mode on its first page and direction, so the car-reflection
+    // page or a sideways camera axis left from the last visit is not what the stick moves now.
     if (mode == Mode::Menu) {
         g_snapshot = TweakSnapshot();
     } else if (mode != Mode::Confirm && mode != Mode::Reset && mode != Mode::Help) {
         TweakTarget target = targetOf(mode);
-        if (!g_snapshot.valid || g_snapshot.target != target) snapshotTake(target);
+        if (!g_snapshot.valid || g_snapshot.target != target) {
+            tweakModeEntered(target);
+            snapshotTake(target);
+        }
     }
 
     switch (mode) {

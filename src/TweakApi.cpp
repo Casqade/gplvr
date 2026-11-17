@@ -890,6 +890,7 @@ const char* tweakPageName(TweakTarget target) {
 
 void tweakModeEntered(TweakTarget target) {
     if (target == TweakTarget::Mirror) g_mirrorPage = kMirrorPageAim;
+    if (target == TweakTarget::Camera) cameraConfigSelect(kCameraForward);
 }
 
 int32_t tweakIndexCount(TweakTarget target) {

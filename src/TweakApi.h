@@ -229,7 +229,8 @@ constexpr int32_t kMirrorPageAim = 0;
 constexpr int32_t kMirrorPageCar = 1;
 int32_t     tweakPage(TweakTarget target);
 const char* tweakPageName(TweakTarget target);
-// A tweak mode being entered: it opens on its first page (Mirror setup on the aim).
+// A tweak mode's session starting: it opens on its first page (Mirror setup on the aim, not
+// the car in it) and the camera on its first direction, forward.
 void        tweakModeEntered(TweakTarget target);
 
 // The default controller mapping for a target's tweak mode. THIS TABLE IS THE MAPPING:
