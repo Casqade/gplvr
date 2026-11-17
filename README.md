@@ -110,8 +110,9 @@ If you're having trouble with any step or understanding its phrasing, feel free 
 ## Configuration
 
 1. **Disable all compatibility fixes applied to your GPL executable (untick everything in File -> Properties -> Compatibility)**
-2. If you're going to use GPLVR in flat (non-VR) mode, open `gplvr.ini`, set `vr` to `0` and save changes. Otherwise proceed to the next step
-3. GPLVR can be launched in two ways. Pick one which is easier for you:
+2. If you use GEM+, **Disable all [incompatible XML patches](#compatibility)**
+3. If you're going to use GPLVR in flat (non-VR) mode, open `gplvr.ini`, set `vr` to `0` and save changes. Otherwise proceed to the next step
+4. GPLVR can be launched in two ways. Pick one which is easier for you:
   - Via GPLVR launcher: if the exe you use to run GPL is NOT `gplc67.exe`, open gplvr.ini in text editor and rename `exe` value in `[loader]` section to the one you actually use (e.g. `gpl2020demo.exe`). Save changes and you're clear to run gplvr.exe
   - Via GPLVR loader patch: Put `gplvr-load.xml` from `gplvr/patches` dir into your GEM+ patches directory (`GPLSecrets/GEM+/Options`) and apply it in GEM+ so it picks up gplvr.dll automatically
 
@@ -127,9 +128,12 @@ For that reason GPLVR implements a custom renderer to reduce CPU load and utiliz
 
 If you can't get stable fps or the cars/world around you moves choppily, try this until you hit your headset refresh rate:
 - reduce `Detail Bias` in GPL Graphics settings. If cars in the mod you use have well-balanced LOD tiers, this step should be the most impactful
+- reduce `Mirror draw distance`
+- reduce `Mirror LOD distance`
+- disable `Show player car in mirror`
 - reduce mirror update rate (movement in mirrors will be choppy)
-- try setting 2.5D or 2D mirrors (2D mirrors will lose depth, which to my experience hurts eye comfort and immersion)
-- disable mirrors completely (mirror update rate = 0)
+- try setting `2.5D` or `2D` mirrors (2D mirrors will lose depth, which to my experience hurts eye comfort and immersion)
+- disable mirrors completely (`Mirror update rate = 0`)
 
 In my experience, default GPL 2020 Demo carset has the worst performance:
 - `Ferrari 330 P4` has 3 mirrors which adds 2 more render passes per frame
@@ -181,3 +185,4 @@ One of the stock gpl67 GEM+ patches raises flagman count limit for the tracks. H
 - Tough F1 drivers who had guts to drive so fast on those dangerous cars & tracks
 - GPL World and other GPL websites maintainers for offering GPL Installers, helpful URLs and all the GPL content we love
 - GEM+ developers and other asm enthusiasts who make patches for GPL (Paul Thurston, Lee Bowden, Petteri Pajunen, Nigel Pattinson et al.)
+- Playtesters for reporting valuable feedback during Beta, which made GPLVR much better: JohnnyR, GrandPrixYannick, Illyra, GPLaps, Wyber Boyes
